@@ -44,6 +44,21 @@ pub enum ProposeError<I> {
   #[error("the log index space is exhausted")]
   LogIndexExhausted,
 
+  /// A merge naming this group as its TARGET is in flight (a `CommitMerge` proposed, parked, or
+  /// absorbed with its compaction still landing), and membership changes are fenced until it
+  /// settles: a replica added inside the window could be log-walked across the absorb point and
+  /// silently miss the union. The fence releases on its own within a storage crank of the
+  /// resolution; re-propose then.
+  #[error("a merge into this group is in flight; membership changes are fenced until it settles")]
+  MergeInFlight,
+  /// The group is FROZEN by a merge — a `PrepareMerge` has entered its log (append-observed) or
+  /// applied — and accepts no new entries: anything appended above the freeze would either
+  /// diverge the absorbed state across target replicas (each absorbs its LOCAL source at its own
+  /// apply progress) or be silently dropped from the union. The freeze is released only by the
+  /// merge completing (the group is then absorbed and gone) or an explicit `RollbackMerge` — the
+  /// ONE entry proposable while frozen. Nothing was appended.
+  #[error("the group is frozen by an in-flight merge")]
+  Frozen,
   /// The proposed entry is too large to ever fit in one transport frame. Accepting it would append a
   /// committed log entry that no `AppendEntries` could carry, so every follower's connection would
   /// close on each resend and replication would wedge cluster-wide. `size` is the entry's worst-case
@@ -53,6 +68,21 @@ pub enum ProposeError<I> {
     /// The entry's worst-case encoded wire cost, in bytes.
     size: usize,
     /// The per-frame entry budget, in bytes.
+    max: usize,
+  },
+  /// The membership this conf change would install carries a `ConfState` so large that its
+  /// `InstallSnapshot` metadata leaves no room for a data chunk under the frame limit. A committed
+  /// such config would make `send_snapshot_chunk` defer FOREVER after the next compaction — a silent,
+  /// permanent replication wedge. Refused at propose so the entry never enters the log. `size` is the
+  /// metadata's worst-case encoded frame cost and `max` the permitted share of the frame, in bytes.
+  /// Nothing was appended.
+  #[error(
+    "the resulting membership is too large to snapshot ({size} > {max} bytes of frame metadata)"
+  )]
+  MembershipTooLargeToSnapshot {
+    /// The resulting `ConfState`'s worst-case `InstallSnapshot` metadata frame cost, in bytes.
+    size: usize,
+    /// The permitted share of a transport frame for snapshot metadata, in bytes.
     max: usize,
   },
 }
@@ -138,6 +168,66 @@ pub enum CreateGroupError {
   StorageInUse,
 }
 
+/// Why [`MultiRaft::remove_group`](crate::MultiRaft::remove_group) — or a multi coordinator's
+/// tombstone-aware wrapper of it — refused to tear a group down. The group is left FULLY intact
+/// (endpoint, stores, obligations, and the coordinator's tombstone/side state) in the refusal; a
+/// refused removal is a no-op the caller retries, never a partial teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RemoveError {
+  /// The group still owes an aborted upstream merge its thaw: a merge it applied as a TARGET was
+  /// aborted, recording a durable `abandoned` obligation its per-crank thaw pass has not yet
+  /// discharged. Tearing it down would destroy that obligation's ONLY replay source — the holder's
+  /// own log — leaving the upstream source frozen forever with no holder left to run the thaw. The
+  /// teardown-door sibling of [`MergeError::SourceOwesThaw`](crate::MergeError::SourceOwesThaw):
+  /// that gate guards the merge-absorb door (a source dissolving), this one guards the EXPLICIT
+  /// teardown door (a hosted group removed). TRANSIENT and self-clearing, exactly like it: the thaw pass
+  /// discharges each obligation within a few cranks, after which the SAME removal admits. The
+  /// escape for a genuinely-dead holder is the catalog — flooring the OWED SOURCE discharges the
+  /// obligation (the thaw pass's `!floor_admits` arm), after which removal admits.
+  #[error("the group still owes an aborted merge its thaw and cannot be torn down")]
+  OwesThaw,
+  /// The group is a merge SOURCE whose freeze is ACTIVE — an applied `PrepareMerge` (`Frozen`), or
+  /// an appended-but-unapplied one (freeze-pending). Its claimed target parks its `CommitMerge`
+  /// against exactly this freeze, so tearing the source down strands that park with nothing left to
+  /// absorb or abort against. Roll the merge back first (abort → thaw): once the source thaws the
+  /// SAME removal admits. NOT produced for an OWED source (one a hosted target already owes a thaw):
+  /// that abort has already resolved the choreography, and the teardown purge plus the driver floor
+  /// discharge the obligation — the designed catalog escape, so a genuinely-dead frozen source is
+  /// still removable.
+  #[error("the group is a frozen merge source mid-choreography and cannot be torn down")]
+  Frozen,
+  /// The group is a merge TARGET parked on a committed `CommitMerge`, holding its apply drain at the
+  /// freeze boundary while the container resolves the absorb-or-abort. Removing the decider strands
+  /// the frozen source it names — no park is left to complete the absorb or relay the abort. Let the
+  /// merge resolve first (the per-crank service absorbs or aborts it), after which the SAME removal
+  /// admits.
+  #[error("the group is a target parked on a merge commit and cannot be torn down")]
+  MergeParked,
+  /// Another hosted group's parked `CommitMerge` names THIS group as its merge source — the
+  /// cross-endpoint leg, which fires even before this group's own replica has observed its freeze.
+  /// Removing it strands that park (its replicas are log-complete, so the install-supersede route
+  /// never fires). Resolve or roll back the naming merge first; recovery for a genuinely-dead
+  /// participant is the embedder's catalog, exactly like any dead group.
+  #[error("a parked merge names this group as its source and it cannot be torn down")]
+  SpokenFor,
+  /// Another hosted endpoint is a merge SOURCE that names THIS group as its TARGET — either
+  /// applied-frozen (its `frozen_for` claim is this group) or with an append-pending `PrepareMerge`
+  /// in its unapplied suffix whose decoded claim is this group — while this group has not yet parked
+  /// its own `CommitMerge`. The pre-park leg the other participant refusals miss: the source is not
+  /// yet `SpokenFor` by any park (this group never proposed one), and this group is neither `Frozen`
+  /// nor `MergeParked`. Removing it strands that source frozen for a target that no longer exists —
+  /// both the absorb (`CommitMerge`) and the abort (`RollbackMerge`) ride THIS group's log, so
+  /// tearing it down leaves the source with no log left to propose either against, and the source's
+  /// own removal then refuses `Frozen` (it owes no thaw). Roll the naming merge back first
+  /// (`rollback_merge` on this group names the source — this group is still hosted pre-park, so the
+  /// abort rides its log and thaws the source), after which this group's removal admits; or let the
+  /// merge complete. Recovery for a genuinely-dead target is the embedder's catalog, like any dead
+  /// group.
+  #[error("a merge source claims this group as its target and it cannot be torn down")]
+  Claimed,
+}
+
 /// Why [`MultiRaft::propose_split`](crate::MultiRaft::propose_split) — or a coordinator/driver
 /// delegator around it — refused to propose a group split. One enum, three producer layers: the
 /// container produces the consensus-shaped refusals (`NotLeader`/`JointConfig`/`ChildExists`/
@@ -176,6 +266,13 @@ pub enum SplitError<I> {
   /// until the conflict resolves — refuse at propose instead of manufacturing that conflict.
   #[error("a group with the child id is already hosted")]
   ChildExists,
+  /// The child id is TOMBSTONED by a removal on this host (a coordinator-layer refusal through its
+  /// `retired` set): a committed split against a locally-retired id could never materialize here
+  /// (admission refuses [`CreateGroupError::Retired`]) — refuse at propose so the entry is never
+  /// appended. Re-admission is the explicit clear-then-recreate rejoin path, exactly as for
+  /// [`CreateGroupError::Retired`]; retry the split once the id is live again.
+  #[error("the child group id is tombstoned by a removal on this host")]
+  ChildRetired,
   /// The child id's `Data` encoding is outside the group-tag wire bound (1..=1024 bytes).
   /// Refused at propose because a COMMITTED split whose child cannot decode poisons every
   /// replica of the parent (`SplitDecode`) — a self-inflicted cluster-wide fail-stop.
@@ -203,9 +300,283 @@ pub enum SplitError<I> {
   /// freeze machinery is its surface; nothing produces this today).
   #[error("the parent group is frozen by an in-flight merge")]
   Frozen,
+  /// The parent's lineage counter is one below the reserved
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) terminal, so the split's `parent_gen_after` mint would
+  /// reach the sentinel — a generation every downstream reader treats as merged-away, never a
+  /// working incarnation. Refused at propose so the unmintable value never enters the log (the
+  /// lineage analogue of [`ProposeError::LogIndexExhausted`]); this parent can never split again.
+  /// Unreachable short of log-index exhaustion — every mint consumes a log index — so only a
+  /// crafted or corrupt lineage counter reaches it. Nothing was appended.
+  #[error(
+    "the parent group's lineage counter is exhausted (a split cannot mint past the reserved u64::MAX terminal)"
+  )]
+  LineageExhausted,
+  /// The parent group's state machine does not support splitting
+  /// ([`StateMachine::supports_split`](crate::StateMachine::supports_split) is `false`). A committed
+  /// `Split` against a non-splitting FSM would poison every replica at apply
+  /// (`PoisonReason::SplitUnsupported`); refused at propose so the entry is never appended. A fixed
+  /// property of the FSM type — re-propose only against a group whose FSM implements `split`.
+  #[error("the parent group's state machine does not support splitting")]
+  Unsupported,
   /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
   /// entry too large for one frame). The split-specific gates all passed; the failure is the
   /// ordinary admin-append class, surfaced verbatim.
+  #[error(transparent)]
+  Propose(#[from] ProposeError<I>),
+}
+
+/// Why a merge verb — [`MultiRaft::prepare_merge`](crate::MultiRaft::prepare_merge),
+/// [`commit_merge`](crate::MultiRaft::commit_merge), or
+/// [`rollback_merge`](crate::MultiRaft::rollback_merge), or a coordinator/driver delegator
+/// around them — refused to propose. One enum, three producer layers, the [`SplitError`]
+/// precedent verbatim: the container produces the consensus-shaped refusals, a coordinator's
+/// delegator produces the floor refusals through its per-call seam, and a sharded host's handle
+/// produces `CrossPlane` before any command crosses a plane. Nothing is appended in every case.
+/// A propose-time [`Unsupported`](Self::Unsupported) gate consults the leader's
+/// [`StateMachine::supports_absorb`](crate::StateMachine::supports_absorb) — a type-constant property —
+/// so a merge into a non-absorbing FSM is refused before it is appended; the apply-time
+/// `PoisonReason::MergeUnsupported` fail-stop remains the determinism backstop for a mixed-version cluster.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum MergeError<I> {
+  /// This node is not the mutated group's leader; redirect to `leader` if known. Each merge verb
+  /// rides exactly one group's log — `prepare_merge` the source's, `commit_merge` and
+  /// `rollback_merge` the TARGET's (the abort must be totally ordered against the commit),
+  /// the relayed thaw the source's — so only that group's leader can propose it.
+  #[error("not the mutated group's leader")]
+  NotLeader {
+    /// The believed current leader of the mutated group, if known.
+    leader: Option<I>,
+  },
+  /// The source and target are the same group. A group cannot absorb itself.
+  #[error("a group cannot merge into itself")]
+  SelfMerge,
+  /// The claim points the WRONG way along the fixed total order over ids: a merge claim must
+  /// point strictly DOWN it, so the source's canonical [`Data`](crate::Data) encoding must sort
+  /// STRICTLY ABOVE the target's (their encoded byte strings compared with `Ord`). Because every
+  /// edge strictly decreases one total order, a claim cycle (A→B→…→A) is UNCONSTRUCTIBLE — no
+  /// cycle can strictly decrease all the way around — which is what keeps concurrently-admitted
+  /// freezes at different leaders from deadlocking every release valve. The encoding-minimal id of
+  /// any pair is therefore always the target/survivor; the embedder orients each pair (source =
+  /// the encoding-larger side) before proposing. This is a property of the id PAIR, not of any
+  /// mutable state, so it never self-clears — re-pair with the roles swapped.
+  #[error("the merge claim is inverted: the source must encode strictly above the target")]
+  DirectionInverted,
+  /// `prepare_merge`'s target group is not hosted by this container. The preconditions compare
+  /// the two groups' LOCAL replicas (voter sets, read modes), so the target must live here —
+  /// which colocation guarantees for every legitimate pairing.
+  #[error("the merge target is not hosted locally")]
+  TargetMissing,
+  /// `commit_merge`'s source group is not hosted by this container: there is no local frozen
+  /// replica to gate on (or absorb). Same colocation contract as [`TargetMissing`](Self::TargetMissing).
+  #[error("the merge source is not hosted locally")]
+  SourceMissing,
+  /// The two groups' VOTER sets are not identical node sets. Colocation is what makes the
+  /// absorb a purely local hand-off on every replica; merge the memberships first.
+  #[error("the source and target voter sets differ")]
+  VoterSetsDiffer,
+  /// A participant's committed configuration still carries LEARNERS. A merge is a purely local
+  /// hand-off on every replica, and the driver's relay places children only on VOTER hosts and
+  /// parks a live `CommitMerge` only on the target's VOTER hosts — so a target-learner host, even
+  /// one that later becomes leader, would park its absorb at `k − 1` forever. Align the replica
+  /// sets first: promote or remove the learners on both sides (the CRDB doctrine). Boot-config
+  /// observers never enter a committed configuration, so they are unaffected; and the non-joint
+  /// gate this refusal sits behind already empties `learners_next`, leaving the stable learner
+  /// set as the whole of it.
+  #[error("a merge participant's configuration carries learners")]
+  LearnersPresent,
+  /// One of the groups is mid-joint-configuration; its effective voter set is ambiguous for the
+  /// colocation comparison. Finish (or leave) the joint change first.
+  #[error("a merge participant is in a joint configuration")]
+  JointConfig,
+  /// The groups run different ACTIVE read modes. A merged group serves under one mode's
+  /// guarantees; migrate one side first (the shipped `SetReadMode` machinery).
+  #[error("the source and target read modes differ")]
+  ReadModesDiffer,
+  /// A membership change is still in flight (appended, not yet applied) on a participant. The
+  /// voter-set comparison would race its apply — and a conf entry committing above the freeze
+  /// strands the changed membership outside the merge. Re-propose after it applies.
+  #[error("a merge participant has a membership change in flight")]
+  ConfChangeInFlight,
+  /// A group SPLIT is still in flight (a `Split` appended, not yet applied) on a participant. A
+  /// merge verb mints its lineage generation from the participant's LIVE `shape_gen`, but a split
+  /// appended BELOW the merge entry applies FIRST and bumps that counter — so the merge's mint is
+  /// already stale by the time it applies. On a `commit_merge` target that is fatal: the stale
+  /// `CommitMerge` no-ops at its apply-time lineage guard and emits `MergeAborted` WITHOUT parking
+  /// or recording the source's thaw obligation, stranding the frozen source (only a manual
+  /// rollback recovers it). On a `prepare_merge` source the freeze's generation would COLLIDE with
+  /// the split's on one counter. The same serialize-one-lineage-move rule as
+  /// [`ConfChangeInFlight`](Self::ConfChangeInFlight) and the dual of
+  /// [`SplitError::Frozen`](crate::SplitError::Frozen) (which refuses a split on a freezing group).
+  /// TRANSIENT and self-clearing: re-propose once the split applies — the merge then mints from the
+  /// post-split counter and completes (or aborts through the normal claim path, which DOES record
+  /// the thaw obligation).
+  #[error("a merge participant has a split in flight")]
+  SplitInFlight,
+  /// A merge ROLLBACK is still in flight (a target-role `RollbackMerge` appended, not yet applied)
+  /// on the `commit_merge` TARGET. The same lineage-staling hazard as
+  /// [`SplitInFlight`](Self::SplitInFlight): an abort applies at its live mint and bumps `shape_gen`,
+  /// so an unapplied one below a fresh `CommitMerge` stales its generation mint — the fan-in strand,
+  /// where a target absorbing one source while a release-valve abort of a DIFFERENT frozen source
+  /// sits unapplied on its log makes the absorb no-op at its STRICT lineage guard and strand the
+  /// committed source with no thaw obligation. (The abort of the SAME merge being committed is caught
+  /// earlier by [`AlreadyPending`](Self::AlreadyPending); this closes the cross-source case. The
+  /// SOURCE side of a merge is unaffected — the freeze fold is a monotone max, not a stale-aborting
+  /// guard, and its collision is honored downstream by the absorb's Resolve-arm hold.) TRANSIENT:
+  /// re-propose once the abort applies — its own thaw is relayed and the merge mints afresh.
+  #[error("a merge participant has a merge rollback in flight")]
+  RollbackInFlight,
+  /// The source is already frozen (or its freeze is pending in the log). One merge at a time
+  /// per source; the standing freeze must resolve or roll back first.
+  #[error("the source group is already frozen or freezing")]
+  AlreadyFrozen,
+  /// A `CommitMerge` is already in flight or parked on the target. One absorb at a time; the
+  /// standing one must resolve first.
+  #[error("a merge into this target is already in flight or parked")]
+  AlreadyPending,
+  /// `commit_merge`'s LOCAL source replica is not yet frozen-applied at its freeze boundary —
+  /// not frozen at all, or still applying toward it. The propose gate is deliberately local and
+  /// cheap (every replica's parked apply re-checks the same facts); retry after the local
+  /// source catches up, or roll the merge back.
+  #[error("the local source replica is not frozen-applied at its freeze boundary")]
+  SourceNotReady,
+  /// The all-source-voters freeze barrier is not yet observably met. `commit_merge` refuses to
+  /// dissolve the source until EVERY source voter has matched the freeze boundary, so a
+  /// committed `CommitMerge` certifies that the whole voter set already holds the freeze — the
+  /// dissolution that rides it can then run on every host with no straggler orphaned, even if the
+  /// source leader is lost. The barrier is observable only on the source LEADER's tracker, so this
+  /// refuses when the local source is a follower (colocate the target's leadership onto the source
+  /// leader first) or when a voter still lags the boundary (the frozen source keeps replicating —
+  /// retry once it catches up, or roll the merge back if a voter is permanently gone).
+  #[error("not every source voter has reached the freeze boundary yet")]
+  SourceBarrierPending,
+  /// The source still owes an aborted upstream merge its thaw: a merge this endpoint applied as a
+  /// TARGET was aborted, recording a durable `abandoned` obligation that its per-crank thaw pass has
+  /// not yet discharged. It cannot dissolve as a fresh merge's source — the Resolve arm removes the
+  /// source endpoint, and every undischarged obligation would vanish with it, stranding the upstream
+  /// source frozen forever. TRANSIENT, exactly like [`SourceBarrierPending`](Self::SourceBarrierPending):
+  /// the thaw pass drives each abandoned source past its freeze within a few cranks, discharging the
+  /// obligation, after which the same freeze admits.
+  #[error("the source still owes an aborted merge its thaw")]
+  SourceOwesThaw,
+  /// The `prepare_merge` source is itself the CLAIMED TARGET of another in-flight merge: a
+  /// co-hosted source's freeze — applied (`frozen_for`) or still append-pending in its log —
+  /// names this group. Freezing it as a fresh merge's source would
+  /// let a later absorb dissolve it, and the claimant's release verbs BOTH ride the dissolved
+  /// group's log (`commit_merge` and `rollback_merge` are target-proposed), stranding the
+  /// claimant frozen with no release valve. The propose-time twin of the teardown gate's
+  /// [`Claimed`](crate::RemoveError::Claimed) leg, sharing its claim read — equal-voter-set
+  /// pairing means every host of this group co-hosts the claimant, so the claim is locally
+  /// visible wherever this propose can run — and FAIL-CLOSED like it (an unreadable claim
+  /// refuses). TRANSIENT: the claiming choreography's resolution releases it — an absorb
+  /// dissolves the claim holder, an abort's relayed thaw clears its claim — after which the
+  /// same freeze admits.
+  #[error("the source is another in-flight merge's claimed target")]
+  SourceClaimedAsTarget,
+  /// The `commit_merge` TARGET already owes THIS source incarnation an aborted-merge thaw: a prior
+  /// abort of this very merge committed+applied on the target — recording a durable `abandoned`
+  /// obligation for `(source, freeze generation)` — while the source is still frozen at that
+  /// generation, its relayed thaw not yet applied. Re-proposing the commit would park every replica
+  /// at the aborted freeze generation, and the per-crank thaw pass then drives the source PAST it —
+  /// so the park could never observe the source frozen-at-expected again and would wedge the
+  /// target's apply forever. The apply-time dual of [`SourceOwesThaw`](Self::SourceOwesThaw), on the
+  /// target side. GENERATION-EXACT: a spent obligation the source already thawed past (and re-froze
+  /// above for a fresh merge) names a DEAD incarnation and does not refuse the legitimate new merge.
+  /// TRANSIENT: the thaw pass discharges the obligation within a few cranks, after which the source
+  /// re-freezes and the same target admits the commit.
+  #[error("the merge target still owes this source incarnation an aborted-merge thaw")]
+  TargetOwesThaw,
+  /// A participant's CURRENT incarnation is below its persisted admission floor (a
+  /// coordinator-layer refusal through its floor seam): this replica belongs to a fenced
+  /// incarnation — a stale survivor that must not anchor a merge.
+  #[error("a merge participant's incarnation is below its admission floor ({floor})")]
+  BelowFloor {
+    /// The persisted admission floor that fenced the participant.
+    floor: u64,
+  },
+  /// The source and target map to different planes on a sharded (K-plane) host. A merge is a
+  /// same-plane operation (the absorb is an in-container hand-off); cross-plane merges are the
+  /// same explicit non-goal as cross-plane splits.
+  #[error("the source and target map to different planes")]
+  CrossPlane,
+  /// `rollback_merge`'s local source replica holds no APPLIED freeze — there is nothing to
+  /// abort. A merely pending freeze also refuses (its generation and claim are unreadable
+  /// until it applies; a freeze that never commits self-heals through truncation instead).
+  #[error("the local source replica holds no applied freeze")]
+  NotFrozen,
+  /// The source's freeze names a DIFFERENT target: the freeze is a CLAIM by exactly one
+  /// target, pinned on the source's log for the freeze's whole generation — only that target
+  /// may absorb it or abort it (the claim is what makes two targets naming one frozen source
+  /// resolve identically on every replica).
+  #[error("the source's freeze names a different target")]
+  SourceClaimed,
+  /// The relayed thaw names freeze generation `expected`, but this source leader's applied
+  /// lineage `seen` has not reached it yet — the freeze is committed but not yet folded on a
+  /// freshly elected leader. TRANSIENT: the relay retries once the source's apply catches up.
+  #[error(
+    "the source has not applied the thaw's freeze generation yet (expected {expected}, at {seen})"
+  )]
+  SourceBehindFreeze {
+    /// The freeze generation the relay authorizes a thaw for.
+    expected: u64,
+    /// The source's current applied lineage, still short of it.
+    seen: u64,
+  },
+  /// The relayed thaw names freeze generation `expected`, but the source's lineage `seen` has
+  /// already advanced past it — the freeze was thawed, and the same source→target pair may have
+  /// re-frozen for a NEW merge. A relay retained across source-leader churn must bind to the
+  /// incarnation it abandoned, never the source's live counter, or it would thaw that later
+  /// freeze with no matching target-side abort — aborting the new merge out of order. TERMINAL:
+  /// the relay is a spent authorization and is dropped.
+  #[error("the thaw's freeze generation is stale (expected {expected}, source at {seen})")]
+  StaleThaw {
+    /// The freeze generation the relay authorized a thaw for.
+    expected: u64,
+    /// The source's current lineage, already past it.
+    seen: u64,
+  },
+  /// A hosted target's parked `CommitMerge` still names this source — the fail-safe belt on the
+  /// DEAD-TARGET thaw derivation. A source frozen for a terminally-floored, no-longer-hosted target
+  /// derives its OWN thaw (the second legitimate thaw derivation); this belt refuses that mint while
+  /// any local park names the source, because a live park means an absorb of this source may still
+  /// be resolving on this very host, and minting a thaw underneath would move the counter the park
+  /// gates on. TRANSIENT: the park resolves (absorb or abort) within a few cranks, after which — if
+  /// the target is genuinely dead — the derivation admits.
+  #[error("a hosted target's parked commit still names this source")]
+  SourceAbsorbParked,
+  /// The CLAIMED target holds NO committed abort obligation for this `(source, expected)`
+  /// incarnation — the structural derived-from-abort gate. A source thaw is legal ONLY as the
+  /// downstream consequence of a committed target-side abort: the target's durable `abandoned`
+  /// record for exactly this source and freeze generation is what authorizes moving the source's
+  /// counter. Absent it, appending the thaw would unfreeze a source no target ever abandoned —
+  /// the cross-log rollback race the whole abort-derives-thaw path exists to prevent. Unreachable
+  /// from the container's own per-crank service, which derives the drive FROM the obligation; the
+  /// belt-and-suspenders refusal that makes the invariant intrinsic to the thaw path itself.
+  #[error("the claimed target holds no committed abort obligation for this source incarnation")]
+  UnbackedThaw,
+  /// The mutated group's lineage counter is one below the reserved
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) terminal, so this verb's generation mint (a freeze's
+  /// `source_gen_after`, an absorb's or abort's `target_gen_after`, or a thaw's `source_gen_after`)
+  /// would reach the sentinel — a generation every downstream reader treats as merged-away, never a
+  /// working incarnation. Refused at propose so the unmintable value never enters the log (the
+  /// lineage analogue of [`ProposeError::LogIndexExhausted`]); this group can never reshape again.
+  /// Unreachable short of log-index exhaustion — every mint consumes a log index. Nothing was
+  /// appended.
+  #[error(
+    "the group's lineage counter is exhausted (a merge verb cannot mint past the reserved u64::MAX terminal)"
+  )]
+  LineageExhausted,
+  /// A merge participant's state machine does not support absorbing
+  /// ([`StateMachine::supports_absorb`](crate::StateMachine::supports_absorb) is `false`). A committed
+  /// `CommitMerge` against a non-absorbing
+  /// FSM would poison every replica at apply (`PoisonReason::MergeUnsupported`); refused at propose so
+  /// the entry is never appended. A fixed property of the FSM type — re-propose only against groups
+  /// whose FSM implements `absorb`.
+  #[error("a merge participant's state machine does not support absorbing")]
+  Unsupported,
+  /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
+  /// entry too large). The merge-specific gates all passed; the failure is the ordinary
+  /// admin-append class, surfaced verbatim.
   #[error(transparent)]
   Propose(#[from] ProposeError<I>),
 }
@@ -227,6 +598,18 @@ pub enum TransferError<I> {
   /// The target node is the current leader — no transfer needed.
   #[error("transfer target is already the leader")]
   AlreadyLeader,
+  /// The group is FROZEN by an in-flight merge: its leadership is about to be dissolved into the
+  /// absorbing target, so handing it off is refused (a transferee would inherit the same frozen
+  /// group). Roll the merge back first if the transfer genuinely matters.
+  #[error("the group is frozen by an in-flight merge")]
+  Frozen,
+  /// A forced handoff is already in flight THIS term: a `TimeoutNow` was sent to an earlier target,
+  /// authorizing a forced campaign. Retargeting to a DIFFERENT node would authorize a SECOND forced
+  /// campaign in the same term — two peers bypassing PreVote/lease at once. Retrying the SAME target
+  /// is idempotent (`Ok`); a different target is admitted only once a fresh leadership term begins
+  /// (`become_leader` resets the flag), since a mere step-down leaves the node unable to transfer at all.
+  #[error("a forced leadership handoff is already in flight this term")]
+  HandoffPending,
   /// The node has entered the permanent poisoned state and accepts no new work. The transfer was
   /// NOT initiated; inspect `poison_reason()`.
   #[error("the node is poisoned and cannot initiate a transfer")]
@@ -270,6 +653,11 @@ pub enum ReadIndexError {
   /// rather than silently accepted onto a path that never completes.
   #[error("node is poisoned; reads cannot be confirmed")]
   Poisoned,
+  /// The group is FROZEN by an applied merge freeze: it fails reads CLOSED, typed, rather than
+  /// parking them forever — sailing sits below routing, so the embedder re-routes the query to
+  /// the absorbing target once the merge resolves (or rolls the merge back).
+  #[error("the group is frozen by an in-flight merge; reads fail closed")]
+  Frozen,
 }
 
 /// Why constructing a [`crate::Config`] failed.

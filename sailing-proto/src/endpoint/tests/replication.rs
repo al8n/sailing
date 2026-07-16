@@ -487,8 +487,8 @@ fn duplicate_append_does_not_ack_in_flight_tail() {
 /// unconditional advance, even though no `pending` action survives. A later duplicate's
 /// immediate ack must report 1, proving the watermark advanced.
 ///
-/// MUTATION: revert FIX 2 so the advance lives only inside the `FollowerAck`/`LeaderAppend`
-/// arms. Then the cleared-pending completion hits the `_` arm, `durable_index` stays at 0, and
+/// MUTATION: move the advance back inside the `FollowerAck`/`LeaderAppend`
+/// arms only. Then the cleared-pending completion hits the `_` arm, `durable_index` stays at 0, and
 /// the duplicate clamps to `min(1, 0) = 0` — the assertion (duplicate acks 1) FAILS.
 #[test]
 fn durable_index_advances_after_term_cleared_follower_ack() {
@@ -720,7 +720,8 @@ fn stale_append_entries_does_not_erase_committed_entries() {
   assert_eq!(log.last_index(), Index::new(3), "log must hold 3 entries");
 
   // Now feed a stale/duplicate AppendEntries carrying only entry 1 (a short prefix already
-  // present). Under the old code this would have truncated entries 2 and 3.
+  // present). A blind truncate-to-the-append's-end would delete entries 2 and 3: a matching prefix
+  // is not a conflict, so only a genuinely DIVERGENT entry may truncate.
   let e1_dup = Entry::new(
     Term::new(1),
     Index::new(1),
@@ -1065,6 +1066,277 @@ fn owned_zero_payload_backlog_reads_are_count_bounded() {
   );
 }
 
+/// The per-crank apply budget: a single `handle_storage` crank applies at MOST one budget of committed
+/// entries (a HARD bound — the fetch is capped by the remaining allowance, so never budget + a batch),
+/// stops strictly below `commit`, and reports `MorePending` so the driver re-drives without sleeping —
+/// instead of draining the whole backlog
+/// in one crank and starving co-located groups / timers / IO. Repeated cranks then reach `applied ==
+/// commit`, and the final crank reports `Drained` (liveness). Single-voter leader, snapshot disabled so
+/// no capture/compaction perturbs the drain; the backlog is force-appended and `commit` advanced directly.
+#[test]
+fn apply_drain_is_budgeted_and_re_driven_to_completion() {
+  use crate::{
+    Config, Entry, EntryKind, Index, Instant, StorageProgress, Term, endpoint::APPLY_BUDGET_ENTRIES,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  // Above the whole backlog: no snapshot capture/compaction fires mid-drain to perturb the counters.
+  .with_snapshot_threshold((10 * MAX_READ_BATCH_ENTRIES) as usize);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+
+  // Elect the single voter and settle the no-op (applied == commit == 1, stores drained).
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  while ep.handle_storage(d, &mut log, &mut stable) == StorageProgress::MorePending {}
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  let applied_before = ep.applied_index();
+
+  // A committed backlog of 3 budgets of small Normal entries, appended durably and committed directly.
+  let n = 3 * MAX_READ_BATCH_ENTRIES;
+  let first = applied_before.next().get();
+  let entries: Vec<Entry> = (0..n)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(first + i),
+        EntryKind::Normal,
+        encode_cmd(b"x"),
+      )
+    })
+    .collect();
+  log.force_append(&entries);
+  ep.commit = Index::new(first + n - 1);
+
+  // ONE crank must NOT drain the whole backlog: at most one budget (a HARD bound, since the fetch is
+  // capped by the remaining allowance — never budget + a batch), strictly below commit, and it
+  // reports MorePending. Unbudgeted, one crank drains everything to commit and reports Drained.
+  let p1 = ep.handle_storage(d, &mut log, &mut stable);
+  let applied1 = ep.applied_index();
+  assert!(
+    applied1.get() <= applied_before.get() + APPLY_BUDGET_ENTRIES,
+    "one crank applied {} entries — must be at most one budget",
+    applied1.get() - applied_before.get()
+  );
+  assert!(
+    applied1 < ep.commit_index(),
+    "one crank must leave the backlog partly unapplied (applied {} < commit {})",
+    applied1.get(),
+    ep.commit_index().get()
+  );
+  assert_eq!(
+    p1,
+    StorageProgress::MorePending,
+    "a budget cut must re-drive via the storage-progress signal"
+  );
+
+  // Repeated cranks reach applied == commit in a bounded number of passes; the last reports Drained.
+  let mut last = p1;
+  let mut cranks = 0u32;
+  while last == StorageProgress::MorePending {
+    last = ep.handle_storage(d, &mut log, &mut stable);
+    cranks += 1;
+    assert!(
+      cranks < 1000,
+      "the budgeted drain must reach applied == commit in bounded cranks"
+    );
+  }
+  assert_eq!(
+    ep.applied_index(),
+    ep.commit_index(),
+    "the budgeted drain completes to applied == commit"
+  );
+  assert_eq!(
+    last,
+    StorageProgress::Drained,
+    "the final crank (nothing left) reports Drained, not MorePending"
+  );
+}
+
+/// `apply_read_span` is the HARD-bound seam of the per-crank apply budget: the next fetch's exclusive
+/// upper bound is capped by BOTH the read-batch width AND the allowance still unspent, so a
+/// byte-cap-shortened first batch can never let the next fetch pull a full batch PAST the budget. Pinned
+/// directly here: the tiny-entry e2e batch above hits the entry-count cap exactly, so it cannot exercise
+/// the allowance clamp — only this seam does. An un-capped fetch (one that ignores `applied_this_call`
+/// and always requests a full `MAX_READ_BATCH_ENTRIES`) overshoots the budget by up to a batch.
+#[test]
+fn apply_read_span_caps_each_fetch_by_the_remaining_allowance() {
+  use crate::{
+    Index,
+    endpoint::{APPLY_BUDGET_ENTRIES, MAX_READ_BATCH_ENTRIES, apply_read_span},
+  };
+  let applied = Index::new(1000);
+  // A commit far beyond one budget, so `commit.next()` never governs the span here.
+  let commit = Index::new(1000 + 10 * MAX_READ_BATCH_ENTRIES);
+
+  // FULL allowance (nothing applied this call): the span is a full read batch.
+  let full = apply_read_span(applied, commit, 0);
+  assert_eq!(
+    full.get() - applied.next().get(),
+    MAX_READ_BATCH_ENTRIES,
+    "a fresh crank fetches a full read batch"
+  );
+
+  // PARTIAL allowance: 8000 already applied leaves 192 of the 8192 budget, so the span clamps to 192 —
+  // NOT the full 8192 the un-capped fetch requested (the defect that let one crank overrun the budget).
+  let partial = apply_read_span(applied, commit, APPLY_BUDGET_ENTRIES - 192);
+  assert_eq!(
+    partial.get() - applied.next().get(),
+    192,
+    "a fetch is clamped to the allowance still unspent"
+  );
+
+  // ZERO allowance (a full budget already applied): the span is EMPTY, so no fetch runs — the caller's
+  // boundary check will have already cut the drain at exactly the budget.
+  let none = apply_read_span(applied, commit, APPLY_BUDGET_ENTRIES);
+  assert_eq!(
+    none,
+    applied.next(),
+    "a spent allowance yields an empty span (no fetch)"
+  );
+}
+
+/// With commit CLOSE, `commit.next()` governs the span before either cap fires — the drain never reads
+/// past the committed frontier regardless of the allowance.
+#[test]
+fn apply_read_span_never_reads_past_commit() {
+  use crate::{Index, endpoint::apply_read_span};
+  let applied = Index::new(1000);
+  let commit = Index::new(1050); // only 50 committed entries left, well under a batch
+  assert_eq!(
+    apply_read_span(applied, commit, 0),
+    commit.next(),
+    "the span clamps to commit.next() when the backlog is smaller than a batch"
+  );
+}
+
+/// No-spin pin: a cold (`EntriesRead::Pending`) apply stop is `Waiting`, never `BudgetCut`, so it must
+/// NOT report `MorePending` — the store's storage-ready wake re-drives it, and folding it into
+/// MorePending would busy-spin the driver against that external wait. With the range held cold the
+/// storage cranks SETTLE to `Drained` in a bounded number of passes even though `applied < commit`.
+#[test]
+fn cold_apply_stop_does_not_report_more_pending() {
+  use crate::{Config, Instant, StorageProgress};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
+
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  while ep.handle_storage(d, &mut log, &mut stable) == StorageProgress::MorePending {}
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Arm cold, propose + flush: commit advances but every apply read is cold, so applied stays behind.
+  log.return_cold_on_read();
+  ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
+    .unwrap();
+  ep.flush_appends(d, &log, &stable);
+
+  // The cranks must SETTLE to Drained despite applied < commit — a cold (Waiting) stop that spun
+  // MorePending would loop here until the guard trips.
+  let mut progress = StorageProgress::MorePending;
+  let mut cranks = 0u32;
+  while progress == StorageProgress::MorePending {
+    progress = ep.handle_storage(d, &mut log, &mut stable);
+    cranks += 1;
+    assert!(
+      cranks < 100,
+      "a cold apply stop must not spin MorePending — it is Waiting, never BudgetCut"
+    );
+  }
+  assert!(ep.poison_reason().is_none(), "a cold read is not a fault");
+  assert!(
+    ep.applied_index() < ep.commit_index(),
+    "the proposed entry stays cold-unapplied while the read is held"
+  );
+}
+
+/// A budget-cut backlog is quiesce-INELIGIBLE — a quiesced group stops being cranked, which would
+/// strand the un-applied remainder forever (nothing re-drives the budget's re-crank). The driver-tier
+/// quiesce-eligibility predicate (`group_idle` in the multi drivers) refuses a group unless, among
+/// other conjuncts, its peers are all caught up, no merge is parked, AND `commit == applied`. This PIN
+/// proves that conjunct is load-bearing here: after a budget cut a single-voter leader has NO lagging
+/// peer and NO parked merge (the peer/park conjuncts are satisfied), yet `applied < commit` — so
+/// `commit == applied` is the sole gate that keeps it non-quiescent. It already holds; this pins it.
+#[test]
+fn a_budget_cut_backlog_is_quiesce_ineligible() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, StorageProgress, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold((10 * MAX_READ_BATCH_ENTRIES) as usize);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  while ep.handle_storage(d, &mut log, &mut stable) == StorageProgress::MorePending {}
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // A committed backlog larger than one budget, so a single crank leaves a partly-unapplied remainder.
+  let n = 2 * MAX_READ_BATCH_ENTRIES;
+  let first = ep.applied_index().next().get();
+  let entries: Vec<Entry> = (0..n)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(first + i),
+        EntryKind::Normal,
+        encode_cmd(b"x"),
+      )
+    })
+    .collect();
+  log.force_append(&entries);
+  ep.commit = Index::new(first + n - 1);
+
+  // One crank: the budget cuts the drain, leaving applied < commit.
+  assert_eq!(
+    ep.handle_storage(d, &mut log, &mut stable),
+    StorageProgress::MorePending
+  );
+  assert!(
+    ep.applied_index() < ep.commit_index(),
+    "a budget cut leaves committed entries unapplied"
+  );
+  // The peer and park conjuncts of quiesce-eligibility are BOTH satisfied — so the applied == commit
+  // conjunct is the sole reason the group cannot quiesce (and thus cannot strand the remainder).
+  assert!(
+    !ep.has_lagging_peer(),
+    "the sole voter is caught up — no peer blocks quiescence"
+  );
+  assert!(
+    ep.pending_merge().is_none(),
+    "no parked merge — the park conjunct does not block quiescence"
+  );
+}
+
 /// A follower must not send AppendResponse until the new log entries are durable.
 /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
 #[test]
@@ -1335,10 +1607,10 @@ fn leader_paces_by_inflight_window() {
 }
 
 /// A SINGLE-entry ack from a peer already in Replicate must NOT
-/// rewind `next_index` or reset the in-flight window. The old code called
-/// `become_replicate()` unconditionally on every successful ack, which rewound
-/// `next_index` to `match.next()` and reset the whole `Inflights` window — so the next
-/// `maybe_send_append` re-sent the already-in-flight tail and the window cap never tripped.
+/// rewind `next_index` or reset the in-flight window. Calling `become_replicate()`
+/// unconditionally on every successful ack rewinds `next_index` to `match.next()` and resets the
+/// whole `Inflights` window — so the next `maybe_send_append` re-sends the already-in-flight tail
+/// and the window cap never trips.
 ///
 /// Setup (window = 2, one entry per message so each send is observable):
 ///   peer 2 in Replicate at match=1, next=2; propose 4 entries (indexes 2..=5).
@@ -1390,7 +1662,8 @@ fn single_ack_does_not_rewind_replicate_window() {
   while ep.poll_event().is_some() {}
 
   // Move peer 2 into Replicate by acking the no-op (index 1). This is the legitimate
-  // Probe -> Replicate transition (must still happen — preserved by the fix).
+  // Probe -> Replicate transition, which must still happen: the guard narrows WHEN the window is
+  // reset, it never suppresses this transition.
   ep.handle_message(
     d,
     &mut log,
@@ -1495,8 +1768,8 @@ fn single_ack_does_not_rewind_replicate_window() {
 
   // (4) The window cap is respected: freeing one slot lets the leader send at most ONE
   //     new entry. It must be a *fresh* entry (index 4), NOT a re-send of the entry that
-  //     is still in flight (index 3). The old code re-sent index 3 because the window was
-  //     reset and next rewound to 3.
+  //     is still in flight (index 3) — which is what a reset window with next rewound to 3
+  //     would produce.
   assert!(
     appends_after <= 1,
     "expected at most one new AppendEntries after freeing one slot, got {appends_after}"
@@ -1756,7 +2029,8 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
 /// is thousands of reject cycles compressed into a single tick, making a run pathologically slow.
 /// (The symptom was a >350s run that the jump cuts to ~20s.)
 ///
-/// Before fix: a `(0,0)` hint took the `conflict == 0` branch and stepped `next_index` back by one.
+/// A `(0,0)` hint takes the `conflict == 0` branch and steps `next_index` back by ONE per round —
+/// the decrement walk this jump exists to replace.
 #[test]
 fn deeply_divergent_follower_jumps_to_one_not_decrement() {
   use crate::{AppendResponse, Entry, EntryKind, Index, Message, Term};
@@ -2013,19 +2287,19 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
   );
 }
 
-// ---- Fix 1 regression: empty appends must NOT consume the inflight window ----
+// ---- Empty appends must NOT consume the inflight window ----
 
 /// A Replicate peer whose `match` is STALE (caught up by `next_index`, but the acks were lost in
 /// transit) triggers an empty AppendEntries on every HeartbeatResponse — the probe whose success
-/// ack refreshes `match`. Before the fix, each call to `sent_entries` added a zero-byte inflight
-/// slot that was never freed (no ack for empty sends), so after `max_inflight_msgs`
-/// heartbeat-responses the window filled and newly proposed entries were silently not delivered.
+/// ack refreshes `match`. An empty send must therefore take NO inflight slot: a zero-byte slot is
+/// never freed (an empty send draws no ack), so after `max_inflight_msgs` heartbeat-responses the
+/// window fills and newly proposed entries are silently not delivered.
 ///
 /// (This regression originally drove the empty probe through a fully CAUGHT-UP peer — `match ==
 /// last_index` — but such a responder no longer draws any append at all: the heartbeat-response
 /// pump is gated on the responder being behind or probing. The stale-`match` shape here is the one
-/// that still legitimately elicits per-response empty appends, so it is the one that keeps this
-/// pin FAILS-ON-OLD for the recording guard.)
+/// that still legitimately elicits per-response empty appends, so it is the only shape that can
+/// still exercise the recording guard.)
 ///
 /// This test uses a small window (4 slots), delivers many HeartbeatResponses (more than 4),
 /// then proposes a new entry and asserts that an AppendEntries carrying it IS emitted.
@@ -2485,7 +2759,8 @@ fn lagging_follower_hint_is_two_sided() {
   };
   assert!(ar.reject(), "follower must reject (prev=20 > last=2)");
   // Two-sided hint: hint_index_raw=min(20,2)=2; find_conflict_by_term(log, 2, ceiling=1):
-  // term(2)=1 ≤ 1 → stop → hint_index=2, hint_term=1 (NOT Term::ZERO as in the old code).
+  // term(2)=1 ≤ 1 → stop → hint_index=2, hint_term=1. The hint term must be the REAL term at the
+  // hint index, never Term::ZERO — a zero term forfeits the two-sided walk (see below).
   assert_eq!(
     ar.reject_hint_index(),
     Index::new(2),
@@ -2583,8 +2858,8 @@ fn lagging_follower_hint_is_two_sided() {
   );
 
   // The leader must send AppendEntries with prev_log_index ≤ 2 (next_index ≤ 3).
-  // If the old code were used with hint=(2, 0), it would fall back to cur_next-1 = 20
-  // (because find_conflict_by_term walks to 0 with ceiling=0 → safe_next = cur_next-1).
+  // A hint of (2, 0) instead falls back to cur_next-1 = 20 (find_conflict_by_term walks to 0 with
+  // ceiling=0 → safe_next = cur_next-1) — one index per round-trip instead of one jump.
   let mut found_low_prev = false;
   while let Some(out) = leader.poll_message() {
     if out.to() == 2u64
@@ -2976,8 +3251,8 @@ fn commit_persist_is_fenced_by_durable_index() {
 /// r.Term` MsgAppResp branch; only fires when CheckQuorum or PreVote is enabled (plain Raft relies
 /// on the disruptive higher-term campaign instead).
 ///
-/// Before fix: the stale-term branch silently `return`ed for every non-pre-vote message, so NO
-/// response was sent and the lower-term leader never learned it was stale — a permanent livelock.
+/// A stale-term branch that silently `return`s for every non-pre-vote message sends NO
+/// response, so the lower-term leader never learns it is stale — a permanent livelock.
 #[test]
 fn stale_term_heartbeat_forces_leader_step_down() {
   use crate::{Config, Index, Instant, Message, Term};
@@ -3644,5 +3919,60 @@ fn append_below_snapshot_boundary_does_not_poison() {
   assert!(
     !sent_reject,
     "the follower does not reject a below-boundary re-send"
+  );
+}
+
+/// The conflict-term walk is BOUNDED per dispatch: a peer-supplied `hint_term` of 0 against a long
+/// higher-term tail would otherwise force an O(tail) synchronous `log_term` scan inside one message
+/// dispatch. The walk stops after `CONFLICT_WALK_BUDGET` steps and returns the best-so-far index; a
+/// second call from that lower hint continues down to the boundary, so the search converges.
+///
+/// MUTATION: drop the `budget` guard in `find_conflict_by_term` → the first call walks the whole
+/// 2000-entry tail to the floor in ONE dispatch (result `Index::ZERO`, not the budget-capped index).
+#[test]
+fn conflict_by_term_walk_is_bounded_per_dispatch() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, Term, endpoint::CONFLICT_WALK_BUDGET};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  // A 2000-entry tail all in term 5 (> the hint term 0), so the walk never breaks early on term.
+  let entries: std::vec::Vec<Entry> = (1..=2000u64)
+    .map(|i| {
+      Entry::new(
+        Term::new(5),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  log.force_append(&entries);
+
+  // A `hint_term` of 0 forces the walk downward for every entry. One dispatch stops at the budget.
+  let first = ep
+    .find_conflict_by_term(&log, Index::new(2000), Term::ZERO)
+    .expect("walk does not poison");
+  assert_eq!(
+    first,
+    Index::new(2000 - u64::from(CONFLICT_WALK_BUDGET)),
+    "the walk stops after the budget, returning the best-so-far index (not the floor)"
+  );
+
+  // The next reject probes from that lower hint; within one more budget it reaches the boundary
+  // (`Index::ZERO` = first_index - 1), so the search converges over an extra round-trip.
+  let second = ep
+    .find_conflict_by_term(&log, first, Term::ZERO)
+    .expect("walk does not poison");
+  assert_eq!(
+    second,
+    Index::ZERO,
+    "a second dispatch from the lower hint completes the walk to the boundary"
   );
 }

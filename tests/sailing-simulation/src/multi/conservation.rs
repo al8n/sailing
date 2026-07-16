@@ -45,8 +45,9 @@ impl ConservationLedger {
       .unwrap_or(&[])
   }
 
-  /// Every key recorded under `gid`, ascending.
-  fn keys_of(&self, gid: u64) -> BTreeSet<u16> {
+  /// Every key recorded under `gid`, ascending. `pub(crate)` so the world can assemble the set of
+  /// keys a registered union carried into a group (the split partition's absorb exemption).
+  pub(crate) fn keys_of(&self, gid: u64) -> BTreeSet<u16> {
     self
       .histories
       .keys()
@@ -56,53 +57,160 @@ impl ConservationLedger {
   }
 
   /// Assert the split of `parent` that assigned `child_keys` to `child` CONSERVED every key's
-  /// history — each continues in exactly one side:
-  ///   - an assigned key's child history must start with the parent's FULL recorded history (the
-  ///     transferred baseline; anything shorter or diverging is LOSS);
-  ///   - once both sides extend past their common prefix the key continued on BOTH sides (DUP);
-  ///   - an unassigned key must never surface in the child at all (CROSS-TALK).
+  /// history — each continues in exactly one side. The split-merge algebra reunifies sides, so
+  /// the two closure sets exempt exactly the keys a REGISTERED union re-routed, symmetrically:
+  ///   - `absorbed` — keys a union carried INTO the child (the child became a merge TARGET). An
+  ///     unassigned key normally may never surface in the child (CROSS-TALK), but a child that
+  ///     absorbs a source legitimately gains the source's whole population — including keys the
+  ///     source OWNED but never wrote, which the child then writes for the first time. Those keys
+  ///     are exempted here; the merge's own [`assert_union`](Self::assert_union) judges any
+  ///     absorbed HISTORY.
+  ///   - `reacquired` — keys a union re-introduced INTO the parent (the parent became a merge
+  ///     TARGET). The parent's copy of such a key is the ABSORBED lineage, not a continuation of
+  ///     the split's assignment, so it need not relate to the child's inherited copy at all: it
+  ///     may extend the child's history (which the LOSS leg reads as truncation) or descend from
+  ///     a DIFFERENT source entirely (which the DUP leg reads as a double-claim). Both legs
+  ///     exempt a re-acquired key; the merge's own [`assert_union`](Self::assert_union) judges the
+  ///     re-introduced history. A key no union re-acquired still trips both legs, so a genuine
+  ///     double-claim — two sides past a common prefix with no re-acquiring union — is caught.
+  ///
+  /// `inherited` exempts individual PARENT-side cells, not whole keys. An absorb copies the
+  /// source's whole FSM RECORD into the target — including cells for keys OUTSIDE the source's
+  /// owned population (carried/foreign-tagged cells) — so cells of an ASSIGNED key can reach the
+  /// parent's append-only ledger history through a union whose `absorbed_keys` never named the
+  /// key, invisible to the key-level `reacquired` set. The caller supplies, per assigned key, the
+  /// values found in any inbound union source's record; on BOTH legs the parent counts as
+  /// continuing past the common prefix only on an OWN-WRITE witness — a post-prefix cell whose
+  /// value is NOT exempt. Values are globally unique, so a fresh own-write can never appear in
+  /// any union source's history (the exemption cannot mask a REAL double-claim: an own-write on
+  /// both sides still trips both legs); conversely a value in a union source's history reached
+  /// the parent's record only via that absorb. The shared prefix itself is never filtered — an
+  /// inherited cell inside it is legitimate common history the child copied at fork, and dropping
+  /// it would break the prefix match. Symmetrically, `child_inherited` exempts individual
+  /// CHILD-side cells: the same whole-record absorb can carry cells of an UNASSIGNED key INTO a
+  /// child that became a merge target (a parked key's cells ride the source's record), recorded
+  /// under the child though the union's `absorbed_keys` never named it — invisible to the
+  /// key-level `absorbed` set above. On the cross-talk leg the child counts as leaking only on
+  /// a STRAY cell — one whose value no inbound union source carries; values being globally
+  /// unique, a child own-write of an unassigned key can never match a union source's history and
+  /// still trips (a key with no registered union still trips). The LOSS leg applies the same
+  /// reduction: a parent tail that
+  /// is entirely inherited counts as not-continuing (the common prefix is the effective end), so
+  /// a child stopping short of only-inherited tail cells does not trip. Accepted residual,
+  /// symmetric on both sides: an inherited-then-lost parent tail — and a union-carried-then-stray
+  /// child cell — is excused here, each exemption reading the source's recorded HISTORY (a
+  /// superset of the exact absorb capture); the inbound union's own
+  /// [`assert_union`](Self::assert_union) judges that absorb.
   ///
   /// Panics with the group ids, the key, and both histories on any violation.
-  pub(crate) fn assert_partition(&self, parent: u64, child: u64, child_keys: &BTreeSet<u16>) {
+  // Seven inputs — two ledger ids, the assigned set, and the four union-reroute exemptions
+  // (key-level `absorbed`/`reacquired`, cell-level `inherited`/`child_inherited`); a params struct
+  // would only indirect the mirror-symmetric call sites.
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn assert_partition(
+    &self,
+    parent: u64,
+    child: u64,
+    child_keys: &BTreeSet<u16>,
+    absorbed: &BTreeSet<u16>,
+    reacquired: &BTreeSet<u16>,
+    inherited: &BTreeMap<u16, BTreeSet<u64>>,
+    child_inherited: &BTreeMap<u16, BTreeSet<u64>>,
+  ) {
     let mut keys = self.keys_of(parent);
     keys.extend(self.keys_of(child));
     for k in keys {
       let p = self.history(parent, k);
       let c = self.history(child, k);
       if !child_keys.contains(&k) {
+        if absorbed.contains(&k) {
+          continue; // carried in by a registered union — the merge's assert_union judges it
+        }
+        // Cross-talk with the CHILD-side cell-level exemption, the mirror of `inherited`: a
+        // registered union's whole-record absorb can carry cells of a key OUTSIDE its transferred
+        // population into the child (a parked key rides the source's record), recorded under the
+        // child though `absorbed` never named it. Such a cell's value is in the inbound source's
+        // history and is exempt; a stray cell — a child own-write of an unassigned key, whose
+        // globally-unique value no union source carries — still trips.
+        let inh = child_inherited.get(&k);
+        let child_strays = c
+          .iter()
+          .any(|&(_, value)| !inh.is_some_and(|s| s.contains(&value)));
         assert!(
-          c.is_empty(),
+          !child_strays,
           "[conservation] split g{parent}->g{child}: key {k} was never assigned to the child \
-           but surfaced there\n  child={c:?}",
+           but surfaced there\n  child={c:?}{}",
+          inh.map_or_else(String::new, |s| {
+            let stray: Vec<_> = c.iter().filter(|&&(_, v)| !s.contains(&v)).collect();
+            format!("\n  stray (non-union-carried) cells={stray:?}")
+          }),
         );
         continue;
       }
       let common = p.iter().zip(c.iter()).take_while(|(a, b)| a == b).count();
+      let inh = inherited.get(&k);
+      // Own-write witness: the parent continues past the common prefix only via a cell no
+      // inbound union's record carries — an inherited-only tail is that union's cargo, not a
+      // continuation of the split's assignment.
+      let parent_continues = p[common..]
+        .iter()
+        .any(|&(_, value)| !inh.is_some_and(|s| s.contains(&value)));
       assert!(
-        !(common < p.len() && common < c.len()),
+        !(parent_continues && common < c.len()) || reacquired.contains(&k),
         "[conservation] split g{parent}->g{child}: key {k} continued on BOTH sides past their \
          common prefix ({common} cells)\n  parent={p:?}\n  child={c:?}",
       );
       assert!(
-        common == p.len(),
+        !parent_continues || reacquired.contains(&k),
         "[conservation] split g{parent}->g{child}: key {k} history LOST — the child's copy \
          stops short of the parent's recorded history\n  parent={p:?}\n  child={c:?}",
       );
     }
   }
 
-  /// Assert the merge of `source` into `target` absorbed every source key's FULL history: the
-  /// target's copy must start with the source's recorded history as a prefix (M5's shape).
-  /// Panics with the group ids, the key, and both histories otherwise.
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the merge milestone wires assert_union")
-  )]
-  pub(crate) fn assert_union(&self, target: u64, source: u64) {
-    for k in self.keys_of(source) {
+  /// Assert the merge of `source` into `target` CONSERVED every OWNED source key's history: every
+  /// non-departed source VALUE must appear SOMEWHERE in the target's recorded values for that key.
+  /// Conservation is a CONTAINMENT property, not an order property — a faithful `absorb` appends the
+  /// source record intact, but a cross-incarnation merge folds it under the target's ledger id where
+  /// a PRIOR incarnation's cells (and the source's OWN earlier-absorbed run) already sit, so the
+  /// absorbed values legitimately INTERLEAVE with the target's own in a different order. ORDER is the
+  /// absorb-DETERMINISM oracle's business — the byte-for-byte cross-host record comparison at the
+  /// resolution coordinate (the world's `register_or_check_merge`) — not conservation's; an
+  /// ordered-subsequence demand here false-trips a source that folded an earlier-absorbed run under a
+  /// different interleaving. Values are globally unique (the fuzzer's
+  /// command counter), so a present value is an EXACT absorb witness and a genuinely DROPPED source
+  /// value is absent from the target's value set and still trips.
+  ///
+  /// `absorbed_keys` is the source's key POPULATION at the merge — the keys this union actually
+  /// handed over. A key the source WROTE but then SPLIT AWAY before merging is NOT here (it rode
+  /// that split, whose partition verdict judges the handover), so it is not demanded of the
+  /// target — a written-history (`keys_of`) sweep would false-trip it. An owned key the source
+  /// never wrote judges vacuously (its source history is empty).
+  ///
+  /// `departed` exempts individual source VALUES, not whole keys. The ledger is append-only save for
+  /// the ONE legitimate FSM mutation — `LogSm::split` evicts a moved key's cells record-wide — so
+  /// values a split carried away are demanded of no later target. The caller supplies them per key:
+  /// values are globally unique, so a value present in a registered split child's record for `k` is
+  /// an EXACT departure witness. Exempt values are subtracted from the demand; every remaining source
+  /// value must still be a member of the target's set, so a dropped NON-exempt value still trips — the
+  /// seam keeps its teeth for every value the caller does not hand it. Panics with the group ids, the
+  /// key, and both histories otherwise.
+  pub(crate) fn assert_union(
+    &self,
+    target: u64,
+    source: u64,
+    absorbed_keys: &BTreeSet<u16>,
+    departed: &BTreeMap<u16, BTreeSet<u64>>,
+  ) {
+    for &k in absorbed_keys {
       let s = self.history(source, k);
       let t = self.history(target, k);
-      let absorbed = t.len() >= s.len() && &t[..s.len()] == s;
+      let gone = departed.get(&k);
+      let target_values: BTreeSet<u64> = t.iter().map(|&(_, value)| value).collect();
+      let absorbed = s
+        .iter()
+        .filter(|&&(_, value)| !gone.is_some_and(|d| d.contains(&value)))
+        .all(|&(_, value)| target_values.contains(&value));
       assert!(
         absorbed,
         "[conservation] merge g{source}->g{target}: key {k} source history not absorbed\n  \

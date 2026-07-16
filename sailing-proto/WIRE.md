@@ -109,13 +109,44 @@ reference — this section pins the SEMANTICS:
   The payload is G-FREE by design — the child id rides as raw bytes — so the group-unaware consensus
   core can decode and fold the entry at the deterministic apply point; and the forked state itself
   NEVER rides the entry (every replica derives it locally at apply), so a split's wire cost is
-  independent of state size. The three MERGE entry kinds (`ENTRY_KIND_PREPARE_MERGE` = 5,
-  `ENTRY_KIND_COMMIT_MERGE` = 6, `ENTRY_KIND_ROLLBACK_MERGE` = 7) are RESERVED in the same
-  `LABEL_VERSION` bump — their pb values are pinned so the merge milestone adds no wire change,
-  nothing encodes them yet, and a frame carrying one rejects at conversion until that milestone maps
-  them. **A node predating the `Split` kind would reject a committed split's frame (an unknown
-  kind), black-holing replication to it, so a pre-split peer is fenced by `LABEL_VERSION`:** the
-  handshake fences it.
+  independent of state size. **A node predating the `Split` kind would reject a committed split's
+  frame (an unknown kind), black-holing replication to it, so a pre-split peer is fenced by
+  `LABEL_VERSION`:** the handshake fences it.
+
+  The three MERGE entry kinds (`ENTRY_KIND_PREPARE_MERGE` = 5, `ENTRY_KIND_COMMIT_MERGE` = 6,
+  `ENTRY_KIND_ROLLBACK_MERGE` = 7) were RESERVED in the same `LABEL_VERSION` bump (their pb
+  values pinned), and the merge milestone MAPPED them without any wire change. Deliberately NO
+  lease/clock field rides any of them — the freeze kills lease serving at APPEND observation of
+  the `PrepareMerge` entry, so the merge choreography is clock-free end to end. Payloads:
+
+  `sailing.v1.PrepareMergePayload` (on the SOURCE group's log — freeze so `target` can absorb):
+
+  | field | type | meaning |
+  |---|---|---|
+  | `target` (1) | `bytes` | the absorbing group id's `Data` encoding, **1..=1024 bytes** (the group-tag bound) — retained at apply as the freeze's CLAIM: only this target may absorb or abort the frozen generation |
+  | `source_gen_after` (2) | `uint64` | the source's lineage counter AFTER the freeze applies (the unified per-id counter) |
+
+  `sailing.v1.CommitMergePayload` (on the TARGET group's log — absorb the frozen `source` at
+  exactly `freeze_index`; the absorbed state itself NEVER rides the entry, every replica
+  extracts its LOCAL source replica at the boundary, so the wire cost is independent of FSM
+  size):
+
+  | field | type | meaning |
+  |---|---|---|
+  | `source` (1) | `bytes` | the absorbed group id's `Data` encoding, **1..=1024 bytes** |
+  | `freeze_index` (2) | `uint64` | the source's `PrepareMerge` index — the boundary the local source must be frozen-applied at before the parked apply can resolve |
+  | `source_gen_after` (3) | `uint64` | the generation the source's freeze set (the park's log-determined comparator) |
+  | `target_gen_after` (4) | `uint64` | the target's own lineage mint: the commit applies only at exactly this generation — a stale mint (an abort or competing reshape won the base) no-ops deterministically on every replica |
+  | `freeze_term` (5) | `uint64` | the `PrepareMerge` entry's term — with `freeze_index`, the freeze's LOG IDENTITY: a parked host whose local source log contains the pair may advance that source's commit to the boundary (log matching carries the committed prefix), so a source follower stranded below the boundary by a lost final heartbeat cannot wedge the park after the absorb consumed the source's quorum (0 = no identity; the park only waits) |
+
+  `sailing.v1.RollbackMergePayload` — the merge's explicit abort, in one of two log roles told
+  apart by `source`:
+
+  | field | type | meaning |
+  |---|---|---|
+  | `source_gen_after` (1) | `uint64` | target role: the freeze generation being abandoned; source role: the source's lineage counter AFTER the thaw applies |
+  | `source` (2) | `bytes` | PRESENT (**1..=1024 bytes**): the TARGET-side abort, riding the TARGET's log so it is totally ordered against `CommitMerge` there; ABSENT/empty: the SOURCE-side thaw the container relays onto the source's own log (byte-identical to the pre-abort encoding of this payload) |
+  | `target_gen_after` (3) | `uint64` | target role only (0/absent in the source role): the target's lineage mint — the abort applies only at exactly this generation, so aborts and commits racing from one base resolve to one log-ordered winner |
 - `SnapshotMeta.shape_gen` (8) carries the snapshotted group's LINEAGE counter at the boundary (the
   same unified per-id counter `parent_gen_after` bumps), so a node restoring a post-split snapshot
   knows its lineage without replaying the compacted split entries, and the multi container seeds its
@@ -261,3 +292,24 @@ see the decoder obligations documented on `src/hard_state.rs`. Note that `ConfCh
 THE LOG carry the §1 envelope encoding (`sailing.v1.ConfChangeV2`): a log written before the
 envelope migration does not replay against this version (pre-release; no migration path is
 provided).
+
+## 6. Reserved: the group-header incarnation stamp (the generation fence)
+
+The next `LABEL_VERSION` bump grows the §3 group-demux header by one field:
+
+```
+[u16 group_len][group bytes][varint generation]
+```
+
+`generation` is the SENDER's incarnation counter for that gid (the unified lineage/shape counter;
+`0` for an unreshaped group). It gives the receiver a demux-time fence for retired incarnations —
+`floor_admits(floor(gid), generation)` fails ⇒ drop the frame, exactly as a tombstoned gid's frame
+is dropped today — the durable, generation-exact form of the volatile removal tombstone, and the
+append/vote-plane counterpart of the snapshot path's lineage gate (which token-discriminates
+snapshot traffic alone).
+
+Reserved rather than landed: the field's ENFORCEMENT semantics — the comparator, tolerance for
+same-lineage generation skew (a mid-split replica legitimately trails by one), and per-message-class
+policy — are settled by the enforcement design that lands the bump, and a field whose semantics later
+change would burn a version byte for nothing. The hello's version fence (§4) makes the eventual bump safe: mixed-version
+peers reject at the handshake, never mis-parse the header.

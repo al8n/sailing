@@ -700,6 +700,7 @@ mod election;
 mod lease;
 mod leaseguard;
 mod membership;
+mod merge;
 mod misc;
 mod read_index;
 mod replication;

@@ -285,6 +285,16 @@ pub trait LogStore {
   fn restore(&mut self, last_index: Index, last_term: Term);
 
   /// Drain the next completion, if any.
+  ///
+  /// **Completion contract (NORMATIVE):** every accepted [`submit_append`](Self::submit_append) MUST
+  /// eventually surface EXACTLY ONE matching completion here, in FIFO order. A LOST completion — an
+  /// accepted write whose `LogDone` never arrives — is a STORE-CONTRACT VIOLATION, not a tolerated
+  /// outcome. The core gates real actions on durability (persist-before-ack, persist-before-vote, the
+  /// term-durable gate), so a missing completion STALLS the gated path
+  /// rather than advancing it — the SAFE direction: the node makes no unsafe progress (never a stale
+  /// ack, never a lost-vote grant), it merely fails to make forward progress. A restart re-submits from
+  /// the durable state and heals the stall. The contract is thus "eventually, exactly once"; violating
+  /// it costs liveness (a wedge), never safety.
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>>;
 
   /// Whether a subsequent [`poll`](Self::poll) would return `Some` — i.e. at least one completion
@@ -341,19 +351,43 @@ pub trait StableStore {
   /// blob as `Recorded(None)` would assert "promised nothing" and reopen the disruptive-vote-inside-a-live-
   /// lease hole for one post-upgrade restart of a previously-enforcing node. In-tree impls store `HardState`
   /// by value (no serialization), so they preserve all three cases automatically.
+  ///
+  /// [`HardState::lineage`] must round-trip VERBATIM as well — restart reconciliation compares it against
+  /// the durable snapshot's token to decide whether the surviving log belongs to the snapshot's lineage,
+  /// so dropping it turns an adopted node's restart into a lineage mismatch. An ABSENT field in a
+  /// pre-`lineage` blob decodes to `None` — exact, not merely conservative: no pre-`lineage` writer could
+  /// ever have forked or adopted, so its log is unconditionally the token-less lineage's.
   fn hard_state(&self) -> HardState<Self::NodeId>;
 
   /// Queue a hard-state write. Durable on the matching `poll` (completions are ordered).
   fn submit_write(&mut self, id: OpId, hard_state: HardState<Self::NodeId>);
 
   /// Queue a snapshot write. Completes as `StableDone::SnapshotWritten(id)`.
+  ///
+  /// META FIDELITY (NORMATIVE for out-of-tree DISK impls): every `SnapshotMeta` the store later hands back
+  /// for this snapshot — from [`snapshot`](Self::snapshot), [`durable_snapshot`](Self::durable_snapshot), and
+  /// its chunk staging ([`accept_snapshot_chunk`](Self::accept_snapshot_chunk)) — MUST be THIS value,
+  /// VERBATIM, including [`shape_gen`](SnapshotMeta::shape_gen) and [`fork_id`](SnapshotMeta::fork_id). A
+  /// store that SERIALIZES the meta and rebuilds it on read must round-trip both
+  /// ([`with_shape_gen`](SnapshotMeta::with_shape_gen) / [`with_fork_id`](SnapshotMeta::with_fork_id) restore
+  /// them); one that persists only `(last_index, last_term, conf)` silently breaks the core.
+  ///
+  /// The lineage token is what makes a meta a snapshot's IDENTITY (see
+  /// [`identity_eq`](SnapshotMeta::identity_eq)) — `(last_index, last_term, conf)` alone is NOT a
+  /// content-identity across a fork boundary. Drop it, and a restored meta compares UNEQUAL to the very
+  /// snapshot it is: a deferred install STALLS (its durable evidence never matches its own blob) and a chunked
+  /// transfer RESTARTS ON EVERY CHUNK (the staging belt reads its own partial as a foreign meta, discards, and
+  /// re-stages). Both are silent — no crash, no error, just a group that never installs. Dropping `shape_gen`
+  /// restores a wrong lineage counter, which the generation floor then admits against. In-tree impls store
+  /// `SnapshotMeta` BY VALUE (no serialization), so they preserve both automatically.
   fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<Self::NodeId>, data: Bytes);
 
   /// Read the latest SUBMITTED snapshot (synchronous). Returns `None` if no snapshot exists.
   ///
   /// This is the VISIBLE/optimistic slot: `submit_snapshot` makes its blob readable here IMMEDIATELY,
   /// before the write is durable. Use it for serving/streaming, NOT for durability decisions —
-  /// see [`durable_snapshot`](Self::durable_snapshot).
+  /// see [`durable_snapshot`](Self::durable_snapshot). The meta comes back VERBATIM — see the meta-fidelity
+  /// contract on [`submit_snapshot`](Self::submit_snapshot).
   fn snapshot(&self) -> Option<(SnapshotMeta<Self::NodeId>, Bytes)>;
 
   /// Metadata of the last DURABLE (fsync'd) snapshot — `None` until a submitted snapshot is actually
@@ -372,6 +406,10 @@ pub trait StableStore {
   /// boundary durable). Returning the visible (pre-fsync) blob here would let a crash orphan the log — the
   /// exact ordering hole this method closes. Returns owned metadata (no `Bytes` — the install needs only
   /// the boundary, and the blob was already handed to the SM at `submit_snapshot`).
+  ///
+  /// The core compares this meta by IDENTITY — lineage token included — to confirm the durable blob is the
+  /// pending install's OWN, so it MUST come back VERBATIM (see the meta-fidelity contract on
+  /// [`submit_snapshot`](Self::submit_snapshot)).
   fn durable_snapshot(&self) -> Option<SnapshotMeta<Self::NodeId>>;
 
   /// Read up to `len` bytes of the latest SUBMITTED snapshot starting at byte `offset`, with its
@@ -454,6 +492,11 @@ pub trait StableStore {
   /// term's bytes. A store relies on that ordering for cross-term separation; do NOT key staging on content
   /// to compensate.
   ///
+  /// The meta a store RETAINS alongside its partial must be the one it staged under, VERBATIM (see the
+  /// meta-fidelity contract on [`submit_snapshot`](Self::submit_snapshot)): a store that persists staging and
+  /// rebuilds the meta, dropping the lineage token, reads its OWN partial as a foreign snapshot on the next
+  /// chunk and re-stages from scratch — every chunk, forever, never completing the transfer.
+  ///
   /// The returned contiguous offset drives IN-SESSION resume — a lost chunk re-sends from it, not from `0`.
   /// Staging is VOLATILE across RESTART, however: a store MAY persist it internally, but the core does NOT
   /// resume a partial across a crash (no recovery API restores the transfer identity) — it calls
@@ -488,6 +531,12 @@ pub trait StableStore {
   fn discard_snapshot_staging(&mut self);
 
   /// Drain the next completion, if any.
+  ///
+  /// **Completion contract (NORMATIVE):** as for [`LogStore::poll`](crate::LogStore::poll), every
+  /// accepted `submit_write`/`submit_snapshot` MUST eventually surface EXACTLY ONE matching
+  /// `StableDone` here, in FIFO order. A LOST completion is a store-contract violation: it STALLS the
+  /// durability-gated path (a term/vote persist that never lands blocks the become-leader / cast-vote
+  /// it fences) rather than advancing it — the safe direction — and a restart re-submits and heals.
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>>;
 
   /// Whether a subsequent [`poll`](Self::poll) would return `Some` — i.e. at least one completion

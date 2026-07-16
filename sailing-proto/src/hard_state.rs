@@ -1,6 +1,7 @@
-//! The durable Raft metadata: `(term, vote, commit, lease_support)`, persisted before acting.
-use crate::{CheapClone, Index, Term};
+//! The durable Raft metadata: `(term, vote, commit, lease_support, lineage)`, persisted before acting.
+use crate::{CheapClone, ForkId, Index, Term};
 use core::time::Duration;
+use std::boxed::Box;
 
 /// The durable provenance + magnitude of this node's LeaseBased read-lease promise.
 ///
@@ -71,12 +72,25 @@ impl LeaseSupport {
 /// An out-of-tree disk decoder MUST map a genuine pre-`lease_support` blob to [`LeaseSupport::Unrecorded`]
 /// (never `Recorded(None)`): `Unrecorded` triggers the conservative restart fence, so a freshly-upgraded
 /// node is never less safe than before.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `lineage` is the durable record of which lineage this node's LOG belongs to — the fork token the node
+/// was manufactured under or adopted at a snapshot install, `None` for a node that never did either. The
+/// log itself carries no token, so without this record a restart cannot tell whether a durable snapshot
+/// and the surviving log suffix are the SAME lineage's artifacts — and `(index, term)` coordinate proofs
+/// cannot answer that across a fork boundary (Log Matching holds only within one lineage). Restart
+/// reconciliation therefore compares this record against the durable snapshot's token BEFORE any
+/// coordinate arm. Written at the durable choke-point on every hard-state write (the node's current
+/// lineage), so an adoption makes its lineage durable before the destructive re-baseline acts on it.
+/// An out-of-tree disk decoder maps an absent field to `None` — exact, not merely conservative: no
+/// pre-`lineage` writer could ever have forked or adopted, so its log is unconditionally the token-less
+/// lineage's.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardState<I> {
   term: Term,
   vote: Option<I>,
   commit: Index,
   lease_support: LeaseSupport,
+  lineage: Option<Box<ForkId>>,
 }
 
 impl<I> HardState<I> {
@@ -88,6 +102,7 @@ impl<I> HardState<I> {
       vote: None,
       commit: Index::ZERO,
       lease_support: LeaseSupport::Recorded(None),
+      lineage: None,
     }
   }
 
@@ -146,6 +161,21 @@ impl<I> HardState<I> {
   #[must_use]
   pub fn with_vote(mut self, vote: Option<I>) -> Self {
     self.vote = vote;
+    self
+  }
+
+  /// The lineage this node's log belongs to — its fork token, or `None` for a node that never forked
+  /// nor adopted. See the type-level doc for why restart needs this durable.
+  #[inline(always)]
+  pub fn lineage(&self) -> Option<&ForkId> {
+    self.lineage.as_deref()
+  }
+
+  /// Replace the lineage record (consuming builder).
+  #[inline(always)]
+  #[must_use]
+  pub fn with_lineage(mut self, lineage: Option<ForkId>) -> Self {
+    self.lineage = lineage.map(Box::new);
     self
   }
 }

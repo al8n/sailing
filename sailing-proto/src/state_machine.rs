@@ -62,6 +62,27 @@ pub trait StateMachine {
     let _ = source;
     false
   }
+
+  /// Whether this FSM supports [`split`](Self::split) — consulted at PROPOSE time (on the leader's
+  /// FSM) so a split verb is refused with `SplitError::Unsupported` BEFORE it is appended, rather than
+  /// committing and then poisoning every replica at apply (`PoisonReason::SplitUnsupported`). Default
+  /// `false`, matching the default `split` (which returns `None`).
+  ///
+  /// MUST be TYPE-CONSTANT — a fixed property of the type, never of runtime state. Only the leader's
+  /// answer gates the propose, so a value that varied with state could let one replica admit a split
+  /// another cannot apply; the apply-time poison remains the determinism backstop, but this gate must
+  /// not itself introduce divergence.
+  fn supports_split(&self) -> bool {
+    false
+  }
+
+  /// Whether this FSM supports [`absorb`](Self::absorb) — the merge-side mirror of
+  /// [`supports_split`](Self::supports_split). Consulted at propose time so a merge verb is refused with
+  /// `MergeError::Unsupported` before it is appended, rather than poisoning every replica at apply
+  /// (`PoisonReason::MergeUnsupported`). Default `false`; MUST likewise be TYPE-CONSTANT.
+  fn supports_absorb(&self) -> bool {
+    false
+  }
 }
 
 #[cfg(test)]

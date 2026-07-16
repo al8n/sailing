@@ -1,18 +1,25 @@
 use super::*;
 use crate::{InstallSnapshot, ProgressState, SnapshotChunkRead, SnapshotMeta};
 
-/// The outcome of a snapshot-chunk send attempt. A FATAL store error and a benign cold deferral are
-/// DISTINCT outcomes — both emit no `InstallSnapshot`, but conflating them let a poisoned node keep
-/// mutating state (advance commit, compact) in the same dispatch. Callers match exhaustively, so the
-/// poison case can never be silently treated as a retryable defer.
+/// The outcome of a snapshot-chunk send attempt. A FATAL store error, a benign TRANSIENT deferral, and
+/// a PERMANENT unsendable frame are DISTINCT outcomes — all three emit no `InstallSnapshot`, but
+/// conflating the poison with a defer let a poisoned node keep mutating state (advance commit, compact)
+/// in the same dispatch, and conflating the permanent wedge with a transient defer hides a config that
+/// can never replicate. Callers match exhaustively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use = "a ChunkSend::Poisoned must fail-stop the caller; Sent/Deferred drive resend-pacing"]
+#[must_use = "a ChunkSend::Poisoned must fail-stop the caller; Sent/Deferred/Unsendable drive resend-pacing"]
 pub(crate) enum ChunkSend {
   /// An `InstallSnapshot` was emitted — arm the resend-pacing deadline.
   Sent,
-  /// No chunk went out for a BENIGN reason (cold `Pending`, nothing persisted, or an unsendable frame) —
-  /// clear the deadline so the next heartbeat retries immediately.
+  /// No chunk went out for a TRANSIENT reason (cold `Pending`, nothing persisted yet) — clear the
+  /// deadline so the next heartbeat retries immediately; a retry is expected to make progress.
   Deferred,
+  /// No chunk went out because the snapshot METADATA alone leaves no room for a data byte under the
+  /// frame limit — the config is too large to snapshot on this transport. Retrying cannot help (the
+  /// meta never shrinks), so the peer stays wedged in `Snapshot`; a diagnostic counter is bumped so
+  /// the wedge is visible. Native `propose_conf_change` refuses such a membership up front
+  /// (`MembershipTooLargeToSnapshot`), so this only guards a config that predates the gate.
+  Unsendable,
   /// A FATAL store error poisoned the node — the caller MUST bail (no further work this dispatch).
   Poisoned,
 }
@@ -39,7 +46,11 @@ where
   /// Expose `pending_compact` for testing.
   #[cfg(test)]
   pub(crate) fn pending_compact(&self) -> Option<(OpId, Index)> {
-    self.snapshot.pending_compact
+    self
+      .snapshot
+      .pending_compact
+      .as_ref()
+      .map(|(pid, m)| (*pid, m.last_index()))
   }
 
   /// Re-send the persisted snapshot to a peer that is stuck in `Snapshot` state.
@@ -144,15 +155,18 @@ where
     // invariants, NOT encoded size) leaves no room for even one data byte under the frame limit, the
     // snapshot is UNSENDABLE on this transport. Do NOT enqueue an oversized frame (the stream transport
     // would close the connection / QUIC would drop it): return without sending. The peer stays in Snapshot
-    // — this is a misconfiguration (a membership too large to snapshot), not a transient condition a
-    // re-send resolves.
+    // — this is a misconfiguration (a membership too large to snapshot), NOT a transient condition a
+    // re-send resolves, so it is a distinct `Unsendable` outcome (the propose-time
+    // `MembershipTooLargeToSnapshot` gate normally prevents ever reaching it).
     // Also reserve the transport's group-demux header (prepended to every frame payload) so a
     // maximum-size chunk plus a group tag still fits under the frame limit.
     let frame_budget = crate::wire::MAX_FRAME_BYTES
       .saturating_sub(overhead + data_field_max_self_cost + crate::wire::GROUP_HEADER_RESERVE)
       as u64;
     if frame_budget == 0 {
-      return ChunkSend::Deferred;
+      // Bump the diagnostic so a permanently-wedged peer is visible; retrying cannot shrink the meta.
+      self.snapshot.unsendable_meta_frames = self.snapshot.unsendable_meta_frames.saturating_add(1);
+      return ChunkSend::Unsendable;
     }
     let chunk_len = config_chunk.min(frame_budget);
     // Reuse the chunk already read at `from_offset` when the reconciled offset is unchanged (the common
@@ -258,6 +272,29 @@ where
     {
       return;
     }
+    // THE MERGE REPLAY FENCE: while a freeze is pending or applied, this endpoint captures no
+    // snapshot. A capture at applied >= the freeze would compact the PrepareMerge entry, and a
+    // crash then restarts this replica UNFROZEN (frozen is derived by replaying that entry) —
+    // it could serve reads and accept writes while a target still holds a parked absorb of it.
+    // The fence guarantees every restart re-derives the freeze from the (snapshot ⊔ log) replay
+    // range for as long as the merge is live; the window is bounded by the merge's own explicit
+    // resolution (absorb removes the group; rollback lifts the fence).
+    if self.merge_freeze_active() {
+      return;
+    }
+    // THE ABORT REPLAY FENCE: a TARGET-side abort applied here records its `abandoned` obligation
+    // durable-derived from that entry, re-derivable solely by replaying it. A capture at-or-past
+    // the entry's index would compact it, and a restart from the snapshot would then re-derive no
+    // obligation with the source possibly still frozen — no trigger left to thaw it, a permanent
+    // frozen-source wedge across compaction. Refuse the capture while the abort entry sits
+    // at-or-below `applied` (the capture boundary here). The forced absorb capture shares this
+    // exact predicate (`absorb_capture_blocked`), so no target-capture site can drift; see
+    // `abort_relay_fences` for how the deferred compact and restart floor-advances are covered
+    // transitively, how a snapshot install instead CLEARS a covered obligation
+    // (`note_abort_rebaselined`), and when the fence lifts (the service discharges `abandoned`).
+    if self.abort_relay_fences(self.applied) {
+      return;
+    }
     if self.applied == Index::ZERO {
       // Nothing has been applied yet — nothing to snapshot.
       return;
@@ -301,10 +338,20 @@ where
     if self.reads.read_mode_migrated {
       meta = meta.with_read_only(self.reads.active_read_mode);
     }
+    // Preserve fork PROVENANCE: a forked child's own snapshots must keep carrying its ForkId, so a
+    // child that compacted past its manufactured baseline — or a restart from this snapshot — still
+    // reports its origin. Absent for a non-fork group.
+    if let Some(fork_id) = &self.split.fork_id {
+      meta = meta.with_fork_id(fork_id.clone());
+    }
     let opid = self.mint_op_id();
+    // The capture's meta rides `pending_compact`: the missed-completion fallback fires only on the
+    // durable slot holding THIS capture (identity, lineage included) — bare boundary coverage would
+    // let a foreign blob's durability compact this node's own log.
+    let pc_meta = meta.clone();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
-    self.snapshot.pending_compact = Some((opid, self.applied));
+    self.snapshot.pending_compact = Some((opid, pc_meta));
   }
 
   /// Reclaim an ABANDONED chunked receive: if the recoverable prefix (`min(commit, ack_watermark())`) has
@@ -316,38 +363,81 @@ where
   /// Returns `false` if the Log-Matching proof read hit a FATAL `term` error (the node is now poisoned via
   /// `log_term`): the caller MUST bail immediately rather than continue handler work on a poisoned node.
   #[must_use]
+  /// The ONE snapshot-coverage proof: is `meta`'s snapshot already COVERED by this replica's OWN
+  /// history? Shared by the receipt-time redundancy short-circuit, the completion-time re-check, and
+  /// the staged-receive reclaim — every "may I treat this snapshot as already-held?" decision asks
+  /// HERE, so the lineage clause cannot be forgotten at any one of them.
+  ///
+  /// The LINEAGE clause comes first and is decisive: `(index, term)` is a content-identity only WITHIN
+  /// one lineage (Log Matching §5.3), so a snapshot whose token differs from this replica's — either
+  /// direction, `None` included — is NEVER covered, no matter what the local coordinates claim. A
+  /// colliding replica that independently committed the boundary coordinates must not treat the fork's
+  /// real state as "already present" while holding different bytes: the leader would advance `match`
+  /// on a false ack and replicate later entries over permanent divergence.
+  ///
+  /// Within the lineage, two arms:
+  /// - `boundary <= committed_bound` — the caller's committed/recoverable bound (receipt and reclaim
+  ///   pass `min(commit, ack_watermark())`; the completion re-check passes bare `commit`, its durable
+  ///   evidence already established);
+  /// - `boundary <= durable_index` AND the durable entry at `boundary` carries the snapshot's term —
+  ///   Log Matching: the durable `[first..=boundary]` IS the snapshot's prefix entry-for-entry, the
+  ///   case the committed bound misses on an async follower whose durable log outran `commit`.
+  ///
+  /// Returns `None` when the Log-Matching term read hit a fatal storage error — the node is already
+  /// poisoned via `log_term`, and the caller must bail without acting.
+  fn covered_by_local_history<L: LogStore>(
+    &mut self,
+    log: &L,
+    meta: &SnapshotMeta<I>,
+    committed_bound: Index,
+  ) -> Option<bool> {
+    if meta.fork_id() != self.split.fork_id.as_ref() {
+      return Some(false);
+    }
+    if meta.last_index() <= committed_bound {
+      return Some(true);
+    }
+    if meta.last_index() <= self.durable.durable_index {
+      return self
+        .log_term(log, meta.last_index())
+        .map(|t| t == meta.last_term());
+    }
+    Some(false)
+  }
+
   pub(crate) fn reclaim_stale_snapshot_recv<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     log: &L,
     stable: &mut S,
   ) -> bool {
-    let Some((boundary, last_term)) = self
-      .snapshot
-      .snapshot_recv
-      .as_ref()
-      .map(|r| (r.meta.last_index(), r.meta.last_term()))
-    else {
+    // Free the staging buffer whenever the staged snapshot is COVERED by this replica's own history —
+    // the same proof as the ack-path short-circuit (`covered_by_local_history`, lineage clause
+    // included: a cross-lineage transfer staged on a then-pristine joiner is never "already held" by
+    // content this replica gained since, so it is pinned, not silently freed — the conflict stays
+    // visible). The committed-only bound alone missed the case where in-window appends made the
+    // durable log match through `boundary` while `commit` stayed lower — a later duplicate chunk would
+    // then ack the leader out of Snapshot but strand the full `total_len` allocation. Taken out and
+    // restored around the proof: `covered_by_local_history` needs `&mut self` for the poisoning term
+    // read.
+    let Some(r) = self.snapshot.snapshot_recv.take() else {
       return true;
     };
-    // Free the staging buffer whenever the staged snapshot is redundant by the SAME proof the ack-path
-    // short-circuit uses: committed-and-recoverable, OR the durable log matches through the boundary (Log
-    // Matching). The committed-only `min(commit, ack_watermark())` bound missed the case where in-window
-    // appends made the durable log match through `boundary` while `commit` stayed lower — a later duplicate
-    // chunk would then ack the leader out of Snapshot but strand the full `total_len` allocation. A fatal
-    // `term` Err poisons via `log_term`.
-    let committed_recoverable = core::cmp::min(self.commit, self.ack_watermark());
-    let durable_index = self.durable.durable_index;
-    let redundant = boundary <= committed_recoverable
-      || (boundary <= durable_index
-        && match self.log_term(log, boundary) {
-          Some(t) => t == last_term,
-          None => return false,
-        });
-    if redundant {
-      self.snapshot.snapshot_recv = None;
-      stable.discard_snapshot_staging();
+    let bound = core::cmp::min(self.commit, self.ack_watermark());
+    match self.covered_by_local_history(log, &r.meta, bound) {
+      // Fatal term read: poisoned via `log_term`. Restore the state the caller found and bail.
+      None => {
+        self.snapshot.snapshot_recv = Some(r);
+        false
+      }
+      Some(true) => {
+        stable.discard_snapshot_staging();
+        true
+      }
+      Some(false) => {
+        self.snapshot.snapshot_recv = Some(r);
+        true
+      }
     }
-    true
   }
 
   /// Receive an `InstallSnapshot` from the current leader (follower path). This VALIDATES, persists the
@@ -420,6 +510,84 @@ where
       .max_unwalled_lease_window
       .max(meta.max_unwalled_lease_window());
 
+    // FORK-PROVENANCE gate: this replica's lineage token rides every snapshot of its own lineage
+    // — the manufactured fork baseline carries it, own captures re-stamp it (the forced absorb
+    // capture included), and a sibling twin's transfer repeats it — and the handshake fences
+    // pre-token peers, so absence is meaningful: an authenticated leader shipping a token-less
+    // (or other-token) DESTRUCTIVE install is foreign lineage for this id, not an older version.
+    // Landing it would replace this child's state wholesale while the keep-if-set adoption below
+    // retains the token — the replica would impersonate the fork on foreign state (a parked
+    // parent could resolve its fork redundant against it), and a restart would re-derive
+    // provenance from the foreign durable meta and silently shed the token. REFUSE at receipt —
+    // BEFORE the redundancy short-circuit below (which on an already-committed OR Log-Matching
+    // boundary would ack a foreign leader out of Snapshot and discard this replica's staging
+    // WITHOUT ever consulting provenance), and before any staging — so a foreign leader is never
+    // released, the foreign blob never becomes durable, and restart re-derivation stays coherent
+    // with the live token. The pre-gate steps left above are provenance-neutral: the lease-bound
+    // fold is a monotone raise (only lengthens commit-wait), and `reclaim_stale_snapshot_recv`
+    // frees only THIS replica's own already-recoverable staging (no ack, no foreign effect).
+    // Refusal, not fail-stop: the sender is authenticated, merely mis-lineaged — dropping the
+    // message leaves it pinned in Snapshot state, the same standing-conflict posture as a parked
+    // fork, resolved by placement (removal / the genuine twin's transfer). A matching token
+    // re-installs freely (the twin retransfer leg); a token-less self adopts — but only from
+    // NOTHING (the second leg below).
+    //
+    // EXACT match only — no cross-mint supersession arm exists, by design. A genuine re-mint of
+    // the same child (a later split episode) can never repeat this token's coordinates: every
+    // committed split bumps the parent's lineage counter (the apply arm demands
+    // `parent_gen_after == shape_gen + 1`), so a re-mint carries a strictly higher parent
+    // incarnation — and the coordinator's admission floor retires the stale incarnation, tearing
+    // its replicas down, BEFORE the re-mint is admissible at all. A replica still advertising a
+    // stale mint against a re-minted lineage is therefore a lifecycle breach resolved by
+    // placement, never by letting an authenticated leader destructively replace a token-bearing
+    // replica — which is exactly the loss this gate exists to prevent.
+    if let Some(existing) = &self.split.fork_id
+      && meta.fork_id() != Some(existing)
+    {
+      self.snapshot.refused_cross_lineage_installs = self
+        .snapshot
+        .refused_cross_lineage_installs
+        .saturating_add(1);
+      return;
+    }
+    // A token-less self ADOPTS a lineage only from NOTHING. `(last_index, last_term, conf)` is a
+    // content-identity only WITHIN one lineage (Log Matching), so every coordinate proof downstream
+    // — the redundancy short-circuit, the reclaim proof, the progress-ack watermark, restart's
+    // log-vs-snapshot reconciliation — is sound only when snapshot and receiver share a lineage. A
+    // populated replica that accepted a foreign baseline would hold two lineages' artifacts in one
+    // durable state (its own committed log and the foreign blob); no later predicate can untangle
+    // that, because the log carries no token. So the invariant is held where it is still cheap:
+    // a token-bearing snapshot lands only on a replica with NO committed content — empty log,
+    // nothing committed, and a durable slot that is either empty or holds THIS SAME LINEAGE. The
+    // kin-slot arm is load-bearing: an adoption interrupted after the blob's fsync but before the
+    // install (a crash, or a role flip dropping the deferred body) leaves the blob durable with the
+    // log still virgin, and the leader must be able to COMPLETE the adoption. It keys on lineage,
+    // NOT exact identity: a leader that snapshotted at a different boundary than the orphaned blob
+    // — the norm after a leadership change, since replicas compact at their own points — sends its
+    // own snapshot (possibly at a LOWER index, plus the tail it will replicate afterward), and from
+    // a single latest-snapshot slot it cannot resend the exact orphan. On a virgin receiver that
+    // replacement is harmless: nothing is committed, so the incoming install just re-baselines onto
+    // its own boundary. Requiring exact identity here would refuse every retry and wedge the joiner
+    // out of the group. A DIFFERENT-lineage orphan still blocks — the same standing conflict a
+    // populated squatter poses, resolved by placement (remove, tombstone, recreate pristine), never
+    // by destructive replacement. The manufactured fork baseline's contract has always been the
+    // zero-progress joiner (see `FORK_BASE_INDEX`); this enforces it, uniformly on relay and wire.
+    if self.split.fork_id.is_none() && meta.fork_id().is_some() {
+      let pristine_or_kin = log.last_index() == Index::ZERO
+        && log.first_index() == Index::new(1)
+        && self.commit == Index::ZERO
+        && stable
+          .durable_snapshot()
+          .is_none_or(|m| m.fork_id() == meta.fork_id());
+      if !pristine_or_kin {
+        self.snapshot.refused_cross_lineage_installs = self
+          .snapshot
+          .refused_cross_lineage_installs
+          .saturating_add(1);
+        return;
+      }
+    }
+
     // Redundancy short-circuit: skip the staging+install entirely when this follower ALREADY holds the
     // snapshot's prefix durably, and ack a position at/above the boundary so the leader advances `match`
     // and leaves `ProgressState::Snapshot`. Redundant two ways:
@@ -441,18 +609,16 @@ where
     // acking it lifts the leader's `match` past `pending`. Persist-before-RESPOND: a non-durable term defers
     // the ack (this path runs no install; the term write is the post-dispatch catch-all in `handle_message`)
     // and `flush_term_gated_acks` releases it.
-    let redundant = if meta.last_index() <= core::cmp::min(self.commit, self.ack_watermark()) {
-      true
-    } else if meta.last_index() <= self.durable.durable_index {
-      // Log-Matching proof read. A fatal `term` Err is a STORAGE FAILURE, not a mismatch: funnel it
-      // through `log_term`, which poisons (`PoisonReason::LogTerm`) and returns `None` — never silently
-      // "not redundant", which here would STAGE a transfer of a snapshot the follower already holds.
-      match self.log_term(log, meta.last_index()) {
-        Some(t) => t == meta.last_term(),
-        None => return,
-      }
-    } else {
-      false
+    // The shared coverage proof (`covered_by_local_history`) decides — lineage clause first: past the
+    // door gate this reaches a cross-lineage meta only on a pristine adopter (never covered — a virgin
+    // log covers nothing, and the clause keeps that true even if content lands mid-adoption). A fatal
+    // `term` Err in the Log-Matching arm is a STORAGE FAILURE, not a mismatch: the node is poisoned and
+    // this handler bails — never silently "not redundant", which would STAGE a transfer of a snapshot
+    // the follower already holds.
+    let bound = core::cmp::min(self.commit, self.ack_watermark());
+    let redundant = match self.covered_by_local_history(log, meta, bound) {
+      Some(r) => r,
+      None => return,
     };
     if redundant {
       // Apply the SAME leader-aware staged-receive cleanup as the supersede path BEFORE acking, so the ack
@@ -488,6 +654,43 @@ where
       &self.snapshot.pending_install,
       Some((_, pmeta, ..)) if pmeta.last_index() > meta.last_index() || pmeta.identity_eq(meta)
     ) {
+      return;
+    }
+
+    // SLOT MONOTONICITY: the store keeps ONE latest snapshot, so a submit is destructive — it
+    // REPLACES whatever the slot holds. An inbound snapshot strictly below the slot's boundary must
+    // therefore never reach `submit_snapshot`: the slot may be the only baseline for a prefix the
+    // log has already compacted (a local capture at N compacts through N; a stale leader with an
+    // older compaction point then legitimately offers M < N because this replica's ack watermark
+    // honestly lagged), and replacing it with M leaves (M, N] recoverable NOWHERE — a crash then
+    // restarts into an orphaned log. The VISIBLE slot boundary, tracked endpoint-side so no store
+    // read is needed: the max of the durable boundary and both submitted-awaiting-fsync boundaries
+    // (a submitted-but-unfsynced higher capture must not be clobbered either — store completions
+    // are FIFO, so a later lower submit would end up the durable slot). Checked HERE, after the
+    // coverage short-circuit — which already answers most stale offers with a redundant ack once
+    // the watermark covers them — because in the capture-fsync window the watermark does NOT yet
+    // cover the visible slot, and this drop is the only guard. Silent, no ack: the boundary may not
+    // be recoverable yet, so acking would over-claim; the sender's heartbeat-paced resend re-drives,
+    // and once the capture fsyncs the retry resolves redundant at the coverage arm. Strictly LOWER
+    // only — an equal-boundary different-identity snapshot is the documented re-snapshot supersede.
+    let visible_slot = self
+      .durable
+      .durable_snapshot_index
+      .max(
+        self
+          .snapshot
+          .pending_compact
+          .as_ref()
+          .map_or(Index::ZERO, |(_, m)| m.last_index()),
+      )
+      .max(
+        self
+          .snapshot
+          .pending_install
+          .as_ref()
+          .map_or(Index::ZERO, |(_, m, ..)| m.last_index()),
+      );
+    if visible_slot > meta.last_index() {
       return;
     }
 
@@ -558,25 +761,33 @@ where
         }
         _ => 0,
       };
-      self.send_snapshot_progress_ack(is.leader(), staged);
+      self.send_snapshot_progress_ack(is.leader(), staged, meta.last_index());
       return;
     }
 
     let boundary = meta.last_index();
     // Identify the in-progress transfer by its FULL identity — (sender_term, last_index, last_term, conf,
-    // total_len) — NOT just the boundary index. The SENDER TERM is load-bearing: a NEWER leader sending a
-    // snapshot with the SAME (last_index, last_term, conf) and length is a DISTINCT capture, not a
-    // continuation — appending its chunks into the old leader's staging would MIX bytes from two
-    // independently-captured snapshots (the StateMachine contract does not promise byte-identical encodings
-    // across leaders for the same applied state). A SAME-term recapture at the same boundary is impossible by
-    // construction — a leader snapshots only its own monotone `applied`, `maybe_snapshot` is single-flight,
-    // and compaction advances `first_index` PAST the boundary — so `sender_term` discriminates EXACTLY the
-    // cross-leader recapture, the only way the (boundary, total_len) resume identity can collide. This term
-    // key, checked HERE in the core BEFORE staging, is what bounds byte-mixing — NOT the store's staging key,
-    // which omits the term (`discard_snapshot_staging` runs before the first accept of any differing term).
-    // A mismatch routes to the supersede/replace path below. (The LeaseGuard / read-mode bounds are folded
-    // ungated above and may legitimately differ between same-boundary snapshots, so they are NOT part of the
-    // identity.)
+    // fork_id, total_len) — NOT just the boundary index. Two independent keys bound byte-mixing, and each
+    // covers a collision the other cannot see:
+    //
+    // The SENDER TERM bounds the cross-LEADER recapture WITHIN one lineage: a NEWER leader sending a snapshot
+    // with the same coordinate and length is a DISTINCT capture, not a continuation — appending its chunks
+    // into the old leader's staging would MIX bytes from two independently-captured snapshots (the
+    // StateMachine contract does not promise byte-identical encodings across leaders for the same applied
+    // state). A SAME-term recapture at the same boundary is impossible by construction — a leader snapshots
+    // only its own monotone `applied`, `maybe_snapshot` is single-flight, and compaction advances
+    // `first_index` PAST the boundary — so within a lineage `sender_term` discriminates exactly the recapture.
+    //
+    // The LINEAGE TOKEN (carried by `identity_eq`) bounds the cross-LINEAGE collision, which the term CANNOT:
+    // `(last_index, last_term, conf)` is not a content-identity across a fork boundary, so a manufactured fork
+    // baseline and a colliding tokenless (or differently-forked) snapshot are DIFFERENT bytes — and nothing
+    // stops them arriving under the SAME sender term. Keyed on the term alone, their chunks would combine into
+    // one Frankenstein blob spanning two lineages.
+    //
+    // Both keys are checked HERE in the core BEFORE staging — NOT in the store's staging key, which omits the
+    // term (`discard_snapshot_staging` runs before the first accept of any differing term). A mismatch routes
+    // to the supersede/replace path below. (The LeaseGuard / read-mode bounds are folded ungated above and may
+    // legitimately differ between same-boundary snapshots, so they are NOT part of the identity.)
     let continues = matches!(
       &self.snapshot.snapshot_recv,
       Some(r) if r.sender_term == is.term() && r.meta.identity_eq(meta) && r.total_len == total_len
@@ -645,9 +856,9 @@ where
 
     if staged < total_len {
       // Mid-transfer: a PROGRESS ack carrying the contiguous-staged offset — drives the leader's next
-      // chunk but does NOT advance `match_index` (the peer stays in Snapshot state).
+      // chunk but can never advance `match_index` to the boundary (the peer stays in Snapshot state).
       let leader = is.leader();
-      self.send_snapshot_progress_ack(leader, staged);
+      self.send_snapshot_progress_ack(leader, staged, boundary);
       return;
     }
 
@@ -674,20 +885,28 @@ where
   }
 
   /// Send a mid-transfer PROGRESS ack for a chunked snapshot: carries the contiguous-staged byte offset
-  /// (`acked_through`) so the leader sends the next chunk, with `match_index = min(commit, ack_watermark)`
-  /// — the persist-before-ack-safe RECOVERABLE watermark, which past the staleness guard is strictly
-  /// below the snapshot boundary, so the leader's `maybe_update` does NOT lift the peer out of Snapshot
-  /// state (counting a phantom replica before the blob is durably installed). UNGATED (unlike the final
-  /// install ack): it makes no NEW durable commitment — the watermark is already durable and
-  /// `acked_through` is a transfer-progress hint — so a crash that loses it merely restarts the transfer.
-  fn send_snapshot_progress_ack(&mut self, to: I, acked_through: u64) {
+  /// (`acked_through`) so the leader sends the next chunk, with `match_index` = the persist-before-ack-safe
+  /// RECOVERABLE watermark `min(commit, ack_watermark)` CLAMPED strictly below the transfer's boundary.
+  ///
+  /// The clamp is what keeps a progress ack from lifting the peer out of Snapshot state on the leader
+  /// (`maybe_update` exits at `match >= pending`, counting a phantom replica before the blob is durably
+  /// installed). The watermark alone is NOT strictly below the boundary for every transfer that stages:
+  /// the receipt-time redundancy short-circuit guarantees it only for a snapshot COVERED by this replica's
+  /// own history — a snapshot from a different lineage legitimately stages at a boundary the local
+  /// coordinates appear to cover, so the invariant must hold by value, not by handler ordering. UNGATED
+  /// (unlike the final install ack): it makes no NEW durable commitment — the watermark is already durable
+  /// and `acked_through` is a transfer-progress hint — so a crash that loses it merely restarts the
+  /// transfer.
+  pub(crate) fn send_snapshot_progress_ack(&mut self, to: I, acked_through: u64, boundary: Index) {
     let (term, me) = (self.term, self.config.id());
-    let match_index = self.commit.min(self.ack_watermark());
+    let below_boundary = Index::new(boundary.get().saturating_sub(1));
+    let match_index = self.commit.min(self.ack_watermark()).min(below_boundary);
     self.send(
       to,
       Message::SnapshotResponse(
         crate::SnapshotResponse::new(term, me, false, match_index)
-          .with_acked_through(acked_through),
+          .with_acked_through(acked_through)
+          .with_progress(true),
       ),
     );
   }
@@ -716,12 +935,37 @@ where
     // `Pending::Campaign` self-vote (so `self_vote_durable()` would wrongly report the self-vote durable,
     // reopening a same-term double vote). A winner already holds every committed entry through the
     // boundary (the up-to-date check + Leader Completeness), so the snapshot is redundant with entries it
-    // has — drop it. The blob stays durable in the store: a genuinely-behind candidate that reverts to
-    // follower re-fetches from the leader (its ack never advanced), and a restart would
-    // `reconcile_restart_log::Restore` to the boundary. Skipping the `durable_snapshot_index` raise below
-    // is deliberate here: for a leader it would claim local durability at a boundary the real log has not
-    // yet reached.
+    // has — drop it. The blob stays durable in the store, and both exits stay coherent: a
+    // genuinely-behind candidate that reverts to follower re-fetches from the leader (its ack never
+    // advanced; a same-identity retransfer passes the provenance gate against the leftover slot), and
+    // a restart reconciles lineage-first — a same-lineage blob resolves by the ordinary log-vs-boundary
+    // arms, a cross-lineage one is an unadopted leftover restart IGNORES (never restored under a log
+    // that outvoted it). Skipping the `durable_snapshot_index` raise below is deliberate here: for a
+    // leader it would claim local durability at a boundary the real log has not yet reached.
     if !self.role.is_follower() {
+      return;
+    }
+    // A lineage-ADOPTING install (token-less self, token-bearing snapshot) lands only on the
+    // content-emptiness the door gate demanded — re-checked HERE because admission was deferred
+    // behind the blob's fsync while the gate's check ran at receipt, and the window between them
+    // admits appends. Any content that filled the window is ANOTHER lineage's: this replica's own
+    // lineage cannot reach it (a fork member's log starts past the manufactured baseline, so it
+    // cannot append below the boundary to a zero-progress joiner — the joiner is structurally
+    // forced onto the snapshot path), so re-baselining over it would silently destroy a foreign
+    // group's durably-acked entries — replacement, where the doctrine demands placement. REFUSE:
+    // count and drop; the filled log stands, the conflict stays visible (every retransfer now
+    // refuses at receipt — the receiver is populated), and the sender resolves by placement. The
+    // `durable_snapshot_index` raise below is skipped with the same reasoning as the role gate's
+    // skip: a refused adoption's boundary is NOT recoverable (restart ignores the unadopted
+    // leftover), so raising the watermark would over-claim the recoverable prefix.
+    if self.split.fork_id.is_none()
+      && meta.fork_id().is_some()
+      && !(log.last_index() == Index::ZERO && self.commit == Index::ZERO)
+    {
+      self.snapshot.refused_cross_lineage_installs = self
+        .snapshot
+        .refused_cross_lineage_installs
+        .saturating_add(1);
       return;
     }
     // this runs ONLY once the blob is durable (the matching `SnapshotWritten` or `durable_snapshot()`
@@ -770,15 +1014,16 @@ where
     // (`PoisonReason::LogTerm`) and returns `None`. Treating an Err as "not redundant" would instead fall
     // through to the destructive `log.restore` on unreadable state — discarding a durable tail that may
     // actually match the snapshot prefix (the very hole this guard closes).
-    let redundant = if meta.last_index() <= self.commit {
-      true
-    } else if meta.last_index() <= self.durable.durable_index {
-      match self.log_term(log, meta.last_index()) {
-        Some(t) => t == meta.last_term(),
-        None => return,
-      }
-    } else {
-      false
+    // The shared coverage proof (`covered_by_local_history`), with bare `commit` as the committed
+    // bound — durable evidence is already established here (the blob is durable and
+    // `durable_snapshot_index` was raised above). The lineage clause is defensive at this site: a
+    // lineage-ADOPTING install reaching here proved the receiver still content-empty above, so its
+    // coordinates cover nothing — the clause simply keeps the answer exact if either gate ever
+    // weakens (foreign coverage must never read as "already durable"). A fatal `term` Err poisons
+    // and bails (treating it as "not redundant" would `log.restore` over unreadable state).
+    let redundant = match self.covered_by_local_history(log, &meta, self.commit) {
+      Some(r) => r,
+      None => return,
     };
     if redundant {
       // Release the leader from `ProgressState::Snapshot` NOW, without waiting for a heartbeat resend: a
@@ -826,6 +1071,14 @@ where
     // carrying it — a straggler that installed a post-split parent snapshot, then leads and
     // compacts, must not drop the fold.
     self.split.shape_gen = self.split.shape_gen.max(meta.shape_gen());
+    // Adopt the installed meta's fork PROVENANCE: a sibling replica's manufactured fork baseline (or
+    // a forked child's own snapshot) carries the child's ForkId, so a child materialized ONLY via
+    // snapshot transfer — never through the local fork constructor — still reports its origin, and
+    // the parent's parked fork then resolves REDUNDANT against exactly this token. Keep-if-set: a
+    // later non-fork snapshot must not erase an established provenance.
+    if let Some(fork_id) = meta.fork_id() {
+      self.split.fork_id = Some(fork_id.clone());
+    }
 
     // Step 4: re-baseline the log on the now-durable snapshot. Discards the follower's stale/short log;
     // after this call first_index == last_index + 1 and term(last_index) == last_term, so the next
@@ -834,6 +1087,38 @@ where
     // snapshot present, log not-yet-re-baselined} — both of which `reconcile_restart_log` recovers
     // (None/Compact/Restore), NEVER the OrphanedLog poison.
     log.restore(meta.last_index(), meta.last_term());
+    // The re-baseline discarded every entry above the boundary — a pending merge freeze among
+    // them no longer exists in this log, so the append-observed kill releases (re-armed at
+    // accept if the freeze is still live and re-delivered).
+    self.note_freeze_rebaselined();
+    // The re-baseline also crossed the APPLIED freeze, so clear the whole applied-freeze quartet,
+    // not just the append-observed pending flag above. No conforming snapshot boundary can sit
+    // INSIDE a live freeze: every source-side capture is fenced by `merge_freeze_active` for the
+    // freeze's whole life, the forced absorb capture is target-side, and a fork is refused on a
+    // freezing parent — so any install boundary proves every freeze it covers already RESOLVED (the
+    // same totality argument `note_freeze_rebaselined` makes for the pending flag). Leaving the
+    // quartet set would strand this replica frozen FOREVER — captures fenced, proposes/reads/conf/
+    // transfers refused if elected, its stale `frozen_for` blocking the claimed target's removal —
+    // while a plain restart from the same durable state derives NOT-frozen (install and restart must
+    // agree). The sole other clear site is the thaw apply arm.
+    self.merge.frozen = false;
+    self.merge.freeze_index = None;
+    self.merge.freeze_term = None;
+    self.merge.frozen_for = None;
+    // A parked CommitMerge is SUPERSEDED by the install: at-or-below the boundary, the blob IS
+    // the union (the target leader's forced absorb capture sits past every resolution, so a
+    // log-behind straggler is caught up wholesale without ever touching its local source);
+    // above the boundary, the replay re-encounters the entry and re-parks from log-fixed data.
+    // A stale park kept here would wedge the drain forever below a boundary it cannot re-reach.
+    self.merge.pending_apply = None;
+    // The re-baseline discarded every abort entry at-or-below the boundary — the ONLY restart
+    // re-derivation of the `abandoned` obligation. The install sits past the committed+applied abort,
+    // proving the source thawed past the abandoned freeze (the capturing leader's own service drove
+    // it), so a covered obligation is MOOT; clear it here or `abort_relay_fences` would stay stuck on
+    // a boundary the install already crossed (the source thawed and gone, so the service could never
+    // observe it advance to discharge it) — a permanent capture wedge. An obligation above the
+    // boundary is retained (see the helper).
+    self.note_abort_rebaselined(meta.last_index());
     // `restore` DISCARDS the prior tail, so the durable boundary IS exactly the snapshot's last index — a
     // hard RESET. `durable_index` and the re-baseline advance together, after the blob is durable, so the
     // boundary is recoverable (no stale-HIGH watermark, no orphan).
@@ -912,21 +1197,30 @@ where
       // self.tracker). The pattern mirrors on_append_response's reject branch.
       self.maybe_send_append(now, from, log, stable);
     } else {
-      // Boundary check (shared with `on_append_response` via `match_within_log`): a successful snapshot
-      // ack must not report a match above the leader's own log, for the same reason — an over-run
-      // would corrupt `Progress` and could push the commit candidate off the log and poison the
-      // leader. Ignore the malformed ack; the peer stays in Snapshot and is re-probed normally.
-      if !Self::match_within_log(response.match_index(), log) {
-        return;
+      // A PROGRESS ack is match-inert BY TYPE: it drives the resume cursor and chunk pacing below,
+      // but never touches `match_index` — so it cannot exit Snapshot state or feed the commit
+      // quorum. Only an install/redundancy ack (a durable log-state assertion by the follower) may.
+      // Enforced HERE, on the leader, so the rule holds regardless of the peer's arithmetic — a
+      // version-skewed or malformed peer cannot mint replication progress from a transfer that has
+      // not durably installed.
+      if !response.progress() {
+        // Boundary check (shared with `on_append_response` via `match_within_log`): a successful
+        // snapshot ack must not report a match above the leader's own log, for the same reason — an
+        // over-run would corrupt `Progress` and could push the commit candidate off the log and
+        // poison the leader. Ignore the malformed ack; the peer stays in Snapshot and is re-probed
+        // normally.
+        if !Self::match_within_log(response.match_index(), log) {
+          return;
+        }
+        // maybe_update drives the Snapshot → Probe transition regardless of its return value
+        // ("advanced" hint). We resume unconditionally so a peer leaving Snapshot is never left
+        // un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_response).
+        pr.maybe_update(response.match_index());
       }
-      // Success: maybe_update drives the Snapshot → Probe transition regardless of its return
-      // value ("advanced" hint). We resume unconditionally so a peer leaving Snapshot is never
-      // left un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_response).
-      pr.maybe_update(response.match_index());
       // Advance the resume cursor from the follower's contiguous watermark, then — if the peer is STILL
-      // mid-transfer (a progress ack did not lift it out of Snapshot via maybe_update above) AND this
+      // mid-transfer (a progress ack leaves Snapshot state untouched by construction) AND this
       // ack MOVED the cursor — send the next chunk. A single-chunk snapshot's FINAL ack lifts the peer
-      // out of Snapshot, so this no-ops.
+      // out of Snapshot via maybe_update above, so this no-ops.
       //
       // The moved-gate is the snapshot sibling of the append path's advance gate (`on_append_response`
       // pumps only when `maybe_update` ADVANCED the match): a DUPLICATED ack echoing the same watermark
@@ -961,7 +1255,7 @@ where
               now.mono() + self.config.election_timeout(),
             );
           }
-          ChunkSend::Deferred => {
+          ChunkSend::Deferred | ChunkSend::Unsendable => {
             self.snapshot.snapshot_resend_after.remove(&from);
           }
           ChunkSend::Poisoned => return,

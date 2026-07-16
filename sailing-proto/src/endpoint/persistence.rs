@@ -227,6 +227,11 @@ where
   pub(crate) fn stamp_floors(&self, hs: HardState<I>) -> HardState<I> {
     let raised = hs.lease_support().raise(self.durable.lease_support_floor);
     hs.with_lease_support(raised)
+      // The lineage is a LATCH, not a monotone floor: stamped from the endpoint's current identity on
+      // every write, `None` until the node forks or adopts and that token thereafter. Stamping at the
+      // choke-point means no builder can accidentally persist a hard state that disowns the log's
+      // lineage — the record restart reconciliation compares against the durable snapshot's token.
+      .with_lineage(self.split.fork_id.clone())
   }
 
   pub(crate) fn submit_write<S: StableStore<NodeId = I>>(
@@ -392,6 +397,13 @@ where
   ///
   /// Idempotent via the durable `HardState` read: a same-term message, a pre-vote (which never adopts a
   /// term), or a handler that already persisted the step-down (a vote grant) does NOT double-write.
+  ///
+  /// The persist-before-RESPOND gate this feeds relies on the store's STRICT-completion contract (see
+  /// [`StableStore::poll`](crate::StableStore::poll)): the withheld grant/ack is released only when the
+  /// matching `Wrote` completion drains. A LOST completion is a store-contract violation that STALLS the
+  /// response — the SAFE direction, since a peer never observed the ungranted vote / unacked append — and
+  /// a restart re-submits from the durable state and heals it. Missing a completion costs liveness, never
+  /// §5.1 safety.
   pub(crate) fn ensure_term_durable<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
     if self.poison.poisoned {
       return;
@@ -509,10 +521,21 @@ where
           // Deferred compaction: fire only after the snapshot is durable.
           // This mirrors append-before-ack: the log is never compacted before the
           // snapshot backing it is safely on stable storage.
-          if let Some((pid, up_to)) = self.snapshot.pending_compact
-            && pid == opid
+          if let Some((pid, m)) = &self.snapshot.pending_compact
+            && *pid == opid
           {
-            log.compact(up_to);
+            // The capture is durable, so its boundary is now a RECOVERABLE prefix (a crash restores
+            // from the slot) — record it exactly as the install path does. Without this,
+            // `ack_watermark()` stays at the durable LOG tip, which the compaction below is about to
+            // strand: an async replica whose disk lagged its applied index (capture at N, log durable
+            // only through K < N) would under-ack K — and, worse, under-COVER: a stale same-lineage
+            // snapshot at M in (K, N] would pass the receipt coverage test and its submit would
+            // REPLACE this capture in the store's one snapshot slot, destroying the only baseline for
+            // the prefix the compaction just discarded (a crash then recovers to M with first_index
+            // N+1 — an orphaned log).
+            self.durable.durable_snapshot_index =
+              core::cmp::max(self.durable.durable_snapshot_index, m.last_index());
+            log.compact(m.last_index());
             self.snapshot.pending_compact = None;
           }
           // a DEFERRED follower install whose blob just became durable — run the destructive
@@ -551,21 +574,29 @@ where
     //
     // This is a NO-OP on the happy path: the poll-drain loop above clears `pending_compact` when the
     // completion arrives, so the `if let` does not match. It can only fire when a completion was
-    // genuinely missed AND the durable snapshot already covers `up_to` — so it can never compact
-    // ahead of a durable snapshot (safety preserved). It runs before `maybe_snapshot` so a node that
-    // was wedged can snapshot again in this same call. (Keyed on `durable_snapshot()` — the
-    // fsync'd slot — NOT `snapshot()`, the submit-visible slot, for uniformity with the install fallback.)
-    if let Some((_pid, up_to)) = self.snapshot.pending_compact
-      && matches!(stable.durable_snapshot(), Some(m) if m.last_index() >= up_to)
+    // genuinely missed AND the durable slot holds EXACTLY this capture — identity, not boundary
+    // coverage: captures are single-flight (`maybe_snapshot` gates on `pending_compact`), so the only
+    // own-capture the slot can durably hold is this one, and identity is what a foreign blob at a
+    // covering boundary can never satisfy (compacting this node's own log on another lineage's
+    // durability would discard a prefix that exists nowhere in this lineage). It runs before
+    // `maybe_snapshot` so a node that was wedged can snapshot again in this same call. (Keyed on
+    // `durable_snapshot()` — the fsync'd slot — NOT `snapshot()`, the submit-visible slot, for
+    // uniformity with the install fallback.)
+    if let Some((_pid, m)) = &self.snapshot.pending_compact
+      && matches!(stable.durable_snapshot(), Some(d) if d.identity_eq(m))
     {
-      log.compact(up_to);
+      // The capture's boundary is a recoverable prefix now — record it exactly as the in-loop
+      // completion arm does, for the same reason (the compaction below strands the durable log tip).
+      self.durable.durable_snapshot_index =
+        core::cmp::max(self.durable.durable_snapshot_index, m.last_index());
+      log.compact(m.last_index());
       self.snapshot.pending_compact = None;
     }
     // same missed/coalesced-completion fallback for a DEFERRED install — if the DURABLE snapshot
     // already covers the pending boundary, the blob is durable, so run the install now (else a single
     // dropped `SnapshotWritten` would wedge `pending_install` forever, the follower never installing).
     // Durable evidence ONLY (`durable_snapshot()`): firing on the visible (pre-fsync) `snapshot()` slot
-    // would re-baseline the log ahead of a non-durable blob — the exact orphan this fix prevents.
+    // would re-baseline the log ahead of a non-durable blob — the exact orphan this gate prevents.
     if let Some((_pid, meta, ..)) = &self.snapshot.pending_install {
       // IDENTITY-aware, not merely boundary `>=`: a same-boundary supersede can leave a SUPERSEDED
       // snapshot's blob durable while the replacement is still in flight; firing on that evidence would
@@ -601,10 +632,16 @@ where
     // apply, a SILENT stall (`applied < commit`, no poison). Idempotent: a no-op when caught up, and a
     // still-cold or not-yet-viewable read simply defers again. (Replication has the periodic heartbeat
     // re-pump; apply did not, which is the gap this closes.)
-    if !self.poison.poisoned && self.applied < self.commit {
-      self.apply_committed(log);
+    // Capture the drain verdict: a per-crank budget cut (committed entries still unapplied) must be
+    // re-driven, and it rides the storage-progress signal below — nothing lands in a store queue for
+    // an in-memory apply stop, so `has_pending()` alone would let a budget-cut backlog stall.
+    let apply_drain = if !self.poison.poisoned && self.applied < self.commit {
+      let verdict = self.apply_committed(log);
       self.maybe_flush_deferred_reads(now, log, stable);
-    }
+      verdict
+    } else {
+      ApplyDrain::Drained
+    };
     // apply_committed / the deferred-read flush can poison on a fatal log or state read → fail-stop before
     // the snapshot, auto-leave, and commit-persist tail runs on a dead node.
     if self.poison.poisoned {
@@ -673,12 +710,16 @@ where
     self.reconcile_election_timer(now);
 
     // Storage-derived progress: MorePending iff a completion is queued for the next poll() at EITHER
-    // store, checked AFTER every drain and the whole fixed tail (which can submit / compact into a
-    // queue whose drain already exited). Exact by construction — catches every post-drain enqueue
-    // uniformly (a budget cut leaves the remainder queued; a post-drain submit's completion; a
-    // compact's `LogDone::Compacted`) with no per-site detector. poll() is a FIFO; the remainder
-    // re-drives next call.
-    if log.has_pending() || stable.has_pending() {
+    // store, OR the apply drain was cut by its per-crank budget. The store-queue check, taken AFTER
+    // every drain and the whole fixed tail (which can submit / compact into a queue whose drain already
+    // exited), catches every post-drain STORE enqueue uniformly (a post-drain submit's completion, a
+    // compact's `LogDone::Compacted`) with no per-site detector. A budget cut is NOT a store enqueue —
+    // its remainder is committed-but-unapplied, an in-memory backlog — so it is folded in explicitly:
+    // an immediate re-crank applies the next budget. A cold or parked apply stop (`Waiting`) is
+    // deliberately excluded — those advance only when an EXTERNAL wait completes (the store's
+    // storage-ready signal / the container's merge service), so re-driving them would busy-spin the
+    // driver against that wait. poll() is a FIFO; the remainder re-drives next call.
+    if log.has_pending() || stable.has_pending() || apply_drain == ApplyDrain::BudgetCut {
       StorageProgress::MorePending
     } else {
       StorageProgress::Drained

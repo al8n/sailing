@@ -215,6 +215,21 @@ where
   }
 }
 
+/// Poll `group`'s status until it reports poisoned (fail-stopped), within 15s.
+async fn await_poisoned(group: &GroupHandle<u64, u64, CountSm>, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: the group never fail-stopped"
+    );
+    if group.status().await.is_ok_and(|s| s.is_poisoned) {
+      return;
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+}
+
 /// Group 100's current leader index among `groups` (status-polled, deadline-bounded).
 async fn find_leader(groups: &[GroupHandle<u64, u64, CountSm>], what: &str) -> usize {
   let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -309,8 +324,8 @@ async fn engine_barrier_amortizes_ops_across_groups() {
   assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"w").await, 1);
   assert_eq!(submit_anywhere(std::slice::from_ref(&g200), b"w").await, 1);
 
-  let flushes0 = metrics.flushes();
-  let ops0 = metrics.ops_flushed();
+  let barriers0 = metrics.barriers();
+  let ops0 = metrics.ops_batched();
 
   // A concurrent 16-submit burst across BOTH groups: the loop-top command drain dispatches the
   // batch, so ONE barrier covers many staged appends across the two groups.
@@ -325,14 +340,14 @@ async fn engine_barrier_amortizes_ops_across_groups() {
     r.expect("every burst submit commits");
   }
 
-  let flushes1 = metrics.flushes();
-  let ops1 = metrics.ops_flushed();
-  assert!(flushes1 > 0, "the barrier ran");
+  let barriers1 = metrics.barriers();
+  let ops1 = metrics.ops_batched();
+  assert!(barriers1 > 0, "the barrier ran");
   assert!(
-    ops1 - ops0 > flushes1 - flushes0,
+    ops1 - ops0 > barriers1 - barriers0,
     "the burst amortized: {} ops rode {} barriers",
     ops1 - ops0,
-    flushes1 - flushes0
+    barriers1 - barriers0
   );
 }
 
@@ -469,7 +484,7 @@ async fn a_poisoned_group_leaves_co_hosted_groups_committing() {
 
   // A failover query off the (inert, monotonic-only) failover tier falls back cleanly per group.
   let out: Option<u64> = g200
-    .failover_query(|_fsm: &TrapSm, _limbo: &[sailing_proto::Entry], _win| Some(9))
+    .failover_query(|_fsm: &TrapSm, _win| Some(9))
     .await
     .expect("the failover query resolves");
   assert_eq!(out, None, "no serve window → normal-read fallback");
@@ -2740,20 +2755,19 @@ async fn fork_rollback_leaves_no_engine_residue() {
     handle.clear_tombstone(300).await.expect("clear resolves"),
     "a tombstone existed"
   );
-  handle
+  // The refused fork's rollback removed the freshly-added storage, so there is NO stored state to
+  // restore and the host fails closed. A leaked baseline (stores left behind) would instead let
+  // the restore succeed against them — so NoStoredState IS the no-leak assertion here.
+  match handle
     .restore_group(300, config(1, vec![1]), 9, CountSm::default(), 0)
     .await
-    .expect("a cleared id restores");
-  let status = handle
-    .group(300)
-    .status()
-    .await
-    .expect("the restored group answers");
-  assert_eq!(
-    status.applied_index,
-    Index::ZERO,
-    "virgin stores: the refused fork's baseline did NOT leak through the rollback"
-  );
+  {
+    Err(DriverError::NoStoredState) => {}
+    other => panic!(
+      "the rollback must leave no stored state to restore (a leaked baseline would let restore \
+       succeed), got {other:?}"
+    ),
+  }
 
   // The driver keeps serving after both refusals.
   assert_eq!(
@@ -3355,13 +3369,12 @@ async fn full_voter_blueprint_for_a_fork_born_id_fuses_histories() {
   }
 }
 
-/// An abandoned fork is VISIBLE: a committed split whose child id is tombstoned on this host
-/// cannot materialize — the drain refuses it, resolves the parent's fence, and surfaces
-/// `LifecycleEvent::SplitRefused` so the placement brain learns the child never landed here
-/// (pre-signal, the abandonment was silent). The parent keeps serving on its shrunk half and
-/// the child stays unhosted until the embedder acts.
+/// A split into a child id this host has TOMBSTONED is refused at PROPOSE (the coordinator's
+/// #97-1 ChildRetired gate): the fork could never materialize onto a retired id, so the entry is
+/// never appended and the parent never shrinks — no data loss. The child stays unhosted until the
+/// embedder clears the tombstone and recreates.
 #[tokio::test(flavor = "multi_thread")]
-async fn refused_fork_surfaces_on_the_lifecycle_tail() {
+async fn split_into_a_tombstoned_child_refuses_at_propose() {
   let addr: SocketAddr = "127.0.0.1:45300".parse().unwrap();
   let (driver, handle) = bind_node::<CountSm>(1, addr, Vec::new()).await;
   tokio::spawn(driver.run());
@@ -3376,29 +3389,25 @@ async fn refused_fork_surfaces_on_the_lifecycle_tail() {
   }
 
   // Tombstone the child id (an unhosted removal still tombstones), then split into it: the
-  // parent's propose gate cannot see this host's removal history, so the entry commits and the
-  // refusal happens at the materialization edge.
+  // coordinator's ChildRetired gate refuses at PROPOSE, before anything is appended.
   assert!(!handle.remove_group(300).await.expect("remove resolves"));
-  split_anywhere(std::slice::from_ref(&g100), 300, b"\x02").await;
+  let err = g100
+    .propose_split(300, 0, Bytes::from_static(b"\x02"))
+    .await
+    .expect_err("a split into a locally-tombstoned child is refused at propose");
+  assert!(
+    matches!(&err, DriverError::Rejected { reason } if reason.contains("ChildRetired")),
+    "the typed ChildRetired refusal, got {err:?}"
+  );
 
-  await_lifecycle(handle.lifecycle(), "the refused fork", |ev| {
-    matches!(
-      ev,
-      LifecycleEvent::SplitRefused {
-        parent: 100,
-        child: 300
-      }
-    )
-  })
-  .await;
-
-  // The parent's half shrank exactly once and its fence resolved: it keeps committing.
-  assert_eq!(query_anywhere(std::slice::from_ref(&g100)).await, 1);
+  // The parent never shrank — the split was never appended, so no unit was given away or lost —
+  // and it keeps committing.
+  assert_eq!(query_anywhere(std::slice::from_ref(&g100)).await, 3);
   assert_eq!(
     submit_anywhere(std::slice::from_ref(&g100), b"after").await,
-    2
+    4
   );
-  // The refused child never materialized here.
+  // The tombstoned child id stays unhosted.
   assert!(handle.group(300).status().await.is_err());
 }
 
@@ -3908,4 +3917,551 @@ async fn parked_conflict_survives_a_full_lifecycle_tail() {
       );
     }
   }
+}
+
+/// Retry a leader-routed merge verb across nodes until some leader accepts it (transient
+/// refusals — routing, the local source still catching up to frozen-applied — no-op and retry).
+async fn merge_verb_anywhere<Fut>(what: &str, mut verb: impl FnMut(usize) -> Fut, n: usize) -> usize
+where
+  Fut: core::future::Future<Output = Result<sailing_proto::Index, DriverError<u64>>>,
+{
+  // A DirectionInverted refusal is a property of the id PAIR, not of transient state, so it can
+  // never clear by retrying across nodes or time. Fail on it immediately instead of spinning out
+  // the deadline, so a re-introduced direction bug surfaces as a pointed panic, not a 15s timeout.
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what} never accepted"
+    );
+    for at in 0..n {
+      match verb(at).await {
+        Ok(_) => return at,
+        Err(DriverError::Rejected { reason }) if reason == inverted => {
+          panic!(
+            "{what}: the merge claim is permanently inverted — source must encode above target"
+          )
+        }
+        Err(_) => {}
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+}
+
+/// Colocate `groups`' leadership onto node `to_node`, waiting until it settles there. The merge's
+/// all-source-voters barrier is observable only on the source LEADER's tracker, so `commit_merge`
+/// certifies it only when the absorbing target's leader also leads the source — the CRDB
+/// colocate-then-merge discipline. Move the source onto the target leader BEFORE freezing (a
+/// frozen source refuses a transfer; moving the source leaves the target's leadership pinned).
+async fn colocate_onto(groups: &[GroupHandle<u64, u64, CountSm>], to_node: u64, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: colocation never settled onto node {to_node}"
+    );
+    let at = find_leader(groups, what).await;
+    if at as u64 + 1 == to_node {
+      return;
+    }
+    let _ = groups[at].transfer_leader(to_node).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+}
+
+/// The T11 stream merge gate: 3 nodes, two loaded groups — freeze, parked commit, per-crank
+/// resolution — then the target serves the UNION, the source id refuses forever on its terminal
+/// floor, and the target saw NO leadership churn through the whole choreography (same leader,
+/// same term: the merge rides ordinary appends and the crank, never an election).
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_absorbs_and_source_never_returns() {
+  let addrs = addrs(44_880, 3);
+  let mut handles = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere::<CountSm>(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere::<CountSm>(&handles, 200, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a1").await, 1);
+  assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b3").await, 3);
+
+  // The direction rule makes the encoding-minimal id the survivor: group 100 is the target, group
+  // 200 the source that dissolves (200's LE encoding sorts strictly above 100's). Pin the target's
+  // leadership through the whole choreography.
+  let t_leader = find_leader(&g100, "target pre-merge").await;
+  let t_term = g100[t_leader].status().await.expect("status").term;
+  // Colocate the source onto the target leader so the absorb can certify the freeze barrier.
+  colocate_onto(&g200, t_leader as u64 + 1, "source onto target leader").await;
+
+  merge_verb_anywhere(
+    "the freeze",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.prepare_merge(200, 100).await }
+    },
+    handles.len(),
+  )
+  .await;
+  merge_verb_anywhere(
+    "the commit",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.commit_merge(100, 200).await }
+    },
+    handles.len(),
+  )
+  .await;
+
+  // Every node's crank resolves its park: the union serves from the target on ALL nodes.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the union never served everywhere"
+    );
+    let mut counts = Vec::new();
+    for g in &g100 {
+      if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
+        counts.push(c);
+      }
+    }
+    if counts.len() == 3 && counts.iter().all(|&c| c == 5) {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // No leadership churn on the target: same leader, same term.
+  let status = g100[t_leader].status().await.expect("status");
+  assert_eq!(status.role, Role::Leader, "the target leader never moved");
+  assert_eq!(status.term, t_term, "the target's term never moved");
+
+  // The source id dies everywhere and its floor is terminal: status refuses on every node and
+  // re-admission refuses at ANY generation, forever.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the source never tore down everywhere"
+    );
+    let mut gone = 0;
+    for g in &g200 {
+      if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
+        gone += 1;
+      }
+    }
+    if gone == 3 {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+  for (i, h) in handles.iter().enumerate() {
+    let id = i as u64 + 1;
+    match h
+      .create_group(200, config(id, vec![1, 2, 3]), 9, CountSm::default(), 9)
+      .await
+    {
+      Err(DriverError::Rejected { reason }) => {
+        assert!(
+          reason.contains("floor"),
+          "node {id}: the refusal must be the terminal floor, got: {reason}"
+        );
+      }
+      other => panic!("node {id}: a merged-away id must never re-admit, got {other:?}"),
+    }
+  }
+}
+
+/// The T11 rollback gate: the TARGET-side abort abandons a standing freeze, and the DRIVER's
+/// relay drain proposes the source's thaw on its own log — the source serves fresh writes
+/// again, and a LATER merge of the same pair completes, proving the abort left a clean
+/// lineage. (The abort-vs-commit RACE itself is pinned deterministically at the container and
+/// world tiers, where log adjacency is controllable; over a real mesh the seal wins or loses
+/// by scheduling, so this gate exercises the surface, the relay, and the reuse.)
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_rollback_unfreezes() {
+  let addrs = addrs(44_940, 3);
+  let mut handles = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere::<CountSm>(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere::<CountSm>(&handles, 200, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
+
+  // The direction rule makes the encoding-minimal id the survivor: group 100 is the target, group
+  // 200 the source that dissolves and thaws (200's LE encoding sorts strictly above 100's).
+  merge_verb_anywhere(
+    "the freeze",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.prepare_merge(200, 100).await }
+    },
+    handles.len(),
+  )
+  .await;
+  // The frozen source refuses writes typed.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the freeze never took effect"
+    );
+    let mut frozen = false;
+    for g in &g200 {
+      if matches!(g.submit(Bytes::from_static(b"x")).await, Err(DriverError::Rejected { reason }) if reason.contains("Frozen"))
+      {
+        frozen = true;
+        break;
+      }
+    }
+    if frozen {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // Abort the standing freeze from the TARGET side (retrying across nodes for the target
+  // leader whose local source has applied the freeze).
+  merge_verb_anywhere(
+    "the abort",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.rollback_merge(100, 200).await }
+    },
+    handles.len(),
+  )
+  .await;
+
+  // The relayed thaw lands on the source's own log: it accepts fresh writes again everywhere.
+  assert_eq!(submit_anywhere(&g200, b"a2").await, 2);
+  // Both groups intact: nothing was absorbed.
+  assert_eq!(query_anywhere(&g100).await, 1, "no union — the merge died");
+
+  // A LATER merge of the same pair completes end to end: the abort left a clean lineage. Colocate
+  // the (now thawed) source onto the target leader again so the fresh absorb can certify the barrier.
+  let t2_leader = find_leader(&g100, "target pre-second-merge").await;
+  colocate_onto(
+    &g200,
+    t2_leader as u64 + 1,
+    "source onto target leader (second)",
+  )
+  .await;
+  merge_verb_anywhere(
+    "the fresh freeze",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.prepare_merge(200, 100).await }
+    },
+    handles.len(),
+  )
+  .await;
+  merge_verb_anywhere(
+    "the fresh commit",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.commit_merge(100, 200).await }
+    },
+    handles.len(),
+  )
+  .await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the second merge never completed"
+    );
+    let mut gone = 0;
+    for g in &g200 {
+      if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
+        gone += 1;
+      }
+    }
+    if gone == 3 && query_anywhere(&g100).await == 3 {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+}
+
+/// The direction rule is a permanent, state-independent refusal: an inverted claim (source
+/// encoding strictly BELOW the target) is rejected typed on the FIRST call, before any leadership
+/// consideration and with nothing appended — the id pair, not any mutable state, decides it, so it
+/// can never self-clear and must never be retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn prepare_merge_refuses_an_inverted_claim() {
+  let addrs = addrs(44_900, 3);
+  let mut handles = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere::<CountSm>(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere::<CountSm>(&handles, 200, &[1, 2, 3]).await;
+
+  // source 100 encodes strictly BELOW target 200: the direction gate is the earliest,
+  // constant-vs-constant check, so the host of the source refuses on the first call regardless of
+  // who leads. `map_merge_err` carries the variant's Debug form as the rejection reason.
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
+  match handles[0].prepare_merge(100, 200).await {
+    Err(DriverError::Rejected { reason }) => {
+      assert_eq!(reason, inverted, "the refusal must be DirectionInverted");
+    }
+    other => panic!("an inverted claim must refuse typed on the first call, got {other:?}"),
+  }
+}
+
+/// A query closure that PANICS is caught at the handle seam — the caller gets `QueryPanicked` and the
+/// driver task does NOT unwind. But the caught panic is UNATTRIBUTABLE: the closure captured arbitrary
+/// state that can alias ANY hosted group's FSM, so it FAIL-STOPS THE WHOLE PLANE — the group it read
+/// against AND every co-located group poison, rather than risk one serving silently-divergent state.
+/// Each poison surfaces on the lifecycle tail; the driver survives (a fail-stop, never an unwind).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicking_query_fails_typed_and_the_driver_survives() {
+  let addr: SocketAddr = "127.0.0.1:44800".parse().unwrap();
+  let (driver, handle) = bind_node::<CountSm>(1, addr, Vec::new()).await;
+  tokio::spawn(driver.run());
+
+  for gid in [100u64, 200] {
+    handle
+      .create_group(gid, config(1, vec![1]), 1, CountSm::default(), 0)
+      .await
+      .expect("group admission");
+  }
+  let g100 = handle.group(100);
+  let g200 = handle.group(200);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"x").await, 1);
+
+  // The panic is caught at the handle seam: the caller gets QueryPanicked, the driver task does
+  // NOT unwind.
+  match g100
+    .query(|_: &CountSm| -> u64 { panic!("boom in query") })
+    .await
+  {
+    Err(DriverError::QueryPanicked) => {}
+    other => panic!("expected QueryPanicked, got {other:?}"),
+  }
+
+  // Plane-fatal, not group-scoped: the caught panic is UNATTRIBUTABLE, so BOTH the read's group AND the
+  // co-located sibling fail-stop. Poll status (which cranks the spawned driver) until each reports
+  // poisoned — RED before the fail-stop wiring (a caught panic kept the groups serving, no poison). The
+  // driver survives the panic; every hosted group poisons (the reactor unit tests pin the matching
+  // `LifecycleEvent::Poisoned` surfacing for both groups).
+  await_poisoned(&g100, "the query-panicked group 100").await;
+  await_poisoned(&g200, "the co-located sibling group 200").await;
+}
+
+/// A caught factory panic QUARANTINES the factory — permanently removed, so the plane then behaves
+/// exactly as a driver with no factory — rather than mapping to a one-shot decline that leaves the
+/// SAME `&mut` factory installed for the next solicitation. WHY the stronger cure: the factory is
+/// the admission authority for a group's consensus voter set, and `&mut GroupFactory` is not
+/// unwind-safe. A factory that mutates internal state and THEN panics can, on a LATER call, return a
+/// valid-LOOKING blueprint that names the solicitor but carries a wrong voter set — which clears
+/// every downstream gate (solicitor-naming, floors, split-reservation, the create admission, none
+/// of which check voter-set semantics) and admits a broken quorum. This factory models the torn
+/// authority: `materialize` bumps a counter then panics on the FIRST group-100 solicitation, and
+/// every SUBSEQUENT call returns a full-voter blueprint naming the solicitor that WOULD admit. After
+/// the caught panic the factory is never consulted again (the counter stays 1), group 100 stays
+/// un-hosted, and its solicitation surfaces as `UnknownGroup`. The panic is ALSO plane-fatal — a torn
+/// factory could have aliased a hosted FSM — so node 2's co-hosted sibling fail-stops (quarantine
+/// prevents reuse; the plane fail-stop covers the tear). RED before the quarantine: the retained
+/// factory's second call admits group 100.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_materialize_panic_quarantines_the_factory_and_falls_through() {
+  let addrs = addrs(44_820, 2);
+  let materialized = Arc::new(AtomicUsize::new(0));
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      let materialized = materialized.clone();
+      let driver = driver.with_group_factory(factory_fn(
+        move |group: &u64, from: &u64| -> Option<GroupBlueprint<u64>> {
+          if *group != 100 {
+            return None;
+          }
+          // Mutate, THEN tear: the first solicitation bumps the counter and panics; a RETAINED
+          // factory's later call returns a valid-looking blueprint naming the solicitor and admits.
+          if materialized.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("boom in materialize");
+          }
+          [1u64, 2]
+            .contains(from)
+            .then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2))
+        },
+        |_group: &u64| Some(CountSm::default()),
+      ));
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh and proves node 2 is alive throughout.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists only on node 1; its first solicitation makes node 2's materialize panic —
+  // caught, quarantining the factory — so the signal falls through to the lifecycle tail.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(
+    handles[1].lifecycle(),
+    "the panicked-factory solicitation",
+    |ev| {
+      matches!(
+        ev,
+        LifecycleEvent::UnknownGroup {
+          group: 100,
+          from: 1
+        }
+      )
+    },
+  )
+  .await;
+
+  // The quarantine holds across every retry: node 1 keeps soliciting, but a removed factory is
+  // never consulted again, so group 100 never materializes. A RETAINED factory admits here on its
+  // second call — which is exactly the RED this asserts against.
+  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  while std::time::Instant::now() < deadline {
+    assert!(
+      handles[1].group(100).status().await.is_err(),
+      "a quarantined factory must materialize nothing"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+  assert_eq!(
+    materialized.load(Ordering::SeqCst),
+    1,
+    "the factory was consulted again after a caught panic — not quarantined"
+  );
+
+  // The panic is PLANE-FATAL: node 2's driver survives, but its co-hosted sibling fail-stops (a torn
+  // factory could have aliased the sibling's FSM). Node 1's replica stays alive — only node 2's plane
+  // poisoned.
+  await_poisoned(&handles[1].group(900), "node 2's co-hosted sibling").await;
+}
+
+/// The build-phase twin of the materialize quarantine. This factory's cheap `materialize` always
+/// returns a valid blueprint naming the solicitor, but its `build` (the resource phase) bumps a
+/// counter then panics on the FIRST admitted solicitation. A caught build panic quarantines the
+/// factory exactly as a materialize panic does — the torn `&mut` admission authority is the same —
+/// so `build` is never reached again (the counter stays 1), group 100 never materializes, and the
+/// solicitation surfaces as `UnknownGroup`. The panic is ALSO plane-fatal — a torn factory could have
+/// aliased a hosted FSM — so node 2's co-hosted sibling fail-stops. RED before the quarantine: the
+/// retained factory's second solicitation builds and admits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_panic_quarantines_the_factory_and_falls_through() {
+  let addrs = addrs(45_400, 2);
+  let built = Arc::new(AtomicUsize::new(0));
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      let built = built.clone();
+      let driver = driver.with_group_factory(factory_fn(
+        move |group: &u64, from: &u64| {
+          (*group == 100 && [1u64, 2].contains(from))
+            .then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2))
+        },
+        move |_group: &u64| -> Option<CountSm> {
+          // Mutate, THEN tear: the first admitted solicitation bumps the counter and panics in the
+          // resource phase; a RETAINED factory's later build succeeds and admits.
+          if built.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("boom in build");
+          }
+          Some(CountSm::default())
+        },
+      ));
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh and proves node 2 is alive throughout.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists only on node 1; its first solicitation admits the blueprint, then node 2's
+  // build panics — caught, quarantining the factory — so the signal falls through to the tail.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(
+    handles[1].lifecycle(),
+    "the build-panicked solicitation",
+    |ev| {
+      matches!(
+        ev,
+        LifecycleEvent::UnknownGroup {
+          group: 100,
+          from: 1
+        }
+      )
+    },
+  )
+  .await;
+
+  // The quarantine holds across every retry: a removed factory's build is never reached again, so
+  // group 100 never materializes. A RETAINED factory builds and admits on its second solicitation.
+  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  while std::time::Instant::now() < deadline {
+    assert!(
+      handles[1].group(100).status().await.is_err(),
+      "a quarantined factory must materialize nothing"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+  assert_eq!(
+    built.load(Ordering::SeqCst),
+    1,
+    "the build phase ran again after a caught panic — the factory was not quarantined"
+  );
+
+  // The panic is PLANE-FATAL: node 2's driver survives, but its co-hosted sibling fail-stops (a torn
+  // factory could have aliased the sibling's FSM). Node 1's replica stays alive — only node 2's plane
+  // poisoned.
+  await_poisoned(&handles[1].group(900), "node 2's co-hosted sibling").await;
 }

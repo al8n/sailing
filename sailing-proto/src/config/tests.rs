@@ -426,6 +426,36 @@ fn check_quorum_default_and_override() {
 }
 
 #[test]
+fn assumed_clock_rate_bound_ppm_default_and_override() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert_eq!(DEFAULT_ASSUMED_CLOCK_RATE_BOUND_PPM, 1_000, "1e-3 as ppm");
+  assert_eq!(
+    c.assumed_clock_rate_bound_ppm(),
+    DEFAULT_ASSUMED_CLOCK_RATE_BOUND_PPM,
+    "assumed_clock_rate_bound_ppm must default to 1e-3 (1000 ppm)"
+  );
+  let c2 = c.with_assumed_clock_rate_bound_ppm(5_000);
+  assert_eq!(
+    c2.assumed_clock_rate_bound_ppm(),
+    5_000,
+    "with_assumed_clock_rate_bound_ppm must persist"
+  );
+  let mut c3 = c2;
+  c3.set_assumed_clock_rate_bound_ppm(250);
+  assert_eq!(
+    c3.assumed_clock_rate_bound_ppm(),
+    250,
+    "set_assumed_clock_rate_bound_ppm must persist in place"
+  );
+}
+
+#[test]
 fn disable_proposal_forwarding_default_and_override() {
   let c = Config::try_new(
     1u64,
@@ -713,7 +743,8 @@ fn config_serde_roundtrip_and_partial() {
   .with_check_quorum(true)
   .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
-  .with_clock_drift_bound(Duration::from_millis(50));
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_assumed_clock_rate_bound_ppm(2_500);
 
   let json = serde_json::to_string(&cfg).unwrap();
   // Durations render as humantime strings, not {"secs":..,"nanos":..}.
@@ -739,6 +770,7 @@ fn config_serde_roundtrip_and_partial() {
   assert_eq!(back.read_only(), ReadOnlyOption::LeaseGuard);
   assert_eq!(back.lease_duration(), Some(Duration::from_millis(300)));
   assert_eq!(back.clock_drift_bound(), Some(Duration::from_millis(50)));
+  assert_eq!(back.assumed_clock_rate_bound_ppm(), 2_500);
 
   // A PARTIAL config carries ONLY the required `id` / `voters`; the two timeouts AND every knob fall
   // back to their DEFAULT_* (this is what proves the per-knob serde(default), now including the
@@ -766,6 +798,10 @@ fn config_serde_roundtrip_and_partial() {
   assert_eq!(
     partial.bounded_clock_uncertainty(),
     DEFAULT_BOUNDED_CLOCK_UNCERTAINTY
+  );
+  assert_eq!(
+    partial.assumed_clock_rate_bound_ppm(),
+    DEFAULT_ASSUMED_CLOCK_RATE_BOUND_PPM
   );
 
   // deny_unknown_fields: a misspelled knob is rejected, not silently dropped.

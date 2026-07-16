@@ -74,12 +74,14 @@
 //! ## Serving inherited reads
 //!
 //! While the commit-wait holds, [`Handle::failover_query`] serves a linearizable read on the inherited
-//! committed prefix: the closure runs ON the driver thread against the FSM and the limbo region
-//! `(index, limbo_upper]`, returning `Some(out)` to serve — having confirmed the read's key was not
-//! written in that region (the proto is key-agnostic; the closure owns the command format) — or `None`
-//! to decline. The call resolves to `Ok(None)` when no serve window is available (commit-wait already
-//! lifted — read normally — inherited lease expired, or off the failover tier); the caller then falls
-//! back to [`Handle::query`].
+//! committed prefix. The CHECKED default serves ONLY when the limbo region `(index, limbo_upper]` is
+//! EMPTY, so the closure — which runs ON the driver thread against the FSM and the window — never has to
+//! inspect limbo and cannot serve stale by omission; it returns `Some(out)` to serve or `None` to
+//! decline. For per-key limbo inspection, [`Handle::failover_query_unchecked`] hands the closure the
+//! limbo entries and shifts the key-absence proof onto it (a limbo-ignoring closure can serve stale — the
+//! proto is key-agnostic; the closure owns the command format). Either call resolves to `Ok(None)` when
+//! no serve window is available (commit-wait already lifted — read normally — inherited lease expired, or
+//! off the failover tier); the caller then falls back to [`Handle::query`].
 //!
 //! ## The operator contract (READ THIS)
 //!
@@ -98,6 +100,19 @@
 //! tier is live end-to-end. `unprovable_floor_holds` counts waits held conservatively for want of a
 //! provable wall — nonzero in a configured-failover deployment flags a node OUTSIDE the clock contract
 //! (an unsynchronized clock, a missing source), the intended backstop rather than a wiring fault.
+//! `unprovable_floor_campaigns` is the PRE-election counterpart: it counts campaigns a node started while
+//! holding a walled inherited floor it could not prove as leader, so the wedge is visible BEFORE the node
+//! wins and holds commit (a `tracing` warn fires at the same campaign point).
+//!
+//! ## The precondition (and repairing a wedge)
+//!
+//! Enabling the failover tier on ANY node is a CLUSTER precondition: every electable voter must be able to
+//! prove an inherited wall floor — ε_unc with a supplied wall, or valid LeaseGuard timing for the E′
+//! inflation. A voter that can prove neither stays SAFE (it fail-closes) but HOLDS its own commit if it
+//! wins. Two repairs need no new committed entry: TRANSFER leadership to a capable peer (only
+//! commit-advance is gated — elections, votes, and transfers are not), or RESTART the node with a clock
+//! capability (the veto reads LIVE config, so it heals in place). Capability negotiation is a planned
+//! follow-up.
 
 mod bridge;
 mod driver;

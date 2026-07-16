@@ -27,7 +27,7 @@
 //! [`Instant`](crate::Instant) adapter lives one layer up (the coordinator).
 
 use std::{
-  collections::VecDeque,
+  collections::{BTreeSet, VecDeque},
   net::SocketAddr,
   time::{Duration, Instant},
   vec::Vec,
@@ -643,13 +643,16 @@ impl<I: NodeId> Bridge<I> {
     // exactly once per pump either way.
     let mut queue = core::mem::take(&mut self.deferred_ready);
     queue.append(&mut self.stream_ready);
-    let mut seen: Vec<ConnectionHandle> = Vec::new();
+    let mut seen: BTreeSet<ConnectionHandle> = BTreeSet::new();
+    let mut out: Vec<ConnectionHandle> = Vec::new();
     while let Some(h) = queue.pop_front() {
-      if !seen.contains(&h) {
-        seen.push(h);
+      // `insert` is false for an already-emitted handle, so the output keeps each handle's FIRST
+      // occurrence position without the O(n) rescan a `Vec::contains` guard costs per push.
+      if seen.insert(h) {
+        out.push(h);
       }
     }
-    seen
+    out
   }
 
   /// Pop the next connection that was lost / locally closed, for the coordinator to reap.
@@ -1206,11 +1209,15 @@ impl<I: NodeId> Bridge<I> {
     }
   }
 
-  /// Retry `h`'s staged sends after a `Writable`/`Available` signal reopened a window. Bytes
-  /// reaching the stream are turned into datagrams by a service pass.
+  /// Retry `h`'s staged sends after a `Writable`/`Available` signal reopened a window. Progress
+  /// is marked for this pump's single end-of-turn `service`, which turns the staged bytes into
+  /// datagrams.
   pub(crate) fn flush_stream(&mut self, now: Instant, h: ConnectionHandle) {
     if self.flush_outbound(now, h) {
-      self.service(now);
+      // Defer the whole-table collect to the pump-end `service` (every pump path runs one after
+      // its flush loop, exactly as `write_framed` relies on). Servicing inline here would cost one
+      // whole-table poll per flushed stream.
+      self.needs_service = true;
     }
   }
 
@@ -1313,6 +1320,19 @@ impl<I: NodeId> Bridge<I> {
   #[cfg(test)]
   pub(crate) fn services_run(&self) -> u64 {
     self.services_run
+  }
+
+  /// Test-only: seed the pump's readiness queues directly to exercise [`Self::take_ready_unique`]'s
+  /// dedup/ordering contract with a controlled duplicate pattern. The handles need not name real
+  /// connections — the drain only reads the queues, never the table.
+  #[cfg(test)]
+  pub(crate) fn push_ready_for_test(
+    &mut self,
+    deferred: &[ConnectionHandle],
+    stream: &[ConnectionHandle],
+  ) {
+    self.deferred_ready.extend(deferred.iter().copied());
+    self.stream_ready.extend(stream.iter().copied());
   }
 
   /// The current effective connection cap (the live-membership floor regression watches it).

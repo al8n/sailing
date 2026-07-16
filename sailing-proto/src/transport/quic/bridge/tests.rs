@@ -208,9 +208,9 @@ fn lost_connection_frees_the_quinn_slab_after_drain() {
   assert_eq!(a.table_len(), 0, "the local entry is reaped with it");
 }
 
-/// FAILS-ON-OLD: under a budget-based pre-auth read (rather than one steered by the first
+/// Under a budget-based pre-auth read (rather than one steered by the first
 /// frame's own length prefix), a peer that pipelines a consensus frame behind a SHORT hello in
-/// one flight would have up to a full hello-budget of tail bytes pulled into the decoder before
+/// one flight gets up to a full hello-budget of tail bytes pulled into the decoder before
 /// validation. Exactly the hello must be readable pre-validation — the tail stays backpressured
 /// in quinn until the connection validates, then arrives on the rescheduled read.
 #[test]
@@ -321,7 +321,7 @@ fn max_declared_preface_closes_at_the_header() {
   assert_eq!(b.take_lost(), Some(hb));
 }
 
-/// FAILS-ON-OLD: without applying the deferred feedback BEFORE the cap check, a reconnect
+/// Without applying the deferred feedback BEFORE the cap check, a reconnect
 /// racing the previous connection's teardown is refused for capacity a QUEUED `Drained` event
 /// has already released. The freed slot must be visible to the very dial that needs it.
 #[test]
@@ -381,7 +381,7 @@ fn reconnect_is_not_refused_while_a_drained_event_holds_the_slot() {
   );
 }
 
-/// FAILS-ON-OLD: quinn reuses slab handles after Drained, so a `lost` entry surviving the
+/// quinn reuses slab handles after Drained, so a `lost` entry surviving the
 /// Drained purge would — once the handle is reused by a NEW connection — make the coordinator's
 /// end-of-drain `reap` unbind the new connection's freshly validated route. The Drained arm must
 /// purge EVERY per-handle queue.
@@ -1023,10 +1023,10 @@ fn next_frame_and_flush_on_absent_handles_are_noops() {
   a.flush_stream(now, bogus);
 }
 
-/// FAILS-ON-OLD: staged bytes with no send stream open must NOT open the stream until the identity
-/// preface has been staged. The preface is frame zero on the send stream, so a consensus frame
-/// queued behind an un-sent preface has to be held back — on the old code the flush opened the
-/// stream and wrote that frame as the stream's first bytes. Once the preface step latches
+/// Staged bytes with no send stream open must NOT open the stream until the identity preface has
+/// been staged. The preface is frame zero on the send stream, so a consensus frame queued behind an
+/// un-sent preface has to be held back — a flush that opens the stream regardless writes that frame
+/// as the stream's FIRST bytes, displacing the preface. Once the preface step latches
 /// `preface_done`, the flush opens the stream and drains the staged bytes.
 #[test]
 fn flush_outbound_gates_the_stream_open_on_the_preface() {
@@ -1173,6 +1173,73 @@ fn peer_stop_on_an_unused_half_only_resets_it() {
     "a STOP on an unused half does not close the connection"
   );
   assert!(a.has_entry_for_test(ha));
+}
+
+/// [`Bridge::take_ready_unique`] collapses duplicate readiness signals to each handle's FIRST
+/// occurrence and keeps deferred-ready handles ahead of stream-ready ones — the window-drain
+/// fairness ordering. Green across the set-backed dedup swap: it pins the contract.
+#[test]
+fn take_ready_unique_dedups_first_occurrence_deferred_first() {
+  let ca = TestClusterCa::generate();
+  let (mut a, _b) = pair(&ca);
+  let h = ConnectionHandle;
+  // deferred [3, 1, 3] then stream [1, 2, 3, 2]: deferred-first with first-occurrence dedup ⇒
+  // [3, 1, 2] (1 and 3 already seen from the deferred half; 2 is the only new stream handle).
+  a.push_ready_for_test(&[h(3), h(1), h(3)], &[h(1), h(2), h(3), h(2)]);
+  assert_eq!(
+    a.take_ready_unique(),
+    std::vec![h(3), h(1), h(2)],
+    "deferred handles lead; each surfaces once, at its first occurrence"
+  );
+  assert!(
+    a.take_ready_unique().is_empty(),
+    "the drain consumed both queues"
+  );
+}
+
+/// A pump turn that flushes several progressed streams collects quinn's output with a
+/// SINGLE whole-table service, deferred to the pump's end — not one whole-table poll per flushed
+/// stream. The service count is independent of whether the progressed flushes land on one ready
+/// stream or many, so one validated connection flushed repeatedly stands in for the ready loop.
+#[test]
+fn flush_stream_defers_its_service_to_one_per_turn() {
+  let ca = TestClusterCa::generate();
+  let (mut a, mut b) = pair(&ca);
+  let now = Instant::now();
+  let (ha, hb) = validated(now, &mut a, &mut b);
+
+  let msgs: Vec<Message<u64>> = (1u64..=4)
+    .map(|k| Message::TimeoutNow(TimeoutNow::new(Term::new(k), 1u64)))
+    .collect();
+  let before = a.services_run();
+  for m in &msgs {
+    let mut payload = Vec::new();
+    crate::wire::encode_message(m, &mut payload);
+    let mut framed = Vec::new();
+    crate::transport::frame::encode_frame(&payload, &mut framed);
+    a.stage_outbound_for_test(ha, &framed);
+    a.flush_stream(now, ha); // a progressed flush: bytes reach the send stream
+  }
+  a.service_if_deferred(now); // the pump-end service's test analog
+  assert_eq!(
+    a.services_run() - before,
+    1,
+    "four progressed flushes defer to a single service, not one each"
+  );
+
+  // Delivery intact: all four frames arrive at b, in order.
+  pump(now, &mut a, &mut b);
+  let ready = b.take_ready_unique();
+  assert!(ready.contains(&hb));
+  assert!(!b.ingest_recv(now, hb));
+  let mut got: Vec<Message<u64>> = Vec::new();
+  while let Ok(Some(frame)) = b.next_frame(hb) {
+    got.push(crate::wire::decode_message::<u64>(frame).expect("decodes"));
+  }
+  assert_eq!(
+    got, msgs,
+    "every flushed frame is delivered, none lost to the deferral"
+  );
 }
 
 /// Strip the group-demux header off a received frame, yielding the encoded-message bytes. Tests send

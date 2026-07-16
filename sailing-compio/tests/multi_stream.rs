@@ -9,9 +9,10 @@ mod common;
 use std::{net::SocketAddr, rc::Rc, time::Duration};
 
 use bytes::Bytes;
-use common::CountSm;
+use common::{CountSm, TrapSm};
 use sailing_compio::{
-  CompioMultiStreamDriver, DriverConfig, DriverError, GroupHandle, MultiHandle, Node,
+  CompioMultiStreamDriver, DriverConfig, DriverError, GroupHandle, LifecycleEvent, MultiHandle,
+  Node,
 };
 use sailing_proto::{ClusterId, Config, Data, LabelOptions, Labeled, Passthrough};
 
@@ -202,14 +203,12 @@ async fn two_node_multi_host_commits_and_removes() {
   }
 }
 
-/// An abandoned fork is VISIBLE on the compio plane too: a committed split whose child id is
-/// tombstoned on this host cannot materialize — the drain refuses it, resolves the parent's
-/// fence, and surfaces `LifecycleEvent::SplitRefused` on the lifecycle tail. The parent keeps
-/// serving on its shrunk half; the child stays unhosted until the embedder acts.
+/// A split into a child id this host has TOMBSTONED is refused at PROPOSE on the compio plane too
+/// (the coordinator's #97-1 ChildRetired gate): the fork could never materialize onto a retired id,
+/// so the entry is never appended and the parent never shrinks — no data loss. The child stays
+/// unhosted; clear-then-recreate is the rejoin path.
 #[compio::test]
-async fn refused_fork_surfaces_on_the_lifecycle_tail() {
-  use sailing_compio::LifecycleEvent;
-
+async fn split_into_a_tombstoned_child_refuses_at_propose() {
   let addr: SocketAddr = "127.0.0.1:45310".parse().unwrap();
   let (dialer, acceptor) = plain_factories(1);
   let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _>::bind(
@@ -236,38 +235,349 @@ async fn refused_fork_surfaces_on_the_lifecycle_tail() {
   }
 
   // Tombstone the child id (an unhosted removal still tombstones), then split into it: the
-  // propose gate cannot see this host's removal history, so the entry commits and the refusal
-  // happens at the materialization edge.
+  // coordinator's ChildRetired gate refuses at PROPOSE, before anything is appended.
   assert!(!handle.remove_group(300).await.expect("remove resolves"));
-  g100
+  let err = g100
     .propose_split(300, 0, Bytes::from_static(b"\x02"))
     .await
-    .expect("the single-voter leader appends the split");
+    .expect_err("a split into a locally-tombstoned child is refused at propose");
+  assert!(
+    matches!(&err, DriverError::Rejected { reason } if reason.contains("ChildRetired")),
+    "the typed ChildRetired refusal, got {err:?}"
+  );
 
-  // The driver shares this thread's runtime: await the tail, never block it.
+  // The parent never shrank — the split was never appended, so no unit was given away or lost —
+  // and it keeps committing.
+  assert_eq!(query_anywhere(std::slice::from_ref(&g100)).await, 3);
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&g100), b"after").await,
+    4
+  );
+  // The tombstoned child id stays unhosted.
+  assert!(handle.group(300).status().await.is_err());
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// The compio single-plane merge, end to end: two loaded groups on one 2-node mesh — freeze,
+/// parked commit, per-crank resolution — then the target serves the union, the source id
+/// answers no-such-group everywhere, and re-admission at any generation refuses on the terminal
+/// floor. The clock-free choreography needs nothing from the harness but patience: every
+/// resolution input is log-determined, so both nodes converge on their own cranks.
+#[compio::test]
+async fn merge_absorbs_and_source_never_returns() {
+  let addrs: Vec<SocketAddr> = (0..2)
+    .map(|i| format!("127.0.0.1:{}", 45_620 + i).parse().unwrap())
+    .collect();
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (dialer, acceptor) = plain_factories(id);
+    let (driver, handle) = CompioMultiStreamDriver::bind(
+      addrs[(id - 1) as usize],
+      peers,
+      dialer,
+      acceptor,
+      DriverConfig::default(),
+    )
+    .await
+    .expect("the empty multi host binds");
+    compio::runtime::spawn(driver.run()).detach();
+    handles.push(handle);
+  }
+  for gid in [100u64, 200] {
+    for (i, h) in handles.iter().enumerate() {
+      let id = i as u64 + 1;
+      h.create_group(
+        gid,
+        config(id, vec![1, 2]),
+        id * 10 + gid,
+        CountSm::default(),
+        0,
+      )
+      .await
+      .expect("group admission");
+    }
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a1").await, 1);
+  assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b3").await, 3);
+
+  // Freeze 200 into 100 (retry across nodes for the source leader). The direction rule makes the
+  // encoding-minimal id the survivor: group 100 is the target, group 200 the source that dissolves
+  // (200's LE encoding sorts strictly above 100's). DirectionInverted is a property of the id pair,
+  // never transient, so fail fast on it — `map_merge_err` carries the variant's Debug form.
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
-  loop {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    assert!(remaining > Duration::ZERO, "no SplitRefused in time");
-    match compio::time::timeout(remaining, handle.lifecycle().recv_async()).await {
-      Ok(Ok(LifecycleEvent::SplitRefused { parent, child })) => {
-        assert_eq!((parent, child), (100, 300), "the typed refusal");
-        break;
+  'freeze: loop {
+    assert!(std::time::Instant::now() < deadline, "no freeze accepted");
+    for h in &handles {
+      match h.prepare_merge(200, 100).await {
+        Ok(_) => break 'freeze,
+        Err(DriverError::Rejected { reason }) if reason == inverted => {
+          panic!("the freeze is permanently inverted — source must encode above target")
+        }
+        Err(_) => {}
       }
-      Ok(Ok(_)) => {}
-      Ok(Err(e)) => panic!("the lifecycle tail closed: {e:?}"),
-      Err(_) => panic!("no SplitRefused in time"),
+    }
+    compio::time::sleep(Duration::from_millis(40)).await;
+  }
+  // Commit the absorb (retries ride out both leader routing and the local source still
+  // catching up to frozen-applied on the target leader's node).
+  'commit: loop {
+    assert!(std::time::Instant::now() < deadline, "no commit accepted");
+    for h in &handles {
+      if h.commit_merge(100, 200).await.is_ok() {
+        break 'commit;
+      }
+    }
+    compio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // The union serves from the target once each node's crank resolves its park.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the union never served"
+    );
+    let mut counts = Vec::new();
+    for g in &g100 {
+      if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
+        counts.push(c);
+      }
+    }
+    if counts.contains(&5) {
+      break;
+    }
+    compio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // The source id dies everywhere: status answers no-such-group on both nodes, and
+  // re-admission refuses at ANY generation — the floor is terminal.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the source never tore down everywhere"
+    );
+    let mut gone = 0;
+    for g in &g200 {
+      if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
+        gone += 1;
+      }
+    }
+    if gone == handles.len() {
+      break;
+    }
+    compio::time::sleep(Duration::from_millis(40)).await;
+  }
+  for (i, h) in handles.iter().enumerate() {
+    let id = i as u64 + 1;
+    match h
+      .create_group(200, config(id, vec![1, 2]), 9, CountSm::default(), 9)
+      .await
+    {
+      Err(DriverError::Rejected { reason }) => {
+        assert!(
+          reason.contains("floor"),
+          "node {id}: the refusal must be the terminal floor, got: {reason}"
+        );
+      }
+      other => panic!("node {id}: a merged-away id must never re-admit, got {other:?}"),
     }
   }
 
-  // The parent's half shrank exactly once and its fence resolved: it keeps committing.
-  assert_eq!(query_anywhere(std::slice::from_ref(&g100)).await, 1);
-  assert_eq!(
-    submit_anywhere(std::slice::from_ref(&g100), b"after").await,
-    2
+  for h in &handles {
+    h.shutdown().await.expect("the multi host tears down");
+  }
+}
+
+/// A restore for a group the host holds NO stored state for fails closed instead of fabricating a
+/// blank incarnation: removing a group drops its in-memory stores, so a later restore of that id
+/// finds nothing to recover and returns `NoStoredState` rather than a silent empty `Ok`. The id is
+/// not resurrected, and the co-hosted live group keeps committing.
+#[compio::test]
+async fn restore_without_stored_state_fails_closed() {
+  let addr: SocketAddr = "127.0.0.1:45330".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _>::bind(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+  )
+  .await
+  .expect("the empty multi host binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("the live co-hosted group admits");
+  handle
+    .create_group(200, config(1, vec![1]), 2, CountSm::default(), 0)
+    .await
+    .expect("the second group admits");
+  let g200 = handle.group(200);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g200), b"x").await, 1);
+  assert!(
+    handle.remove_group(200).await.expect("remove resolves"),
+    "the hosted removal dropped storage"
   );
-  // The refused child never materialized here.
-  assert!(handle.group(300).status().await.is_err());
+  assert!(
+    handle.clear_tombstone(200).await.expect("clear resolves"),
+    "the removal left a tombstone to clear"
+  );
+
+  // The tombstone is cleared, so nothing but the ABSENT stores stands between this call and a
+  // restore. The removal dropped those in-memory stores, so the restore has nothing to recover:
+  // it fails closed rather than silently standing up a blank index-0 incarnation.
+  match handle
+    .restore_group(200, config(1, vec![1]), 2, CountSm::default(), 0)
+    .await
+  {
+    Err(DriverError::NoStoredState) => {}
+    other => panic!("expected NoStoredState for a group with no stored state, got {other:?}"),
+  }
+  assert!(
+    handle.group(200).status().await.is_err(),
+    "the group was not resurrected"
+  );
+
+  // The co-hosted live group is undisturbed by the refused restore.
+  let g100 = handle.group(100);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"y").await, 1);
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// A query closure that PANICS is caught at the handle seam — the caller gets `QueryPanicked` and the
+/// driver task does NOT unwind. But the caught panic is UNATTRIBUTABLE: the closure captured arbitrary
+/// state that can alias ANY hosted group's FSM, so it FAIL-STOPS THE WHOLE PLANE — the group it read
+/// against AND every co-located group poison. Each surfaces on the best-effort lifecycle tail; the
+/// driver survives (a fail-stop, never an unwind).
+#[compio::test]
+async fn a_panicking_query_fails_typed_and_the_driver_survives() {
+  let addr: SocketAddr = "127.0.0.1:45340".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _>::bind(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+  )
+  .await
+  .expect("the empty multi host binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  for gid in [100u64, 200] {
+    handle
+      .create_group(gid, config(1, vec![1]), 1, CountSm::default(), 0)
+      .await
+      .expect("group admission");
+  }
+  let g100 = handle.group(100);
+  let g200 = handle.group(200);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"x").await, 1);
+
+  // The panic is caught at the handle seam: the caller gets QueryPanicked, the driver task does
+  // NOT unwind.
+  match g100
+    .query(|_: &CountSm| -> u64 { panic!("boom in query") })
+    .await
+  {
+    Err(DriverError::QueryPanicked) => {}
+    other => panic!("expected QueryPanicked, got {other:?}"),
+  }
+
+  // The read ran against group 100's FSM, so the caught panic FAIL-STOPS group 100 — it surfaces on
+  // the best-effort lifecycle tail as `Poisoned`. Cranking the driver via sibling submits drains the
+  // observation. RED before the fail-stop wiring (a caught panic kept the group serving, no poison).
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let mut seen = false;
+  while !seen && std::time::Instant::now() < deadline {
+    let _ = g200.submit(Bytes::from_static(b"tick")).await;
+    while let Ok(ev) = handle.lifecycle().try_recv() {
+      if matches!(ev, LifecycleEvent::Poisoned { group: 100 }) {
+        seen = true;
+      }
+    }
+  }
+  assert!(
+    seen,
+    "the query-panicked group fail-stopped and surfaced on the lifecycle tail"
+  );
+
+  // Plane-fatal, not group-scoped: the caught panic is unattributable, so the co-located sibling 200
+  // fail-stops too — a submit to it now reports `Poisoned`, not a fresh commit.
+  match g200.submit(Bytes::from_static(b"z")).await {
+    Err(DriverError::Poisoned) => {}
+    other => panic!("the sibling must fail-stop on the plane-fatal panic, got {other:?}"),
+  }
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// A storage/apply fault fail-stops a group and the container surfaces it on the aggregate
+/// lifecycle tail as `LifecycleEvent::Poisoned` — best-effort, with NO auto-teardown: a sibling
+/// group on the same host keeps committing throughout.
+#[compio::test]
+async fn a_poisoned_group_surfaces_on_the_lifecycle_tail() {
+  let addr: SocketAddr = "127.0.0.1:45320".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, TrapSm, _>::bind(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+  )
+  .await
+  .expect("the empty multi host binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  for gid in [100u64, 200] {
+    handle
+      .create_group(gid, config(1, vec![1]), 1, TrapSm::default(), 0)
+      .await
+      .expect("group admission");
+  }
+  let g100 = handle.group(100);
+  let g200 = handle.group(200);
+
+  // Fail-stop group 100 with a trapped apply: retry until it leads and the BOOM commits+applies.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the trapped apply never poisoned"
+    );
+    match g100.submit(Bytes::from_static(b"BOOM")).await {
+      Err(DriverError::Poisoned) => break,
+      _ => compio::time::sleep(Duration::from_millis(50)).await,
+    }
+  }
+
+  // The fail-stop rides the best-effort lifecycle tail. Sibling group 200 keeps committing (no
+  // auto-teardown) and each submit cranks the driver, draining the pending observation.
+  let mut seen = false;
+  while !seen && std::time::Instant::now() < deadline {
+    let _ = g200.submit(Bytes::from_static(b"tick")).await;
+    while let Ok(ev) = handle.lifecycle().try_recv() {
+      if matches!(ev, LifecycleEvent::Poisoned { group: 100 }) {
+        seen = true;
+      }
+    }
+  }
+  assert!(seen, "the poisoned group surfaced on the lifecycle tail");
 
   handle.shutdown().await.expect("the multi host tears down");
 }

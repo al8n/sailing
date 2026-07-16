@@ -980,3 +980,80 @@ fn lease_based_expired_lease_degrades_to_safe() {
   assert!(ev.is_read_state(), "expected ReadState");
   assert_eq!(ev.unwrap_read_state_ref().index(), Index::new(1));
 }
+
+/// A pending merge freeze stops CheckQuorum lease RENEWAL, not just serving: a fresh quorum
+/// response echoing the current round must NOT arm `lease_valid_until` once a `PrepareMerge`
+/// sits in the leader's log — formation is killed with serving, so a frozen-in-progress source
+/// can never bank a lease to serve the instant a rollback lands.
+///
+/// MUTATION: drop the `!self.merge_freeze_active()` conjunct from the renewal arm in
+/// `on_heartbeat_response` → the response arms the lease and this fails.
+#[test]
+fn pending_freeze_stops_lease_renewal() {
+  use crate::{EntryKind, PrepareMergePayload};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseBased)
+  .with_check_quorum(true);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+
+  // The freeze enters the log BEFORE any lease round completes.
+  let payload = {
+    let p = PrepareMergePayload::new(bytes::Bytes::from_static(b"\x2b"), 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(&p, &mut buf);
+    bytes::Bytes::from(buf)
+  };
+  let _ = ep
+    .propose_merge_entry(d, &mut log, EntryKind::PrepareMerge, payload)
+    .expect("freeze appended");
+
+  // A full fresh round: broadcast, then a quorum response echoing the CURRENT round with
+  // enforcement advertised — everything a renewal normally needs.
+  let hb_at = ep.poll_timeout().expect("heartbeat timer armed");
+  ep.handle_timeout(hb_at, &mut log, &mut stable);
+  let lease_round = {
+    let mut lr = None;
+    while let Some(out) = ep.poll_message() {
+      if let Message::Heartbeat(hb) = out.message() {
+        lr = Some(hb.lease_round());
+      }
+    }
+    lr.expect("a heartbeat carrying a lease round")
+  };
+  ep.handle_message(
+    hb_at,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+        .with_lease_round(lease_round)
+        .with_lease_support(Duration::from_millis(1000)),
+    ),
+  );
+  assert!(
+    ep.check_quorum_lease.lease_valid_until.is_none(),
+    "a pending freeze must stop the renewal arming the lease"
+  );
+}

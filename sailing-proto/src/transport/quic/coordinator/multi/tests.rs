@@ -37,6 +37,24 @@ impl GroupStores<u64, VecLog, AsyncStable> for Stores {
   }
 }
 
+impl FloorStore<u64> for Stores {
+  fn floor(&self, _gid: &u64) -> u64 {
+    0
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
+/// An empty store seam for a coordinator teardown whose participant gate resolves on in-memory
+/// state alone (no freeze-pending source to scan for the `Claimed` leg).
+fn empty_stores() -> Stores {
+  Stores {
+    map: BTreeMap::new(),
+  }
+}
+
 fn single_voter(id: u64) -> Config<u64> {
   Config::try_new(
     id,
@@ -525,7 +543,7 @@ fn unhosted_coalesced_entry_drops_over_quic() {
   let _ = drain_controls(&mut b);
 
   // b de-hosts group 200; a (unaware) keeps beating both groups in one coalesced frame.
-  assert!(b.remove_group(&200).is_some());
+  assert!(b.remove_group(&200, &mut empty_stores()).unwrap().is_some());
   let d100 = a.group(&100).unwrap().poll_timeout().unwrap();
   let d200 = a.group(&200).unwrap().poll_timeout().unwrap();
   now = now.max(d100).max(d200);
@@ -595,7 +613,7 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
   let _ = drain_controls(&mut b);
 
   assert!(!b.is_retired(&100), "a hosted group is not tombstoned");
-  assert!(b.remove_group(&100).is_some());
+  assert!(b.remove_group(&100, &mut empty_stores()).unwrap().is_some());
   assert!(b.is_retired(&100), "removal tombstones the id");
 
   // Both leaders beat in one crank: the coalesced frame carries a tombstoned entry (100) beside
@@ -737,7 +755,10 @@ fn unknown_group_traffic_surfaces_over_quic() {
 
   // Tombstoning the id silences the solicitations entirely (an unhosted removal still
   // tombstones: the embedder declared the id retired).
-  assert!(b.remove_group(&200).is_none(), "b never hosted 200");
+  assert!(
+    b.remove_group(&200, &mut empty_stores()).unwrap().is_none(),
+    "b never hosted 200"
+  );
   assert!(b.is_retired(&200));
   let _ = campaign_a(&mut a, &mut b, &mut sa, &mut sb, 200, now);
   assert_eq!(
@@ -884,7 +905,7 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     .unwrap_err();
   assert!(matches!(e, CreateGroupError::Exists));
   // cell 2 (the subtlest): tombstoned + HIGHER gen → Retired (consent gate holds at any gen)
-  assert!(c.remove_group(&100).is_some());
+  assert!(c.remove_group(&100, &mut empty_stores()).unwrap().is_some());
   let e = c
     .create_group(
       100,
@@ -1002,7 +1023,7 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
     &NoFloors,
   )
   .unwrap();
-  assert!(c.remove_group(&100).is_some());
+  assert!(c.remove_group(&100, &mut empty_stores()).unwrap().is_some());
 
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   let e = c
@@ -1013,6 +1034,7 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
       1,
       CountSm::default(),
       fork_blob(3),
+      None,
       None,
       1,
       0,
@@ -1037,6 +1059,7 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
     1,
     CountSm::default(),
     fork_blob(3),
+    None,
     None,
     1,
     0,
@@ -1078,6 +1101,7 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       CountSm::default(),
       fork_blob(3),
       None,
+      None,
       1,
       1,
       &Floors(2),
@@ -1095,6 +1119,7 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       CountSm::default(),
       fork_blob(3),
       None,
+      None,
       1,
       u64::MAX,
       &Floors(2),
@@ -1111,6 +1136,7 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       1,
       CountSm::default(),
       fork_blob(3),
+      None,
       None,
       1,
       u64::MAX,
@@ -1132,6 +1158,7 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       CountSm::default(),
       fork_blob(3),
       None,
+      None,
       1,
       u64::MAX - 1,
       &Floors(MERGED_FLOOR),
@@ -1151,6 +1178,7 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       1,
       CountSm::default(),
       fork_blob(3),
+      None,
       None,
       1,
       u64::MAX,
@@ -1173,6 +1201,7 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
     1,
     CountSm::default(),
     fork_blob(3),
+    None,
     None,
     1,
     2,
@@ -1205,6 +1234,7 @@ fn fork_refuses_boot_epoch_zero() {
       1,
       CountSm::default(),
       fork_blob(3),
+      None,
       None,
       0,
       0,
@@ -1247,6 +1277,7 @@ fn fork_purges_a_queued_unknown_group_signal() {
     1,
     CountSm::default(),
     fork_blob(3),
+    None,
     None,
     1,
     0,
@@ -1368,6 +1399,10 @@ fn quic_restore_seeds_the_replay_guard_from_the_floor_seam() {
       let give = u64::from(*instruction.first()?).min(self.units);
       self.units -= give;
       Some(Self { units: give })
+    }
+
+    fn supports_split(&self) -> bool {
+      true
     }
   }
 
@@ -1566,6 +1601,7 @@ fn quic_admission_refuses_an_in_flight_splits_child_id() {
       CountSm::default(),
       fork_blob(1),
       None,
+      None,
       1,
       0,
       &NoFloors,
@@ -1578,5 +1614,138 @@ fn quic_admission_refuses_an_in_flight_splits_child_id() {
     scratch_l.last_index(),
     Index::ZERO,
     "every refusal wrote nothing"
+  );
+}
+
+/// A floor store reporting the terminal MERGED_FLOOR for every id — the coordinator leg's
+/// refusal input.
+struct MaxFloors;
+
+impl FloorStore<u64> for MaxFloors {
+  fn floor(&self, _gid: &u64) -> u64 {
+    MERGED_FLOOR
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
+#[test]
+fn merge_verbs_ride_the_coordinator() {
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([9u8; 16]);
+  let opts = ca
+    .cluster_tls(&san(1, &cluster))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+    .build();
+  let mut seed = [0u8; 32];
+  seed[0] = 9;
+  let mut coord =
+    MultiQuicCoordinator::<u64, u64, CountSm>::with_identity(opts, Some(seed), cluster);
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+  };
+  for gid in [1u64, 2] {
+    stores
+      .map
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    coord
+      .create_group(
+        gid,
+        single_voter(1),
+        Instant::ORIGIN,
+        1,
+        CountSm::default(),
+        0,
+        &NoFloors,
+      )
+      .unwrap();
+    let d = coord.group(&gid).unwrap().poll_timeout().unwrap();
+    {
+      let (l, s) = stores.stores(&gid).unwrap();
+      coord.handle_timeout(&gid, d, l, s).unwrap();
+    }
+    for _ in 0..2 {
+      let (l, s) = stores.stores(&gid).unwrap();
+      coord.handle_storage(&gid, d, l, s).unwrap();
+    }
+    assert!(coord.group(&gid).unwrap().role().is_leader());
+  }
+  let now = Instant::ORIGIN;
+
+  // The coordinator's floor leg refuses a fenced participant BEFORE anything is appended.
+  assert!(matches!(
+    coord
+      .prepare_merge(&2, now, &mut stores, &1, &MaxFloors)
+      .unwrap(),
+    Err(crate::MergeError::BelowFloor {
+      floor: MERGED_FLOOR
+    })
+  ));
+  // The container preconditions surface through the delegator verbatim.
+  assert!(matches!(
+    coord
+      .prepare_merge(&2, now, &mut stores, &2, &NoFloors)
+      .unwrap(),
+    Err(crate::MergeError::SelfMerge)
+  ));
+
+  // Freeze, park, and resolve THROUGH the coordinator.
+  coord
+    .prepare_merge(&2, now, &mut stores, &1, &NoFloors)
+    .unwrap()
+    .unwrap();
+  {
+    let (l, s) = stores.stores(&2).unwrap();
+    coord.handle_storage(&2, now, l, s).unwrap();
+  }
+  assert!(coord.group(&2).unwrap().is_frozen());
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord
+      .commit_merge(&1, now, l, s, &2, &NoFloors)
+      .unwrap()
+      .unwrap();
+    coord.handle_storage(&1, now, l, s).unwrap();
+  }
+  assert!(coord.group(&1).unwrap().pending_merge().is_some());
+  // The first pass seals the park's abort window; the drain commits the seal; the next pass
+  // absorbs.
+  assert!(
+    coord.service_merge_applies(now, &mut stores).is_empty(),
+    "the first pass only seals"
+  );
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_storage(&1, now, l, s).unwrap();
+  }
+  let resolutions = coord.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![crate::MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }]
+  );
+  // The source id is TOMBSTONED at the coordinator: stragglers drop silently (the P5 wire
+  // story), and re-admission refuses until the explicit clear — while the terminal floor the
+  // DRIVER persists from the resolution outlives even that.
+  assert!(coord.group(&2).is_none());
+  assert!(coord.is_retired(&2), "resolved merge tombstones the source");
+
+  // The abort delegator is reachable too, with a typed refusal: the merged-away source is gone
+  // (`SourceMissing`). The source-side thaw has NO delegator — it is fully service-driven, so no
+  // external path can move a frozen source's counter without a committed target abort.
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    assert!(matches!(
+      coord.rollback_merge(&1, now, l, s, &2).unwrap(),
+      Err(crate::MergeError::SourceMissing)
+    ));
+  }
+  assert!(
+    coord.group(&1).is_some_and(|ep| !ep.has_abandoned()),
+    "no abort applied — the target records no thaw obligation"
   );
 }

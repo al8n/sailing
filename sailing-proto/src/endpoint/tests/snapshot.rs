@@ -14,7 +14,7 @@ use crate::{
 /// and a DUPLICATE of it arrives before `handle_storage` drains. The immediate-ack clamp
 /// (`last_new.min(durable_index)`) must report 2 (the snapshot boundary), not the unflushed 3.
 ///
-/// MUTATION: revert FIX 1 to `self.durable.durable_index = self.durable.durable_index.max(meta.last_index())`.
+/// MUTATION: restore `self.durable.durable_index = self.durable.durable_index.max(meta.last_index())`.
 /// Then after install `durable_index` stays at the stale-high 3, the duplicate clamps to
 /// `min(3, 3) = 3`, and the assertion (duplicate acks 2) FAILS — the follower over-acks an
 /// unflushed entry, reopening the phantom-replica commit hole.
@@ -294,7 +294,7 @@ fn maybe_snapshot_does_not_refire_while_pending() {
 /// per-entry `wall + window` floor must fold NOTHING. The two floors are independent — a non-failover
 /// snapshot must never let `lease_window` alone masquerade as a wall-derived release floor.
 ///
-/// MUTATION (revert FIX 1 — drop the `e.wall_timestamp() != 0` guard in `submit_append`): each
+/// MUTATION (drop the `e.wall_timestamp() != 0` guard in `submit_append`): each
 /// `0`-wall entry then folds `0.saturating_add(lease_window) == lease_window` into
 /// `max_wall_plus_window`, so it rises to equal `max_lease_window` and the `== 0` assertion FAILS.
 #[test]
@@ -356,8 +356,9 @@ fn non_failover_leaseguard_snapshot_has_zero_wall_plus_window() {
     meta.max_lease_window() > 0,
     "a LeaseGuard snapshot must carry the inherited commit-wait window"
   );
-  // ... but the wall+window floor is ZERO: a `0`-wall entry folds nothing into it. Without FIX 1
-  // it would instead equal `max_lease_window` (the bug this regression pins).
+  // ... but the wall+window floor is ZERO: a `0`-wall entry folds nothing into it. Without the
+  // `wall_timestamp() != 0` guard it would instead equal `max_lease_window` — a lease window
+  // masquerading as a wall-derived release floor.
   assert_eq!(
     meta.max_wall_plus_window(),
     0,
@@ -683,7 +684,7 @@ fn normal_append_at_boundary_not_snapshot() {
 /// A HeartbeatResponse from a peer still stuck in Snapshot state (its
 /// InstallSnapshot was dropped) must RE-SEND the InstallSnapshot, carrying the same meta.
 ///
-/// FAILS-ON-OLD: without the resend hook the HeartbeatResponse produces NO InstallSnapshot
+/// Without the resend hook the HeartbeatResponse produces NO InstallSnapshot
 /// (maybe_send_append early-returns on the paused Snapshot peer), so the follower wedges.
 ///
 /// PACING (deadline armed AT each send): the initial install (sent at ORIGIN by the helper) arms
@@ -773,10 +774,10 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   );
 }
 
-/// FAILS-ON-OLD: when the heartbeat-response PUMP is what opens the install window
+/// When the heartbeat-response PUMP is what opens the install window
 /// (a compacted Probe peer resumes on a heartbeat ack), the same response handling must not send
-/// the blob TWICE — once from the pump's compacted-hole branch and once from the resend hook,
-/// which previously saw "Snapshot state + no deadline" and fired immediately.
+/// the blob TWICE — once from the pump's compacted-hole branch and once from the resend hook, which
+/// would otherwise see "Snapshot state + no deadline" and fire immediately.
 #[test]
 fn heartbeat_pump_initial_install_is_not_double_sent() {
   use crate::{Index, Instant, Message, Term};
@@ -817,7 +818,7 @@ fn heartbeat_pump_initial_install_is_not_double_sent() {
   );
 }
 
-/// FAILS-ON-OLD: a pacing deadline left over from a PREVIOUS install window must not
+/// A pacing deadline left over from a PREVIOUS install window must not
 /// leak into a new one. The peer exits Snapshot via `maybe_update` (no heartbeat observation to
 /// clean the map), falls behind a fresh compaction, and re-enters Snapshot — the NEW install send
 /// must overwrite the stale (long-expired) deadline, so a response right after the new install
@@ -2792,7 +2793,8 @@ fn chunked_install_frame_stays_under_limit_with_large_metadata() {
 }
 
 /// When the snapshot METADATA alone exceeds the frame limit (no room for even a 1-byte chunk), the snapshot
-/// is UNSENDABLE — `send_snapshot_chunk` must emit NOTHING, never an oversized frame the transport refuses.
+/// is UNSENDABLE — `send_snapshot_chunk` must emit NOTHING and report the distinct `ChunkSend::Unsendable`
+/// outcome (not a transient `Deferred`), bumping the diagnostic counter so the permanent wedge is visible.
 ///
 /// MUTATION: revert the unsendable guard to `frame_budget.max(1)` → a 1-byte chunk is enqueued in an
 /// oversized frame (poll_message returns Some, assert fails). `#[ignore]` — allocates a >64 MiB ConfState.
@@ -2820,10 +2822,73 @@ fn unsendable_oversized_metadata_emits_no_chunk() {
   if let Some(p) = ep.tracker.progress_mut(&1u64) {
     p.become_snapshot(Index::new(10), 1024);
   }
-  let _ = ep.send_snapshot_chunk(1u64, &stable, 0);
+  let outcome = ep.send_snapshot_chunk(1u64, &stable, 0);
+  assert_eq!(
+    outcome,
+    ChunkSend::Unsendable,
+    "an oversized-meta snapshot is a distinct permanent Unsendable, not a transient Deferred"
+  );
+  assert_eq!(
+    ep.unsendable_snapshot_meta_count(),
+    1,
+    "the Unsendable outcome bumps the diagnostic counter"
+  );
   assert!(
     ep.poll_message().is_none(),
     "an InstallSnapshot whose metadata alone exceeds MAX_FRAME_BYTES must NOT be enqueued (no oversized frame)"
+  );
+}
+
+/// A membership whose RESULTING `ConfState` is too large to snapshot is refused at PROPOSE with
+/// `MembershipTooLargeToSnapshot` — nothing is appended — rather than committing and wedging
+/// `send_snapshot_chunk` forever after the next compaction.
+///
+/// MUTATION: drop the propose-time size gate → the oversized conf change appends (the log grows) and
+/// the wedge is deferred to the post-compaction snapshot path. `#[ignore]` — builds a ~3.5M-voter result.
+#[test]
+#[ignore = "builds a ~3.5M-voter resulting ConfState (~35 MiB); run with cargo test -- --ignored"]
+fn oversized_membership_refused_at_propose() {
+  use crate::{
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, Config, Instant,
+    ProposeError,
+  };
+  use core::time::Duration;
+  // A single-voter leader is a self-quorum, so it is cheap to elect.
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable); // self-vote durable → become_leader
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+  let last_before = log.last_index();
+
+  // A joint change adding enough new voters that the resulting ConfState's InstallSnapshot metadata
+  // exceeds MAX_SNAPSHOT_META_FRAME_BYTES (half of MAX_FRAME_BYTES ≈ 32 MiB): ~10 bytes per u64 voter,
+  // so ~3.5M voters clears it with margin.
+  let changes: std::vec::Vec<ConfChangeSingle<u64>> = (2..=3_500_001u64)
+    .map(|id| ConfChangeSingle::new(ConfChangeType::AddNode, id))
+    .collect();
+  let ccv2 = ConfChangeV2::new(ConfChangeTransition::Explicit, changes, bytes::Bytes::new());
+  let err = ep
+    .propose_conf_change_v2(d, &mut log, &stable, ccv2)
+    .unwrap_err();
+  assert!(
+    matches!(err, ProposeError::MembershipTooLargeToSnapshot { .. }),
+    "an oversized membership must be refused at propose; got {err:?}"
+  );
+  assert_eq!(
+    log.last_index(),
+    last_before,
+    "a refused conf change appends nothing"
   );
 }
 
@@ -3088,7 +3153,7 @@ fn receipt_stale_above_watermark_records_durable_snapshot() {
   );
 }
 
-/// FAILS-ON-OLD: a peer REMOVED by a committed conf change while still in Snapshot
+/// A peer REMOVED by a committed conf change while still in Snapshot
 /// state can never be observed leaving it (its Progress is gone, and a dead peer sends no further
 /// responses), so its resend-pacing deadline would linger for the rest of the term — and
 /// add/remove churn of lagging peers would grow the map past the live peer set. The apply-time
@@ -3232,8 +3297,8 @@ fn migrated_snapshot_carries_explicit_read_mode() {
 
 /// A snapshot install whose LogStore::restore does NOT re-baseline (first_index != last_index + 1
 /// afterward) is a storage-contract violation: the read-view would be inconsistent with the advanced
-/// commit/applied. The install must fail-stop (poison), not silently serve off a torn boundary — a
-/// release-mode check, where the old debug_assert was a no-op.
+/// commit/applied. The install must fail-stop (poison), not silently serve off a torn boundary. The
+/// check is RELEASE-mode: a `debug_assert` compiles out exactly where the violation would ship.
 #[test]
 fn install_with_torn_rebaseline_poisons() {
   use crate::{Index, Instant, Message, PoisonReason, Term, conf::ConfState};
@@ -3427,6 +3492,234 @@ fn redundant_install_below_durable_tip_keeps_the_log() {
   );
 }
 
+/// A token-bearing snapshot lands on a token-less replica only from NOTHING. `(index, term)` is NOT a
+/// content-identity across a fork boundary — Log Matching holds only WITHIN one lineage — so a NONE-self
+/// endpoint that INDEPENDENTLY committed a colliding baseline can neither ack the fork snapshot as
+/// "already present" (its own state diverges from the fork's — the coordinate-fusion hazard) nor let it
+/// install destructively (wholesale replacement of a populated replica's committed state on the wire,
+/// which placement, not replacement, resolves). It REFUSES: no ack, no staging, no state change — the
+/// sender stays pinned in Snapshot state, the standing-conflict posture, and the refusal counter is the
+/// local signal.
+///
+/// Setup: a fresh (None-self) follower makes an async-follower tail [1..=9] at term 2 durable with commit
+/// held at 2 — its OWN lineage. A fork snapshot then arrives at boundary 5 term 2 (5 > commit 2, 5 <=
+/// durable 9, term matches at 5 — the Log-Matching redundancy coordinates) carrying a fork TOKEN and the
+/// fork's real state (count 500).
+///
+/// MUTATION 1: drop the populated-receiver leg of the fork-provenance gate → the snapshot stages and
+/// installs over the squatter (the untouched-state assertions FAIL). MUTATION 2: additionally drop the
+/// cross-lineage redundancy guard → it acks redundant at the colliding coordinates (the no-ack assertion
+/// FAILS).
+#[test]
+fn a_populated_none_self_lineage_refuses_a_colliding_fork_snapshot() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, ForkId, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  assert!(
+    ep.fork_id().is_none(),
+    "the follower boots None-self: no local ForkId"
+  );
+
+  // The endpoint's OWN independent lineage: durable [1..=9] at term 2, leader_commit = 2 (the tail outran
+  // commit — an async follower). Its state machine holds its OWN state (count 0), distinct from the fork's.
+  let tail: Vec<Entry> = (1u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(9),
+    "tail flushed → durable=9"
+  );
+  assert_eq!(ep.commit, Index::new(2), "leader_commit held commit at 2");
+  assert_eq!(
+    log.term(Index::new(5)).unwrap(),
+    Term::new(2),
+    "the durable entry at the boundary carries term 2 — the Log-Matching collision"
+  );
+  let own = ep.state_machine().count();
+  assert_ne!(
+    own, 500,
+    "the endpoint holds its OWN state, distinct from the fork's"
+  );
+
+  // A genuine fork snapshot COLLIDING at (index 5, term 2) — the Log-Matching coordinates — but carrying a
+  // fork TOKEN and the fork's real state (count 500), shipped by a foreign leader (node 9).
+  let token = ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::from_static(&[9u8]),
+    1,
+  );
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  )
+  .with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    9u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      9u64,
+      meta,
+      encode_count_snapshot(500),
+    )),
+  );
+  // Drive storage as a driver would; a refused install must leave nothing to complete.
+  for _ in 0..8 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+
+  // REFUSED at the door: no staging, no deferred install, no state change, no token — and above all
+  // NO ack in either direction (neither redundant-at-coordinates nor installed).
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "a refused cross-lineage install acks NOTHING — the sender stays pinned in Snapshot state"
+  );
+  assert!(ep.snapshot.pending_install.is_none(), "nothing deferred");
+  assert!(ep.snapshot.snapshot_recv.is_none(), "nothing staged");
+  assert_eq!(
+    log.last_index(),
+    Index::new(9),
+    "the squatter's own log is untouched — placement resolves the conflict, not replacement"
+  );
+  assert_ne!(
+    ep.state_machine().count(),
+    500,
+    "the endpoint keeps its OWN state"
+  );
+  assert!(ep.fork_id().is_none(), "no token adopted");
+  assert_eq!(
+    ep.refused_cross_lineage_install_count(),
+    1,
+    "the refusal is counted — the local signal distinguishing a lineage conflict from a slow transfer"
+  );
+}
+
+/// The no-over-install regression: the cross-lineage guard changes ONLY the token-vs-None-self collision. A
+/// SAME-lineage snapshot — a `Some`-self endpoint whose token MATCHES the incoming — still takes the
+/// Log-Matching short-circuit: no install, the durable tail preserved, the token unchanged. (The NON-fork
+/// short-circuit is `redundant_install_below_durable_tip_keeps_the_log`, unaffected by the guard.)
+#[test]
+fn a_same_lineage_matching_token_snapshot_still_short_circuits() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, ForkId, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // The SAME async-follower shape as the collider test: durable [1..=9] term 2, commit held at 2.
+  let tail: Vec<Entry> = (1u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(9),
+    "tail flushed → durable=9"
+  );
+
+  // This endpoint IS the fork: seed its own token, then receive a snapshot carrying the SAME token at the
+  // Log-Matching boundary. Same lineage ⇒ `(index, term)` IS a content-identity here ⇒ still redundant.
+  let token = ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::from_static(&[9u8]),
+    1,
+  );
+  ep.seed_fork_id_for_test(token.clone());
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  )
+  .with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      meta,
+      encode_count_snapshot(500),
+    )),
+  );
+  for _ in 0..8 {
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+  }
+
+  assert_eq!(
+    log.last_index(),
+    Index::new(9),
+    "a same-lineage (matching-token) redundant snapshot still short-circuits — the durable tail is preserved"
+  );
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "a redundant same-lineage snapshot stages no install"
+  );
+  assert_eq!(ep.fork_id(), Some(token), "the matching token is unchanged");
+}
+
 /// Completion-time Log-Matching redundancy (the IN-WINDOW catch-up case the receipt guard cannot see):
 /// the snapshot's boundary is ABOVE the follower's durable tip AT RECEIPT, so the receipt short-circuit
 /// does NOT fire and the install is STAGED. Then in-window AppendEntries make the matching prefix durable
@@ -3574,8 +3867,9 @@ fn redundant_install_caught_up_mid_transfer_dropped_at_completion() {
 /// focuses on the `durable_index` RESET + the later ack-clamp; this one isolates the commit/applied/
 /// first_index/last_index advance for a boundary strictly above a non-zero `commit`.)
 ///
-/// MUTATION: this direction is unaffected by the redundancy test — both forms install — so it stays GREEN
-/// under the reverted guard; it fences the redundancy test against over-suppressing a divergent install.
+/// MUTATION: this direction is unaffected by the redundancy guard — both forms install — so the
+/// reverted guard does not surface here; it fences the redundancy test against over-suppressing a
+/// divergent install.
 #[test]
 fn divergent_install_below_durable_tip_still_rebaselines() {
   use crate::{AppendEntries, Entry, EntryKind, Index, Instant, Message, Term};
@@ -3803,9 +4097,16 @@ fn snapshot_redundancy_term_read_failure_poisons_at_completion() {
   // A deferred compaction is pending when the install completes. The install poison must FAIL-STOP the
   // storage handler BEFORE its compaction fallback runs — a poisoned node must do no destructive
   // `log.compact`. (op 99 != the install's op, so the in-loop compaction at the completion does not match;
-  // only the post-loop fallback could fire, and with the durable snapshot covering up_to it WOULD — so the
-  // surviving entry proves the bail skipped it.)
-  ep.snapshot.pending_compact = Some((OpId::new(99), Index::new(2)));
+  // only the post-loop fallback could fire, and with the durable slot holding exactly this identity it
+  // WOULD — so the surviving entry proves the bail skipped it.)
+  ep.snapshot.pending_compact = Some((
+    OpId::new(99),
+    crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      crate::conf::ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    ),
+  ));
   let progress = ep.handle_storage(d, &mut log, &mut stable);
   assert_eq!(
     ep.poison_reason(),
@@ -3819,7 +4120,7 @@ fn snapshot_redundancy_term_read_failure_poisons_at_completion() {
   );
   assert_eq!(
     ep.pending_compact(),
-    Some((OpId::new(99), Index::new(2))),
+    Some((OpId::new(99), Index::new(5))),
     "the fail-stop skips the compaction fallback — no destructive log.compact after a poison"
   );
 }
@@ -4854,4 +5155,1469 @@ fn deferred_install_off_follower_preserves_log_and_campaign() {
     core::iter::from_fn(|| ep.poll_event()).all(|e| !e.is_snapshot_installed()),
     "no SnapshotInstalled event for a dropped off-follower install"
   );
+}
+
+/// A fork token for a child at the given `child` id — the lineage discriminator that makes a manufactured
+/// baseline distinguishable from an independently-committed snapshot at the same coordinate.
+fn fork_token(child: u8) -> crate::ForkId {
+  use crate::{ForkId, Index, Term};
+  ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::copy_from_slice(&[child]),
+    1,
+  )
+}
+
+/// PERSIST-BEFORE-ACK across a fork boundary, held one layer earlier than the durable-evidence fallback:
+/// a replica whose store already holds ANOTHER lineage's durable blob (an old tokenless snapshot it never
+/// installed) is not a pristine adopter, so a colliding fork baseline is REFUSED at the door — it is never
+/// staged, never submitted, and never deferred, so no fallback can ever mistake the tokenless blob's
+/// durability for the fork's. The colliding-durability window is unrepresentable, not merely guarded.
+///
+/// MUTATION: drop the durable-slot arm from the gate's pristine check → the fork baseline defers behind
+/// the held fsync while `durable_snapshot()` reports the colliding tokenless blob — the exact ambiguity
+/// the identity-keyed fallback then has to disarm (and the refusal assertions below FAIL).
+#[test]
+fn a_populated_slot_refuses_a_colliding_fork_baseline() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // An OLD tokenless snapshot at (10, 2) is DURABLE in the store — a lineage this follower never installed.
+  stable.force_snapshot(
+    SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()),
+    encode_count_snapshot(111),
+  );
+
+  // The genuine fork baseline: the SAME coordinate, a fork TOKEN, the fork's real state.
+  stable.hold_snapshot_fsync(true);
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      baseline,
+      encode_count_snapshot(777),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "a replica holding another lineage's committed content or durable blob never defers a foreign install"
+  );
+  assert_eq!(ep.commit, Index::new(3), "no commit advance");
+  assert_eq!(log.last_index(), Index::new(3), "no re-baseline");
+  assert_ne!(ep.state_machine().count(), 777, "no foreign state restored");
+  assert!(ep.fork_id().is_none(), "no token adopted");
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "PERSIST-BEFORE-ACK: nothing was accepted, so nothing may be acked"
+  );
+  assert_eq!(ep.refused_cross_lineage_install_count(), 1);
+}
+
+/// A pristine joiner's adoption acks ONLY on its own durability. The fork baseline's install is deferred
+/// behind its fsync; while the blob is in flight nothing destructive runs and nothing is acked, and once
+/// its OWN `SnapshotWritten` lands the install completes, the token is adopted, and exactly one ack goes
+/// out — deferred, not lost.
+///
+/// MUTATION: ack at receipt instead of completion (or run the destructive body before the fsync) → the
+/// withheld-ack / no-re-baseline assertions FAIL.
+#[test]
+fn an_adoption_acks_only_on_its_own_durability() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  stable.hold_snapshot_fsync(true);
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      baseline,
+      encode_count_snapshot(777),
+    )),
+  );
+  assert!(
+    ep.snapshot.pending_install.is_some(),
+    "a pristine joiner adopts: the install is deferred behind its fsync"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The blob's own fsync has not landed: nothing destructive, nothing acked.
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.snapshot.pending_install.is_some(),
+    "no durability evidence yet — the install stays deferred"
+  );
+  assert_ne!(ep.state_machine().count(), 777, "no restore before fsync");
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "PERSIST-BEFORE-ACK: no ack may leave before the blob's own bytes are durable"
+  );
+
+  // The ack is DEFERRED, not lost: the blob's own fsync completes the adoption.
+  stable.flush_held_snapshots();
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.snapshot.pending_install.is_none(), "install completed");
+  assert_eq!(ep.commit, Index::new(10));
+  assert_eq!(ep.state_machine().count(), 777, "the fork's state landed");
+  assert_eq!(ep.fork_id(), Some(token), "the joiner adopted the token");
+  let acks: Vec<_> = core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| matches!(o.message(), Message::SnapshotResponse(_)))
+    .collect();
+  assert_eq!(acks.len(), 1, "exactly one ack, once the bytes are durable");
+  match acks[0].message() {
+    Message::SnapshotResponse(r) => {
+      assert!(!r.reject());
+      assert_eq!(r.match_index(), Index::new(10));
+    }
+    _ => unreachable!(),
+  }
+}
+
+/// A fork baseline arriving at the coordinate of an in-flight TOKENLESS install on a POPULATED replica is
+/// a different snapshot from a different lineage — and the replica is not a pristine adopter, so it is
+/// REFUSED outright: never deduped against the pending install (the coordinate-fusion hazard), and never
+/// allowed to displace it either. The replica's own in-flight native install completes undisturbed on its
+/// own durability.
+///
+/// MUTATION: drop the populated-receiver leg of the gate → the fork baseline displaces the pending native
+/// install and lands its state on a populated squatter (the count/token assertions FAIL).
+#[test]
+fn a_pending_install_on_a_populated_lineage_is_not_displaced_by_a_fork_baseline() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // A TOKENLESS install at (10, 2) is in flight (fsync held): `install_at` carries state count 10.
+  stable.hold_snapshot_fsync(true);
+  ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(10));
+  assert!(
+    ep.snapshot
+      .pending_install
+      .as_ref()
+      .expect("the tokenless install is pending")
+      .1
+      .fork_id()
+      .is_none(),
+    "the in-flight install is the tokenless lineage"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The fork baseline arrives at the SAME coordinate: REFUSED — this replica holds committed content
+  // (and a visible blob) of another lineage.
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      baseline,
+      encode_count_snapshot(777),
+    )),
+  );
+  assert!(
+    ep.snapshot
+      .pending_install
+      .as_ref()
+      .expect("the native install is still pending")
+      .1
+      .fork_id()
+      .is_none(),
+    "the refused fork baseline neither deduped against nor displaced the in-flight native install"
+  );
+  assert_eq!(ep.refused_cross_lineage_install_count(), 1);
+
+  // The native install completes undisturbed on its own durability.
+  stable.flush_held_snapshots();
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the install completed"
+  );
+  assert_eq!(ep.commit, Index::new(10));
+  assert_eq!(
+    ep.state_machine().count(),
+    10,
+    "the NATIVE lineage's state landed — the refused fork never displaced it"
+  );
+  assert!(ep.fork_id().is_none(), "no token adopted");
+}
+
+/// Two chunked transfers with the SAME coordinate AND the same `total_len` but DIFFERENT lineages must never
+/// COMBINE their chunks into one blob. On a POPULATED replica the door refuses the foreign chunk before any
+/// staging exists to mix into: the native partial survives untouched and the foreign transfer never begins.
+///
+/// MUTATION: drop the populated-receiver leg of the gate → the fork's chunk reaches the staging identity;
+/// the native partial is displaced on a squatter the fork may never convert (the staged-intact assertions
+/// FAIL).
+#[test]
+fn cross_lineage_chunks_never_combine_into_one_blob() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // A TOKENLESS transfer at (10, 2), total_len 6: stage [0,3).
+  let tokenless = SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      tokenless,
+      bytes::Bytes::from_static(b"AAA"),
+      0,
+      6,
+    )),
+  );
+  assert_eq!(
+    ep.snapshot
+      .snapshot_recv
+      .as_ref()
+      .map(|r| r.contiguous_staged),
+    Some(3),
+    "the tokenless transfer staged [0,3)"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The fork baseline: SAME coordinate, SAME total_len, SAME sender term — ONLY the lineage differs.
+  // REFUSED at the door: this replica holds committed content of the tokenless lineage.
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      baseline,
+      bytes::Bytes::from_static(b"BBB"),
+      3,
+      6,
+    )),
+  );
+  let recv = ep
+    .snapshot
+    .snapshot_recv
+    .as_ref()
+    .expect("a transfer is in progress");
+  assert!(
+    recv.meta.fork_id().is_none(),
+    "the native partial survives — the refused foreign chunk never reached staging"
+  );
+  assert_eq!(recv.contiguous_staged, 3, "the native [0,3) is intact");
+  assert_eq!(ep.refused_cross_lineage_install_count(), 1);
+}
+
+/// The pristine face of the same property: two lineages RACING into one pristine joiner supersede — the
+/// staging identity keys on the lineage token, so the second lineage's chunk REPLACES the first's partial
+/// rather than continuing it. Never a mixed blob, in either receiver state.
+///
+/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the second lineage's chunk CONTINUES the
+/// first's partial (contiguous_staged 6 — a mixed [0,6) blob that would then decode and INSTALL) instead
+/// of replacing it (contiguous_staged 0 — its own [3,6) with a gap).
+#[test]
+fn two_lineages_racing_into_a_pristine_joiner_never_mix() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // Lineage A stages [0,3) of a transfer at (10, 2), total_len 6 — the joiner is pristine, so it adopts.
+  let a = SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()).with_fork_id(fork_token(8));
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      a,
+      bytes::Bytes::from_static(b"AAA"),
+      0,
+      6,
+    )),
+  );
+  assert_eq!(
+    ep.snapshot
+      .snapshot_recv
+      .as_ref()
+      .map(|r| r.contiguous_staged),
+    Some(3),
+    "lineage A staged [0,3)"
+  );
+  while ep.poll_message().is_some() {}
+
+  // Lineage B: SAME coordinate, SAME total_len, SAME sender term — only the token differs. Still a
+  // pristine joiner (staging is not content), so B is admitted and SUPERSEDES A's partial.
+  let b_token = fork_token(9);
+  let b = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(b_token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      b,
+      bytes::Bytes::from_static(b"BBB"),
+      3,
+      6,
+    )),
+  );
+  let recv = ep
+    .snapshot
+    .snapshot_recv
+    .as_ref()
+    .expect("a transfer is in progress");
+  assert_eq!(
+    recv.meta.fork_id(),
+    Some(&b_token),
+    "lineage B's transfer REPLACED lineage A's partial"
+  );
+  assert_eq!(
+    recv.contiguous_staged, 0,
+    "A's [0,3) was discarded — B's [3,6) leaves a gap, NOT a mixed [0,6) blob"
+  );
+}
+
+/// The lineage machinery must not OVER-reject: a pristine joiner taking the fork's chunked baseline (every
+/// chunk carrying the SAME token) continues ONE transfer to completion and adopts — the designed twin
+/// catch-up. This is the green fence for both the door gate (a pristine adopter is admitted) and the
+/// staging identity (same token continues, never restarts).
+///
+/// MUTATION: refuse whenever a token is present (an over-broad gate), or compare `fork_id` by identity
+/// rather than value → the transfer refuses or restarts, and the install never completes.
+#[test]
+fn same_lineage_chunks_still_continue_one_transfer() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  // The fork's blob, split across two chunks of ONE transfer.
+  let blob = encode_count_snapshot(500);
+  let total = blob.len() as u64;
+  let cut = 1usize;
+
+  for (offset, data) in [
+    (0u64, blob.slice(0..cut)),
+    (cut as u64, blob.slice(cut..blob.len())),
+  ] {
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(InstallSnapshot::new_chunk(
+        Term::new(2),
+        1u64,
+        baseline.clone(),
+        data,
+        offset,
+        total,
+      )),
+    );
+  }
+  assert!(
+    ep.snapshot.snapshot_recv.is_none(),
+    "the completed transfer left no staged receive"
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.state_machine().count(),
+    500,
+    "a same-lineage chunked transfer continues one transfer and installs the fork's state"
+  );
+  assert_eq!(ep.commit, Index::new(10));
+  assert_eq!(ep.fork_id(), Some(token));
+}
+
+/// A transfer-progress ack must never carry a `match_index` at or above its own transfer's boundary —
+/// the leader exits Snapshot state at `match >= pending`, so an at-boundary progress ack would count the
+/// peer as a full replica while it holds none of the snapshot's bytes. The recoverable watermark alone
+/// does not guarantee the strict inequality: a snapshot from a different lineage stages at a boundary the
+/// local coordinates appear to cover, so the property must hold by value.
+///
+/// MUTATION: drop the boundary clamp in `send_snapshot_progress_ack` → the first ack reads the raw
+/// watermark (3) instead of 0.
+#[test]
+fn a_progress_ack_is_clamped_below_its_transfer_boundary() {
+  use crate::{Index, Message};
+  let (mut ep, _log, _stable, _cfg) = follower_committed_to_3();
+
+  // A boundary at/below the recoverable watermark: the clamp is load-bearing.
+  ep.send_snapshot_progress_ack(1u64, 50, Index::new(1));
+  let ack = core::iter::from_fn(|| ep.poll_message())
+    .find_map(|o| match o.message() {
+      Message::SnapshotResponse(r) => Some(*r),
+      _ => None,
+    })
+    .expect("a progress ack must be emitted");
+  assert!(!ack.reject());
+  assert_eq!(ack.acked_through(), 50);
+  assert_eq!(
+    ack.match_index(),
+    Index::ZERO,
+    "the ack must sit strictly below the boundary, not at the raw watermark"
+  );
+
+  // A boundary far above the watermark: the clamp is inert — the honest watermark flows unchanged.
+  ep.send_snapshot_progress_ack(1u64, 60, Index::new(10));
+  let ack = core::iter::from_fn(|| ep.poll_message())
+    .find_map(|o| match o.message() {
+      Message::SnapshotResponse(r) => Some(*r),
+      _ => None,
+    })
+    .expect("a progress ack must be emitted");
+  assert_eq!(ack.match_index(), Index::new(3));
+}
+
+/// When the recoverable prefix catches up past an in-flight transfer's boundary, the exit signal is the
+/// FULL redundancy ack on the next chunk — at/above the boundary, so the leader leaves Snapshot state
+/// within one round-trip — never a progress ack. This is the liveness face of the boundary clamp: a
+/// covered transfer still terminates promptly even though progress acks can no longer reach the boundary.
+#[test]
+fn commit_catchup_mid_transfer_exits_via_a_full_ack() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // Durable [1..=4] term 2, commit 2: boundary 5 is uncovered, so a partial chunk stages.
+  let head: Vec<Entry> = (1u64..=4)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      head,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  let blob = encode_count_snapshot(5);
+  let half = blob.len() / 2;
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta.clone(),
+      blob.slice(0..half),
+      0,
+      blob.len() as u64,
+    )),
+  );
+  assert!(ep.snapshot.snapshot_recv.is_some(), "the partial staged");
+  while ep.poll_message().is_some() {}
+
+  // In-window appends commit THROUGH the boundary and become durable.
+  let tail: Vec<Entry> = (5u64..=6)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::new(4),
+      Term::new(2),
+      tail,
+      Index::new(5),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // The next chunk of the now-covered transfer answers with a FULL ack at/above the boundary.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta,
+      blob.slice(half..),
+      half as u64,
+      blob.len() as u64,
+    )),
+  );
+  let ack = core::iter::from_fn(|| ep.poll_message())
+    .find_map(|o| match o.message() {
+      Message::SnapshotResponse(r) => Some(*r),
+      _ => None,
+    })
+    .expect("the covered transfer must answer, not stall");
+  assert!(!ack.reject());
+  assert!(
+    ack.match_index() >= Index::new(5),
+    "a covered transfer exits via the full redundancy ack at/above the boundary"
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_none(),
+    "the redundant transfer's staging is reclaimed"
+  );
+}
+
+/// A mid-transfer PROGRESS ack is match-inert on the leader: it drives the resume cursor and chunk
+/// pacing, but never moves `match_index`, never exits Snapshot state, and never feeds the commit
+/// quorum — even when its `match_index` claims the pending boundary itself. Only an install or
+/// redundancy ack (a durable log-state assertion by the follower) may. The rule is enforced on the
+/// leader, so a version-skewed or malformed peer cannot mint replication progress from a transfer
+/// that has not durably installed.
+///
+/// MUTATION: feed progress acks to `maybe_update` in `on_snapshot_response` → the first assert sees
+/// the peer leave Snapshot state.
+#[test]
+fn a_progress_ack_never_lifts_a_peer_out_of_snapshot_state() {
+  use crate::{Instant, Message, Term};
+
+  let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(5, 2);
+  while ep.poll_message().is_some() {}
+  let match_before = ep.tracker.progress(&2u64).unwrap().match_index();
+  let commit_before = ep.commit;
+
+  // A progress ack whose match claims the pending boundary itself.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::SnapshotResponse(
+      SnapshotResponse::new(Term::new(1), 2u64, false, pending)
+        .with_acked_through(3)
+        .with_progress(true),
+    ),
+  );
+  let pr = ep.tracker.progress(&2u64).unwrap();
+  assert!(
+    pr.state().is_snapshot(),
+    "a progress ack must leave the peer in Snapshot state"
+  );
+  assert_eq!(
+    pr.match_index(),
+    match_before,
+    "a progress ack must not move match_index"
+  );
+  assert_eq!(
+    ep.commit, commit_before,
+    "a progress ack must not feed the commit quorum"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The FINAL ack (no flag) at the same match still exits — the flag, not the value, gates.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::SnapshotResponse(SnapshotResponse::new(Term::new(1), 2u64, false, pending)),
+  );
+  assert!(
+    !ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
+    "the final install ack still lifts the peer out of Snapshot state"
+  );
+}
+
+/// The EOF empty-chunk re-ack is behind the door too: a foreign lineage's EOF probe into a populated
+/// replica is refused outright — not answered with a true-watermark progress ack. Every ack arm, the EOF
+/// echo included, speaks only for transfers this replica could legitimately hold.
+///
+/// MUTATION: hoist the EOF arm above the fork-provenance gate → the foreign EOF elicits a progress ack
+/// from a replica that refuses the transfer itself (the no-ack assertion FAILS).
+#[test]
+fn a_foreign_lineage_eof_probe_is_refused_not_acked() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(fork_token(9));
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      baseline,
+      bytes::Bytes::new(),
+      6,
+      6,
+    )),
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "a refused lineage's EOF probe is not acked"
+  );
+  assert_eq!(ep.refused_cross_lineage_install_count(), 1);
+}
+
+/// An adoption interrupted between the blob's fsync and the install must COMPLETE on the leader's
+/// retransfer of the same snapshot, not wedge on its own leftover evidence. A deferred install dropped
+/// off-follower (the blob durable, the log still virgin, no token adopted) leaves the durable slot
+/// holding the fork baseline; the retransfer arrives on a now-tokenless, still-virgin replica whose slot
+/// is occupied — occupied by EXACTLY this snapshot, which is the one durable state a token-bearing
+/// install may land on besides emptiness.
+///
+/// MUTATION: tighten the gate's slot arm to `durable_snapshot().is_none()` → the retransfer is refused
+/// forever and the joiner wedges (the completion assertions FAIL).
+#[test]
+fn an_interrupted_adoption_completes_on_the_same_identity_retransfer() {
+  use super::super::Role;
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  let install = InstallSnapshot::new(Term::new(2), 1u64, baseline, encode_count_snapshot(777));
+
+  // The adoption begins: pristine joiner, install deferred behind the fsync.
+  stable.hold_snapshot_fsync(true);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(install.clone()),
+  );
+  assert!(ep.snapshot.pending_install.is_some());
+  while ep.poll_message().is_some() {}
+
+  // The node campaigns while the fsync is in flight; the blob then turns durable and the deferred
+  // install is DROPPED off-follower — leaving {durable fork blob, virgin log, no token}.
+  ep.role = Role::Candidate;
+  stable.flush_held_snapshots();
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the off-follower drop consumed the deferred install"
+  );
+  assert!(
+    ep.fork_id().is_none(),
+    "no token adopted — the install never ran"
+  );
+  assert_eq!(log.last_index(), Index::ZERO, "the log is still virgin");
+  assert_eq!(
+    stable
+      .durable_snapshot()
+      .expect("the blob outlived the dropped install")
+      .fork_id(),
+    Some(&token),
+    "the fork baseline occupies the durable slot"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The leader retransfers the SAME snapshot (its match never advanced). The kin-slot arm admits it —
+  // the slot holds exactly this snapshot — and the adoption completes.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(install),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(ep.snapshot.pending_install.is_none(), "install completed");
+  assert_eq!(ep.commit, Index::new(10));
+  assert_eq!(ep.state_machine().count(), 777, "the fork's state landed");
+  assert_eq!(ep.fork_id(), Some(token), "the token was adopted");
+  assert_eq!(
+    ep.refused_cross_lineage_install_count(),
+    0,
+    "the same-identity retransfer is kin, not a refusal"
+  );
+}
+
+/// An adoption admitted onto a pristine joiner can race in-window AppendEntries: by the time the blob
+/// is durable, the once-empty log is populated and committed. That content can only be ANOTHER
+/// lineage's — the joiner's own lineage cannot append below the boundary (a fork member's log starts
+/// past the manufactured baseline; the zero-progress joiner is structurally forced onto the snapshot
+/// path) — so the completion re-runs the door gate's emptiness demand and REFUSES: no re-baseline over
+/// durably-acked foreign entries (replacement), no false-ack of the raced-in coverage as "already
+/// durable" (the lineage clause), no ack at all. The filled log stands; every retransfer now refuses
+/// at receipt (the receiver is populated); the conflict resolves by placement.
+///
+/// MUTATION 1: drop the completion pristine re-check → the install re-baselines to 10, destroying
+/// committed-and-acked entries 11..=12 and regressing commit (the untouched-log assertions FAIL).
+/// MUTATION 2: drop the lineage clause from `covered_by_local_history` → the re-check reads the
+/// raced-in commit as coverage and ACKS the boundary redundantly (the no-ack assertion FAILS).
+#[test]
+fn a_mid_adoption_append_race_refuses_the_adoption() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // The adoption begins on a PRISTINE joiner; the blob's fsync is held in flight.
+  stable.hold_snapshot_fsync(true);
+  let token = fork_token(9);
+  let baseline =
+    SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()).with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      baseline,
+      encode_count_snapshot(777),
+    )),
+  );
+  assert!(ep.snapshot.pending_install.is_some(), "adoption deferred");
+  while ep.poll_message().is_some() {}
+
+  // In-window appends from another conf member land FOREIGN content through the boundary and commit it.
+  let tail: Vec<Entry> = (1u64..=12)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(12),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(
+    ep.commit,
+    Index::new(12),
+    "the race committed past the boundary"
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_message()).any(|o| matches!(
+      o.message(),
+      Message::AppendResponse(r) if !r.reject() && r.match_index() == Index::new(12)
+    )),
+    "the raced entries were durably ACKED — the destruction the refusal prevents would be of \
+     acked-and-counted entries"
+  );
+
+  // The blob turns durable: the completion finds the receiver no longer content-empty and REFUSES —
+  // nothing destructive, nothing acked, the refusal counted.
+  stable.flush_held_snapshots();
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the refused install is consumed, not left pending"
+  );
+  assert_ne!(
+    ep.state_machine().count(),
+    777,
+    "no foreign state restored over the filled log"
+  );
+  assert!(ep.fork_id().is_none(), "no token adopted");
+  assert_eq!(
+    log.last_index(),
+    Index::new(12),
+    "the durably-acked entries survive — no re-baseline over them"
+  );
+  assert_eq!(ep.commit, Index::new(12), "commit never regresses");
+  assert_eq!(
+    ep.refused_cross_lineage_install_count(),
+    1,
+    "the completion-time refusal is counted"
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "a refused adoption acks NOTHING — neither installed nor redundant"
+  );
+}
+
+/// The staged half of the same race: a chunked adoption staged on a then-pristine joiner is NOT
+/// reclaimed as "already held" when raced-in foreign appends cover its boundary — the staged transfer
+/// (and the leader's Snapshot pin) survive, keeping the conflict visible instead of silently freeing
+/// the fork's partial against bytes that are not the fork's.
+///
+/// MUTATION: drop the lineage clause from `covered_by_local_history` → the reclaim frees the staged
+/// receive on the raced-in coverage (the staged-intact assertion FAILS).
+#[test]
+fn a_mid_adoption_append_race_does_not_reclaim_the_staged_transfer() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // Chunk [0,3) of the fork's baseline stages on the PRISTINE joiner.
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(fork_token(9));
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      baseline,
+      bytes::Bytes::from_static(b"AAA"),
+      0,
+      6,
+    )),
+  );
+  assert!(ep.snapshot.snapshot_recv.is_some(), "the partial staged");
+  while ep.poll_message().is_some() {}
+
+  // Raced-in foreign appends commit through the boundary and become durable.
+  let tail: Vec<Entry> = (1u64..=12)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(12),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(ep.commit, Index::new(12));
+
+  // The staged FORK transfer is not "already held" by the foreign coverage: reclaim leaves it pinned.
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "the cross-lineage partial survives foreign coverage — the conflict stays visible, never silently freed"
+  );
+}
+
+/// The missed-completion compaction fallback fires only on the durable slot holding EXACTLY the
+/// pending capture — identity, lineage included — never on bare boundary coverage. A foreign blob at a
+/// covering boundary is another lineage's durability: compacting this node's own log on it would
+/// discard a prefix that exists nowhere in this lineage.
+///
+/// MUTATION: key the fallback on `durable.last_index() >= boundary` coverage → the foreign blob's
+/// durability compacts the own log (the intact-prefix assertion FAILS).
+#[test]
+fn the_compaction_fallback_ignores_a_foreign_blobs_durability() {
+  use crate::{Index, Instant, OpId, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+
+  // A foreign lineage's blob occupies the durable slot at a COVERING boundary (10 >= 2).
+  stable.force_snapshot(
+    SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+    .with_fork_id(fork_token(9)),
+    encode_count_snapshot(777),
+  );
+  // A pending own capture at boundary 2 whose completion was missed.
+  ep.snapshot.pending_compact = Some((
+    OpId::new(99),
+    crate::SnapshotMeta::new(
+      Index::new(2),
+      Term::new(2),
+      crate::conf::ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    ),
+  ));
+
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(
+    log.first_index(),
+    Index::new(1),
+    "the own log's prefix survives — a foreign blob's durability is not this capture's"
+  );
+  assert!(
+    ep.pending_compact().is_some(),
+    "the pending capture stays pending (its own completion never arrived)"
+  );
+}
+
+/// A local capture's durability makes its boundary a RECOVERABLE prefix, and the ack watermark must
+/// say so the moment the compaction fires — the durable LOG tip alone is about to be stranded below
+/// the boundary. An async replica (applied ran ahead of its lagging disk) that captures at N and
+/// compacts must ack N, and — the safety face — a stale same-lineage snapshot at M in (K, N] must
+/// read as covered at receipt, resolving redundant instead of reaching the store's one snapshot
+/// slot, where its submit would REPLACE the only baseline for the compacted prefix.
+///
+/// MUTATION: drop the `durable_snapshot_index` raise from the capture-completion arm → the watermark
+/// stays at the stranded log tip (first assert) and the stale snapshot submits, so a crash-restart
+/// recovers to M with the log baselined at N+1 — an orphaned log (the restart asserts fail).
+#[test]
+fn a_local_captures_durability_covers_its_boundary() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg_low = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(2);
+  let mut ep = Endpoint::new(cfg_low, Instant::ORIGIN, 7, CountSm::default());
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let d = Instant::ORIGIN;
+
+  // The replica's own committed history 1..=6 at term 2: appended, drained durable, applied.
+  let entries: Vec<Entry> = (1u64..=6)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(6),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while ep.poll_message().is_some() {}
+  assert_eq!(ep.applied, Index::new(6));
+  // The drain also fired the local capture at N = 6 (the lowered threshold), turned it durable, and
+  // compacted through 6 — the whole own-capture lifecycle.
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(log.first_index(), Index::new(7), "the compaction fired");
+
+  // The async-disk shape: the durable APPEND tip honestly lags the boundary the capture now
+  // underwrites. The watermark must ride the capture, not the stranded tip — this is what a stale
+  // leader's picture of this replica is built from.
+  ep.durable.durable_index = Index::new(3);
+  assert_eq!(
+    ep.ack_watermark(),
+    Index::new(6),
+    "the durable capture's boundary is the recoverable prefix — not the stranded log tip"
+  );
+
+  // A stale same-lineage snapshot at M = 5 (a leader with an older compaction point, honestly
+  // believing this replica sits at 3): covered at receipt — resolves redundant, never submitted.
+  let stale = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      stale,
+      encode_count_snapshot(5),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    stable
+      .durable_snapshot()
+      .expect("the capture occupies the slot")
+      .last_index(),
+    Index::new(6),
+    "the stale snapshot never replaced the capture in the slot"
+  );
+
+  // The proof of the stakes: a crash-restart recovers the full committed prefix from the slot.
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let ep2 = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(
+    !ep2.poison.poisoned,
+    "the compacted prefix stays recoverable: {:?}",
+    ep2.poison_reason()
+  );
+  assert_eq!(
+    ep2.applied,
+    Index::new(6),
+    "recovered at the capture, not the stale offer"
+  );
+}
+
+/// The capture-fsync WINDOW: the capture at N is submitted but not yet durable, so the ack
+/// watermark cannot cover it yet — the receipt coverage test is blind, and slot monotonicity is the
+/// only guard. A stale lower snapshot arriving in the window must be dropped silently (no ack — the
+/// boundary is not yet recoverable, and the store's FIFO completions would otherwise leave the
+/// LOWER blob as the final durable slot). Once the capture fsyncs, the retry resolves redundant.
+///
+/// MUTATION: drop the visible-slot monotonicity check → the stale snapshot submits behind the held
+/// capture, the FIFO flush leaves the slot at M, and the crash-restart orphans the log.
+#[test]
+fn a_stale_snapshot_in_the_capture_fsync_window_is_refused() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg_low = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(2);
+  let mut ep = Endpoint::new(cfg_low, Instant::ORIGIN, 7, CountSm::default());
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let d = Instant::ORIGIN;
+
+  let entries: Vec<Entry> = (1u64..=6)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(6),
+    )),
+  );
+  stable.hold_snapshot_fsync(true);
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while ep.poll_message().is_some() {}
+  assert_eq!(ep.applied, Index::new(6));
+  assert!(
+    ep.pending_compact().is_some(),
+    "the drain fired the capture; its fsync is HELD, so no compaction and no coverage yet"
+  );
+  assert_eq!(
+    log.first_index(),
+    Index::new(1),
+    "no compaction before the fsync"
+  );
+
+  // The async-disk shape, inside the window: the watermark covers neither the stranded tail nor the
+  // held capture.
+  ep.durable.durable_index = Index::new(3);
+  assert_eq!(
+    ep.ack_watermark(),
+    Index::new(3),
+    "the held capture covers nothing yet"
+  );
+
+  // The stale offer at M = 5 lands INSIDE the window: dropped silently — no submit, no ack.
+  let stale = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      stale,
+      encode_count_snapshot(5),
+    )),
+  );
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the stale offer never became a deferred install"
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "no ack for a boundary that is not yet recoverable"
+  );
+
+  // The capture's fsync lands: the compaction fires and the slot holds the capture, not the offer.
+  stable.flush_held_snapshots();
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(log.first_index(), Index::new(7), "the compaction fired");
+  assert_eq!(
+    stable
+      .durable_snapshot()
+      .expect("the capture occupies the slot")
+      .last_index(),
+    Index::new(6),
+    "FIFO completions ended with the CAPTURE durable — the stale offer never entered the store"
+  );
+
+  // And the crash-restart proof, as above.
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let ep2 = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep2.poison.poisoned, "{:?}", ep2.poison_reason());
+  assert_eq!(ep2.applied, Index::new(6));
+}
+
+/// A same-lineage snapshot at ANY boundary completes an interrupted adoption on a pristine receiver
+/// — the kin arm keys on LINEAGE, not exact identity. A joiner fsyncs snapshot N (token B) but
+/// crashes before the install; restart leaves N durable-but-unadopted and boots the joiner virgin.
+/// A leader that snapshotted EARLIER can offer only a LOWER same-lineage snapshot K (plus the tail
+/// it replicates after) — and from its single latest-snapshot slot it cannot resend N. The joiner
+/// must adopt K, or it is wedged out of the group through a normal crash window.
+///
+/// MUTATION: require `identity_eq` in the kin clause → K (boundary != N) is refused forever, the
+/// joiner never adopts, and the refusal counter climbs (the adoption assertions FAIL).
+#[test]
+fn a_lower_same_lineage_snapshot_completes_an_interrupted_adoption() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg = || {
+    Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+  };
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+  let token = fork_token(9);
+
+  // Post-crash durable state: N = 10 (token B) fsynced in the slot, log virgin, no lineage stamp
+  // (the install never ran). Restart ignores the slot and boots the joiner virgin + tokenless.
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  stable.force_snapshot(
+    SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()).with_fork_id(token.clone()),
+    encode_count_snapshot(777),
+  );
+  let mut ep = Endpoint::restart(
+    cfg(),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep.poison.poisoned);
+  assert!(ep.fork_id().is_none(), "the unadopted N confers no lineage");
+  assert_eq!(log.last_index(), Index::ZERO, "booted virgin");
+  assert_eq!(
+    stable
+      .durable_snapshot()
+      .expect("N outlives the ignore")
+      .last_index(),
+    Index::new(10),
+    "the orphan is still in the slot"
+  );
+
+  // A same-lineage leader offers a LOWER snapshot K = 5 (token B): admitted (kin by lineage), and
+  // installed over the orphan.
+  let d = Instant::ORIGIN;
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      SnapshotMeta::new(Index::new(5), Term::new(2), conf.clone()).with_fork_id(token.clone()),
+      encode_count_snapshot(500),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.refused_cross_lineage_install_count(),
+    0,
+    "a same-lineage completion never refuses"
+  );
+  assert_eq!(
+    ep.fork_id(),
+    Some(token.clone()),
+    "the joiner adopted the lineage at K"
+  );
+  assert_eq!(ep.state_machine().count(), 500, "K's state landed");
+  assert_eq!(
+    log.first_index(),
+    Index::new(6),
+    "the log re-baselined onto K"
+  );
+  while ep.poll_message().is_some() {}
+
+  // Catch up the tail K+1..=10 via AppendEntries (prev at the K boundary).
+  let tail: Vec<Entry> = (6u64..=10)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::new(5),
+      Term::new(2),
+      tail,
+      Index::new(10),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(10),
+    "caught up the committed tail"
+  );
+  while ep.poll_message().is_some() {}
+
+  // Final crash-restart proof: adopted-at-K-plus-tail recovers cleanly (the lineage is now stamped).
+  let ep2 = Endpoint::restart(
+    cfg(),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep2.poison.poisoned, "{:?}", ep2.poison_reason());
+  assert_eq!(ep2.fork_id(), Some(token), "the lineage survives restart");
+  assert_eq!(ep2.commit_index(), Index::new(10));
+}
+
+/// The kin arm rejects a DIFFERENT lineage: a virgin joiner holding lineage C's orphaned blob
+/// refuses lineage B's snapshot — the standing cross-lineage conflict placement resolves, never a
+/// destructive replacement. (The complement of the same-lineage completion above.)
+#[test]
+fn a_different_lineage_orphan_still_blocks_adoption() {
+  use crate::{
+    Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  stable.force_snapshot(
+    SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()).with_fork_id(fork_token(8)),
+    encode_count_snapshot(777),
+  );
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  let d = Instant::ORIGIN;
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      SnapshotMeta::new(Index::new(5), Term::new(2), conf).with_fork_id(fork_token(9)),
+      encode_count_snapshot(500),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.refused_cross_lineage_install_count(),
+    1,
+    "a different-lineage orphan blocks adoption — placement resolves it"
+  );
+  assert!(ep.fork_id().is_none(), "no adoption");
+  assert_ne!(ep.state_machine().count(), 500, "no foreign state landed");
 }

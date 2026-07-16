@@ -26,19 +26,21 @@
 //! key surfacing in a later child is judged as the handover it is.
 //!
 //! The recorder walks every replica's FULL RAW applied record each sweep and appends each gkv
-//! cell once — values are globally unique and strictly increase per `(group, key)`, so
-//! "strictly above the last recorded value" dedupes across replicas, crash re-walks, and the
-//! child's inherited baseline alike. The walk trusts VALUES, never positions: `LogSm::split`
-//! mutates the record non-append-only (moved-key cells vanish record-wide) and a crash restore
-//! can resurrect a pre-split state, so a cell can sit BELOW any position an earlier sweep
-//! reached — a positional resume watermark skips it forever, punching an interior hole in the
-//! recorded history that a later fork baseline exposes as a false conservation verdict. The
-//! value dedupe needs no resume state at all: a full re-walk re-presents only cells the ledger
-//! already admitted. Histories are keyed by an INCARNATION-QUALIFIED ledger id, so a recreated
-//! gid's fresh history can never pollute a recorded split pair's verdict. The child's opening
-//! history is recorded from its OWN materialized record (the fork blob) — never copied from the
-//! parent's — which is what gives [`ConservationLedger::assert_partition`] teeth: a partition
-//! bug in the FSM shows up as a parent/child history mismatch, not a tautology.
+//! cell once — values are globally unique, so the per-`(group, key)` SET of recorded values
+//! dedupes across replicas, crash re-walks, and the child's inherited baseline alike. A set, not
+//! a monotone high-water mark: a MERGE folds a source's cells under the TARGET's ledger id where
+//! they can sit BELOW the target's own values, and a mark would drop each as stale though it is a
+//! distinct cell of a different lineage. The walk trusts membership, never positions either:
+//! `LogSm::split` mutates the record non-append-only (moved-key cells vanish record-wide) and a
+//! crash restore can resurrect a pre-split state, so a cell can sit below any position an earlier
+//! sweep reached — a positional resume watermark skips it forever, punching an interior hole in
+//! the recorded history that a later fork baseline exposes as a false conservation verdict. The
+//! set needs no resume state at all: a full re-walk re-presents only cells the ledger already
+//! admitted. Histories are keyed by an INCARNATION-QUALIFIED ledger id, so a recreated gid's
+//! fresh history can never pollute a recorded split pair's verdict. The child's opening history
+//! is recorded from its OWN materialized record (the fork blob) — never copied from the parent's
+//! — which is what gives [`ConservationLedger::assert_partition`] teeth: a partition bug in the
+//! FSM shows up as a parent/child history mismatch, not a tautology.
 
 use super::*;
 
@@ -91,7 +93,7 @@ impl MultiWorld {
   /// The incarnation-qualified conservation-ledger id: `gid + generation * 1_000_000`. Injective
   /// for this harness's id space (monotone gids from 100, far below the band) and readable in a
   /// panic (generation 1 of g105 prints as 1000105).
-  fn ledger_id(generation: u64, gid: u64) -> u64 {
+  pub(super) fn ledger_id(generation: u64, gid: u64) -> u64 {
     debug_assert!(gid < 1_000_000, "gid {gid} escaped the ledger-id band");
     generation * 1_000_000 + gid
   }
@@ -214,11 +216,26 @@ impl MultiWorld {
         .filter(|key| *key >= pending.point)
     }));
     let voters: BTreeSet<u64> = fork.config.voters().iter().copied().collect();
+    // The child's TAG LINEAGE: its inherited baseline carries the parent's tag — and whatever
+    // foreign tags the parent itself legitimately carried (its own ancestry and absorbs). The
+    // baseline floor covers these cells positionally for the child's own sweep; the carried
+    // set is what keeps them legitimate when a LATER MERGE moves them above another group's
+    // floor (the arrival-path-independence rule, merge edition).
+    let carried_tags: BTreeSet<u64> = self
+      .groups
+      .get(&pending.parent)
+      .map(|m| {
+        let mut t = m.carried_tags.clone();
+        t.insert(pending.parent);
+        t
+      })
+      .unwrap_or_default();
     self.groups.insert(
       fork.child,
       lifecycle::GroupMeta {
         voters,
         generation: fork.child_gen,
+        carried_tags,
         keys: pending.child_keys.clone(),
         // Every replica of this incarnation opens with the same inherited record, whichever
         // path delivered it: every parent replica manufactures the fork at the same applied
@@ -264,8 +281,18 @@ impl MultiWorld {
   /// passing through this path.
   fn wire_fork_replica(&mut self, node: u64, fork: sailing_proto::GroupFork<u64, u64, LogSm>) {
     let child = fork.child;
-    self.logs.insert((node, child), MemLog::new());
-    self.stables.insert((node, child), MemStable::new());
+    // Record the parent's DURABLE relay lineage on this node — mirroring a real driver's
+    // `engine.set_group_gen(&parent, fork.parent_gen_after)` in its fork drain — so a later restart
+    // restores the container's relay guard past this now-materialized fork (see `relayed_lineage`).
+    {
+      let e = self.relayed_lineage.entry((node, fork.parent)).or_insert(0);
+      *e = (*e).max(fork.parent_gen_after);
+    }
+    // Fresh stores in the world's configured mode (async under the merge profiles), so a fork-born
+    // child's stores match every other replica's rather than silently reverting to synchronous.
+    let (fresh_log, fresh_stable) = self.fresh_stores(node, child);
+    self.logs.insert((node, child), fresh_log);
+    self.stables.insert((node, child), fresh_stable);
     self.configs.insert((node, child), fork.config.clone());
     self.member_view.insert((node, child), true);
     *self.restarts.entry((node, child)).or_insert(0) += 1;
@@ -291,6 +318,9 @@ impl MultiWorld {
         fork.fsm,
         fork.blob,
         fork.read_only,
+        // The child's provenance token rides its manufactured baseline, so every replica — this
+        // one and any snapshot-wired latecomer — reports the same origin.
+        Some(fork.fork_id),
         epoch,
         log,
         stable,
@@ -353,14 +383,15 @@ impl MultiWorld {
   /// docs for the dedupe and ordering argument). Cells are recorded under the group HOLDING
   /// them — the payload's gid tag is the cross-talk oracle's business.
   ///
-  /// A FULL walk every sweep, on purpose: within one record values are monotone with position
-  /// (one global counter, accepted in log order), so the per-`(ledger, key)` value dedupe
-  /// admits each cell exactly once and a re-walk is pure no-op re-presentation. Any positional
-  /// (or value-anchored) resume shortcut has a hole this oracle cannot afford: a split-apply
-  /// shifts kept cells below the watermark within one settle window, and a crash restore
-  /// resurrects moved cells a pre-crash sweep never met — both skip real cells forever. The
-  /// world already pays O(record) per replica sweep to clone the record, so the walk adds no
-  /// asymptotic cost.
+  /// A FULL walk every sweep, on purpose: each value is globally unique, so the per-`(ledger,
+  /// key)` recorded-value SET admits each cell exactly once and a re-walk is pure no-op
+  /// re-presentation. A set rather than a value watermark because a merge folds a source's cells
+  /// under the target's ledger id BELOW the target's own values — a watermark would drop them as
+  /// stale though each is a distinct cell of a different lineage. Any positional resume shortcut
+  /// has a hole this oracle cannot afford either: a split-apply shifts kept cells below where a
+  /// watermark sat within one settle window, and a crash restore resurrects moved cells a
+  /// pre-crash sweep never met — both skip real cells forever. The world already pays O(record)
+  /// per replica sweep to clone the record, so the walk adds no asymptotic cost.
   pub(super) fn conserve_sweep(&mut self, gid: u64) {
     let led = Self::ledger_id(self.generation_of(gid), gid);
     for node in self.node_ids.clone() {
@@ -370,12 +401,16 @@ impl MultiWorld {
       let applied = self.applied_of(node, gid);
       for (index, cmd) in &applied {
         if let Some((_, key, value)) = super::super::decode_gkv(cmd) {
-          match self.cons_last.get(&(led, key)) {
-            Some(&last) if value <= last => {}
-            _ => {
-              self.conservation.record(led, key, *index, value);
-              self.cons_last.insert((led, key), value);
-            }
+          // Record each distinct value once, in first-encounter order: `insert` is true only the
+          // first time a value is seen, so full re-walks re-present cells harmlessly, and an
+          // absorbed cell folded below the target's own values is recorded rather than shadowed.
+          if self
+            .cons_recorded
+            .entry((led, key))
+            .or_default()
+            .insert(value)
+          {
+            self.conservation.record(led, key, *index, value);
           }
         }
       }
@@ -395,9 +430,81 @@ impl MultiWorld {
         parent_led: rec.parent_led,
         child_led: rec.child_led,
       };
-      self
-        .conservation
-        .assert_partition(rec.parent_led, rec.child_led, &rec.child_keys);
+      // The split-merge algebra reunifies sides through registered unions; the two exemption
+      // sets are the keys a merge re-routed, read off the merge records' transferred POPULATION
+      // (`absorbed_keys`). A written-history set would miss a key the absorbing side owned but
+      // never wrote and only writes post-absorb — the cross-talk leg's parent-merged-into-child
+      // gap. Both are one-hop: a source folds every earlier absorb into the population it hands
+      // on, so the transferred set is already transitive.
+      //
+      // `absorbed` — keys a union carried INTO this child (the child became a merge target): the
+      // cross-talk exemption.
+      let absorbed: BTreeSet<u16> = self
+        .merges
+        .iter()
+        .filter(|m| m.target_led == rec.child_led)
+        .flat_map(|m| m.absorbed_keys.iter().copied())
+        .collect();
+      // `reacquired` — keys a union re-introduced INTO this parent (the parent became a merge
+      // target): the LOSS exemption, symmetric to `absorbed`.
+      let reacquired: BTreeSet<u16> = self
+        .merges
+        .iter()
+        .filter(|m| m.target_led == rec.parent_led)
+        .flat_map(|m| m.absorbed_keys.iter().copied())
+        .collect();
+      // `inherited` — the parent-side CELL-level exemption, deliberately population-blind. An
+      // absorb copies the source's whole FSM RECORD into the target — including cells for keys
+      // OUTSIDE the source's owned population (carried/foreign-tagged cells) — and the sweep
+      // records them under the target, so an assigned key's cells can reach this parent through a
+      // union whose `absorbed_keys` never named the key (`reacquired` above is blind to them).
+      // Collect, per assigned key, every value in ANY inbound union source's record: values are
+      // globally unique, so such a value reached the parent's record only via that absorb, and a
+      // fresh parent own-write can never match one.
+      let mut inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+      for m in self
+        .merges
+        .iter()
+        .filter(|m| m.target_led == rec.parent_led)
+      {
+        for &k in &rec.child_keys {
+          let hist = self.conservation.history(m.source_led, k);
+          if !hist.is_empty() {
+            inherited
+              .entry(k)
+              .or_default()
+              .extend(hist.iter().map(|&(_, v)| v));
+          }
+        }
+      }
+      // `child_inherited` — the CHILD-side CELL-level exemption, the mirror of `inherited`. The
+      // same whole-record absorb carries cells of keys OUTSIDE the transferred population into a
+      // child that became a merge target (a parked key's cells ride the source's record), and the
+      // sweep records them under the child though `absorbed` never named the key. Collect, per key
+      // the source recorded, every value in its record: values are globally unique, so such a value
+      // reached the child only via that absorb, and a child own-write of an unassigned key can
+      // never match one.
+      let mut child_inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+      for m in self.merges.iter().filter(|m| m.target_led == rec.child_led) {
+        for k in self.conservation.keys_of(m.source_led) {
+          let hist = self.conservation.history(m.source_led, k);
+          if !hist.is_empty() {
+            child_inherited
+              .entry(k)
+              .or_default()
+              .extend(hist.iter().map(|&(_, v)| v));
+          }
+        }
+      }
+      self.conservation.assert_partition(
+        rec.parent_led,
+        rec.child_led,
+        &rec.child_keys,
+        &absorbed,
+        &reacquired,
+        &inherited,
+        &child_inherited,
+      );
       drop(ctx); // no panic: disarm silently
     }
   }

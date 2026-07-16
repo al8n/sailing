@@ -32,7 +32,10 @@ mod data;
 pub use data::{ByteCursor, Data, DecodeError};
 
 mod entry;
-pub use entry::{Entry, EntryKind, SplitPayload};
+pub use entry::{
+  CommitMergePayload, Entry, EntryKind, PrepareMergePayload, RollbackMergePayload, SplitPayload,
+  ThawDischargedPayload,
+};
 
 mod maybe_owned;
 pub use maybe_owned::MaybeOwned;
@@ -45,14 +48,30 @@ pub use conf::{
   ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
 };
 
+/// Decode a `ConfChange` entry's payload bytes into a [`ConfChangeV2`] — the read half of the
+/// committed membership-change codec. Exposed for audit / replay walks over a committed log where no
+/// live tracker survives to fold the change (e.g. a simulation checker reconstructing the config a
+/// committed conf-change installed after the applying replicas have all departed).
+pub fn decode_conf_change_v2<I: NodeId>(
+  data: bytes::Bytes,
+) -> Result<ConfChangeV2<I>, DecodeError> {
+  crate::wire::decode_conf_change_v2::<I>(data)
+}
+
+/// Encode a [`ConfChangeV2`] to its `ConfChange` entry-payload bytes — the write half of the codec,
+/// the exact inverse of [`decode_conf_change_v2`].
+pub fn encode_conf_change_v2<I: NodeId>(cc: &ConfChangeV2<I>, buf: &mut std::vec::Vec<u8>) {
+  crate::wire::encode_conf_change_v2::<I>(cc, buf)
+}
+
 mod quorum;
 pub(crate) use quorum::{JointConfig, MajorityConfig, VoteResult};
 
 mod message;
 pub mod wire;
 pub use message::{
-  AppendEntries, AppendResponse, Heartbeat, HeartbeatResponse, InstallSnapshot, Message, Outgoing,
-  ReadIndex, ReadIndexResponse, RequestVote, SnapshotMeta, SnapshotResponse, TimeoutNow,
+  AppendEntries, AppendResponse, ForkId, Heartbeat, HeartbeatResponse, InstallSnapshot, Message,
+  Outgoing, ReadIndex, ReadIndexResponse, RequestVote, SnapshotMeta, SnapshotResponse, TimeoutNow,
   VoteResponse,
 };
 
@@ -67,7 +86,8 @@ pub use storage::{
 
 mod error;
 pub use error::{
-  ConfigError, CreateGroupError, ProposeError, ReadIndexError, SplitError, TransferError,
+  ConfigError, CreateGroupError, MergeError, ProposeError, ReadIndexError, RemoveError, SplitError,
+  TransferError,
 };
 
 mod inflights;
@@ -86,16 +106,18 @@ pub use read_only::{FailoverReadWindow, ReadState};
 
 mod event;
 pub use event::{
-  Applied, ConfChanged, Event, LeaderChanged, ReadModeChanged, SplitApplied, SplitStale,
+  Applied, ConfChanged, Event, LeaderChanged, MergeAborted, MergeFrozen, MergeRolledBack, Merged,
+  ReadModeChanged, SplitApplied, SplitStale,
 };
 
 mod endpoint;
-pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
+pub use endpoint::{Endpoint, PeerProgress, PendingMergeApply, PoisonReason, Role, TimerKind};
 
 mod multi;
 pub use multi::{
   EngineLog, EngineStable, EngineStorageError, FORK_BASE_INDEX, FORK_BASE_TERM, FloorStore,
-  GroupEngine, GroupFork, GroupId, MERGED_FLOOR, MultiRaft, NoFloors, floor_admits,
+  GroupEngine, GroupFork, GroupId, GroupStores, MERGED_FLOOR, MergeResolution, MultiRaft, NoFloors,
+  floor_admits,
 };
 
 mod tracker;
@@ -157,8 +179,8 @@ pub use transport::quic::MultiQuicCoordinator;
 pub use transport::{ClusterId, ConnId, ConnRole, Peer, TransportError};
 #[cfg(feature = "tcp")]
 pub use transport::{
-  GroupControl, GroupStores, Intake, LabelOptions, Labeled, MultiStreamCoordinator, Passthrough,
-  RecordIo, StreamCoordinator, StreamTransport,
+  GroupControl, Intake, LabelOptions, Labeled, MultiStreamCoordinator, Passthrough, RecordIo,
+  StreamCoordinator, StreamTransport,
 };
 
 #[cfg(test)]

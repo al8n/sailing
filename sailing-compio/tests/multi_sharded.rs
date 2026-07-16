@@ -249,11 +249,11 @@ fn sharded_host_commits_and_isolates_planes() {
   // independently-nonzero counters on one node witness the independent WALs).
   for h in &handles {
     assert!(
-      h.engine_metrics(shard_a).unwrap().flushes() > 0,
+      h.engine_metrics(shard_a).unwrap().barriers() > 0,
       "plane {shard_a}'s barrier ran"
     );
     assert!(
-      h.engine_metrics(shard_b).unwrap().flushes() > 0,
+      h.engine_metrics(shard_b).unwrap().barriers() > 0,
       "plane {shard_b}'s barrier ran"
     );
   }
@@ -733,4 +733,114 @@ fn sharded_split_stays_in_plane_and_refuses_cross_plane() {
   for h in [&node1, &node2] {
     bo(h.shutdown()).expect("the sharded host tears down");
   }
+}
+
+/// Merges stay within one plane: a same-plane pair freezes, parks, and resolves through the
+/// plane's own crank (the union served, the source floored terminally — the factory/admission
+/// edge refuses its id at every generation), while a cross-plane pairing is refused typed at
+/// the HANDLE, before any command crosses a channel — the plane cannot even see the other
+/// group.
+#[test]
+fn same_plane_merges_resolve_and_cross_plane_refuses() {
+  let base: SocketAddr = "127.0.0.1:45300".parse().unwrap();
+  let node: ShardedMultiHandle<u64, u64, CountSm> = spawn_host(1, base, None);
+  let map = ShardMap::<u64>::uniform(2);
+  // Two gids on ONE plane (the merge pair) + one on the other (the refusal probe).
+  let g1 = 100u64;
+  let plane = map.shard(&g1);
+  let g2 = (2u64..200)
+    .map(|i| i * 100)
+    .find(|g| map.shard(g) == plane)
+    .expect("a same-plane sibling exists");
+  let g3 = (2u64..200)
+    .map(|i| i * 100)
+    .find(|g| map.shard(g) != plane)
+    .expect("an other-plane gid exists");
+  for gid in [g1, g2, g3] {
+    bo(node.create_group(gid, config(1, vec![1]), gid, CountSm::default(), 0))
+      .expect("group admission");
+  }
+  let h1 = node.group(g1);
+  let h2 = node.group(g2);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&h1), b"s1"), 1);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&h1), b"s2"), 2);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&h2), b"t1"), 1);
+
+  // Orient the pair by the direction rule: the source must encode strictly ABOVE the target, which
+  // for u64 is LE-byte-string order, NOT numeric order — g2 is the first same-plane multiple of
+  // 100, which may be a two-byte id (e.g. 300) whose LE encoding sorts BELOW the single-byte g1.
+  // The larger-encoding id is the source that dissolves; the union (2 + 1 = 3) is served by the
+  // target either way.
+  let (msrc, mtgt, h_tgt, h_src) = if g1.to_le_bytes() > g2.to_le_bytes() {
+    (g1, g2, &h2, &h1)
+  } else {
+    (g2, g1, &h1, &h2)
+  };
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
+
+  // Cross-plane pairings refuse at the handle edge, typed, before ANY propose.
+  for verdict in [
+    bo(node.prepare_merge(g2, g3)),
+    bo(node.commit_merge(g3, g2)),
+  ] {
+    match verdict {
+      Err(DriverError::Rejected { reason }) => {
+        assert!(reason.contains("planes"), "got: {reason}");
+      }
+      other => panic!("cross-plane must refuse at the handle, got {other:?}"),
+    }
+  }
+
+  // The same-plane merge runs the full choreography inside its plane.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(std::time::Instant::now() < deadline, "no freeze accepted");
+    match bo(node.prepare_merge(msrc, mtgt)) {
+      Ok(_) => break,
+      Err(DriverError::Rejected { reason }) if reason == inverted => {
+        panic!("the freeze is permanently inverted — source must encode above target")
+      }
+      Err(_) => {}
+    }
+    std::thread::sleep(Duration::from_millis(30));
+  }
+  loop {
+    assert!(std::time::Instant::now() < deadline, "no commit accepted");
+    if bo(node.commit_merge(mtgt, msrc)).is_ok() {
+      break;
+    }
+    std::thread::sleep(Duration::from_millis(30));
+  }
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the union never served"
+    );
+    if bo(h_tgt.query(|sm: &CountSm| sm.count())) == Ok(3) {
+      break;
+    }
+    std::thread::sleep(Duration::from_millis(30));
+  }
+
+  // The merged-away id is floored TERMINALLY on its plane: re-admission refuses at any
+  // generation — the same floor_admits gate the factory's pre-build check runs, so a solicited
+  // re-materialization can never resurrect it either.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the source never died"
+    );
+    if matches!(bo(h_src.status()), Err(DriverError::Rejected { .. })) {
+      break;
+    }
+    std::thread::sleep(Duration::from_millis(30));
+  }
+  match bo(node.create_group(msrc, config(1, vec![1]), 9, CountSm::default(), 42)) {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(reason.contains("floor"), "got: {reason}");
+    }
+    other => panic!("a merged-away id must never re-admit, got {other:?}"),
+  }
+
+  bo(node.shutdown()).expect("every plane tears down");
 }

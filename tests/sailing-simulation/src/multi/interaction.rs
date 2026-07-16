@@ -47,6 +47,22 @@ impl Default for MultiInteractionEnv {
   }
 }
 
+/// A one-node view over the harness's `(node, gid)` store table — the [`GroupStores`] seam a
+/// container teardown reads a freeze-pending source's log through (the `Claimed` leg).
+struct NodeStores<'a> {
+  node: u64,
+  stores: &'a mut BTreeMap<(u64, u64), (MemLog, MemStable<u64>)>,
+}
+
+impl sailing_proto::GroupStores<u64, MemLog, MemStable<u64>> for NodeStores<'_> {
+  fn stores(&mut self, group: &u64) -> Option<(&mut MemLog, &mut MemStable<u64>)> {
+    self
+      .stores
+      .get_mut(&(self.node, *group))
+      .map(|(l, s)| (l, s))
+  }
+}
+
 /// Run a single multi-group data-driven file: execute each directive against a fresh
 /// [`MultiInteractionEnv`], comparing rendered output against the recorded expectation, or
 /// rewriting the file in place when `SAILING_REWRITE` is set. Panics with a readable diff on any
@@ -168,7 +184,7 @@ impl MultiInteractionEnv {
       let host = self.hosts.entry(id).or_default();
       let cfg = Config::try_new(id, voters.clone(), ELECTION_TIMEOUT, HEARTBEAT_INTERVAL)
         .expect("valid harness config");
-      match host.create_group(gid, cfg, self.now, id, LogSm::new()) {
+      match host.create_group(gid, 0, cfg, self.now, id, LogSm::new()) {
         Ok(()) => {
           self
             .stores
@@ -198,11 +214,16 @@ impl MultiInteractionEnv {
       return std::format!("g{gid}: not hosted anywhere\n");
     }
     for &id in &hosting {
-      self
-        .hosts
-        .get_mut(&id)
-        .expect("host exists")
-        .remove_group(&gid);
+      {
+        let host = self.hosts.get_mut(&id).expect("host exists");
+        let mut ns = NodeStores {
+          node: id,
+          stores: &mut self.stores,
+        };
+        host
+          .remove_group(&gid, &mut ns)
+          .expect("a scenario never tears down an unresolved merge participant");
+      }
       self.stores.remove(&(id, gid));
     }
     let before = self.bus.len();
@@ -332,7 +353,7 @@ impl MultiInteractionEnv {
           .expect("valid observer config");
       let host = self.hosts.entry(node).or_default();
       host
-        .create_group(gid, cfg, self.now, node, LogSm::new())
+        .create_group(gid, 0, cfg, self.now, node, LogSm::new())
         .expect("observer admission");
       self
         .stores
@@ -683,6 +704,7 @@ impl MultiInteractionEnv {
             fork.fsm,
             fork.blob,
             fork.read_only,
+            Some(fork.fork_id),
             1,
             log,
             stable,

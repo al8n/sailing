@@ -1,16 +1,16 @@
-//! A shared in-memory group-storage engine with ONE batched durability barrier.
+//! A shared in-memory group-storage engine with ONE batched visibility barrier.
 //!
 //! [`GroupEngine`] hosts every co-located Raft group's log and stable state and lends each group a
 //! `(log, stable)` handle pair ([`EngineLog`], [`EngineStable`]) implementing the ordinary
 //! single-group [`LogStore`]/[`StableStore`] contracts, with one engine-wide difference: a
 //! `submit_*`/`compact` STAGES its completion instead of enqueueing it, and only
-//! [`GroupEngine::flush`] — the durability barrier — releases every group's staged completions
-//! into that group's poll FIFO. One flush is one fsync-equivalent covering ALL groups' staged
-//! writes: the cross-group fsync amortization the multi-Raft design exists for. This is the
-//! Sans-I/O reference implementation of the Phase-2 storage contract in `MULTI_RAFT.md`; a disk
-//! engine mirrors these semantics over group-prefixed keys and a real write batch — INCLUDING
-//! the per-group lineage records (incarnation gen + admission floor), which outlive
-//! `remove_group` and fold at the same barrier.
+//! [`GroupEngine::flush`] — the batch barrier — releases every group's staged completions
+//! into that group's poll FIFO. One flush is one batched in-memory visibility barrier covering ALL
+//! groups' staged writes — NOT crash durability: the cross-group batching the multi-Raft design
+//! exists for. This is the Sans-I/O reference implementation of the Phase-2 storage contract in
+//! `MULTI_RAFT.md`; a disk engine mirrors these semantics over group-prefixed keys and a real
+//! write batch — the durable form — INCLUDING the per-group lineage records (incarnation gen +
+//! admission floor), which outlive `remove_group` and fold at the same barrier.
 //!
 //! The per-group storage invariants hold BY CONSTRUCTION under a barrier: log durability is
 //! prefix-ordered because everything staged becomes durable together, and stable completions
@@ -98,7 +98,7 @@ impl LineageRecord {
 }
 
 /// A shared in-memory storage engine: ONE engine hosts EVERY co-located group's replicated log
-/// and stable state, keyed by group id, with a single batched durability barrier
+/// and stable state, keyed by group id, with a single batched visibility barrier
 /// ([`flush`](Self::flush)) spanning all of them.
 ///
 /// Per-group handles come from [`stores`](Self::stores) — and, under the `tcp` feature, from the
@@ -118,8 +118,8 @@ pub struct GroupEngine<G, I> {
   /// Lineage writes staged since the last barrier, monotone-max folded into `lineage` by
   /// [`flush`](Self::flush).
   lineage_staged: BTreeMap<G, LineageRecord>,
-  flushes: u64,
-  ops_flushed: u64,
+  barriers: u64,
+  ops_batched: u64,
   /// The per-group snapshot-staging byte cap (see
   /// [`set_snapshot_staging_cap`](Self::set_snapshot_staging_cap)); allocator-bound by default.
   staging_cap: usize,
@@ -136,8 +136,8 @@ impl<G, I> GroupEngine<G, I> {
       groups: BTreeMap::new(),
       lineage: BTreeMap::new(),
       lineage_staged: BTreeMap::new(),
-      flushes: 0,
-      ops_flushed: 0,
+      barriers: 0,
+      ops_batched: 0,
       staging_cap: usize::MAX,
     }
   }
@@ -171,17 +171,17 @@ impl<G, I> GroupEngine<G, I> {
   }
 
   /// How many times [`flush`](Self::flush) has run — every call counts, including a barrier that
-  /// released nothing. Together with [`ops_flushed`](Self::ops_flushed) this is the amortization
-  /// metric: operations per flush is the cross-group batch factor.
+  /// released nothing. Together with [`ops_batched`](Self::ops_batched) this is the batch metric:
+  /// operations per barrier is the cross-group batch factor.
   #[must_use]
-  pub const fn flushes(&self) -> u64 {
-    self.flushes
+  pub const fn barriers(&self) -> u64 {
+    self.barriers
   }
 
   /// Total operations completed across every [`flush`](Self::flush) so far.
   #[must_use]
-  pub const fn ops_flushed(&self) -> u64 {
-    self.ops_flushed
+  pub const fn ops_batched(&self) -> u64 {
+    self.ops_batched
   }
 
   /// Whether ANY hosted group holds staged-but-unreleased work — the driver's exact re-arm signal
@@ -202,13 +202,15 @@ impl<G, I> GroupEngine<G, I> {
       || !self.lineage_staged.is_empty()
   }
 
-  /// THE durability barrier: make every group's staged log appends/compactions and stable
-  /// writes/snapshots durable at once, releasing their completions into each owning group's poll
+  /// THE batch barrier: make every group's staged log appends/compactions and stable
+  /// writes/snapshots VISIBLE at once, releasing their completions into each owning group's poll
   /// FIFO. Returns the number of operations completed across all groups.
   ///
-  /// One flush is one fsync-equivalent covering EVERY hosted group's staged writes — the
-  /// cross-group batching a multi-Raft host exists for (a disk engine renders it as one write
-  /// batch + one fsync over group-prefixed keys). The per-group contracts hold trivially under a
+  /// One flush is one batched in-memory visibility barrier covering EVERY hosted group's staged
+  /// writes — NOT crash durability (this engine is in-memory; the host drivers' "Storage is
+  /// in-memory" notes say the same): the cross-group batching a multi-Raft host exists for (a disk
+  /// engine renders the same barrier as one write batch + one fsync over group-prefixed keys, and
+  /// only that adds durability). The per-group contracts hold trivially under a
   /// barrier: log durability is prefix-ordered (everything staged becomes durable together), and
   /// stable completions release in submit order (each group's staging is a FIFO). Log completions
   /// release in submit order too — the trait permits any order; submit order is the simplest
@@ -228,8 +230,8 @@ impl<G, I> GroupEngine<G, I> {
       self.lineage.entry(gid).or_default().fold(staged);
       released += 1;
     }
-    self.flushes += 1;
-    self.ops_flushed += released as u64;
+    self.barriers += 1;
+    self.ops_batched += released as u64;
     released
   }
 }
@@ -281,12 +283,30 @@ where
   /// The next boot epoch for `gid` — a per-group monotonic counter (first call returns 1). Pass
   /// it to [`MultiRaft::restore_group`](crate::MultiRaft::restore_group) so each incarnation's
   /// [`OpId`]s strictly exceed every prior incarnation's for that group (the epoch-major ordering
-  /// the completion plumbing relies on). `None` if no such group.
-  #[must_use = "`None` means no such group; the returned epoch is the restore_group argument"]
+  /// the completion plumbing relies on).
+  ///
+  /// `None` if no such group is hosted, OR if the counter is EXHAUSTED. The increment is CHECKED,
+  /// never wrapping: a wrapped epoch restarts at 0 and collides with a live incarnation, folding
+  /// two incarnations onto ONE `(group, epoch)` identity for every gen-keyed observer — the same
+  /// identity fail-stop class as the [`OpId`]/read-round ceilings. Exhaustion is unreachable in
+  /// practice (2^64 restarts of one group), so a caller surfaces the refusal rather than wrapping.
+  #[must_use = "`None` means no such group or an exhausted counter; the returned epoch is the restore_group argument"]
   pub fn next_boot_epoch(&mut self, gid: &G) -> Option<u64> {
     let storage = self.groups.get_mut(gid)?;
-    storage.boot_epochs += 1;
-    Some(storage.boot_epochs)
+    let next = storage.boot_epochs.checked_add(1)?;
+    storage.boot_epochs = next;
+    Some(next)
+  }
+
+  /// Seed `gid`'s boot-epoch counter so the exhaustion fail-stop can be exercised without 2^64
+  /// calls. Panics if no such group is hosted — a test must admit the group first.
+  #[cfg(test)]
+  fn set_boot_epochs_for_test(&mut self, gid: &G, boot_epochs: u64) {
+    self
+      .groups
+      .get_mut(gid)
+      .expect("group must be hosted to seed its boot epoch")
+      .boot_epochs = boot_epochs;
   }
 
   /// `gid`'s admission floor (0 = never floored) — the FRESHEST value, `max(durable, staged)`.
@@ -342,6 +362,76 @@ where
     let rec = self.lineage_staged.entry(gid.clone()).or_default();
     rec.generation = rec.generation.max(generation);
   }
+
+  /// The admission floor a REMOVAL of `gid` must persist — one past the id's removal CEILING,
+  /// the highest generation this incarnation could have minted on this host: the engine's
+  /// mirrored lineage record ⊔ the stores' snapshot-meta lineage ⊔ a shape-kind scan of the
+  /// resident log (every `Split`/`PrepareMerge`/`CommitMerge`/`RollbackMerge` entry names the
+  /// generation it sets for its OWN group, and every lineage move rides the group's own log or
+  /// its snapshot meta — nothing else can mint). `0` (no fence) for an id that never reshaped,
+  /// preserving the gen-0 volatile-tombstone rejoin.
+  ///
+  /// With the drivers' eager mirrors (admission, fork relay, and the merge lineage events) the
+  /// record leg already carries the ceiling, so the stores legs are almost always a no-op; they
+  /// exist for the crash window where an applied move's mirror never became durable and the
+  /// group was never re-hosted (a stores-only removal). Flooring one past the ceiling makes
+  /// every outstanding gen-keyed authorization (a merge-abort thaw obligation's `expected`
+  /// above all) discharge off the floor and forces a recreate to admit strictly above it — with
+  /// NO knowledge of any other group. Over-approximation is safe: a truncated-away suffix entry
+  /// only raises the fence, never lowers what durability would demand. The `+ 1` SATURATES: a
+  /// ceiling at the highest working generation (one below the reserved terminal) floors at
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) — the id is then permanently retired, exactly the
+  /// terminal verdict a group that can never reshape again should carry — rather than wrapping
+  /// past the terminal to `0`.
+  #[must_use]
+  pub fn removal_floor(&self, gid: &G) -> u64 {
+    let mut ceiling = self.group_gen(gid);
+    if let Some(storage) = self.groups.get(gid) {
+      let meta_gen = storage
+        .stable
+        .snapshot
+        .as_ref()
+        .map_or(0, |(m, _)| m.shape_gen())
+        .max(
+          storage
+            .stable
+            .durable_snapshot
+            .as_ref()
+            .map_or(0, SnapshotMeta::shape_gen),
+        );
+      ceiling = ceiling.max(meta_gen);
+      for entry in &storage.log.entries {
+        let minted = match entry.kind() {
+          crate::EntryKind::Split => crate::wire::decode_split_payload(entry.data_bytes())
+            .map_or(0, |p| p.parent_gen_after()),
+          crate::EntryKind::PrepareMerge => {
+            crate::wire::decode_prepare_merge_payload(entry.data_bytes())
+              .map_or(0, |p| p.source_gen_after())
+          }
+          crate::EntryKind::CommitMerge => {
+            crate::wire::decode_commit_merge_payload(entry.data_bytes())
+              .map_or(0, |p| p.target_gen_after())
+          }
+          crate::EntryKind::RollbackMerge => {
+            crate::wire::decode_rollback_merge_payload(entry.data_bytes()).map_or(0, |p| {
+              if p.is_unfreeze() {
+                p.source_gen_after()
+              } else {
+                p.target_gen_after()
+              }
+            })
+          }
+          _ => 0,
+        };
+        ceiling = ceiling.max(minted);
+      }
+    }
+    if ceiling == 0 {
+      0
+    } else {
+      ceiling.saturating_add(1)
+    }
+  }
 }
 
 impl<G, I> Default for GroupEngine<G, I> {
@@ -350,9 +440,9 @@ impl<G, I> Default for GroupEngine<G, I> {
   }
 }
 
-/// Frame-demux resolution for the multi-group coordinators: stable and non-aliasing by
-/// construction (disjoint map entries); an unknown group is `None` — the unhosted-drop path.
-#[cfg(feature = "tcp")]
+/// Frame-demux resolution for the multi-group coordinators — and the per-crank merge service's
+/// store seam: stable and non-aliasing by construction (disjoint map entries); an unknown group
+/// is `None` — the unhosted-drop path.
 impl<G, I> crate::GroupStores<G, EngineLog, EngineStable<I>> for GroupEngine<G, I>
 where
   G: Ord,

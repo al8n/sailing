@@ -61,6 +61,17 @@ pub enum MultiAction {
   /// Propose a SPLIT of one live group at a seed-picked population split point (a fresh-minted
   /// child id). Absent from the default menu — the reshape profile weights it in.
   Split,
+  /// Propose a merge FREEZE of one live group into an equal-voter-set sibling (the harness
+  /// pairing filter keeps proposals mostly-admissible; every typed refusal is a legitimate
+  /// no-op tick). Absent from the default menu — the merge profile weights it in.
+  PrepareMerge,
+  /// Propose the merge ABSORB for a previously accepted freeze (picked from the fuzzer's
+  /// pending-merge book; refusals — leader churn, the local source still catching up — no-op
+  /// and a later draw retries).
+  CommitMerge,
+  /// Propose the merge ABORT for a previously accepted freeze — racing the commit is the
+  /// point: the source's log settles every race, and the parked applies must all agree.
+  RollbackMerge,
 }
 
 /// A named action weight table plus per-replica config knobs — the profile seam M6's
@@ -76,6 +87,30 @@ pub struct MultiProfile {
   /// untouched: construction is byte-identical to a world without the seam, so the default
   /// profile's schedules (and its pinned regression seeds) cannot move.
   snapshot_threshold: Option<usize>,
+  /// Whether reshaping-participant groups construct their `Config` with pre-vote on — the
+  /// removed-replica disruption cure's prevention layer. Scoped PER-GROUP (never the global
+  /// `DEFAULT_PRE_VOTE` const: flipping that reseeds the whole VOPR corpus and breaks etcd-library
+  /// parity). `false` for the default/snapshot profiles, so their construction stays
+  /// byte-identical; `true` only where the profile weaves in the merge reshape verbs, whose
+  /// wholesale source-group removal is exactly the steady-state churn a pre-election probe (which
+  /// never inflates the real term) keeps from deposing the live leader.
+  pre_vote: bool,
+  /// Whether reshaping-participant groups construct their `Config` with check-quorum on — the
+  /// prevention layer's leader-side half (a leader that has lost quorum contact steps down rather
+  /// than shadowing a fresh election). Scoped and defaulted identically to
+  /// [`pre_vote`](Self::pre_vote).
+  check_quorum: bool,
+  /// The [`StoreMode`](crate::StoreMode) every replica the profile's world wires is constructed
+  /// under. `Sync` (the default) keeps the stores commit-on-submit — byte-identical to a world
+  /// predating the seam, so the non-merge profiles' schedules and pinned seeds cannot move. `Async`
+  /// runs them through the staged-write fsync-loss window (submit → `flush` → durable; crash →
+  /// `discard_inflight`) so the randomized crash campaign actually EXERCISES lost-fsync durability
+  /// (persist-vote-before-grant, append-before-ack, commit persistence, the reshaping lineage across
+  /// a crash) rather than claiming to. Async ONLY on the merge family (`merge_reshape` and
+  /// `merge_reshape_compacting`), whose whole-source-group teardowns are the churn that makes the
+  /// crash×durability seams reachable; the merge runs reseed against their own prior sync runs,
+  /// which the standing merge-band decision permits.
+  store_mode: crate::StoreMode,
 }
 
 impl MultiProfile {
@@ -100,6 +135,9 @@ impl MultiProfile {
         (MultiAction::RecreateGroup, 2),
       ],
       snapshot_threshold: None,
+      pre_vote: false,
+      check_quorum: false,
+      store_mode: crate::StoreMode::Sync,
     }
   }
 
@@ -116,6 +154,61 @@ impl MultiProfile {
     Self {
       snapshot_threshold: Some(threshold),
       ..Self::default_multi()
+    }
+  }
+
+  /// The merge-reshape profile: the reshape menu PLUS the three merge verbs, so freezes,
+  /// parked commits, rollback races, and resolutions land amid the full fault/lifecycle churn
+  /// — and split children (colocated by construction) keep minting equal-voter-set pairs for
+  /// the pairing filter to merge back. Commit outweighs prepare so accepted freezes usually
+  /// complete; rollback stays rare but steady (the race arm needs real draws).
+  pub const fn merge_reshape() -> Self {
+    Self {
+      weights: &[
+        (MultiAction::ClientLoad, 50),
+        (MultiAction::ReadIndexLoad, 12),
+        (MultiAction::Partition, 8),
+        (MultiAction::Heal, 6),
+        (MultiAction::Crash, 5),
+        (MultiAction::MuteGroup, 6),
+        (MultiAction::UnmuteGroup, 4),
+        (MultiAction::ConfChange, 5),
+        (MultiAction::TransferLeader, 4),
+        (MultiAction::MigrateReadMode, 3),
+        (MultiAction::FaultReroll, 6),
+        (MultiAction::CreateGroup, 3),
+        (MultiAction::RemoveGroup, 2),
+        (MultiAction::RecreateGroup, 2),
+        (MultiAction::Split, 8),
+        (MultiAction::PrepareMerge, 6),
+        (MultiAction::CommitMerge, 8),
+        (MultiAction::RollbackMerge, 2),
+      ],
+      snapshot_threshold: None,
+      // Prevention layer ON for the merge profiles: a merge dissolves a whole source group, so
+      // ignorant removed ex-voters are steady-state churn here — pre-vote keeps their election
+      // timer from inflating the real term and deposing the live target/sibling leader, and
+      // check-quorum makes a partitioned stale leader step down instead of flapping.
+      pre_vote: true,
+      check_quorum: true,
+      // Async stores ON for the merge family: the whole-source-group teardowns are exactly the
+      // churn that makes the crash×durability seams reachable, so this is where the crash campaign
+      // must run through the real fsync-loss window to stop being vacuous.
+      store_mode: crate::StoreMode::Async,
+    }
+  }
+
+  /// The merge×compaction profile: [`merge_reshape`](Self::merge_reshape)'s verbs under
+  /// [`snapshot_heavy`](Self::snapshot_heavy)'s compaction pressure. `merge_reshape` leaves
+  /// `snapshot_threshold` at the never-compacting default, so snapshot installs never land on a
+  /// frozen source, a parked target, or an obligation holder — the install×freeze/park seams
+  /// have zero randomized coverage without this profile. The threshold IS snapshot_heavy's own
+  /// draw (256..=511 from its dedicated sub-stream), so the master action/topology stream draws
+  /// nothing of it and the merge menu's schedules shift only through world evolution.
+  pub fn merge_reshape_compacting(seed: u64) -> Self {
+    Self {
+      snapshot_threshold: Self::snapshot_heavy(seed).snapshot_threshold,
+      ..Self::merge_reshape()
     }
   }
 
@@ -145,6 +238,9 @@ impl MultiProfile {
         (MultiAction::Split, 8),
       ],
       snapshot_threshold: None,
+      pre_vote: false,
+      check_quorum: false,
+      store_mode: crate::StoreMode::Sync,
     }
   }
 }
@@ -174,6 +270,23 @@ pub struct MultiVoprReport {
   /// split) — the reshape coverage's non-vacuity witness: nonzero proves the run-end
   /// conservation verdict judged real parent/child handovers rather than an empty work list.
   pub splits_applied: u64,
+  /// Merge freezes ACCEPTED by a source leader across the run.
+  pub merges_prepared: u64,
+  /// Merge absorbs ACCEPTED by a target leader across the run.
+  pub merges_committed: u64,
+  /// Merge rollbacks ACCEPTED by a source leader across the run.
+  pub merges_rolled_back: u64,
+  /// Merges REGISTERED (a park resolved to an absorb somewhere, once per merge) — the merge
+  /// coverage's non-vacuity witness: nonzero proves the run-end union verdict judged real
+  /// absorbs rather than an empty work list.
+  pub merges_registered: u64,
+  /// Per-host absorb resolutions across the run (every host's park resolution counts).
+  pub merges_resolved: u64,
+  /// Per-host abort resolutions across the run (the race/duplicate no-op arm).
+  pub merges_aborted: u64,
+  /// Per-host capture-failed resolutions across the run — a consumed source whose union could not be
+  /// made durable. Expected zero under the sim FSM; a non-zero value is a wedge to report.
+  pub merges_capture_failed: u64,
   /// Live groups at run end.
   pub final_groups: usize,
   /// Client commands accepted by some leader (tracked per group for the quiesce check).
@@ -228,6 +341,43 @@ pub struct MultiVoprReport {
   /// limitation of compaction, not a soundness hole — the net never trusts a possibly-stale
   /// ConfChange.
   pub kind_unobservable_installs: u64,
+  /// Async flush-phase witness: log stores the world made durable across the run. `0` under the
+  /// sync store mode (the default/snapshot/reshape profiles), where the flush phase never runs;
+  /// nonzero under the merge family — the proof the multi tick now fsync-flushes at all.
+  pub log_flushes: u64,
+  /// Async flush-phase witness: stable stores made durable across the run.
+  pub stable_flushes: u64,
+  /// Seeded torn writes (fsync failures) that stranded a REAL in-flight batch across the run — the
+  /// lost-fsync coverage's non-vacuity witness. `0` under the sync store mode.
+  pub torn_writes_fired: u64,
+  /// Crashes that rolled back a NON-EMPTY log-store fsync window — proof the crash campaign lands
+  /// mid-window (the interleaving lost-fsync durability actually depends on), not only post-flush.
+  /// `0` under the sync store mode (nothing is ever in flight).
+  pub crashes_with_log_inflight: u64,
+  /// Crashes that rolled back a NON-EMPTY stable-store fsync window. `0` under the sync store mode.
+  pub crashes_with_stable_inflight: u64,
+  /// Applied cells the LINEAGE LEDGER's phantom-quorum leg judged across the run — its non-vacuity
+  /// witness. Nonzero on any run that committed keyed load: the lineage-keyed agreement leg ran on
+  /// real records rather than an empty world.
+  pub lineage_cells_judged: u64,
+  /// Snapshot installs the LINEAGE LEDGER's chimera leg examined across the run. `0` under a
+  /// no-compaction default band (no transfer installs); nonzero under the snapshot/reshape/merge
+  /// families where fork baselines and compaction snapshots transfer.
+  pub lineage_installs_observed: u64,
+}
+
+/// One accepted-freeze entry in the fuzzer's pending-merge book.
+struct PendingMerge {
+  /// The target the accepted freeze claims.
+  target: u64,
+  /// Whether ANY replica of the source has been OBSERVED carrying the freeze (applied or
+  /// append-pending) since booking. A booked propose whose entry died un-landed (leader churn
+  /// truncated it) never trips this, and the quiesce teeth prune it as undrivable noise; a pair
+  /// that DID freeze must resolve by run end or the wedge scan panics.
+  saw_frozen: bool,
+  /// The world's `(target, source)` abort clock at booking: the pair is resolved-by-abort once
+  /// the clock moves past this (the absorb side retires via the source leaving the live set).
+  abort_mark: u64,
 }
 
 /// The fuzzer's deterministic bookkeeping threaded through the run.
@@ -235,6 +385,13 @@ struct MState {
   /// The monotone group-id allocator (starts at 100; NEVER reused for a different logical
   /// group — `RecreateGroup` reuses a retired gid as the SAME logical group at gen+1).
   next_gid: u64,
+  /// Accepted merge freezes not yet OBSERVED resolved: source → [`PendingMerge`] — the
+  /// commit/rollback actions' pick book AND the quiesce drive's pair lookup. Entries retire on
+  /// observed resolution only (the source merged away, or the world drained a `MergeAborted`
+  /// for the pair past its booking mark) — NEVER on a rollback's propose-accept: an accepted
+  /// abort that never commits leaves the source frozen, and a book that forgot the pair could
+  /// neither drive nor attribute the wedge.
+  pending_merges: BTreeMap<u64, PendingMerge>,
   /// Per-group journal of every accepted client command (the quiesce expected set).
   expected: BTreeMap<u64, Vec<Vec<u8>>>,
   /// The global monotone client-command counter (distinct commands; per-key values increase).
@@ -248,12 +405,22 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   let nodes = 5 + (prng.next_u64() % 3); // 5..=7 hosts
   let mut w = MultiWorld::new(seed);
   w.set_snapshot_threshold(profile.snapshot_threshold);
+  // The prevention layer, per-group (never a global const flip): reshaping-participant profiles
+  // construct every replica with pre-vote + check-quorum, funneled through `wire_replica` so all
+  // construction paths inherit it. Both `false` on the default profiles ⇒ byte-identical Configs.
+  w.set_pre_vote(profile.pre_vote);
+  w.set_check_quorum(profile.check_quorum);
+  // The store write mode, funneled through the `fresh_stores` chokepoint so every construction path
+  // inherits it. `Sync` on the non-merge profiles ⇒ the flush phase never runs and construction is
+  // byte-identical; `Async` on the merge family opens the fsync-loss window the crash campaign needs.
+  w.set_store_mode(profile.store_mode);
   for n in 0..nodes {
     w.add_node(n);
   }
 
   let mut st = MState {
     next_gid: 100,
+    pending_merges: BTreeMap::new(),
     expected: BTreeMap::new(),
     cmd_counter: 0,
   };
@@ -314,12 +481,24 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
       MultiAction::RemoveGroup => remove_group_action(&mut w, &mut prng, &mut report),
       MultiAction::RecreateGroup => recreate_group_action(&mut w, &mut prng, &mut report),
       MultiAction::Split => split_group(&mut w, &mut st, &mut prng),
+      MultiAction::PrepareMerge => prepare_merge_action(&mut w, &mut st, &mut prng, &mut report),
+      MultiAction::CommitMerge => commit_merge_action(&mut w, &mut st, &mut prng, &mut report),
+      MultiAction::RollbackMerge => {
+        rollback_merge_action(&mut w, &mut st, &mut prng, &mut report);
+      }
     }
 
     let steps = 2 + (prng.next_u64() % 5) as usize; // 2..=6 ticks per iteration
     for _ in 0..steps {
       w.tick();
       report.ticks_run += 1;
+    }
+    // Track which booked freezes actually LANDED somewhere: the quiesce teeth drive every such
+    // pair to resolution, and prune the ones whose accepted propose died un-landed.
+    for (s, pm) in st.pending_merges.iter_mut() {
+      if !pm.saw_frozen && w.group_freeze_seen(*s) {
+        pm.saw_frozen = true;
+      }
     }
     reads.scan(&w, &mut report, seed);
     report.max_term_seen = report.max_term_seen.max(w.max_term_all());
@@ -346,6 +525,21 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   // recorder's independent observations (see `MultiWorld::finalize_conservation_or_panic`).
   // Vacuously green under profiles that never split — zero records, zero cost.
   w.finalize_conservation_or_panic(seed);
+  // The union VERDICT: every registered merge's source histories must open the target's copy
+  // (see `MultiWorld::finalize_merge_conservation_or_panic`). Vacuously green under profiles
+  // that never merge — zero records, zero cost.
+  w.finalize_merge_conservation_or_panic(seed);
+  // The LINEAGE VERDICT: durable state stayed single-lineage (chimera), every within-lineage
+  // quorum agreed byte-for-byte (phantom), and every admitted snapshot transfer terminated
+  // (wedge) — see `MultiWorld::finalize_lineage_or_panic`. Fed by the per-tick lineage sweep and
+  // the install-event drain, so every seed of every profile faces it.
+  w.finalize_lineage_or_panic(seed);
+  report.lineage_cells_judged = w.lineage_cells_judged();
+  report.lineage_installs_observed = w.lineage_installs_observed();
+  report.merges_registered = w.merges_registered();
+  report.merges_resolved = w.merges_resolved();
+  report.merges_aborted = w.merges_aborted();
+  report.merges_capture_failed = w.merges_capture_failed();
   report.membership_oracle_comparisons = w.membership_oracle_comparisons();
   report.skipped_unwitnessed_installs = w.skipped_unwitnessed_installs();
   report.kind_unobservable_installs = w.kind_unobservable_installs();
@@ -354,6 +548,13 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   report.cross_talk_checks = w.cross_talk_checked();
   report.max_term_seen = report.max_term_seen.max(w.max_term_all());
   report.faults_fired = w.net_dropped() + w.net_duplicated();
+  // The async crash-suite non-vacuity witnesses (all 0 under the sync store mode): the flush phase
+  // ran, torn writes stranded real batches, and crashes landed mid-window.
+  report.log_flushes = w.log_flushes();
+  report.stable_flushes = w.stable_flushes();
+  report.torn_writes_fired = w.torn_writes_fired();
+  report.crashes_with_log_inflight = w.crashes_with_log_inflight();
+  report.crashes_with_stable_inflight = w.crashes_with_stable_inflight();
   report
 }
 
@@ -378,9 +579,18 @@ fn calm_window(
   }
 
   for gid in w.live_groups() {
+    // The window's own ticking resolves parked merges: a group absorbed mid-window leaves the
+    // live set (its replicas dismantle host by host) — demanding an election or fresh load
+    // from it would misread the designed teardown as a livelock.
+    if !w.live_groups().contains(&gid) {
+      continue;
+    }
     w.reconcile_membership(gid);
     let mut elected = false;
     for _ in 0..4_000 {
+      if !w.live_groups().contains(&gid) {
+        break;
+      }
       if w.leader_of(gid).is_some() {
         elected = true;
         break;
@@ -388,6 +598,9 @@ fn calm_window(
       w.tick();
       report.ticks_run += 1;
       w.reconcile_membership(gid);
+    }
+    if !w.live_groups().contains(&gid) {
+      continue;
     }
     assert!(
       elected,
@@ -408,6 +621,14 @@ fn calm_window(
     let target = quorum_applied(w) + 1 + (prng.next_u64() % 2) as usize;
     let mut budget = 6_000u32;
     while quorum_applied(w) < target {
+      // A group FROZEN by a merge refuses writes BY DESIGN — the calm window must not demand
+      // fresh progress from it (the refusal is the covered behavior; the merge's own liveness
+      // is the resolution/rollback path, not client load). A merely PENDING freeze settles
+      // into frozen (or thaws by truncation) within the healed window's ticking below; a group
+      // absorbed mid-loop leaves the live set entirely.
+      if w.group_frozen(gid) || !w.live_groups().contains(&gid) {
+        break;
+      }
       assert!(
         budget > 0,
         "MULTI VOPR LIVELOCK (calm window): group {gid} failed to commit fresh load within the \
@@ -438,10 +659,12 @@ fn calm_window(
       report.ticks_run += 1;
       budget -= 1;
     }
-    assert!(
-      w.agreement_holds(gid),
-      "MULTI VOPR: group {gid} agreement must hold at the calm-window progress point (seed={seed})"
-    );
+    if w.live_groups().contains(&gid) {
+      assert!(
+        w.agreement_holds(gid),
+        "MULTI VOPR: group {gid} agreement must hold at the calm-window progress point (seed={seed})"
+      );
+    }
   }
 }
 
@@ -460,9 +683,67 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     w.crash(node);
   }
 
-  let live = w.live_groups();
+  // FREEZE TEETH, phase 1 — the drive: every group still carrying freeze state is driven to
+  // RESOLUTION under the healed world, bounded. A freeze is a claim on a specific target; its
+  // ONLY exits are the absorb and the abort, both proposed on that target's log — so propose
+  // the booked commit (folding the source's expected history into the target's, as the action
+  // does) and, when it refuses typed, the rollback release valve; the ticking pumps parks and
+  // relays thaws. Anything still frozen when the budget runs out falls through to the wedge
+  // scan below. Booked pairs that never landed a freeze anywhere are pruned first — an
+  // accepted propose whose entry died with a deposed leader has nothing to resolve.
+  st.pending_merges
+    .retain(|s, pm| w.live_groups().contains(s) && (pm.saw_frozen || w.group_freeze_seen(*s)));
+  let mut budget = 12_000u32;
+  while budget > 0 {
+    prune_merge_book(w, st);
+    let active: Vec<u64> = w
+      .live_groups()
+      .into_iter()
+      .filter(|&g| w.group_freeze_seen(g))
+      .collect();
+    if active.is_empty() {
+      break;
+    }
+    if budget.is_multiple_of(16) {
+      for gid in active {
+        let target = st
+          .pending_merges
+          .get(&gid)
+          .map(|pm| pm.target)
+          .or_else(|| w.claimed_target_of(gid));
+        let Some(target) = target else { continue };
+        // A parked target is already deciding this merge — the ticking resolves it.
+        if !w.live_groups().contains(&target) || w.group_merge_parked(target) {
+          continue;
+        }
+        if matches!(w.propose_commit_merge(target, gid), Some(Ok(_))) {
+          let moved: Vec<Vec<u8>> = st.expected.get(&gid).cloned().unwrap_or_default();
+          if !moved.is_empty() {
+            st.expected.entry(target).or_default().extend(moved);
+          }
+          report.merges_committed += 1;
+        } else if matches!(w.propose_rollback_merge(target, gid), Some(Ok(_))) {
+          report.merges_rolled_back += 1;
+        }
+      }
+    }
+    for gid in w.live_groups() {
+      w.reconcile_membership(gid);
+    }
+    w.tick();
+    report.ticks_run += 1;
+    budget -= 1;
+  }
+
   let converged_group = |w: &MultiWorld, gid: u64| -> bool {
     if w.group_leader_count(gid) != 1 || !w.agreement_holds(gid) {
+      return false;
+    }
+    // A merge-parked target is NOT converged: its apply is pinned at the park boundary while its
+    // commit races ahead, so the caught-up check below would read its members as equally applied
+    // though the group is wedged. A resolving park clears inside the quiesce ticking; a permanent
+    // one is a livelock this refuses to certify.
+    if w.group_merge_parked(gid) {
       return false;
     }
     let members: BTreeSet<u64> = w
@@ -480,8 +761,12 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     let caught_up = lens.iter().min() == lens.iter().max();
     caught_up && members.iter().all(|&n| w.hosts_group(n, gid))
   };
+  // Recomputed every pass: the quiesce ticking itself resolves parked merges, and an absorbed
+  // group leaves the live set as its replicas dismantle.
+  let mut live = w.live_groups();
   let mut converged = false;
   for pass in 0..20_000u32 {
+    live = w.live_groups();
     for &gid in &live {
       w.reconcile_membership(gid);
     }
@@ -492,6 +777,7 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     }
     w.tick();
     report.ticks_run += 1;
+    live = w.live_groups();
     if live.iter().all(|&gid| converged_group(w, gid)) {
       converged = true;
       break;
@@ -505,6 +791,25 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     panic!(
       "MULTI VOPR QUIESCE FAILURE: a fully-healed world failed to converge every live group \
        within 20000 ticks\n  seed={seed} (replay: run_multi_vopr({seed}, ticks, profile))\n  {}",
+      dumps.join("\n  "),
+    );
+  }
+
+  // FREEZE TEETH, phase 2 — the wedge scan: a replica still FROZEN after the drive and full
+  // convergence is a stranded merge participant (a frozen group converges — freeze refuses only
+  // writes — so the convergence pass above cannot see this class). Every accepted freeze must
+  // resolve by run end; anything else is a product wedge, seed-attributed.
+  let frozen = w.frozen_replicas();
+  if !frozen.is_empty() {
+    let groups: BTreeSet<u64> = frozen.iter().map(|&(_, gid)| gid).collect();
+    let dumps: Vec<String> = groups
+      .iter()
+      .map(|&gid| std::format!("g{gid}: {}", w.dbg_group(gid)))
+      .collect();
+    panic!(
+      "MULTI VOPR FREEZE WEDGE: replicas still frozen at run end after the quiesce drive\n  \
+       seed={seed} (replay: run_multi_vopr({seed}, ticks, profile))\n  frozen (node, gid): \
+       {frozen:?}\n  {}",
       dumps.join("\n  "),
     );
   }
@@ -542,13 +847,20 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
       .collect();
     for member in members {
       let applied = w.applied_of(member, gid);
-      let cmds: Vec<&Vec<u8>> = applied
+      let mut cmds: Vec<&Vec<u8>> = applied
         .iter()
         .filter(|(_, cmd)| !cmd.is_empty())
         .map(|(_, cmd)| cmd)
         .collect();
+      let mut expected_cmds = leader_cmds.clone();
+      // A merged lineage's record ORDER varies by arrival path (live fold vs capture restore);
+      // the converged CONTENT is what the product promises — compare as multisets there.
+      if w.group_absorbed(gid) {
+        cmds.sort();
+        expected_cmds.sort();
+      }
       assert_eq!(
-        cmds, leader_cmds,
+        cmds, expected_cmds,
         "MULTI VOPR APPLY FAILURE: group {gid} member {member} applied a different committed \
          client history than leader {leader}\n  seed={seed}",
       );

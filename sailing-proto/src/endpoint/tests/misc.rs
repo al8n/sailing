@@ -655,8 +655,8 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
 /// revived only by an external `restart`, never by a timer (a poisoned, already-removed voter that
 /// froze the simulated clock would starve every election).
 ///
-/// Before fix: `serviceable_now` ignored `poisoned`, so a poisoned voter's election timer was
-/// surfaced and `poll_timeout` returned `Some`.
+/// A `serviceable_now` that ignores `poisoned` surfaces a poisoned voter's election timer, so
+/// `poll_timeout` returns `Some`.
 #[test]
 fn poisoned_node_surfaces_no_timer() {
   use core::time::Duration;
@@ -829,9 +829,9 @@ fn handle_timeout_makes_progress_no_wedge() {
 /// `Err` must POISON the node with `PoisonReason::Apply` — not silently stall apply — and the
 /// poisoned node must be inert (all `handle_*` are no-ops).
 ///
-/// FAILS-ON-OLD: with the bare `break` (no `self.poison()`), `is_poisoned()` stays `false`,
-/// `applied` stays stuck behind `commit`, and the node keeps serving — so all three asserts
-/// (poisoned, reason, inertness) fail.
+/// With a bare `break` (no `self.poison()`), `is_poisoned()` stays `false`,
+/// `applied` stays stuck behind `commit`, and the node keeps serving — poisoned, reason and
+/// inertness all violated at once.
 #[test]
 fn failing_fsm_apply_poisons_node() {
   use crate::{AppendEntries, Index, Message, Term};
@@ -923,7 +923,7 @@ fn failing_fsm_apply_poisons_node() {
 /// Regression: a committed Normal entry whose `data` does NOT decode as the
 /// SM's `Command` must POISON the node with `PoisonReason::NormalEntryDecode`.
 ///
-/// FAILS-ON-OLD: with the bare `break` the decode error silently stalls apply —
+/// With a bare `break` the decode error silently stalls apply —
 /// `is_poisoned()` stays `false` and `applied` is stuck behind `commit`.
 #[test]
 fn corrupt_normal_entry_poisons_node() {
@@ -1032,6 +1032,9 @@ fn poison_reason_as_str_covers_all_variants() {
     (CommitWaitUnrepresentable, "commit_wait_unrepresentable"),
     (LogExhausted, "log_exhausted"),
     (LegacyLeaseUnrecoverable, "legacy_lease_unrecoverable"),
+    (OpIdExhausted, "op_id_exhausted"),
+    (ReadRoundExhausted, "read_round_exhausted"),
+    (LeaseRoundExhausted, "lease_round_exhausted"),
   ] {
     assert_eq!(reason.as_str(), name);
     assert_eq!(std::format!("{reason}"), name, "Display mirrors as_str");
@@ -1080,7 +1083,7 @@ fn timer_kind_as_str_covers_all_variants() {
 /// over a durable-but-undecodable `Normal` entry; `apply_committed` poisons (`NormalEntryDecode`)
 /// and the handler would otherwise still queue a `HeartbeatResponse` to the leader.
 ///
-/// FAILS-ON-OLD: without the `send` guard the poisoned follower still replies a `HeartbeatResponse`,
+/// Without the `send` guard the poisoned follower still replies a `HeartbeatResponse`,
 /// acking a heartbeat it can no longer honor.
 #[test]
 fn poison_after_apply_emits_nothing() {
@@ -1144,11 +1147,11 @@ fn poison_after_apply_emits_nothing() {
 /// Follower side: a fatal term-read inside `find_conflict_by_term` during an AppendEntries
 /// reject walk must short-circuit — the node poisons and sends NO reject `AppendResponse`.
 ///
-/// On the follower path the no-send guarantee is enforced jointly by FIX 1 (propagate `None`) and
-/// the pre-existing `hint_term` guard (the index `find_conflict_by_term` fails on is the same index
-/// the follower would re-read for `hint_term`, which fails again). This test locks in the
-/// end-to-end behavior; the leader-side sibling test is the one that isolates FIX 1's
-/// progress-mutation short-circuit.
+/// On the follower path the no-send guarantee is enforced jointly by the `None` propagation out of
+/// `find_conflict_by_term` and the `hint_term` guard (the index `find_conflict_by_term` fails on is
+/// the same index the follower would re-read for `hint_term`, which fails again). This test locks in
+/// the end-to-end behavior; the leader-side sibling test isolates the progress-mutation
+/// short-circuit on its own.
 #[test]
 fn find_conflict_by_term_poison_propagation_follower() {
   use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
@@ -1224,7 +1227,7 @@ fn find_conflict_by_term_poison_propagation_follower() {
 /// triggers a fatal term-read mid-`on_append_entries` and poisons — those already-queued votes must
 /// be SUPPRESSED at the egress, not leak from a dead node.
 ///
-/// FAILS-ON-OLD: with the `if self.poisoned { return None; }` guard removed from `poll_message`, a
+/// With the `if self.poisoned { return None; }` guard removed from `poll_message`, a
 /// queued `RequestVote` leaks and the `is_none()` assertion below fires.
 #[test]
 fn queued_message_is_suppressed_after_later_dispatch_poisons() {
@@ -1330,7 +1333,7 @@ fn queued_message_is_suppressed_after_later_dispatch_poisons() {
 /// (not silently `Ok` or `NotLeader`), and — because every durability submit routes through the
 /// `submit_*` no-op-when-poisoned wrappers — none of them may advance the durable log.
 ///
-/// FAILS-ON-OLD: with the `if self.poisoned { return Err(ProposeError::Poisoned); }` guard
+/// With the `if self.poisoned { return Err(ProposeError::Poisoned); }` guard
 /// removed from `propose`, a poisoned leader's `propose` returns `Ok`/`NotLeader` instead.
 #[test]
 fn poisoned_node_rejects_work_and_persists_nothing() {
@@ -1597,5 +1600,75 @@ fn tracing_subscriber_panic_does_not_drop_a_queued_event() {
   assert!(
     ep.poll_event().is_some(),
     "a queued consensus event must survive a tracing subscriber panic"
+  );
+}
+
+/// The op-id counter fail-stops on exhaustion rather than mint a DUPLICATE id: `OpId::next` saturates
+/// its `seq`, so a re-minted id would alias the pending-write map and let an older completion satisfy a
+/// newer op's durability watermark (`opid >= term_persist_opid`) — marking a term durable off a stale
+/// write. Seeded near the ceiling so the boundary is exercised without 2^64 mints.
+///
+/// MUTATION: drop the `if next == id` guard in `mint_op_id` → the saturated counter re-mints the same
+/// id forever with no poison.
+#[test]
+fn mint_op_id_fail_stops_on_exhaustion() {
+  use crate::{Config, Instant, OpId, PoisonReason};
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  // One below the saturating ceiling: the penultimate id is still handed out cleanly.
+  ep.set_next_op_id_for_test(OpId::new(u64::MAX - 1));
+  let a = ep.mint_op_id_for_test();
+  assert!(
+    ep.poison_reason().is_none(),
+    "the penultimate id must mint without poisoning"
+  );
+  // The next mint is at the ceiling: it hands out the last unique id AND poisons, so the following
+  // mint (which would duplicate) can never run on a live node.
+  let b = ep.mint_op_id_for_test();
+  assert_ne!(
+    a, b,
+    "the last unique id still differs from the penultimate"
+  );
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::OpIdExhausted));
+}
+
+/// Every hard-state write carries the endpoint's CURRENT lineage, stamped at the durable choke-point:
+/// `None` until the node forks or adopts, its token thereafter — so no builder can persist a hard
+/// state that disowns the log's lineage, and restart reconciliation always has the record to compare
+/// against the durable snapshot's token.
+///
+/// MUTATION: drop the lineage stamp from `stamp_floors` → the adopted endpoint's writes carry `None`
+/// (the second assert FAILS).
+#[test]
+fn every_hard_state_write_carries_the_current_lineage() {
+  use crate::{ForkId, HardState, Index, Term};
+  let (mut ep, _log, _stable) = make_follower();
+
+  let hs = ep.stamp_floors(HardState::initial());
+  assert!(
+    hs.lineage().is_none(),
+    "a never-forked endpoint stamps None"
+  );
+
+  let token = ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::from_static(&[9u8]),
+    1,
+  );
+  ep.seed_fork_id_for_test(token.clone());
+  let hs = ep.stamp_floors(HardState::initial());
+  assert_eq!(
+    hs.lineage(),
+    Some(&token),
+    "an adopted endpoint stamps its token on every write"
   );
 }

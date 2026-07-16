@@ -97,6 +97,46 @@ fn shard_guard_declines_wrong_plane_groups_before_the_factory() {
   assert!(guard.build(&0).is_some(), "build delegates untouched");
 }
 
+/// A NONDETERMINISTIC custom map is caught at the decline site: the guard's stability probe trips
+/// in debug/test builds, so a map that returns different shards for one group cannot silently slip
+/// a group onto the wrong plane. Debug-only — the probe is a `debug_assert`.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "deterministic")]
+fn nondeterministic_map_trips_the_stability_probe() {
+  use core::time::Duration;
+  use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  };
+
+  use sailing_driver::{BoxedGroupFactory, GroupBlueprint, GroupFactory, factory_fn};
+
+  let inner: BoxedGroupFactory<u64, u64, Vec<u8>> = Box::new(factory_fn(
+    move |group: &u64, _from: &u64| {
+      let config = sailing_proto::Config::try_new(
+        2u64,
+        vec![1, 2],
+        Duration::from_millis(1000),
+        Duration::from_millis(100),
+      )
+      .expect("a valid seed config");
+      Some(GroupBlueprint::new(config, *group))
+    },
+    |_group: &u64| Some(Vec::new()),
+  ));
+  // A map whose shard for one group ALTERNATES between calls — the determinism the guard relies on,
+  // violated on purpose.
+  let flip = Arc::new(AtomicUsize::new(0));
+  let mut guard = ShardGuardedFactory {
+    inner,
+    map: ShardMap::with_mapping(2, move |_g: &u64| flip.fetch_add(1, Ordering::SeqCst) % 2),
+    plane: 0,
+  };
+  // The two-consult stability probe in `materialize` must trip.
+  let _ = guard.materialize(&0, &7);
+}
+
 /// The port convention advances the port and preserves the IP; overflow is a `None`, never a
 /// wrap (a wrapped port would silently dial an unrelated service).
 #[test]

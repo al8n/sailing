@@ -143,9 +143,9 @@ impl Cluster {
   }
 
   /// Activate the FAILOVER-tier SYNCHRONIZED WALL clock: every subsequent node-facing call carries a
-  /// `Now::synchronized` reading (so the precise commit-anchor can fire), and [`resync_offsets`] draws
+  /// `Now::synchronized` reading (so the precise commit-anchor can fire), and `resync_offsets` draws
   /// each node's wall offset uniformly from `[−ε_unc, +ε_unc]`. Call right after construction, before any
-  /// tick (like [`set_clock_drift`]). This is the ONLY thing that gives the failover precise-release its
+  /// tick (like `set_clock_drift`). This is the ONLY thing that gives the failover precise-release its
   /// randomized coverage — the monotonic-only clock the rest of the harness uses leaves the wall absent,
   /// so the anchor permanently defers to the conservative bound. Offsets stay at their last-drawn values
   /// (zero until the first `resync_offsets`).

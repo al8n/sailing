@@ -196,7 +196,10 @@ impl<I: Ord + CheapClone> ConnTable<I> {
   /// choke-point, so `seq` is always table-assigned and never reused.
   pub(crate) fn insert(&mut self, h: ConnectionHandle, mut entry: ConnEntry<I>) {
     entry.seq = self.next_seq;
-    self.next_seq += 1;
+    // `seq` is a RECENCY order (compared, never used as an identity), so saturate rather than wrap: a
+    // wrap would hand a fresh connection a low `seq` and mis-reap it as the oldest. At the ceiling every
+    // later connection ties at the top — still "no older than" its predecessors, the safe direction.
+    self.next_seq = self.next_seq.saturating_add(1);
     self.entries.insert(h, entry);
   }
 

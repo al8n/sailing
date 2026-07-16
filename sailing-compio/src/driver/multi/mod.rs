@@ -110,6 +110,20 @@ pub(crate) fn map_split_err<I: core::fmt::Debug>(
   }
 }
 
+/// Map the proto's merge-verb error — the split mapping's sibling, same redirect and poison
+/// preservation.
+pub(crate) fn map_merge_err<I: core::fmt::Debug>(
+  e: sailing_proto::MergeError<I>,
+) -> DriverError<I> {
+  match e {
+    sailing_proto::MergeError::NotLeader { leader } => DriverError::NotLeader { leader },
+    sailing_proto::MergeError::Propose(inner) => crate::driver::map_propose_err(inner),
+    other => DriverError::Rejected {
+      reason: format!("{other:?}"),
+    },
+  }
+}
+
 /// The election-jitter seed a driver mints for a RELAYED fork's child (no embedder call supplies
 /// one): an FNV-1a fold of the host's node id, so co-located children fold further per group
 /// (the container's `group_seed`) while REPLICAS of one child draw distinct jitter — the same
@@ -138,6 +152,51 @@ impl<G> sailing_proto::FloorStore<G> for FloorSnapshot {
 
   fn lineage(&self, _gid: &G) -> u64 {
     self.lineage
+  }
+}
+
+/// A pre-read copy of TWO ids' lineage records — the merge verbs' floor seam (the engine is
+/// lent to the propose as `(log, stable)`, so the coordinator's per-call floor reads come from
+/// this snapshot). Exact for the two ids a merge names; any other id answers the no-fence zero.
+pub(crate) struct PairFloors<G> {
+  entries: [(G, u64, u64); 2],
+}
+
+impl<G: sailing_proto::GroupId> PairFloors<G> {
+  /// Snapshot `source` and `target`'s floors + lineage off the engine.
+  pub(crate) fn snapshot<I>(
+    engine: &sailing_proto::GroupEngine<G, I>,
+    source: &G,
+    target: &G,
+  ) -> Self {
+    let read = |gid: &G| {
+      (
+        gid.cheap_clone(),
+        engine.group_floor(gid),
+        engine.group_gen(gid),
+      )
+    };
+    Self {
+      entries: [read(source), read(target)],
+    }
+  }
+}
+
+impl<G: PartialEq> sailing_proto::FloorStore<G> for PairFloors<G> {
+  fn floor(&self, gid: &G) -> u64 {
+    self
+      .entries
+      .iter()
+      .find(|(g, _, _)| g == gid)
+      .map_or(0, |(_, floor, _)| *floor)
+  }
+
+  fn lineage(&self, gid: &G) -> u64 {
+    self
+      .entries
+      .iter()
+      .find(|(g, _, _)| g == gid)
+      .map_or(0, |(_, _, lineage)| *lineage)
   }
 }
 
@@ -179,6 +238,11 @@ where
     || !ep.role().is_leader()
     || !matches!(ep.active_read_mode(), sailing_proto::ReadOnlyOption::Safe)
     || ep.has_lagging_peer()
+    // A parked merge is resolved by the per-crank service, which a quiesced group would never
+    // reach. Structurally redundant today (a park always leaves commit > applied, which the
+    // caught-up check below already refuses) — kept explicit so quiesce eligibility never
+    // silently inherits that coupling.
+    || ep.pending_merge().is_some()
   {
     return false;
   }
@@ -243,9 +307,9 @@ where
 }
 
 /// Cross-thread observability for a multi driver: the driver republishes the shared engine's
-/// [`flushes`](sailing_proto::GroupEngine::flushes) /
-/// [`ops_flushed`](sailing_proto::GroupEngine::ops_flushed) counters after every storage crank —
-/// so a test or operator thread can watch the fsync-amortization ratio (operations per barrier)
+/// [`barriers`](sailing_proto::GroupEngine::barriers) /
+/// [`ops_batched`](sailing_proto::GroupEngine::ops_batched) counters after every storage crank —
+/// so a test or operator thread can watch the batch ratio (operations per barrier)
 /// while the driver task exclusively owns the engine — plus the QUIESCED-group gauge the driver's
 /// scheduler maintains (idle groups whose timers it neither arms nor sweeps), published after
 /// every quiesce sweep. Obtain it from the driver BEFORE spawning `run()` (e.g.
@@ -259,24 +323,24 @@ pub struct EngineMetrics {
 
 #[derive(Default)]
 struct EngineMetricsInner {
-  flushes: AtomicU64,
-  ops_flushed: AtomicU64,
+  barriers: AtomicU64,
+  ops_batched: AtomicU64,
   quiesced_groups: AtomicU64,
 }
 
 impl EngineMetrics {
-  /// Durability barriers run so far (every [`GroupEngine::flush`](sailing_proto::GroupEngine::flush)
+  /// Batch barriers run so far (every [`GroupEngine::flush`](sailing_proto::GroupEngine::flush)
   /// call counts, including one that released nothing).
   #[must_use]
-  pub fn flushes(&self) -> u64 {
-    self.inner.flushes.load(Ordering::Acquire)
+  pub fn barriers(&self) -> u64 {
+    self.inner.barriers.load(Ordering::Acquire)
   }
 
-  /// Total storage operations completed across every barrier so far. `ops_flushed / flushes` is
+  /// Total storage operations completed across every barrier so far. `ops_batched / barriers` is
   /// the cross-group batch factor the shared engine exists for.
   #[must_use]
-  pub fn ops_flushed(&self) -> u64 {
-    self.inner.ops_flushed.load(Ordering::Acquire)
+  pub fn ops_batched(&self) -> u64 {
+    self.inner.ops_batched.load(Ordering::Acquire)
   }
 
   /// The number of hosted groups currently QUIESCED (idle: the driver neither arms nor sweeps
@@ -287,9 +351,9 @@ impl EngineMetrics {
   }
 
   /// Publish the engine's current counters (driver-side, once per crank).
-  pub(crate) fn record(&self, flushes: u64, ops_flushed: u64) {
-    self.inner.flushes.store(flushes, Ordering::Release);
-    self.inner.ops_flushed.store(ops_flushed, Ordering::Release);
+  pub(crate) fn record(&self, barriers: u64, ops_batched: u64) {
+    self.inner.barriers.store(barriers, Ordering::Release);
+    self.inner.ops_batched.store(ops_batched, Ordering::Release);
   }
 
   /// Publish the quiesced-group gauge (driver-side, once per quiesce sweep).

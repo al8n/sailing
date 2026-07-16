@@ -1,6 +1,15 @@
 use super::*;
 use crate::{ConfChangeV2, ProposeError};
 
+/// The largest share of [`MAX_FRAME_BYTES`](crate::wire::MAX_FRAME_BYTES) a membership's
+/// `InstallSnapshot` metadata may occupy before a conf change is refused at propose. A committed
+/// `ConfState` whose encoded snapshot metadata leaves no room for a data chunk under the frame limit
+/// makes `send_snapshot_chunk` defer FOREVER — a silent, permanent replication wedge that surfaces
+/// only after the next compaction. Half the frame guarantees ample room for a full data chunk: real
+/// memberships are kilobytes, so this ~32 MiB metadata bound is unreachable outside a crafted or
+/// corrupt `ConfState`.
+const MAX_SNAPSHOT_META_FRAME_BYTES: usize = crate::wire::MAX_FRAME_BYTES / 2;
+
 impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
@@ -133,9 +142,25 @@ where
     if self.transfer.lead_transferee.is_some() {
       return Err(ProposeError::LeaderTransferInProgress);
     }
+    // A pending or applied merge freeze pins the voter set: the merge preconditions compared
+    // the source and target sets, and a membership change slipping in above the freeze would
+    // strand replicas outside the target (a frozen zombie no resolution ever reaches).
+    if self.merge_freeze_active() {
+      return Err(ProposeError::Frozen);
+    }
     // One change in flight at a time: refuse if a ConfChange entry is not yet applied.
     if self.pending_conf_index > self.applied {
       return Err(ProposeError::ConfChangeInFlight);
+    }
+    // The TARGET side's membership fence: no conf change while a CommitMerge is in flight,
+    // parked, or absorbed-but-not-yet-compacted. A replica added in those windows can be
+    // LOG-WALKED across the absorb point — it parks there with no local source to absorb and
+    // no floor, no-ops past the union, and silently diverges from every replica that absorbed.
+    // The fence's three legs release on their own within a crank of the resolution. Checked
+    // AFTER the one-in-flight gate: a fresh leader's conservative re-seats arm both, and the
+    // established conf-in-flight verdict is the truthful one there.
+    if self.merge_conf_fence(log) {
+      return Err(ProposeError::MergeInFlight);
     }
     // Every id entering the LOG must satisfy the wire bound (1..=1024-byte encoding):
     // the apply path decodes committed conf changes through the envelope, whose id
@@ -169,8 +194,31 @@ where
       } else {
         changer.simple(&self.tracker, cc.changes())
       };
-      if result.is_err() {
-        return Err(ProposeError::InvalidConfChange);
+      let resulting = match result {
+        Ok(tracker) => tracker,
+        Err(_) => return Err(ProposeError::InvalidConfChange),
+      };
+      // Refuse a membership too large to snapshot BEFORE it enters the log. If the RESULTING
+      // ConfState's InstallSnapshot metadata would leave no room for a data chunk under the frame
+      // limit, `send_snapshot_chunk` defers forever once the log compacts past the boundary — a silent,
+      // permanent wedge. Size the metadata frame in closed form (no meta clone; `total_len = u64::MAX`
+      // for the worst-case varint) and refuse above the documented share. The precedent is the
+      // `EntryTooLarge` refusal below, which fences the append path against an oversized single entry.
+      let conf = resulting.conf_state();
+      let meta = crate::SnapshotMeta::new(self.applied, crate::Term::ZERO, conf);
+      let meta_frame = crate::wire::install_snapshot_encoded_len(
+        self.term,
+        &self.config.id(),
+        &meta,
+        0,
+        u64::MAX,
+        0,
+      );
+      if meta_frame > MAX_SNAPSHOT_META_FRAME_BYTES {
+        return Err(ProposeError::MembershipTooLargeToSnapshot {
+          size: meta_frame,
+          max: MAX_SNAPSHOT_META_FRAME_BYTES,
+        });
       }
     }
     // Reject a conf change whose entry would exceed one transport frame BEFORE it enters the log: the

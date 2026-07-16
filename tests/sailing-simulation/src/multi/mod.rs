@@ -47,3 +47,8 @@ pub use interaction::{MultiInteractionEnv, run_multi_interaction_file};
 // The world's split wiring records into it and judges every registered split's partition; the
 // union (merge) assertion stays teeth-tests-only until the merge milestone wires it.
 mod conservation;
+
+// Deterministic multi-container LINEAGE scenarios (squatter transfer, empty-joiner adoption, the
+// same-token retry) the pure-container world cannot construct with its fresh-child-id verbs.
+#[cfg(test)]
+mod lineage_scenarios;

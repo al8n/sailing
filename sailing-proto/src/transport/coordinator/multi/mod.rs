@@ -4,16 +4,17 @@
 //! demuxed by their group tag and fed to the owning group's endpoint, and each group's outbound
 //! messages are routed back stamped with that group's id. One connection per peer carries every
 //! co-located group's traffic. Storage is per group: [`handle_conn_data`](MultiStreamCoordinator::handle_conn_data)
-//! resolves each decoded frame's group store through a caller-supplied [`GroupStores`], while the
+//! resolves each decoded frame's group store through a caller-supplied
+//! [`GroupStores`](crate::GroupStores), while the
 //! single-group driving methods take the target group's store directly.
 use super::super::{
   CoalescedEntry, ConnId, TransportError, frame::COALESCED_FLAG_QUIESCE, router::PeerRouter,
   stream::RecordIo,
 };
 use crate::{
-  Config, CreateGroupError, Data, Endpoint, Event, FloorStore, GroupId, Index, Instant, LogStore,
-  Message, MultiRaft, NodeId, Now, ProposeError, StableStore, StateMachine, StorageProgress,
-  multi::validate_floor,
+  Config, CreateGroupError, Data, Endpoint, Event, FloorStore, GroupId, GroupStores, Index,
+  Instant, LogStore, Message, MultiRaft, NodeId, Now, ProposeError, RemoveError, StableStore,
+  StateMachine, StorageProgress, multi::validate_floor,
 };
 use bytes::Bytes;
 use std::{
@@ -21,23 +22,10 @@ use std::{
   vec::Vec,
 };
 
-/// Per-group storage a [`MultiStreamCoordinator`] uses to drive each group's endpoint when inbound
-/// bytes span multiple groups. The caller implements it over its own per-group store table.
-///
-/// CONTRACT: resolution must be STABLE (the same group always resolves to the same stores) and
-/// NON-ALIASING (two groups must never share a store — a shared log is a safety violation).
-/// Returning `Some` for a group the `MultiRaft` does not host is a harmless per-message drop;
-/// returning `None` for a hosted group starves it.
-pub trait GroupStores<G, L, S> {
-  /// The `(log, stable)` stores for `group`, or `None` if this host has no storage for it — an
-  /// inbound message for an unknown group is then dropped (the sender retries on its own cadence).
-  fn stores(&mut self, group: &G) -> Option<(&mut L, &mut S)>;
-}
-
 /// A group-scoped scheduling signal a multi-group coordinator surfaces to its driver (drained via
-/// `poll_group_control`, like `poll_event`). The queue preserves DISPATCH ORDER, so a driver that
-/// folds the signals left to right always lands on the group's latest state — e.g. a quiesce-flagged
-/// beat followed by an append in the same read yields `Quiesce` then `Wake`, ending awake.
+/// `poll_group_control`, like `poll_event`). Only the LATEST signal per group survives to the
+/// driver — a group's net state is its last control in stream order — so a quiesce-flagged beat
+/// followed by an append in the same read collapses to a single `Wake`, landing the group awake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GroupControl {
@@ -62,7 +50,9 @@ pub enum GroupControl {
   /// non-empty `AppendEntries` is live replication, votes/transfers/reads/snapshots are live
   /// consensus, and an empty `AppendEntries` or `AppendResponse` no longer belongs to an idle
   /// round at all, so a spurious one costs one wake instead of riding the absorb trust surface.
-  /// A connection loss, the liveness oracle, is the driver's own wake signal.
+  /// A connection loss, the liveness oracle, is the driver's own wake signal — and a silent
+  /// blackhole (a peer that stops sending without closing the socket) becomes exactly such a loss:
+  /// the transport idle-probe/reap closes the quiet connection, so even a fully-quiesced plane wakes.
   Wake,
 }
 
@@ -107,8 +97,15 @@ where
   /// Groups whose NEXT heartbeat broadcast carries the QUIESCE flag (set by
   /// [`mark_quiescing`](Self::mark_quiescing), consumed by the flush that stamps the beats).
   quiesce_intents: BTreeSet<G>,
-  /// Group-scoped scheduling signals for the driver, in dispatch order (see [`GroupControl`]).
-  controls: VecDeque<(G, GroupControl)>,
+  /// The LATEST group-scoped scheduling signal per group. A group's net driver state is its last
+  /// control in stream order (`Wake` re-arms its timers, `Quiesce` parks them), and cross-group
+  /// order carries no invariant, so keeping only the latest per group delivers the same net state
+  /// as the full stream would — a burst collapses to the one control that matters.
+  control_state: BTreeMap<G, GroupControl>,
+  /// Groups with a pending scheduling signal, in first-signal order, membership-deduped by
+  /// `control_state` (see [`poll_group_control`](Self::poll_group_control)). A gid whose map entry
+  /// was purged (removal/merge) stays queued but inert and is skipped at poll.
+  controls: VecDeque<G>,
   /// Tombstoned group ids: REMOVED groups whose inbound frames drop silently and whose
   /// create/restore refuses until an explicit [`clear_tombstone`](Self::clear_tombstone) (see
   /// [`remove_group`](Self::remove_group)). In-memory and volatile — a restart starts clean; the
@@ -142,6 +139,7 @@ where
       next_conn_id: 1,
       hb_batches: BTreeMap::new(),
       quiesce_intents: BTreeSet::new(),
+      control_state: BTreeMap::new(),
       controls: VecDeque::new(),
       retired: BTreeSet::new(),
       unknown_pending: VecDeque::new(),
@@ -153,9 +151,10 @@ where
   /// then the tombstone, then the container: `generation` — the id's incarnation under the
   /// single-incarnation contract, 0 unless the embedder reshapes ids — is compared against the
   /// persisted admission floor read through `floors`, and an under-floor incarnation is refused
-  /// before anything volatile is consulted (the durable fence outranks in-session state; the
-  /// coordinator itself does not otherwise consume `generation` yet — the driver records it
-  /// after the `Ok`, and the split milestone consumes it at this layer). The driver hands its
+  /// before anything volatile is consulted (the durable fence outranks in-session state). The
+  /// ADMITTED generation then SEEDS the container's lineage counter — the created incarnation
+  /// mints strictly above its floor, so it can never repeat a fenced predecessor's generations —
+  /// and the driver records the same value in its engine after the `Ok`. The driver hands its
   /// engine as `floors`; the deterministic sim and proto-level embedders hand their own store —
   /// durability is the store-owner's job. A tombstoned id still REFUSES creation at ANY
   /// generation until an explicit [`clear_tombstone`](Self::clear_tombstone) consents to
@@ -194,7 +193,9 @@ where
       return Err(CreateGroupError::SplitReserved);
     }
     let key = gid.cheap_clone();
-    self.multi.create_group(gid, config, now, seed, fsm)?;
+    self
+      .multi
+      .create_group(gid, generation, config, now, seed, fsm)?;
     self.purge_unknown_signal(&key);
     Ok(())
   }
@@ -288,6 +289,7 @@ where
     fsm: F,
     snapshot: Bytes,
     read_only: Option<crate::ReadOnlyOption>,
+    fork_id: Option<crate::ForkId>,
     boot_epoch: u64,
     generation: u64,
     floors: &impl FloorStore<G>,
@@ -312,7 +314,8 @@ where
     }
     let key = gid.cheap_clone();
     self.multi.create_group_from_fork(
-      gid, generation, config, now, seed, fsm, snapshot, read_only, boot_epoch, log, stable,
+      gid, generation, config, now, seed, fsm, snapshot, read_only, fork_id, boot_epoch, log,
+      stable,
     )?;
     self.purge_unknown_signal(&key);
     Ok(())
@@ -336,12 +339,33 @@ where
   /// group is unsound without epochs (matching the NodeId reuse rules). Across a restart the
   /// tombstone is gone; the embedder's placement catalog is the persistent record of what must
   /// not live here.
-  pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F>> {
+  ///
+  /// REFUSES every UNRESOLVED merge participant (inherited verbatim from the container's teardown
+  /// gate: [`OwesThaw`](RemoveError::OwesThaw), [`Frozen`](RemoveError::Frozen),
+  /// [`MergeParked`](RemoveError::MergeParked), [`SpokenFor`](RemoveError::SpokenFor),
+  /// [`Claimed`](RemoveError::Claimed)) — nothing is torn down and, crucially, the id is NOT
+  /// tombstoned, so a refused removal is a clean no-op the caller retries once the choreography
+  /// resolves. The gate runs FIRST, before any side-state is cleared, so the refusal leaves the
+  /// group and this coordinator's bookkeeping fully intact. `stores` is the per-group seam the
+  /// container reads a freeze-pending source's log through (the `Claimed` leg's append-pending
+  /// window); a refusal touches nothing through it.
+  pub fn remove_group<L, S, St>(
+    &mut self,
+    gid: &G,
+    stores: &mut St,
+  ) -> Result<Option<Endpoint<I, F>>, RemoveError>
+  where
+    St: GroupStores<G, L, S>,
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let removed = self.multi.remove_group(gid, stores)?;
     self.quiesce_intents.remove(gid);
-    self.controls.retain(|(g, _)| g != gid);
+    // Drop the group's latest control; a still-queued gid goes inert and is skipped at poll.
+    self.control_state.remove(gid);
     self.retired.insert(gid.cheap_clone());
     self.purge_unknown_signal(gid);
-    self.multi.remove_group(gid)
+    Ok(removed)
   }
 
   /// Lift `gid`'s tombstone, returning whether one existed. The EXPLICIT re-admission consent —
@@ -370,6 +394,24 @@ where
   #[must_use]
   pub fn is_retired(&self, gid: &G) -> bool {
     self.retired.contains(gid)
+  }
+
+  /// Fail-stop the addressed group because a user QUERY closure panicked mid-read against its state
+  /// machine, LATCHING the poison for the lifecycle tail (see
+  /// [`MultiRaft::fail_stop_query_panicked`]). A driver caught the unwind to keep its plane and every
+  /// co-located group alive, then routes here so this group joins the poison surface
+  /// ([`poll_poisoned`](Self::poll_poisoned)) and stops serving possibly-torn replicated state.
+  pub fn fail_stop_query_panicked(&mut self, gid: &G) {
+    self.multi.fail_stop_query_panicked(gid);
+  }
+
+  /// Fail-stop EVERY hosted group because a completion caught a user-closure(-drop) panic that names
+  /// no group — the verdict a refusal addressed to a group this host does not carry reports (see
+  /// [`MultiRaft::fail_stop_plane_unattributable_panic`] for why an unattributable tear is PLANE-fatal
+  /// and why that is the safe trade). Every group poisons and surfaces on the lifecycle tail
+  /// ([`poll_poisoned`](Self::poll_poisoned)), so the plane fails LOUDLY, never silently.
+  pub fn fail_stop_plane_unattributable_panic(&mut self) {
+    self.multi.fail_stop_plane_unattributable_panic();
   }
 
   /// Drain the next UNKNOWN-GROUP placement signal: `(group, authenticated sender)` for
@@ -417,19 +459,45 @@ where
     }
   }
 
-  /// Register a freshly opened connection, returning the coordinator-assigned [`ConnId`] the driver
-  /// keys its socket by.
+  /// Register a freshly DIALED connection (the driver dialed `expected`), returning the
+  /// coordinator-assigned [`ConnId`] the driver keys its socket by. A hello authenticating as any
+  /// other id closes the connection ([`TransportError::UnexpectedPeer`]).
+  pub fn on_dial_open(&mut self, expected: I, record: R, now: Instant) -> ConnId {
+    self.refresh_local_id();
+    let id = self.alloc_conn_id();
+    self.router.register_dial(id, expected, record, now);
+    id
+  }
+
+  /// Register a freshly ACCEPTED connection (an inbound socket — no dial expectation), returning the
+  /// coordinator-assigned [`ConnId`] the driver keys its socket by.
+  pub fn on_accept_open(&mut self, record: R, now: Instant) -> ConnId {
+    self.refresh_local_id();
+    let id = self.alloc_conn_id();
+    self.router.register_accept(id, record, now);
+    id
+  }
+
+  /// Allocate the next [`ConnId`] from the monotonic counter.
   ///
   /// # Panics
   /// Panics if the `u64` connection-id space is exhausted (unreachable in practice).
-  pub fn on_conn_open(&mut self, record: R, now: Instant) -> ConnId {
+  fn alloc_conn_id(&mut self) -> ConnId {
     let id = ConnId(self.next_conn_id);
     self.next_conn_id = self
       .next_conn_id
       .checked_add(1)
       .expect("connection id space exhausted");
-    self.router.register(id, record, now);
     id
+  }
+
+  /// Hand the router this host's own id once a group exists — before then a multi host has no
+  /// identity, so the self-ID gate stays a no-op (matching the QUIC coordinator).
+  fn refresh_local_id(&mut self) {
+    if let Some(me) = self.multi.host_id() {
+      let me = me.cheap_clone();
+      self.router.set_local_id(me);
+    }
   }
 
   /// Tear down a driver-closed connection.
@@ -708,6 +776,12 @@ where
     if !self.multi.contains_group(group) {
       return None;
     }
+    // A locally-tombstoned child could never materialize its fork here (admission refuses
+    // `Retired`), so refuse the split at propose — the entry is never appended. The floor leg
+    // fences a below-floor incarnation; this leg fences a removed one, beside it.
+    if self.retired.contains(child) {
+      return Some(Err(crate::SplitError::ChildRetired));
+    }
     if let Err(e) = validate_floor(floors.floor(child), child_gen) {
       return Some(Err(match e {
         CreateGroupError::BelowFloor { floor } => crate::SplitError::BelowFloor { floor },
@@ -721,6 +795,155 @@ where
     let _ = self.multi.flush_appends(group, now, log, stable);
     self.flush();
     Some(r)
+  }
+
+  /// Propose a merge FREEZE of `source` into `target` (see [`MultiRaft::prepare_merge`] for the
+  /// container gates), replicating immediately. The source's log resolves through the caller's
+  /// `stores` seam — the container's claimed-target gate reads co-hosted claimants' logs, not
+  /// just the source's own. The coordinator adds the merge's floor leg through the caller's
+  /// `floors` seam: a participant whose CURRENT incarnation sits below its persisted admission
+  /// floor is a stale survivor of a fenced incarnation — refused BEFORE anything is appended,
+  /// exactly as the split delegator fences its child. `None` if no group `source` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn prepare_merge<L, S, St>(
+    &mut self,
+    source: &G,
+    now: impl Into<Now>,
+    stores: &mut St,
+    target: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    St: GroupStores<G, L, S>,
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.multi.contains_group(source) {
+      return None;
+    }
+    if let Err(e) = self.merge_floor_check(source, target, floors) {
+      return Some(Err(e));
+    }
+    let now: Now = now.into();
+    let r = self.multi.prepare_merge(source, now, stores, target)?;
+    if let Some((log, stable)) = stores.stores(source) {
+      let _ = self.multi.flush_appends(source, now, log, stable);
+    }
+    self.flush();
+    Some(r)
+  }
+
+  /// Propose the merge ABSORB on `target` (see [`MultiRaft::commit_merge`]), replicating
+  /// immediately, with the same per-call floor leg as
+  /// [`prepare_merge`](Self::prepare_merge). `None` if no group `target` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn commit_merge<L, S>(
+    &mut self,
+    target: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    source: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.multi.contains_group(target) {
+      return None;
+    }
+    if let Err(e) = self.merge_floor_check(source, target, floors) {
+      return Some(Err(e));
+    }
+    let now: Now = now.into();
+    let r = self.multi.commit_merge(target, now, log, stable, source)?;
+    let _ = self.multi.flush_appends(target, now, log, stable);
+    self.flush();
+    Some(r)
+  }
+
+  /// Propose the merge ABORT on `target` (see [`MultiRaft::rollback_merge`]): the target-side
+  /// abort entry, totally ordered against `CommitMerge` on the target's own log, replicating
+  /// immediately. No floor leg: aborting is always legitimate on groups this host still runs.
+  /// `None` if no group `target` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn rollback_merge<L, S>(
+    &mut self,
+    target: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    source: &G,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self
+      .multi
+      .rollback_merge(target, now, log, stable, source)?;
+    let _ = self.multi.flush_appends(target, now, log, stable);
+    self.flush();
+    Some(r)
+  }
+
+  /// The merge verbs' floor leg: BOTH participants' current incarnations must clear their
+  /// persisted admission floors — an under-floor participant is a fenced incarnation's stale
+  /// survivor, and anchoring a merge on it would resurrect exactly what the floor buried.
+  fn merge_floor_check(
+    &self,
+    source: &G,
+    target: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Result<(), crate::MergeError<I>> {
+    for gid in [source, target] {
+      let floor = floors.floor(gid);
+      if !crate::floor_admits(floor, self.multi.group_gen(gid)) {
+        return Err(crate::MergeError::BelowFloor { floor });
+      }
+    }
+    Ok(())
+  }
+
+  /// Resolve every parked merge that local facts now decide (see
+  /// [`MultiRaft::service_merge_applies`]) — called once per crank by the driver after the
+  /// per-group storage drains. On a resolved ABSORB or a husk RETIREMENT the coordinator TOMBSTONES
+  /// the source id: its straggler frames drop silently from here on (the P5 wire story, unchanged),
+  /// while the terminal floor the DRIVER persists from the returned resolutions is what makes the
+  /// refusal survive restarts. Aborted resolutions touch nothing here — the source group is still live.
+  pub fn service_merge_applies<L, S, St>(
+    &mut self,
+    now: impl Into<Now>,
+    stores: &mut St,
+  ) -> Vec<crate::MergeResolution<G>>
+  where
+    St: crate::GroupStores<G, L, S> + FloorStore<G>,
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let resolutions = self.multi.service_merge_applies(now, stores);
+    for r in &resolutions {
+      // A `Merged` source (absorbed) and a `Retired` source (husk dissolved) both LEAVE the container
+      // terminally floored — tombstone each id. `Aborted` leaves both groups live. `CaptureFailed`
+      // also removed the source endpoint, but does NOT floor it — its stores are preserved for a
+      // restart re-park — so it is NOT tombstoned here: a terminal refusal would fence exactly the
+      // incarnation the restart must restore.
+      let source = match r {
+        crate::MergeResolution::Merged { source, .. }
+        | crate::MergeResolution::Retired { source } => source,
+        crate::MergeResolution::Aborted { .. } | crate::MergeResolution::CaptureFailed { .. } => {
+          continue;
+        }
+      };
+      self.quiesce_intents.remove(source);
+      // Drop the source's latest control; a still-queued gid goes inert and is skipped at poll.
+      self.control_state.remove(source);
+      self.retired.insert(source.cheap_clone());
+      self.purge_unknown_signal(source);
+    }
+    resolutions
   }
 
   /// The next committed, relay-ready fork from any hosted group (see
@@ -752,6 +975,12 @@ where
   /// tail accepted the peeked event.
   pub fn poll_split_conflict(&mut self) -> Option<(G, G)> {
     self.multi.poll_split_conflict()
+  }
+
+  /// Drain the next FAIL-STOPPED group id (see [`MultiRaft::poll_poisoned`]); the driver surfaces
+  /// it on its lifecycle tail for the placement brain. Best-effort, like the other observations.
+  pub fn poll_poisoned(&mut self) -> Option<G> {
+    self.multi.poll_poisoned()
   }
 
   /// Initiate a linearizable read on `group`; the resulting `ReadState` surfaces via
@@ -842,7 +1071,7 @@ where
 
   /// Drain queued outbound wire bytes as `(conn, bytes)` pairs for the driver to write. This is
   /// the drain-end chokepoint where the crank's batched heartbeats ship (one coalesced frame per
-  /// peer — see [`flush`](Self::flush)), so every `handle_*` call's beats leave with that call's
+  /// peer — see `flush`), so every `handle_*` call's beats leave with that call's
   /// transmit drain.
   pub fn poll_transmit(&mut self) -> Vec<(ConnId, Vec<u8>)> {
     self.ship_heartbeats();
@@ -875,31 +1104,28 @@ where
     self.quiesce_intents.remove(group);
   }
 
-  /// Drain the next group-scoped scheduling signal, in dispatch order (see [`GroupControl`]).
+  /// Drain the next group-scoped scheduling signal — each group's LATEST control, in first-signal
+  /// order (see [`GroupControl`]). Skips a queued gid whose control was purged (removal/merge).
   pub fn poll_group_control(&mut self) -> Option<(G, GroupControl)> {
-    self.controls.pop_front()
+    while let Some(gid) = self.controls.pop_front() {
+      if let Some(ctrl) = self.control_state.remove(&gid) {
+        return Some((gid, ctrl));
+      }
+    }
+    None
   }
 
-  /// The transport's OWN earliest deadline (handshake reaping), without any group's consensus
-  /// deadline — the [`poll_timeout`](Self::poll_timeout) decomposition a quiescing driver needs:
-  /// it folds this with the non-quiesced subset of [`deadlines`](Self::deadlines) instead of the
-  /// all-groups aggregate.
+  /// The transport's OWN earliest deadline — handshake reaping AND validated-connection liveness
+  /// (idle-peer keep-alive probes and silent-peer reaping) — without any group's consensus deadline.
+  /// This is the [`poll_timeout`](Self::poll_timeout) decomposition a quiescing driver needs: it
+  /// folds this with the non-quiesced subset of [`deadlines`](Self::deadlines) instead of the
+  /// all-groups aggregate, so a fully-quiesced host still wakes to keep its links alive and detect a
+  /// blackhole.
   #[must_use]
   pub fn transport_timeout(&self) -> Option<Instant> {
-    self.router.next_handshake_deadline()
-  }
-
-  /// The earliest deadline the driver must wake for: the minimum over every group's consensus
-  /// deadline AND the transport's earliest handshake deadline. The transport half matters when no
-  /// group surfaces a deadline at all (zero hosted groups, every group poisoned, or a host of
-  /// non-voter learners) — without it, un-validated connections would never be reaped. On expiry
-  /// call [`handle_transport_timeout`](Self::handle_transport_timeout) unconditionally and
-  /// [`handle_timeout`](Self::handle_timeout) for whichever groups are due.
-  #[must_use]
-  pub fn poll_timeout(&self) -> Option<Instant> {
     match (
-      self.multi.poll_timeout(),
       self.router.next_handshake_deadline(),
+      self.router.next_liveness_deadline(),
     ) {
       (Some(a), Some(b)) => Some(a.min(b)),
       (a, None) => a,
@@ -907,12 +1133,31 @@ where
     }
   }
 
-  /// Fire the transport's own housekeeping (handshake-deadline reaping) without touching any
-  /// group. Call at every [`poll_timeout`](Self::poll_timeout) expiry: the surfaced deadline may
-  /// be a transport deadline with no group due.
+  /// The earliest deadline the driver must wake for: the minimum over every group's consensus
+  /// deadline AND the transport's earliest deadline ([`transport_timeout`](Self::transport_timeout):
+  /// handshake reaping plus validated-connection liveness). The transport half matters when no group
+  /// surfaces a deadline at all (zero hosted groups, every group poisoned, or a host of non-voter
+  /// learners) — and when every group is quiesced — so un-validated connections are reaped and idle
+  /// links are probed / blackhole-reaped even then. On expiry call
+  /// [`handle_transport_timeout`](Self::handle_transport_timeout) unconditionally and
+  /// [`handle_timeout`](Self::handle_timeout) for whichever groups are due.
+  #[must_use]
+  pub fn poll_timeout(&self) -> Option<Instant> {
+    match (self.multi.poll_timeout(), self.transport_timeout()) {
+      (Some(a), Some(b)) => Some(a.min(b)),
+      (a, None) => a,
+      (None, b) => b,
+    }
+  }
+
+  /// Fire the transport's own housekeeping — handshake-deadline reaping AND validated-connection
+  /// liveness (probing idle peers, reaping silent/blackholed ones) — without touching any group.
+  /// Call at every [`poll_timeout`](Self::poll_timeout) expiry: the surfaced deadline may be a
+  /// transport deadline with no group due.
   pub fn handle_transport_timeout(&mut self, now: impl Into<Now>) {
     let now: Now = now.into();
     self.router.reap_handshakes(now.mono());
+    self.router.service_liveness(now.mono());
   }
 
   /// Each group's next deadline — a driver's input for an aggregate timing wheel.
@@ -1027,7 +1272,7 @@ where
   /// Queue the dispatch-driven [`GroupControl`]s for one delivered message: a `Wake` for every
   /// wake-class kind (see [`GroupControl::Wake`] — the heartbeat response is absorbed), then a
   /// `Quiesce` if the entry carried the flag — flag AFTER wake, so a flagged
-  /// beat nets quiesced. Consecutive duplicates collapse (a burst of appends is one `Wake`).
+  /// beat nets quiesced. Same-group controls collapse to the latest (a burst of appends is one `Wake`).
   fn push_dispatch_controls(&mut self, group: &G, wake: bool, flags: u8) {
     if wake {
       self.push_control(group, GroupControl::Wake);
@@ -1048,14 +1293,17 @@ where
   }
 
   fn push_control(&mut self, group: &G, ctrl: GroupControl) {
+    // Latest-wins: overwrite the group's control, enqueuing the gid only when it was absent so the
+    // queue holds each dirty group once. A later push in the same drain cycle just replaces the
+    // value (Quiesce after Wake nets Quiesce; a Wake after Quiesce re-arms), which the single
+    // queued visit then delivers.
     if self
-      .controls
-      .back()
-      .is_some_and(|(g, c)| g == group && *c == ctrl)
+      .control_state
+      .insert(group.cheap_clone(), ctrl)
+      .is_none()
     {
-      return;
+      self.controls.push_back(group.cheap_clone());
     }
-    self.controls.push_back((group.cheap_clone(), ctrl));
   }
 }
 

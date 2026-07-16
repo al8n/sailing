@@ -191,6 +191,57 @@ where
     // <= meta.last_index, so the SM baseline comes from the snapshot; we then replay only
     // the durable post-snapshot committed tail.
     let snapshot = stable.snapshot();
+    // LINEAGE-FIRST reconciliation, decided BEFORE any coordinate arm: `hs.lineage()` records which
+    // lineage the durable LOG belongs to, and `(index, term)` proofs are content proofs only WITHIN
+    // one lineage — so which artifacts to trust is settled here, and everything below (the FSM
+    // restore, the boundary reconciliation, the split-state seed) sees a coherent view.
+    //  - Lineages AGREE (`None`/`None` included): both artifacts are one lineage's — proceed.
+    //  - Log token-less, slot token-bearing: the slot holds an ADOPTION this node never completed.
+    //    If the log is BASELINED AT the slot's boundary — its prefix below the boundary gone
+    //    (`first_index == boundary + 1`) and the retained boundary term the slot's — the
+    //    destructive `log.restore` already ran: the adoption is a fact, only its hard-state stamp
+    //    is missing (the lineage stamp rides the NEXT stable write, and the log and stable stores
+    //    have no cross-store fsync barrier, so any post-adoption append can durably outrun the
+    //    stamp — the tail above the boundary is the adopted lineage's ordinary replication, NOT
+    //    evidence against the adoption). COMPLETE it: trust the slot; the coordinate arms below
+    //    handle the tail exactly as any snapshot-plus-committed-tail restart. The baselined shape
+    //    is unforgeable by any token-less log: reaching `first_index == boundary + 1` by its own
+    //    compaction requires its OWN snapshot durable in the slot, and the fork-provenance gate
+    //    refuses a foreign overwrite of an occupied slot. Otherwise the blob is an UNADOPTED
+    //    leftover (the install never ran) — IGNORE the slot and boot from (hard state, log) alone:
+    //    a virgin log comes up empty and the transfer re-runs (the leader's match never advanced;
+    //    the gate's kin arm re-admits the retransfer against the leftover blob), and a populated
+    //    log boots as the token-less node it truly is (re-sent foreign snapshots stay refused; the
+    //    conflict resolves by placement).
+    //  - Log token-bearing, slot absent or mismatched: self-contradictory durable state — the
+    //    adopted log's baseline evidence is gone or foreign. Unreachable through the receive path;
+    //    fail-stop (`LineageMismatch`) rather than reconcile coordinates across two lineages.
+    let snapshot = match snapshot {
+      Some((meta, data)) => {
+        if hs.lineage() == meta.fork_id() {
+          Some((meta, data))
+        } else if hs.lineage().is_none() {
+          let baselined_at_boundary = log.first_index() == meta.last_index().next()
+            && log.term(meta.last_index()).ok() == Some(meta.last_term());
+          if baselined_at_boundary {
+            Some((meta, data))
+          } else {
+            None
+          }
+        } else {
+          poisoned = true;
+          poison_reason = Some(PoisonReason::LineageMismatch);
+          None
+        }
+      }
+      None => {
+        if hs.lineage().is_some() {
+          poisoned = true;
+          poison_reason = Some(PoisonReason::LineageMismatch);
+        }
+        None
+      }
+    };
     // The snapshot boundary `(N, last_term)` is captured before the blob is consumed below so the
     // log/snapshot boundary reconciliation can run afterward for both the present and absent cases.
     let snap_nt: Option<(Index, Term)> = snapshot
@@ -218,6 +269,13 @@ where
       .as_ref()
       .map(|(meta, _)| meta.shape_gen())
       .unwrap_or(0);
+    // The fork provenance this snapshot carries (a manufactured fork baseline, or a forked child's
+    // own later snapshot that preserved it) — recovered so a forked child still reports its origin
+    // across restart, exactly as it does across snapshot transfer. `None` for every non-fork
+    // snapshot.
+    let snap_fork_id: Option<crate::ForkId> = snapshot
+      .as_ref()
+      .and_then(|(meta, _)| meta.fork_id().cloned());
     // The failover release floor this snapshot carries over its compacted entries — combined below
     // with a scan of the live log to recompute `max_wall_plus_window` from durable state alone.
     let snap_max_wall_plus: u64 = snapshot
@@ -444,6 +502,8 @@ where
         pending_install: None,
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
+        unsendable_meta_frames: 0,
+        refused_cross_lineage_installs: 0,
       },
       rng,
       votes: BTreeMap::new(),
@@ -463,6 +523,7 @@ where
         // Observability counters reset on restart (in-memory only, never persisted).
         precise_releases: 0,
         unprovable_floor_holds: 0,
+        unprovable_floor_campaigns: 0,
         // Inherited-read serve anchors arm only when a restarted follower (re-)wins an election.
         limbo_upper: Index::ZERO,
         committed_anchor_wall: 0,
@@ -476,6 +537,7 @@ where
       },
       cold_read_defers: 0,
       lease_refreshes: 0,
+      wall_stamp_degradations: 0,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
       // incarnation's ids), so a prior-incarnation storage completion that survives the crash can never
       // match a post-restart op (epoch-major OpId ordering + map-key equality make it miss every lookup
@@ -524,7 +586,8 @@ where
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
       },
-      split: super::split::SplitState::new(snap_shape_gen),
+      split: super::split::SplitState::new(snap_shape_gen, snap_fork_id),
+      merge: super::merge::MergeState::default(),
       reads: Reads {
         read_only: ReadOnly::new(read_only_opt),
         // Seeded from the genesis config default for now; recovered from snapshot ⊔ tail-replay in a later
@@ -549,6 +612,7 @@ where
       transfer: Transfer {
         // A restarted node is not leader (recovers as Follower) and has authorized no handoff.
         forced_handoff_this_term: false,
+        forced_handoff_target: None,
         lead_transferee: None,
         transfer_deadline: None,
       },
@@ -559,7 +623,24 @@ where
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
     if !ep.poison.poisoned {
-      ep.apply_committed(log);
+      // Boot replay must COMPLETE before serving: `scan_freeze_pending` below derives the
+      // append-observed lease kill from the FINAL `applied`, so the per-crank budget (a
+      // steady-state fairness bound, not a boot bound) must not leave a partial replay here.
+      while matches!(ep.apply_committed(log), ApplyDrain::BudgetCut) {}
+    }
+    // Re-derive the append-observed lease kill from the UNAPPLIED suffix: a committed-but-
+    // unapplied PrepareMerge must re-arm `freeze_pending` BEFORE this replica can win an
+    // election and form a fresh lease (the replay above already re-froze any APPLIED freeze).
+    // Fail-stop on a read fault, like the lease-floor scans: an under-derived kill is a stale
+    // read, not a recoverable degradation.
+    if !ep.poison.poisoned {
+      match Self::scan_freeze_pending(log, ep.applied) {
+        Ok(fp) => ep.merge.freeze_pending = fp,
+        Err(reason) => {
+          ep.poison.poisoned = true;
+          ep.poison.poison_reason = Some(reason);
+        }
+      }
     }
     // if this incarnation's enforcement window GREW the durable floor (a config grow, or a legacy
     // record being recorded for the first time under an enforcing config), persist the raised floor ONCE

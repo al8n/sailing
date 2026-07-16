@@ -36,7 +36,13 @@ where
     // echoing THIS round and is bounded by this round's send time. A stale/duplicated
     // earlier-round response then cannot keep an isolated leader's lease alive, and a delayed
     // current-round response cannot extend it past the quorum's election window.
-    self.check_quorum_lease.lease_round += 1;
+    let Some(next_round) = self.check_quorum_lease.lease_round.checked_add(1) else {
+      // The lease-round counter is exhausted: reusing a round would let a stale earlier-round
+      // HeartbeatResponse renew an isolated leader's read lease. Fail-stop before broadcasting.
+      self.poison(PoisonReason::LeaseRoundExhausted);
+      return;
+    };
+    self.check_quorum_lease.lease_round = next_round;
     self.check_quorum_lease.lease_round_start = now.mono();
     self.check_quorum_lease.lease_acks.clear();
     // the contributing quorum's min support resets to the leader's OWN election_timeout (its self
@@ -243,9 +249,11 @@ where
             .snapshot_resend_after
             .insert(peer, now.mono() + self.config.election_timeout());
         }
-        // Nothing went out (no snapshot persisted yet, or a cold/unsendable read) → CLEAR any stale deadline
-        // so the next heartbeat retries immediately rather than honoring a lingering future deadline.
-        ChunkSend::Deferred => {
+        // Nothing went out (no snapshot persisted yet, or a cold read) → CLEAR any stale deadline so the
+        // next heartbeat retries immediately rather than honoring a lingering future deadline. Unsendable
+        // (oversized meta) clears it too: retrying is futile, but a lingering future deadline would
+        // suppress even the diagnostic re-attempt, and clearing keeps the two benign-defer arms uniform.
+        ChunkSend::Deferred | ChunkSend::Unsendable => {
           self.snapshot.snapshot_resend_after.remove(&peer);
         }
         // Fatal store read → the node is poisoned; fall through to the bail below.
@@ -387,7 +395,7 @@ where
   /// burst of proposals replicates as a single broadcast. Correctness-preserving: `maybe_send_append`
   /// derives each peer's `next..last_index` from live state, so coalescing changes only message COUNT.
   ///
-  /// Idempotent per staged append: the [`replication_pending`](Self::replication_pending) dirty flag
+  /// Idempotent per staged append: the `replication_pending` dirty flag
   /// gates the fan-out, so the unconditional per-pump call sends only when a new append was staged.
   pub fn flush_appends<L, S>(&mut self, now: impl Into<Now>, log: &L, stable: &S)
   where
@@ -522,6 +530,48 @@ where
     walled_expired && unwalled_expired
   }
 
+  /// The node LACKS the wall capability to prove an inherited walled-lease floor: no
+  /// `bounded_clock_uncertainty`, so it can neither wall-gate the floor nor E′-inflate a bare mono wait
+  /// past it. The SINGLE capability check shared by the pre-election campaign warning
+  /// ([`campaign_holds_unprovable_floor`](Self::campaign_holds_unprovable_floor)) and the post-election
+  /// veto's fail-closed branch ([`walled_lease_vetoes_conservative`](Self::walled_lease_vetoes_conservative)),
+  /// so warn-time and veto-time can never drift apart.
+  #[inline]
+  fn wall_capability_absent(&self) -> bool {
+    self.config.bounded_clock_uncertainty().is_none()
+  }
+
+  /// Whether WINNING the campaign now starting would leave this node holding a walled inherited-lease
+  /// floor it cannot prove: it carries a walled obligation (`max_wall_plus_window != 0`, folded per-entry
+  /// so present regardless of local tier) but [lacks the wall capability](Self::wall_capability_absent) to
+  /// wall-gate it. Keys on `max_wall_plus_window` because `inherited_release_deadline` — the pinned floor
+  /// the veto reads — is not captured until `become_leader`; the two share the capability check so a
+  /// campaign-time warning and the post-win commit-hold can never disagree.
+  #[inline]
+  fn campaign_holds_unprovable_floor(&self) -> bool {
+    self.lease_guard.max_wall_plus_window != 0 && self.wall_capability_absent()
+  }
+
+  /// Warn and count when a starting campaign holds an unprovable walled floor
+  /// ([`campaign_holds_unprovable_floor`](Self::campaign_holds_unprovable_floor)). A win would HOLD commit
+  /// (the conservative veto) until a wall capability is configured or leadership is transferred away — the
+  /// pre-election signal for a wedge that is otherwise silent until after the node leads. Called from both
+  /// campaign entries (the pre-vote probe and real candidacy).
+  pub(crate) fn note_campaign_floor_provability(&mut self) {
+    if !self.campaign_holds_unprovable_floor() {
+      return;
+    }
+    self.lease_guard.unprovable_floor_campaigns = self
+      .lease_guard
+      .unprovable_floor_campaigns
+      .saturating_add(1);
+    #[cfg(feature = "tracing")]
+    tracing::warn!(
+      target: "sailing::consensus",
+      "campaigning under an unprovable walled inherited-lease floor; winning holds commit until a wall capability (bounded_clock_uncertainty or LeaseGuard timing for E′) is configured or leadership is transferred away"
+    );
+  }
+
   /// Whether a still-live WALLED inherited lease must VETO the conservative mono commit-wait clear this
   /// tick. The invariant: a node may clear its commit-wait for inherited WALLED entries ONLY when it has
   /// proven the wall floor `s_c + W_c` expired — via the WALL, or because its wait is E′-INFLATED (covers
@@ -551,6 +601,23 @@ where
   /// Keys on `inherited_release_deadline` (folded ENTRY-property-gated, so present on EVERY holder
   /// regardless of read mode) — NOT `failover_tier_active`. The fail-closed branches hold a misconfigured
   /// node rather than serve a stale read (safety over the liveness of a node outside the clock contract).
+  ///
+  /// # Operability (an operator-repairable wedge, no new commit required)
+  ///
+  /// A fail-closed hold is SAFE but does not self-resolve, so treat it as a cluster PRECONDITION: enabling
+  /// the failover tier on ANY node means every electable voter must be able to prove an inherited wall
+  /// floor — a `bounded_clock_uncertainty` (ε_unc) with a supplied wall, or valid LeaseGuard timing for the
+  /// E′ inflation. A voter that can prove neither wedges its own commit if it wins. Two repairs exist
+  /// TODAY, neither needing a committed entry:
+  /// - TRANSFER leadership away: only COMMIT-advance is gated here — elections, votes, and leader transfers
+  ///   are not — so a `TimeoutNow` to a capable peer moves leadership off the wedged node at once.
+  /// - RESTART the wedged node with a clock capability: this veto reads the LIVE `config`, so a node
+  ///   brought back up with ε_unc (or valid LeaseGuard timing) heals in place — the next tick proves the
+  ///   floor, no new commit required.
+  ///
+  /// Capability negotiation (refusing the vote / gating membership so an incapable voter never leads) is a
+  /// planned follow-up; today the pre-election signal is the
+  /// [`unprovable_floor_campaigns`](Endpoint::unprovable_floor_campaigns) counter plus its `tracing` warn.
   fn walled_lease_vetoes_conservative(&self, now: Now) -> bool {
     if self.lease_guard.inherited_release_deadline == 0 {
       return false; // no walled inherited lease to honor
@@ -560,12 +627,17 @@ where
     }
     // BARE wait with inherited walled entries: the conservative mono clear is allowed ONLY when the wall
     // proves the floor expired.
-    let Some(eps) = self.config.bounded_clock_uncertainty() else {
-      // No ε_unc AND no E′ (bare wait): the node can neither wall-gate nor inflate, so it cannot bound the
-      // inherited walled lease at all — FAIL CLOSED. (A Safe/LeaseBased successor that inherited failover
-      // entries; outside the synchronized-clock contract the serve assumes.)
+    // No ε_unc AND no E′ (bare wait): the node can neither wall-gate nor inflate, so it cannot bound the
+    // inherited walled lease at all — FAIL CLOSED. (A Safe/LeaseBased successor that inherited failover
+    // entries; outside the synchronized-clock contract the serve assumes.) The capability check is
+    // `wall_capability_absent`, shared with the pre-election campaign warning so the two can never drift.
+    if self.wall_capability_absent() {
       return true;
-    };
+    }
+    let eps = self
+      .config
+      .bounded_clock_uncertainty()
+      .expect("wall_capability_absent ruled out None");
     let eps_ns = u64::try_from(eps.as_nanos()).unwrap_or(u64::MAX);
     // NON-PASSABLE horizon (`deadline + 2·ε ≥ u64::MAX`) is NOT skipped here: a bare ε_unc successor with a
     // non-passable inherited horizon already FAIL-STOPPED at `become_leader`
@@ -732,6 +804,16 @@ where
     // catch up to a fixed last_index and receive TimeoutNow.
     if self.transfer.lead_transferee.is_some() {
       return Err(ProposeError::LeaderTransferInProgress);
+    }
+    // A pending OR applied merge freeze refuses new entries. The gate moves to APPEND
+    // observation (not just apply) because every target replica absorbs its LOCAL source at its
+    // own apply progress: an entry accepted above the freeze would be included in some hosts'
+    // absorbed state and missing from others' — silent union divergence — or dropped from the
+    // union outright. Above a surviving freeze the log may carry only FSM-no-ops (election
+    // no-ops, conf folds, RollbackMerge), which is exactly what makes absorb-at-or-past-the-
+    // boundary deterministic.
+    if self.merge_freeze_active() {
+      return Err(ProposeError::Frozen);
     }
     // Allocate a fresh, usable log index (see `next_log_index`): refuse rather than alias-and-truncate
     // at the saturated ceiling or allocate the unreadable sentinel `u64::MAX`.
@@ -993,6 +1075,10 @@ where
         // suffix and a conflicting AppendEntries (e.g. a reordered/duplicate one) truncates it before
         // the ack leaves the outgoing queue. The new suffix's own ack is registered below.
         let truncate_from = entries[i].index();
+        // A pending merge freeze whose entry lies in the overwritten range no longer exists in
+        // this log: release the append-observed lease kill (the new suffix's own PrepareMerge, if
+        // any, re-arms it below).
+        self.note_freeze_truncated(truncate_from);
         // boundary = truncate_from - 1, so `> boundary` is exactly `>= truncate_from`: scrub every
         // queued success ack / pending FollowerAck whose match index lies in the overwritten range.
         self.scrub_acks_above(Index::new(truncate_from.get() - 1));
@@ -1017,6 +1103,15 @@ where
         let opid = self.mint_op_id();
         self.submit_append(log, opid, &entries[i..]);
         appended_opid = Some(opid);
+        // The append-observed lease kill (follower-accept site): a PrepareMerge ENTERING the
+        // local log kills lease serving and formation from this moment. A KIND check only —
+        // never a payload decode on the hot path; the apply arm owns decoding.
+        for e in &entries[i..] {
+          if e.kind() == crate::EntryKind::PrepareMerge {
+            self.note_freeze_appended(e.index());
+            break;
+          }
+        }
         // Apply-time membership (etcd, spec §9): a follower does NOT fold appended ConfChanges into
         // its tracker. The configuration changes only when those entries commit-and-apply
         // (apply_committed), so the tracker is never ahead of the committed log — no truncation
@@ -1118,8 +1213,12 @@ where
     // The lease deadline is bounded by the MIN support across the contributing quorum (`lease_min_support`,
     // min'd here, seeded to the leader's own election_timeout each round), so a voter with a SHORTER
     // election_timeout caps the lease at its real election window — the leader never out-lives a supporter.
+    // A pending or applied merge freeze stops the renewal re-arming `lease_valid_until`: the
+    // append-observed kill covers FORMATION as well as serving, so a frozen (or freezing) source
+    // can never accumulate a fresh lease to serve the moment a rollback lands.
     if response.lease_round() == self.check_quorum_lease.lease_round
       && response.lease_support() > Duration::ZERO
+      && !self.merge_freeze_active()
     {
       self
         .check_quorum_lease
@@ -1226,7 +1325,7 @@ where
               now.mono() + self.config.election_timeout(),
             );
           }
-          ChunkSend::Deferred => {}
+          ChunkSend::Deferred | ChunkSend::Unsendable => {}
           ChunkSend::Poisoned => return,
         }
       }
@@ -1302,7 +1401,16 @@ where
     // (the boundary), telling the caller "no conflict at or below the boundary". With no snapshot
     // (`first_index == 1`) this is exactly the historical `while index > 0`.
     let floor = log.first_index();
+    let mut budget = CONFLICT_WALK_BUDGET;
     while index >= floor {
+      // Bound the peer-steered walk to CONFLICT_WALK_BUDGET synchronous `log_term` reads per dispatch:
+      // on exhaustion return the best-so-far (higher-than-true) index. It is advisory — the leader's
+      // MaybeDecrTo floor still lowers `next_index` by at least one per reject, so the next, lower
+      // reject refines the search to convergence rather than looping.
+      if budget == 0 {
+        break;
+      }
+      budget -= 1;
       // A fatal term-read poisoned the node (inside `log_term`): propagate `None` so the caller
       // short-circuits rather than acting on a fabricated index the incomplete search would return.
       let t = self.log_term(log, index)?;
@@ -1484,6 +1592,7 @@ where
         .unwrap_or(crate::Index::ZERO);
       if peer_match == log.last_index() {
         let (term, me) = (self.term, self.config.id());
+        self.transfer.forced_handoff_target = Some(from.cheap_clone());
         self.send(
           from.cheap_clone(),
           Message::TimeoutNow(crate::TimeoutNow::new(term, me)),

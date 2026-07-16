@@ -91,8 +91,9 @@ where
     reservation: ReservationGuard,
   },
   /// A failover inherited-read query against one group (see
-  /// [`Handle::failover_query`](crate::Handle::failover_query) for the single-group contract; the
-  /// serve window is per group).
+  /// [`Handle::failover_query`](crate::Handle::failover_query) /
+  /// [`failover_query_unchecked`](crate::Handle::failover_query_unchecked) for the single-group
+  /// contract; the serve window is per group).
   FailoverWindow {
     /// The addressed group.
     group: G,
@@ -143,6 +144,48 @@ where
     /// Answered with the leader's immediate verdict: the proposed log index, or the rejection.
     reply: oneshot::Sender<Result<Index, DriverError<I>>>,
     /// The owning budget reservation, sized to the instruction bytes.
+    reservation: ReservationGuard,
+  },
+  /// Propose a merge FREEZE of `source` into `target` (see `MultiRaft::prepare_merge`): a
+  /// committed `PrepareMerge` freezes the source on every replica so the target can absorb it.
+  /// Answer `reply` with the leader's immediate verdict (the proposed log index).
+  PrepareMerge {
+    /// The group to be absorbed (the freeze rides its log; leader-only).
+    source: G,
+    /// The group that will absorb it.
+    target: G,
+    /// Answered with the source leader's immediate verdict.
+    reply: oneshot::Sender<Result<Index, DriverError<I>>>,
+    /// The owning budget reservation (zero-byte).
+    reservation: ReservationGuard,
+  },
+  /// Propose the merge ABSORB on `target` (see `MultiRaft::commit_merge`): every target replica
+  /// parks at the entry until its local source is frozen-applied at the boundary, then the
+  /// driver's per-crank merge service resolves it — absorbing the source, flooring its id
+  /// terminally, and tearing its storage down behind one barrier. Answer `reply` with the
+  /// target leader's immediate verdict (the proposed log index).
+  CommitMerge {
+    /// The absorbing group (the commit rides its log; leader-only).
+    target: G,
+    /// The frozen group to absorb.
+    source: G,
+    /// Answered with the target leader's immediate verdict.
+    reply: oneshot::Sender<Result<Index, DriverError<I>>>,
+    /// The owning budget reservation (zero-byte).
+    reservation: ReservationGuard,
+  },
+  /// Propose the merge ABORT on `target` (see `MultiRaft::rollback_merge`): the target-side
+  /// abort entry, totally ordered against the commit on the target's own log; the applied
+  /// abort then relays the source's thaw through the driver's per-crank drain. Answer `reply`
+  /// with the target leader's immediate verdict.
+  RollbackMerge {
+    /// The absorbing group whose log carries the abort (leader-only).
+    target: G,
+    /// The frozen (or freezing) group whose merge is being abandoned.
+    source: G,
+    /// Answered with the target leader's immediate verdict.
+    reply: oneshot::Sender<Result<Index, DriverError<I>>>,
+    /// The owning budget reservation (zero-byte).
     reservation: ReservationGuard,
   },
   /// Snapshot one group's runtime [`Status`]; answer `reply` with the status read off that group's
@@ -223,12 +266,13 @@ where
     reservation: ReservationGuard,
   },
   /// Remove a group: its endpoint, its storage, and its parked client work (failed with the
-  /// teardown error) are torn down together. Answer `reply` with whether the group was hosted.
+  /// teardown error) are torn down together. Answer `reply` with whether the group was hosted, or a
+  /// TRANSIENT refusal when the group still owes an aborted merge its thaw (nothing torn down).
   RemoveGroup {
     /// The removed group's id.
     gid: G,
-    /// Answered with whether a group with this id was hosted.
-    reply: oneshot::Sender<bool>,
+    /// Answered with whether a group with this id was hosted, or the transient teardown refusal.
+    reply: oneshot::Sender<Result<bool, DriverError<I>>>,
     /// The owning budget reservation (zero-byte).
     reservation: ReservationGuard,
   },
@@ -320,17 +364,50 @@ pub enum LifecycleEvent<G, I> {
   /// the coordinator's one-shot signal only after the tail accepts this event, so a full tail
   /// defers the cue to a later drain (a park that resolves before delivery drops it with the
   /// episode — the cue would be stale).
-  /// The embedder resolves it: remove the hosted child (the fork then materializes and
-  /// [`SplitApplied`](Self::SplitApplied) fires — removal tombstones the id, so pair it with
-  /// [`MultiHandle::clear_tombstone`] before the next drain, or the abandoned fork surfaces as
-  /// [`SplitRefused`](Self::SplitRefused) and the child rejoins by the ordinary lifecycle
-  /// paths), or let the hosted replica catch up from a sibling — once it carries the fork's
-  /// own lineage at-or-past the manufactured baseline, the parked fork resolves as redundant.
+  /// The embedder resolves it BY THE OCCUPANT'S STATE. A hosted replica with NO committed
+  /// content of its own (a fresh, empty joiner) catches up from a sibling: the transfer adopts
+  /// the fork's lineage, and once it carries it at-or-past the manufactured baseline the parked
+  /// fork resolves as redundant. (One empty sub-case still needs placement: a joiner whose
+  /// durable snapshot slot holds a DIFFERENT lineage's never-installed leftover refuses the
+  /// fork's transfer too — the leftover is the surviving evidence of a lifecycle breach, so it
+  /// resolves by re-materializing the joiner, not by overwriting the evidence.) A POPULATED
+  /// occupant — an older incarnation's replica, or an
+  /// unrelated group at the id — can only be resolved by PLACEMENT: remove the hosted child
+  /// (the fork then materializes and [`SplitApplied`](Self::SplitApplied) fires — removal
+  /// tombstones the id, so pair it with [`MultiHandle::clear_tombstone`] before the next drain,
+  /// or the abandoned fork surfaces as [`SplitRefused`](Self::SplitRefused) and the child
+  /// rejoins by the ordinary lifecycle paths). A sibling's transfer can NEVER convert it: the
+  /// receive path refuses a cross-lineage snapshot into a replica holding another lineage's
+  /// committed content (silently on the wire — watch the endpoint's refusal counter), because
+  /// destructively replacing a populated replica over the wire is exactly the loss the lineage
+  /// gates exist to prevent.
   SplitConflict {
     /// The parent group whose committed split is parked.
     parent: G,
     /// The child group id both the fork and a hosted group claim.
     child: G,
+  },
+  /// The group's endpoint FAIL-STOPPED on this host: a storage or apply fault poisoned it, freezing
+  /// its consensus. Its parked work fails with typed verdicts and NO auto-teardown follows — the
+  /// embedder decides whether to inspect the fault, tear the group down, or replace it. Fired ONCE
+  /// per poisoning (a re-admitted id that faults again signals afresh).
+  Poisoned {
+    /// The fail-stopped group.
+    group: G,
+  },
+  /// A committed merge reached the point of NO RETURN — the `source` endpoint was consumed and its
+  /// state machine extracted into `target` — but the union could not be made durable: the target's
+  /// FSM refused the absorb, or its forced capture faulted. The `target` is POISONED (and surfaces
+  /// its own [`Poisoned`](Self::Poisoned) signal); the `source` endpoint is GONE and its parked
+  /// callers have been failed with [`DriverError::Poisoned`] rather than left hanging on oneshots the
+  /// vanished endpoint can never answer. The source's stores and floor are DELIBERATELY preserved —
+  /// they hold the union's only copy — so the recovery is a RESTART: it restores the source and
+  /// re-parks the merge, which re-resolves once the target's fault is cleared. NO auto-teardown.
+  MergeCaptureFailed {
+    /// The consumed source group, whose durable state a restart restores.
+    source: G,
+    /// The poisoned absorbing target.
+    target: G,
   },
 }
 
@@ -498,6 +575,11 @@ where
   /// cross-restart incarnation authority (pass 0 unless the embedder reshapes ids): a restore
   /// that lies about it collapses two incarnations into one identity for every gen-keyed
   /// observer, voiding exactly what the admission floor exists to distinguish.
+  ///
+  /// Fails closed with [`DriverError::NoStoredState`] when the host holds no stored state for
+  /// `gid` (never staged, or torn down and its volatile state gone with the in-memory engine): a
+  /// restore that found nothing to recover returns the error rather than silently standing up a
+  /// blank index-0 incarnation. A durable engine is the roadmap cure.
   pub async fn restore_group(
     &self,
     gid: G,
@@ -525,6 +607,10 @@ where
   /// untouched. The removal TOMBSTONES the id: straggler frames drop silently and a
   /// create/restore of the id is rejected until [`clear_tombstone`](Self::clear_tombstone)
   /// explicitly consents to re-admission.
+  ///
+  /// A group still owing an aborted merge its thaw refuses TRANSIENTLY ([`DriverError::Rejected`])
+  /// with NOTHING torn down and the id NOT tombstoned: retry once the driver's per-crank thaw pass
+  /// discharges the obligation (a few cranks), or floor the owed source through the catalog.
   pub async fn remove_group(&self, gid: G) -> Result<bool, DriverError<I>> {
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
@@ -533,7 +619,7 @@ where
       reply: tx,
       reservation,
     })?;
-    rx.await.map_err(|_| DriverError::ShuttingDown)
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
   }
 
   /// Lift `gid`'s tombstone, awaiting whether one existed — the EXPLICIT re-admission consent,
@@ -569,6 +655,58 @@ where
       child,
       child_gen,
       instruction,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Propose a merge FREEZE of `source` into `target`, awaiting the source leader's IMMEDIATE
+  /// verdict (the proposed log index; the freeze takes effect apply-time on every replica, and
+  /// the lease kill from the entry's append). Refusals — not leader, differing voter sets or
+  /// read modes, an already-frozen source, a floored participant — resolve typed
+  /// [`DriverError::NotLeader`]/[`DriverError::Rejected`], with nothing appended.
+  pub async fn prepare_merge(&self, source: G, target: G) -> Result<Index, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::PrepareMerge {
+      source,
+      target,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Propose the merge ABSORB on `target`, awaiting the target leader's IMMEDIATE verdict. The
+  /// absorb itself resolves in the driver's storage crank once every replica's local source is
+  /// frozen-applied at the boundary; the merged-away source id is then floored terminally and
+  /// its straggler frames drop at the coordinator's tombstone.
+  pub async fn commit_merge(&self, target: G, source: G) -> Result<Index, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::CommitMerge {
+      target,
+      source,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Propose the merge ABORT on `target`, awaiting the target leader's IMMEDIATE verdict — the
+  /// release valve, riding the TARGET's log so it is totally ordered against the commit it
+  /// races: landing below the commit kills it before any park forms; landing right after a
+  /// parked one un-parks every replica aborted; landing later no-ops (the merge resolved).
+  /// The applied abort relays the source's thaw (the driver proposes the source-side entry per
+  /// crank); a relay lost to churn is recovered by calling this again. No timeout-based
+  /// auto-unfreeze exists.
+  pub async fn rollback_merge(&self, target: G, source: G) -> Result<Index, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::RollbackMerge {
+      target,
+      source,
       reply: tx,
       reservation,
     })?;
@@ -694,6 +832,20 @@ where
   /// Run a linearizable query against this group's state machine and await its result — the
   /// group-keyed [`Handle::query`](crate::Handle::query): the closure runs ON the driver thread
   /// once the group's read index is confirmed AND applied.
+  ///
+  /// # Closure contract
+  ///
+  /// The closure MUST NOT capture state aliased with a replicated state machine such that its
+  /// destructor can tear that state, and MUST NOT panic in `Drop`. The driver runs — and drops — the
+  /// closure under `catch_unwind`. ANY caught `Drop`-panic — for a group this host carries OR one it
+  /// does not — fail-stops the WHOLE PLANE. A `Send + 'static` closure captures whatever it likes and
+  /// `StateMachine` imposes no isolation, so a captured guard's `Drop` can alias state ANY hosted
+  /// group's replicated FSM shares and tear it — not only the addressed group's. The panic therefore
+  /// names no group the container can trust, so rather than leave some torn group serving
+  /// silently-divergent committed state, every hosted group poisons and surfaces on the lifecycle
+  /// tail, its parked work failing with a typed error. Consensus safety outranks availability: a
+  /// fail-stopped plane restarts from durable state, a divergent group does not recover. A panicking
+  /// `Drop` is an abort-level Rust anti-pattern regardless; well-behaved closures never trip this.
   pub async fn query<Out, Q>(&self, f: Q) -> Result<Out, DriverError<I>>
   where
     Out: Send + 'static,
@@ -702,7 +854,16 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
     let complete = Box::new(move |res: Result<&F, DriverError<I>>| {
-      let _ = tx.send(res.map(f));
+      // The user closure runs on the driver thread; a panic here would unwind the driver and take
+      // EVERY co-located group on the plane down. Catch it so the plane survives and this caller
+      // fails with `QueryPanicked`. AssertUnwindSafe is sound for the CATCH, but the closure (or a
+      // captured guard's `Drop`) could have TORN replicated state — and captures arbitrary aliasing
+      // state, so the tear is unattributable — so the outcome reports the catch and the driver
+      // fail-stops the WHOLE plane.
+      let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| res.map(f)));
+      let panicked = caught.is_err();
+      let _ = tx.send(caught.unwrap_or_else(|_| Err(DriverError::QueryPanicked)));
+      crate::shared::CompletionOutcome::caught(panicked)
     });
     self.send(MultiCommand::Query {
       group: self.group.cheap_clone(),
@@ -712,11 +873,51 @@ where
     rx.await.map_err(|_| DriverError::ShuttingDown)?
   }
 
-  /// Run an inherited-read query during this group's post-election failover commit-wait — the
-  /// group-keyed [`Handle::failover_query`](crate::Handle::failover_query). Resolves `Ok(None)`
-  /// whenever the group has no serve window (including on a monotonic-only multi host, whose
-  /// failover tier is inert); the caller falls back to [`query`](Self::query).
+  /// Run a CHECKED inherited-read query during this group's post-election failover commit-wait — the
+  /// group-keyed [`Handle::failover_query`](crate::Handle::failover_query). Serves ONLY when the limbo
+  /// region is EMPTY (the coarse-but-safe mode); resolves `Ok(None)` whenever the group has no serve
+  /// window (including on a monotonic-only multi host, whose failover tier is inert), when the limbo
+  /// region is non-empty, or when the closure declined; the caller falls back to [`query`](Self::query).
+  /// For per-key limbo inspection use
+  /// [`failover_query_unchecked`](Self::failover_query_unchecked).
+  ///
+  /// The closure obeys the same destructor/`Drop`-panic contract as [`query`](Self::query): ANY caught
+  /// `Drop`-panic — hosted or not — fail-stops the WHOLE plane, because the captured guard can tear an
+  /// unattributable state machine.
   pub async fn failover_query<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
+  where
+    Out: Send + 'static,
+    Q: FnOnce(&F, FailoverReadWindow) -> Option<Out> + Send + 'static,
+  {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
+      // Catch a user-closure panic (see `query`): the plane survives, the caller gets QueryPanicked,
+      // and the reported outcome fail-stops the WHOLE plane (the tear is unattributable).
+      let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::shared::apply_checked_failover(res, f)
+      }));
+      let panicked = caught.is_err();
+      let _ = tx.send(caught.unwrap_or_else(|_| Err(DriverError::QueryPanicked)));
+      crate::shared::CompletionOutcome::caught(panicked)
+    });
+    self.send(MultiCommand::FailoverWindow {
+      group: self.group.cheap_clone(),
+      complete,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Run an UNCHECKED inherited-read query during this group's post-election failover commit-wait — the
+  /// group-keyed [`Handle::failover_query_unchecked`](crate::Handle::failover_query_unchecked). Hands the
+  /// closure the limbo region `(index, limbo_upper]`; the closure MUST return `None` when its key was
+  /// written there, an obligation the API cannot verify (a limbo-ignoring closure can serve stale).
+  /// Resolves `Ok(None)` when the group has no serve window or the closure declined.
+  ///
+  /// The closure obeys the same destructor/`Drop`-panic contract as [`query`](Self::query): ANY caught
+  /// `Drop`-panic — hosted or not — fail-stops the WHOLE plane.
+  pub async fn failover_query_unchecked<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
   where
     Out: Send + 'static,
     Q: FnOnce(&F, &[Entry], FailoverReadWindow) -> Option<Out> + Send + 'static,
@@ -724,7 +925,14 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
     let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
-      let _ = tx.send(res.map(|opt| opt.and_then(|(fsm, limbo, win)| f(fsm, limbo, win))));
+      // Catch a user-closure panic (see `query`): the plane survives, the caller gets QueryPanicked,
+      // and the reported outcome fail-stops the WHOLE plane (the tear is unattributable).
+      let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::shared::apply_unchecked_failover(res, f)
+      }));
+      let panicked = caught.is_err();
+      let _ = tx.send(caught.unwrap_or_else(|_| Err(DriverError::QueryPanicked)));
+      crate::shared::CompletionOutcome::caught(panicked)
     });
     self.send(MultiCommand::FailoverWindow {
       group: self.group.cheap_clone(),

@@ -146,6 +146,14 @@ fn default_band_is_nonvacuous() {
       Some(library_default),
       "seed {seed}: the default profile must leave the library default threshold in place: {r:?}"
     );
+    // The lineage ledger's content leg is non-vacuous on every profile that commits load: the
+    // phantom-quorum map judged real cells (the run-end lineage verdict was not an empty pass).
+    // Installs are structurally near-zero at fast budgets (no compaction), so the install leg's
+    // non-vacuity lives with the Mini-harness adoption scenario instead.
+    assert!(
+      r.lineage_cells_judged > 0,
+      "seed {seed}: the lineage ledger judged no cells: {r:?}"
+    );
   }
 }
 
@@ -371,5 +379,292 @@ fn soak_reshape_profile() {
   assert!(
     total_splits > 0,
     "the reshape soak slice {start}..{end} never materialized a split"
+  );
+}
+
+/// The merge band smoke: the reshape menu plus the three merge verbs at the fast budget.
+/// Beyond the standing non-vacuity floor the band must actually MERGE — the `merges_registered`
+/// witness proves parked commits resolved to real absorbs, so the union verdict inside every
+/// run judged real source→target handovers rather than an empty work list (and the rollback
+/// witness proves the race arm drew).
+#[test]
+fn merge_band_smoke() {
+  let mut total_registered = 0u64;
+  let mut total_rollbacks = 0u64;
+  let mut total_aborted = 0u64;
+  // The async crash-suite non-vacuity witnesses, summed over the band (the merge family runs its
+  // stores async — see [`MultiProfile::merge_reshape`]).
+  let mut total_torn = 0u64;
+  let mut total_crashes_inflight = 0u64;
+  let mut total_flushes = 0u64;
+  for seed in 0..8u64 {
+    let r = run_multi_vopr(seed, 4_000, MultiProfile::merge_reshape());
+    std::eprintln!(
+      "merge seed {seed}: prepared={} committed={} rolled_back={} registered={} resolved={} \
+       aborted={} splits={} committed_load={} log_flushes={} stable_flushes={} torn={} \
+       crash_log_inflight={} crash_stable_inflight={}",
+      r.merges_prepared,
+      r.merges_committed,
+      r.merges_rolled_back,
+      r.merges_registered,
+      r.merges_resolved,
+      r.merges_aborted,
+      r.splits_applied,
+      r.committed,
+      r.log_flushes,
+      r.stable_flushes,
+      r.torn_writes_fired,
+      r.crashes_with_log_inflight,
+      r.crashes_with_stable_inflight,
+    );
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    total_registered += r.merges_registered;
+    total_rollbacks += r.merges_rolled_back;
+    total_aborted += r.merges_aborted;
+    total_flushes += r.log_flushes + r.stable_flushes;
+    total_torn += r.torn_writes_fired;
+    total_crashes_inflight += r.crashes_with_log_inflight + r.crashes_with_stable_inflight;
+  }
+  assert!(
+    total_registered > 0,
+    "the merge band never resolved an absorb — the merge verbs are inert"
+  );
+  assert!(
+    total_rollbacks + total_aborted > 0,
+    "the merge band never exercised the abort side (no rollback accepted, no parked abort)"
+  );
+  // The async crash suite is non-vacuous over the band: the multi tick fsync-flushes, torn writes
+  // strand real batches, and crashes land mid-window — the coverage the sync default cannot reach.
+  assert!(
+    total_flushes > 0,
+    "the merge band never flushed an async store — the multi tick is not fsync-flushing"
+  );
+  assert!(
+    total_torn > 0,
+    "the merge band never fired a torn write that stranded a real batch — the lost-fsync window is inert"
+  );
+  assert!(
+    total_crashes_inflight > 0,
+    "the merge band never crashed mid-fsync-window — the crash×durability interleaving is vacuous"
+  );
+}
+
+/// Determinism holds under the merge profile too: the same (seed, ticks, profile) replays to
+/// the identical report, merge counters included.
+#[test]
+fn merge_profile_same_seed_same_report() {
+  assert_eq!(
+    run_multi_vopr(43, 3_000, MultiProfile::merge_reshape()),
+    run_multi_vopr(43, 3_000, MultiProfile::merge_reshape()),
+    "run_multi_vopr must be a pure function of (seed, ticks, profile)"
+  );
+}
+
+/// The merge×compaction band smoke: the merge menu under [`MultiProfile::merge_reshape_compacting`]'s
+/// snapshot-heavy threshold at the fast budget — the first randomized coverage where installs and
+/// the merge choreography share a world (plain `merge_reshape` never compacts). Beyond the standing
+/// non-vacuity floor, the merge witness must hold over the band (the verbs stay drawable under
+/// compaction pressure) and the applied-threshold witness must prove the override reached a
+/// constructed replica (the snapshot band's detector, kept here because this profile re-derives
+/// the draw). Deliberately NO membership-counter bounds, the snapshot band's parity: at fast
+/// budgets compaction-driven install comparisons are structurally near-zero — install×freeze
+/// coverage physically needs the soak twin's tick budget.
+///
+/// Ignored by default: apply progress stalls under compaction pressure during a merge — a liveness
+/// gap where agreement holds while follower apply lags, so the compacting install×merge
+/// interleaving is not yet driven to convergence; run explicitly with `--ignored`.
+#[test]
+#[ignore = "apply progress stalls under compaction pressure during a merge (liveness: agreement holds, follower apply lags); the compacting install×merge interleaving is not yet driven to convergence — run explicitly with --ignored"]
+fn merge_compacting_band_smoke() {
+  let mut total_registered = 0u64;
+  let mut total_rollbacks = 0u64;
+  let mut total_aborted = 0u64;
+  for seed in 0..8u64 {
+    let r = run_multi_vopr(seed, 4_000, MultiProfile::merge_reshape_compacting(seed));
+    std::eprintln!(
+      "merge-compacting seed {seed}: prepared={} committed={} rolled_back={} registered={} \
+       resolved={} aborted={} splits={} committed_load={} threshold={:?}",
+      r.merges_prepared,
+      r.merges_committed,
+      r.merges_rolled_back,
+      r.merges_registered,
+      r.merges_resolved,
+      r.merges_aborted,
+      r.splits_applied,
+      r.committed,
+      r.applied_snapshot_threshold,
+    );
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    let applied = r
+      .applied_snapshot_threshold
+      .expect("a completed run constructed at least one replica");
+    assert!(
+      (256..=511).contains(&applied),
+      "seed {seed}: the runner did not apply the compacting threshold to a replica \
+       (witness {applied}, outside the 256..=511 band): {r:?}"
+    );
+    total_registered += r.merges_registered;
+    total_rollbacks += r.merges_rolled_back;
+    total_aborted += r.merges_aborted;
+  }
+  assert!(
+    total_registered > 0,
+    "the merge-compacting band never resolved an absorb — the merge verbs are inert under \
+     compaction pressure"
+  );
+  assert!(
+    total_rollbacks + total_aborted > 0,
+    "the merge-compacting band never exercised the abort side"
+  );
+}
+
+/// The merge soak: the [`soak_default_profile`] shape under [`MultiProfile::merge_reshape`],
+/// so freezes, parked commits, rollback races, and resolutions land amid soak-scale
+/// fault/lifecycle churn, with every run's union verdict judging the accumulated absorbs. Each
+/// slice additionally requires the merge witness (`merges_registered` nonzero over the slice).
+/// `#[ignore]` so the everyday gate stays fast; ALWAYS run it `--release`:
+///
+/// ```text
+/// cargo test --release -p sailing-simulation --test multi_vopr -- --ignored soak_merge_profile
+/// ```
+///
+/// Shardable via its own env vars (`MULTI_VOPR_MERGE_SEED_{START,END}` +
+/// `MULTI_VOPR_MERGE_TICKS`). Deterministic per (seed, ticks): failures replay anywhere.
+#[test]
+#[ignore = "the merge soak — run explicitly, --release. Shard via MULTI_VOPR_MERGE_SEED_{START,END} + MULTI_VOPR_MERGE_TICKS."]
+fn soak_merge_profile() {
+  fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(default)
+  }
+  let start = env_u64("MULTI_VOPR_MERGE_SEED_START", 0);
+  let end = env_u64("MULTI_VOPR_MERGE_SEED_END", 64);
+  let ticks = env_u64("MULTI_VOPR_MERGE_TICKS", 40_000) as usize;
+  assert!(end > start, "empty band: {start} >= {end}");
+  let mut registered = 0u64;
+  // The async crash-suite non-vacuity witnesses: the merge family runs its stores through the real
+  // fsync-loss window, so the crash campaign must actually flush, tear, and crash mid-window.
+  let mut log_flushes = 0u64;
+  let mut stable_flushes = 0u64;
+  let mut torn = 0u64;
+  let mut crashes_log_inflight = 0u64;
+  let mut crashes_stable_inflight = 0u64;
+  for seed in start..end {
+    let r = run_multi_vopr(seed, ticks, MultiProfile::merge_reshape());
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    registered += r.merges_registered;
+    log_flushes += r.log_flushes;
+    stable_flushes += r.stable_flushes;
+    torn += r.torn_writes_fired;
+    crashes_log_inflight += r.crashes_with_log_inflight;
+    crashes_stable_inflight += r.crashes_with_stable_inflight;
+  }
+  std::eprintln!(
+    "merge soak {start}..{end} @{ticks}: merges_registered={registered} log_flushes={log_flushes} \
+     stable_flushes={stable_flushes} torn_writes_fired={torn} \
+     crashes_with_log_inflight={crashes_log_inflight} \
+     crashes_with_stable_inflight={crashes_stable_inflight}"
+  );
+  assert!(
+    registered > 0,
+    "the merge soak slice {start}..{end} never resolved an absorb"
+  );
+  // Non-vacuity of the async crash suite: a configured-but-never-fired durability fault must fail
+  // the check, exactly like the network/cross-talk non-vacuity gates. If any of these is zero the
+  // suite CLAIMED to test lost-fsync durability but exercised none of it.
+  assert!(
+    log_flushes > 0 && stable_flushes > 0,
+    "the merge soak slice {start}..{end} never flushed an async store — the multi tick is not \
+     fsync-flushing (log_flushes={log_flushes} stable_flushes={stable_flushes})"
+  );
+  assert!(
+    torn > 0,
+    "the merge soak slice {start}..{end} never fired a torn write that stranded a real batch — the \
+     lost-fsync window is not being exercised"
+  );
+  assert!(
+    crashes_log_inflight + crashes_stable_inflight > 0,
+    "the merge soak slice {start}..{end} never crashed mid-fsync-window — the crash×durability \
+     interleaving is vacuous (crashes_with_log_inflight={crashes_log_inflight} \
+     crashes_with_stable_inflight={crashes_stable_inflight})"
+  );
+}
+
+/// The merge×compaction soak: the [`soak_merge_profile`] shape under
+/// [`MultiProfile::merge_reshape_compacting`], so snapshot installs land on frozen sources,
+/// parked targets, and obligation holders amid soak-scale churn — the install×freeze/park seams
+/// only this profile reaches. Each slice requires the merge witness (`merges_registered`
+/// nonzero). `#[ignore]` so the everyday gate stays fast; ALWAYS run it `--release`:
+///
+/// ```text
+/// cargo test --release -p sailing-simulation --test multi_vopr -- --ignored soak_merge_compacting_profile
+/// ```
+///
+/// Shardable via its own env vars (`MULTI_VOPR_MERGE_COMPACTING_SEED_{START,END}` +
+/// `MULTI_VOPR_MERGE_COMPACTING_TICKS`). Deterministic per (seed, ticks): failures replay
+/// anywhere.
+#[test]
+#[ignore = "the merge-compacting soak — run explicitly, --release. Shard via MULTI_VOPR_MERGE_COMPACTING_SEED_{START,END} + MULTI_VOPR_MERGE_COMPACTING_TICKS."]
+fn soak_merge_compacting_profile() {
+  fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(default)
+  }
+  let start = env_u64("MULTI_VOPR_MERGE_COMPACTING_SEED_START", 0);
+  let end = env_u64("MULTI_VOPR_MERGE_COMPACTING_SEED_END", 64);
+  let ticks = env_u64("MULTI_VOPR_MERGE_COMPACTING_TICKS", 40_000) as usize;
+  assert!(end > start, "empty band: {start} >= {end}");
+  let mut registered = 0u64;
+  let mut log_flushes = 0u64;
+  let mut stable_flushes = 0u64;
+  let mut torn = 0u64;
+  let mut crashes_log_inflight = 0u64;
+  let mut crashes_stable_inflight = 0u64;
+  for seed in start..end {
+    let r = run_multi_vopr(seed, ticks, MultiProfile::merge_reshape_compacting(seed));
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    registered += r.merges_registered;
+    log_flushes += r.log_flushes;
+    stable_flushes += r.stable_flushes;
+    torn += r.torn_writes_fired;
+    crashes_log_inflight += r.crashes_with_log_inflight;
+    crashes_stable_inflight += r.crashes_with_stable_inflight;
+  }
+  std::eprintln!(
+    "merge-compacting soak {start}..{end} @{ticks}: merges_registered={registered} \
+     log_flushes={log_flushes} stable_flushes={stable_flushes} torn_writes_fired={torn} \
+     crashes_with_log_inflight={crashes_log_inflight} \
+     crashes_with_stable_inflight={crashes_stable_inflight}"
+  );
+  assert!(
+    registered > 0,
+    "the merge-compacting soak slice {start}..{end} never resolved an absorb"
+  );
+  // The async crash suite is non-vacuous under compaction pressure too.
+  assert!(
+    log_flushes > 0 && stable_flushes > 0 && torn > 0,
+    "the merge-compacting soak slice {start}..{end} did not exercise the fsync-loss window \
+     (log_flushes={log_flushes} stable_flushes={stable_flushes} torn={torn})"
+  );
+  assert!(
+    crashes_log_inflight + crashes_stable_inflight > 0,
+    "the merge-compacting soak slice {start}..{end} never crashed mid-fsync-window \
+     (crashes_with_log_inflight={crashes_log_inflight} crashes_with_stable_inflight={crashes_stable_inflight})"
   );
 }

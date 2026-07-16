@@ -23,7 +23,7 @@
 //! fields are skipped (forward compatibility), and buffa enforces the structural
 //! bounds (length-before-allocation, overlong-varint rejection, recursion depth,
 //! bounded skips). Sailing's stricter, semantic validation lives in the conversions
-//! here, where the old codec's guarantees are preserved:
+//! here, which preserve these guarantees:
 //!
 //! - an id field must be 1..=1024 bytes (the hello's bound) and must decode consuming
 //!   EXACTLY its length ([`Data::decode_exact`]);
@@ -34,8 +34,9 @@
 //!   (parity with the old unknown-tag reject).
 
 use crate::{
-  ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
-  EntryKind, Index, InstallSnapshot, Message, NodeId, SnapshotMeta, SplitPayload, Term,
+  CommitMergePayload, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  ConfState, Entry, EntryKind, Index, InstallSnapshot, Message, NodeId, PrepareMergePayload,
+  RollbackMergePayload, SnapshotMeta, SplitPayload, Term, ThawDischargedPayload,
   data::{Data, DecodeError},
 };
 use buffa::{EnumValue, Message as _};
@@ -164,6 +165,19 @@ pub(crate) fn install_snapshot_encoded_len<I: NodeId>(
   meta_size += present_uint64(meta.max_unwalled_lease_window());
   meta_size += present_uint64(meta.read_only().map_or(0, |o| u64::from(o.as_u8()) + 1));
   meta_size += present_uint64(meta.shape_gen());
+  // The nested ForkId (a present sub-message, field 9 → 1-byte tag): each inner field is present
+  // per proto3 (a default-0 uint64 / empty bytes is absent), then tag + length-prefix + body. Absent
+  // (a non-fork snapshot) costs nothing, exactly as the proto3-default sub-message it is.
+  if let Some(f) = meta.fork_id() {
+    let mut fork_size = 0usize;
+    fork_size += present_bytes(f.parent());
+    fork_size += present_uint64(f.parent_incarnation());
+    fork_size += present_uint64(f.split_index().get());
+    fork_size += present_uint64(f.split_term().get());
+    fork_size += present_bytes(f.child());
+    fork_size += present_uint64(f.child_gen());
+    meta_size += 1 + buffa::encoding::varint_len(fork_size as u64) + fork_size;
+  }
 
   // InstallSnapshot: term/offset/total_len ride only when non-zero; the leader id is always present
   // (1..=1024 bytes); the snapshot sub-message is always set; the data field rides only when non-empty.
@@ -188,6 +202,17 @@ fn present_uint64(value: u64) -> usize {
     0
   } else {
     1 + buffa::types::uint64_encoded_len(value)
+  }
+}
+
+/// The encoded cost of a present `bytes` field with a 1-byte tag (every such field here is
+/// field-number 1..=15), or `0` when empty and so absent on the wire (proto3 default).
+#[inline]
+fn present_bytes(value: &[u8]) -> usize {
+  if value.is_empty() {
+    0
+  } else {
+    1 + buffa::types::bytes_encoded_len(value)
   }
 }
 
@@ -235,7 +260,7 @@ const SNAPSHOT_META_CACHE_MAX_BYTES: usize = 64 * 1024;
 /// leaves the cache untouched and routes through the stateless [`encode_message`]. Hold one per outbound
 /// connection so every chunk of a transfer hits.
 ///
-/// The cache is MEMORY-BOUNDED: it holds at most [`SNAPSHOT_META_CACHE_MAX_BYTES`] (a large meta is not
+/// The cache is MEMORY-BOUNDED: it holds at most `SNAPSHOT_META_CACHE_MAX_BYTES` (a large meta is not
 /// cached at all), it is released the moment a transfer COMPLETES (the final chunk, or a legacy
 /// single-shot), and it can be dropped on connection teardown via [`clear`](Self::clear) — so nothing is
 /// retained after a transfer. Clearing never affects output (a cleared cache simply re-encodes).
@@ -481,6 +506,125 @@ pub(crate) fn decode_split_payload(mut data: Bytes) -> Result<SplitPayload, Deco
   ))
 }
 
+/// Encode a merge-prepare payload as an entry payload.
+pub(crate) fn encode_prepare_merge_payload(p: &PrepareMergePayload, buf: &mut Vec<u8>) {
+  pb::PrepareMergePayload {
+    target: p.target_bytes(),
+    source_gen_after: p.source_gen_after(),
+    ..Default::default()
+  }
+  .encode(buf);
+}
+
+/// Decode a merge-prepare payload from an entry payload. The target id's encoding must satisfy
+/// the group-tag wire bound (1..=[`MAX_GROUP_ID_LEN`] bytes) — the propose side never appends one
+/// outside it, so a committed violation is corrupt, exactly like a split's child id.
+pub(crate) fn decode_prepare_merge_payload(
+  mut data: Bytes,
+) -> Result<PrepareMergePayload, DecodeError> {
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::PrepareMergePayload>(&mut data)
+    .map_err(map_err)?;
+  if w.target.is_empty() || w.target.len() > MAX_GROUP_ID_LEN {
+    return Err(DecodeError::Invalid("PrepareMergePayload.target length"));
+  }
+  Ok(PrepareMergePayload::new(w.target, w.source_gen_after))
+}
+
+/// Encode a merge-commit payload as an entry payload.
+pub(crate) fn encode_commit_merge_payload(p: &CommitMergePayload, buf: &mut Vec<u8>) {
+  pb::CommitMergePayload {
+    source: p.source_bytes(),
+    freeze_index: p.freeze_index().get(),
+    source_gen_after: p.source_gen_after(),
+    target_gen_after: p.target_gen_after(),
+    freeze_term: p.freeze_term().get(),
+    ..Default::default()
+  }
+  .encode(buf);
+}
+
+/// Decode a merge-commit payload from an entry payload, with the same group-tag bound on the
+/// source id as [`decode_prepare_merge_payload`] applies to the target.
+pub(crate) fn decode_commit_merge_payload(
+  mut data: Bytes,
+) -> Result<CommitMergePayload, DecodeError> {
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::CommitMergePayload>(&mut data)
+    .map_err(map_err)?;
+  if w.source.is_empty() || w.source.len() > MAX_GROUP_ID_LEN {
+    return Err(DecodeError::Invalid("CommitMergePayload.source length"));
+  }
+  Ok(CommitMergePayload::new(
+    w.source,
+    Index::new(w.freeze_index),
+    Term::new(w.freeze_term),
+    w.source_gen_after,
+    w.target_gen_after,
+  ))
+}
+
+/// Encode a merge-rollback payload as an entry payload. The source-side unfreeze role leaves
+/// `source` empty and `target_gen_after` 0 — both proto-absent, so that role's bytes are
+/// unchanged from before the target-side abort existed.
+pub(crate) fn encode_rollback_merge_payload(p: &RollbackMergePayload, buf: &mut Vec<u8>) {
+  pb::RollbackMergePayload {
+    source_gen_after: p.source_gen_after(),
+    source: p.source_bytes(),
+    target_gen_after: p.target_gen_after(),
+    ..Default::default()
+  }
+  .encode(buf);
+}
+
+/// Decode a merge-rollback payload from an entry payload. Unlike the other merge payloads the
+/// source id may be ABSENT (the source-side unfreeze role names no group); a PRESENT one obeys
+/// the same group-tag bound.
+pub(crate) fn decode_rollback_merge_payload(
+  mut data: Bytes,
+) -> Result<RollbackMergePayload, DecodeError> {
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::RollbackMergePayload>(&mut data)
+    .map_err(map_err)?;
+  if w.source.len() > MAX_GROUP_ID_LEN {
+    return Err(DecodeError::Invalid("RollbackMergePayload.source length"));
+  }
+  Ok(if w.source.is_empty() {
+    RollbackMergePayload::unfreeze(w.source_gen_after)
+  } else {
+    RollbackMergePayload::abort(w.source, w.source_gen_after, w.target_gen_after)
+  })
+}
+
+/// Encode a thaw-discharged witness payload as an entry payload.
+pub(crate) fn encode_thaw_discharged_payload(p: &ThawDischargedPayload, buf: &mut Vec<u8>) {
+  pb::ThawDischargedPayload {
+    source: p.source_bytes(),
+    generation: p.generation(),
+    ..Default::default()
+  }
+  .encode(buf);
+}
+
+/// Decode a thaw-discharged witness payload from an entry payload. The source id is ALWAYS present
+/// (a witness names exactly one source) and obeys the group-tag bound (1..=[`MAX_GROUP_ID_LEN`]) —
+/// the same rule the commit-merge source obeys; an empty or over-bound source is corrupt.
+pub(crate) fn decode_thaw_discharged_payload(
+  mut data: Bytes,
+) -> Result<ThawDischargedPayload, DecodeError> {
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::ThawDischargedPayload>(&mut data)
+    .map_err(map_err)?;
+  if w.source.is_empty() || w.source.len() > MAX_GROUP_ID_LEN {
+    return Err(DecodeError::Invalid("ThawDischargedPayload.source length"));
+  }
+  Ok(ThawDischargedPayload::new(w.source, w.generation))
+}
+
 /// Map buffa's structural decode errors onto the crate's error surface. The envelope
 /// rejects-and-closes at the transport either way; the distinction that matters to
 /// callers is truncation vs malformation.
@@ -566,6 +710,10 @@ fn pb_entry(e: &Entry) -> pb::Entry {
       EntryKind::Empty => pb::EntryKind::Empty,
       EntryKind::SetReadMode => pb::EntryKind::SetReadMode,
       EntryKind::Split => pb::EntryKind::Split,
+      EntryKind::PrepareMerge => pb::EntryKind::PrepareMerge,
+      EntryKind::CommitMerge => pb::EntryKind::CommitMerge,
+      EntryKind::RollbackMerge => pb::EntryKind::RollbackMerge,
+      EntryKind::ThawDischarged => pb::EntryKind::ThawDischarged,
     }),
     data: e.data_bytes(),
     timestamp: e.timestamp(),
@@ -582,13 +730,11 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
     EnumValue::Known(pb::EntryKind::Empty) => EntryKind::Empty,
     EnumValue::Known(pb::EntryKind::SetReadMode) => EntryKind::SetReadMode,
     EnumValue::Known(pb::EntryKind::Split) => EntryKind::Split,
-    // The merge kinds are RESERVED by this LABEL_VERSION (their pb values are pinned so the
-    // merge milestone adds no wire change) but nothing encodes them yet: reject like an unknown
-    // value until that milestone maps them. The version fence owns mixed-version peers.
-    EnumValue::Known(
-      pb::EntryKind::PrepareMerge | pb::EntryKind::CommitMerge | pb::EntryKind::RollbackMerge,
-    )
-    | EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
+    EnumValue::Known(pb::EntryKind::PrepareMerge) => EntryKind::PrepareMerge,
+    EnumValue::Known(pb::EntryKind::CommitMerge) => EntryKind::CommitMerge,
+    EnumValue::Known(pb::EntryKind::RollbackMerge) => EntryKind::RollbackMerge,
+    EnumValue::Known(pb::EntryKind::ThawDischarged) => EntryKind::ThawDischarged,
+    EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
   };
   Ok(
     Entry::new(Term::new(w.term), Index::new(w.index), kind, w.data)
@@ -619,6 +765,29 @@ fn conf_state_from<I: NodeId>(w: &pb::ConfState) -> Result<ConfState<I>, DecodeE
   ))
 }
 
+fn pb_fork_id(f: &crate::ForkId) -> pb::ForkId {
+  pb::ForkId {
+    parent: f.parent().clone(),
+    parent_incarnation: f.parent_incarnation(),
+    split_index: f.split_index().get(),
+    split_term: f.split_term().get(),
+    child: f.child().clone(),
+    child_gen: f.child_gen(),
+    ..Default::default()
+  }
+}
+
+fn fork_id_from(w: &pb::ForkId) -> crate::ForkId {
+  crate::ForkId::new(
+    w.parent.clone(),
+    w.parent_incarnation,
+    Index::new(w.split_index),
+    Term::new(w.split_term),
+    w.child.clone(),
+    w.child_gen,
+  )
+}
+
 fn pb_snapshot_meta<I: Data>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
   pb::SnapshotMeta {
     last_index: m.last_index().get(),
@@ -629,6 +798,10 @@ fn pb_snapshot_meta<I: Data>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
     max_unwalled_lease_window: m.max_unwalled_lease_window(),
     read_only: m.read_only().map_or(0, |o| u64::from(o.as_u8()) + 1),
     shape_gen: m.shape_gen(),
+    fork_id: match m.fork_id() {
+      Some(f) => buffa::MessageField::some(pb_fork_id(f)),
+      None => buffa::MessageField::default(),
+    },
     ..Default::default()
   }
 }
@@ -650,7 +823,7 @@ fn snapshot_meta_from<I: NodeId>(w: &pb::SnapshotMeta) -> Result<SnapshotMeta<I>
         .ok_or(DecodeError::Invalid("SnapshotMeta.read_only"))?,
     ),
   };
-  let meta = SnapshotMeta::new(
+  let mut meta = SnapshotMeta::new(
     Index::new(w.last_index),
     Term::new(w.last_term),
     conf_state_from(conf)?,
@@ -659,10 +832,15 @@ fn snapshot_meta_from<I: NodeId>(w: &pb::SnapshotMeta) -> Result<SnapshotMeta<I>
   .with_max_wall_plus_window(w.max_wall_plus_window)
   .with_max_unwalled_lease_window(w.max_unwalled_lease_window)
   .with_shape_gen(w.shape_gen);
-  Ok(match read_only {
-    Some(mode) => meta.with_read_only(mode),
-    None => meta,
-  })
+  if let Some(mode) = read_only {
+    meta = meta.with_read_only(mode);
+  }
+  // A present nested ForkId decodes to the child's provenance token; absent stays None (a non-fork
+  // snapshot, byte-identical to a pre-provenance peer's meta).
+  if let Some(f) = w.fork_id.as_option() {
+    meta = meta.with_fork_id(fork_id_from(f));
+  }
+  Ok(meta)
 }
 
 fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
@@ -735,6 +913,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       reject: m.reject(),
       match_index: m.match_index().get(),
       acked_through: m.acked_through(),
+      progress: m.progress(),
       ..Default::default()
     }),
     Message::TimeoutNow(m) => Body::from(pb::TimeoutNow {
@@ -849,7 +1028,8 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
         m.reject,
         Index::new(m.match_index),
       )
-      .with_acked_through(m.acked_through),
+      .with_acked_through(m.acked_through)
+      .with_progress(m.progress),
     ),
     Body::TimeoutNow(m) => Message::TimeoutNow(crate::TimeoutNow::new(
       Term::new(m.term),

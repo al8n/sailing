@@ -47,11 +47,17 @@ fn snapshot_meta_identity_eq() {
   let base = SnapshotMeta::new(Index::new(42), Term::new(5), conf.clone());
 
   // Same (last_index, last_term, conf) is the SAME identity even with a DIFFERENT monotone lease bound:
-  // a later same-boundary re-snapshot may carry a higher bound yet CONTINUES the same transfer.
+  // a later same-boundary re-snapshot may carry a higher bound yet CONTINUES the same transfer. `shape_gen`
+  // is excluded for the same reason — a boundary POSITION within a lineage, not a lineage.
   let higher_bound =
     SnapshotMeta::new(Index::new(42), Term::new(5), conf.clone()).with_max_lease_window(999);
   assert!(base.identity_eq(&higher_bound));
   assert!(higher_bound.identity_eq(&base));
+  assert!(
+    base.identity_eq(
+      &SnapshotMeta::new(Index::new(42), Term::new(5), conf.clone()).with_shape_gen(7)
+    )
+  );
 
   // A different last_term, conf, or boundary at the same index is a DISTINCT snapshot — NOT the same
   // transfer, so a same-boundary snapshot with different committed metadata cannot reuse a prior
@@ -66,7 +72,45 @@ fn snapshot_meta_identity_eq() {
     Term::new(5),
     ConfState::from_voters(std::vec![1u64, 2u64]),
   )));
-  assert!(!base.identity_eq(&SnapshotMeta::new(Index::new(43), Term::new(5), conf)));
+  assert!(!base.identity_eq(&SnapshotMeta::new(
+    Index::new(43),
+    Term::new(5),
+    conf.clone()
+  )));
+
+  // The LINEAGE TOKEN is identity. `(last_index, last_term, conf)` is not a content-identity ACROSS a fork
+  // boundary — Log Matching holds only WITHIN a lineage — so a manufactured fork baseline and a colliding
+  // TOKENLESS snapshot are different bytes at the same coordinate.
+  let fork = |child: u8| {
+    ForkId::new(
+      bytes::Bytes::from_static(&[7u8]),
+      1,
+      Index::new(41),
+      Term::new(5),
+      bytes::Bytes::copy_from_slice(&[child]),
+      1,
+    )
+  };
+  let forked = SnapshotMeta::new(Index::new(42), Term::new(5), conf.clone()).with_fork_id(fork(9));
+  assert!(
+    !base.identity_eq(&forked),
+    "a tokenless collider is NOT the fork baseline at the same coordinate"
+  );
+  assert!(!forked.identity_eq(&base));
+
+  // Two DIFFERENT forks colliding on the coordinate are likewise distinct snapshots.
+  let other_fork =
+    SnapshotMeta::new(Index::new(42), Term::new(5), conf.clone()).with_fork_id(fork(8));
+  assert!(!forked.identity_eq(&other_fork));
+
+  // The SAME lineage IS the same transfer, across the excluded boundary metadata: a child's own later
+  // capture preserves its token, so it CONTINUES an in-flight transfer rather than restarting it.
+  let same_lineage = SnapshotMeta::new(Index::new(42), Term::new(5), conf)
+    .with_fork_id(fork(9))
+    .with_max_lease_window(999)
+    .with_shape_gen(3);
+  assert!(forked.identity_eq(&same_lineage));
+  assert!(same_lineage.identity_eq(&forked));
 }
 
 #[test]

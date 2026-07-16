@@ -509,6 +509,80 @@ fn leaseguard_failover_leader_stamps_wall_timestamp() {
   );
 }
 
+/// A failover-tier leader handed a wall-LESS `Now::monotonic` (the driver clock's transient
+/// `Wall::ABSENT` over-bound fold) must NOT panic — a missing wall is a legitimate runtime
+/// degradation, not a misconfiguration. It fails closed: the entry stamps `wall_timestamp == 0`
+/// (degrading reads to Safe) and `wall_stamp_degradations` counts the fallback.
+#[test]
+fn failover_leader_absent_wall_stamps_zero_and_counts() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_bounded_clock_uncertainty(Duration::from_millis(20));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+
+  // Elect under a SYNCHRONIZED wall so the leader's own no-op stamps normally (no degradation).
+  let mono = ep.poll_timeout().unwrap();
+  let synced = Now::synchronized(mono, crate::Wall::from_nanos(1_700_000_000_000_000_000));
+  ep.handle_timeout(synced, &mut log, &mut stable);
+  ep.handle_storage(synced, &mut log, &mut stable);
+  ep.handle_message(
+    synced,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(synced, &mut log, &mut stable);
+  assert_eq!(
+    ep.wall_stamp_degradations(),
+    0,
+    "the synchronized-wall election never degrades"
+  );
+
+  // Propose with NO synchronized wall: the tier is active, so lease_wall_stamp must fail closed to
+  // 0 and count the degradation — reaching here at all proves it did not panic the debug build.
+  let idx = ep
+    .propose(
+      Now::monotonic(mono),
+      &mut log,
+      &stable,
+      &bytes::Bytes::from_static(b"cmd"),
+    )
+    .expect("leader accepts the proposal");
+  ep.flush_appends(Now::monotonic(mono), &log, &stable);
+
+  let mut stamped = None;
+  while let Some(out) = ep.poll_message() {
+    if let Message::AppendEntries(ae) = out.message()
+      && let Some(e) = ae.entries().iter().find(|e| e.index() == idx)
+    {
+      stamped = Some(e.wall_timestamp());
+      break;
+    }
+  }
+  assert_eq!(
+    stamped,
+    Some(0),
+    "an absent wall stamps 0 on the failover tier (fail-closed to Safe)"
+  );
+  assert_eq!(
+    ep.wall_stamp_degradations(),
+    1,
+    "the absent-wall fallback is counted exactly once"
+  );
+}
+
 /// A FRESH LeaseGuard cluster's first leader has no inherited entries (`max_lease_window = 0`), so it
 /// has no deposed lease to wait out — its no-op commits immediately on a quorum ack, exactly like
 /// Safe. (The commit-wait engages only on a real failover; see
@@ -593,9 +667,10 @@ fn leaseguard_fresh_cluster_has_no_commit_wait() {
 
 /// The LeaseGuard commit-wait covers the MAX inherited lease window (the self-describing cross-leader
 /// safety). A node that inherits entries a deposed leader stamped — each carrying that leader's own
-/// window — holds its first post-election commit until `now + max(inherited window)`, so any deposed
-/// leader's read-lease has provably expired, even under heterogeneous per-node windows (the LARGER
-/// of two inherited windows binds, regardless of entry order — no assumption about other configs).
+/// window — holds its first post-election commit until `now + max(inherited window)` inflated by its OWN
+/// rate bound, so any deposed leader's read-lease has provably expired, even under heterogeneous per-node
+/// windows (the LARGER of two inherited windows binds, regardless of entry order — assuming only that
+/// each node honors its OWN configured rate bound).
 #[test]
 fn leaseguard_commit_wait_covers_inherited_max_window() {
   use crate::{
@@ -689,24 +764,516 @@ fn leaseguard_commit_wait_covers_inherited_max_window() {
     "held by the commit-wait sized at the MAX inherited lease window"
   );
 
-  // 1ns before now+350ms: still held — proves the wait is the 350ms MAX, not the 200ms or 0.
+  // The wait is the MAX inherited window (350ms) INFLATED by this successor's own (1+ρ_S):
+  // ceil(350ms · (300+50)/300) = 408_333_334ns. At the RAW 350ms boundary it is STILL held — a legally
+  // faster successor must not clear at the bare window (the heterogeneous-drift undercut).
+  ep.handle_timeout(d + Duration::from_millis(350), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "not released at the RAW inherited window — the successor-side (1+ρ_S) inflation still holds it"
+  );
+
+  // 1ns before the inflated deadline: still held — proves the wait is the 350ms MAX (not 200ms or 0),
+  // grown by (1+ρ_S).
   ep.handle_timeout(
-    d + Duration::from_nanos(350_000_000 - 1),
+    d + Duration::from_nanos(408_333_334 - 1),
     &mut log,
     &mut stable,
   );
   assert_eq!(
     ep.commit_index(),
     Index::ZERO,
-    "not released before now + max(inherited window)"
+    "not released before now + ceil(max_inherited_window · (1+ρ_S))"
   );
 
-  // At now+350ms: the commit-wait fires; the no-op and the inherited entries commit.
-  ep.handle_timeout(d + Duration::from_millis(350), &mut log, &mut stable);
+  // At the inflated deadline: the commit-wait fires; the no-op and the inherited entries commit.
+  ep.handle_timeout(d + Duration::from_nanos(408_333_334), &mut log, &mut stable);
   assert_eq!(
     ep.commit_index(),
     Index::new(3),
-    "released at now + max(inherited window) = 350ms"
+    "released at now + ceil(350ms · (300+50)/300) = 408_333_334ns"
+  );
+}
+
+/// A KNOB-LESS successor (Safe mode, carrying INERT stale lease knobs) inherits a LeaseGuard leader's
+/// per-entry window and MUST still inflate its post-election commit-wait — by the UNIVERSAL assumed
+/// clock-rate bound, NOT the raw window a legally faster successor would under-wait, and NOT the
+/// off-mode lease knobs (`leaseguard_timing` fails closed on them). Refusing leadership is not an
+/// option: it would wedge the supported mixed Safe + LeaseGuard topology. Pins the STRICT inflation
+/// (held at the RAW window, released at the assumed-rate deadline) AND that the inert
+/// `lease_duration`/`clock_drift_bound` are never read (their `7/6` factor is never applied).
+#[test]
+fn safe_successor_inflates_inherited_wait_by_assumed_rate_bound() {
+  use crate::{
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
+  };
+  use core::time::Duration;
+
+  // A Safe successor. The lease knobs (Δ=300ms, ε=50ms ⇒ a 7/6 factor) are set but INERT under Safe —
+  // present ONLY to prove the inflation ignores them and uses the universal assumed rate instead.
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  assert_eq!(
+    cfg.read_only(),
+    ReadOnlyOption::Safe,
+    "the successor is knob-less (Safe) — the lease knobs are inert"
+  );
+  assert_eq!(
+    cfg.assumed_clock_rate_bound_ppm(),
+    1_000,
+    "the default assumed clock-rate bound is 1e-3 (1000 ppm)"
+  );
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+
+  // A deposed LeaseGuard leader (node 2, term 5) replicated an entry stamped with its own 350ms window.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(350_000_000)
+      ],
+      Index::ZERO,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // The deposed leader goes silent; node 1 times out, campaigns (term 6), wins, appends its no-op.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // peer 3 acks the no-op at index 2 → quorum, but the inherited commit-wait holds it.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(6),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2),
+    )),
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "held by the inherited commit-wait even though this successor serves Safe reads"
+  );
+
+  // The wait is the RAW 350ms window inflated by the UNIVERSAL assumed rate (1 + 1000/1e6):
+  // ceil(350_000_000 · 1_001_000 / 1_000_000) = 350_350_000ns. AT the raw window the commit is STILL
+  // held — a knob-less-but-legally-faster successor must not clear at the bare window.
+  ep.handle_timeout(d + Duration::from_nanos(350_000_000), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "not released at the RAW inherited window — the universal assumed-rate inflation still holds it"
+  );
+
+  // 1ns before the assumed-rate deadline: still held. Had the code read the inert 7/6 lease knobs the
+  // deadline would be 408_333_334ns; this pins it at the assumed-rate 350_350_000, not the stale knobs.
+  ep.handle_timeout(
+    d + Duration::from_nanos(350_350_000 - 1),
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "not released before now + ceil(raw · (1 + ppm/1e6))"
+  );
+
+  // At the assumed-rate deadline the commit-wait fires; the inherited entry and the no-op commit.
+  ep.handle_timeout(d + Duration::from_nanos(350_350_000), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(2),
+    "released at now + ceil(350ms · 1_001_000/1_000_000) = 350_350_000ns (assumed rate, not the 7/6 knobs)"
+  );
+}
+
+/// HETEROGENEOUS-DRIFT falsifying witness: the per-entry commit-wait window is stamped from the
+/// appending leader's config yet consumed RAW on the successor's monotonic clock, so a legally faster
+/// successor can commit past an inherited anchor before a slower deposed leader's lease expires — a
+/// stale read whenever ρ_S > ρ_D. TWO nodes on a SHARED real timeline, each with its OWN
+/// validator-passing config and OWN drift: the deposed leader D (Δ=10s, ε=1s; a slow 0.9× clock, a long
+/// ~11.1s real lease) and the successor S (Δ=300ms, ε=150ms; a fast 1.5× clock). Real t = 0 is both D's
+/// anchor stamp and S's election. At t* = 10s real D's lease is STILL live (D-mono 9s < Δ_D 10s), so S
+/// must NOT yet have committed past the anchor: the RAW wait clears S at ~8.1s real (the stale read);
+/// the successor-side (1+ρ_S) inflation pushes the clear to ~12.2s real, strictly past D's lease.
+#[test]
+fn leaseguard_heterogeneous_drift_successor_must_not_undercut_deposed_lease() {
+  use crate::{
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
+  };
+  use core::time::Duration;
+
+  // The deposed leader D: a slow 0.9× clock and a LONG lease. `w_d` is the exact window D stamps on every
+  // entry and the length S must cover on its own clock.
+  let cfg_d = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_secs(20),
+    Duration::from_secs(2),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_secs(10))
+  .with_clock_drift_bound(Duration::from_secs(1));
+  let w_d = cfg_d
+    .leaseguard_commit_wait_ns(ReadOnlyOption::LeaseGuard)
+    .expect("D's LeaseGuard window is valid");
+
+  // D elects (term 1) and commits its no-op — a current-term, LeaseGuard-stamped anchor (window `w_d`,
+  // timestamp = the election mono d0). D holds no inherited window, so nothing defers this commit.
+  let mut d = Endpoint::new(cfg_d, Instant::ORIGIN, 1, CountSm::default());
+  let mut d_log = VecLog::default();
+  let mut d_stable = NoopStable::default();
+  let d0 = d.poll_timeout().unwrap();
+  d.handle_timeout(d0, &mut d_log, &mut d_stable);
+  d.handle_storage(d0, &mut d_log, &mut d_stable);
+  d.handle_message(
+    d0,
+    &mut d_log,
+    &mut d_stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(d.role().is_leader());
+  d.handle_storage(d0, &mut d_log, &mut d_stable);
+  while d.poll_message().is_some() {}
+  d.handle_message(
+    d0,
+    &mut d_log,
+    &mut d_stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert_eq!(
+    d.commit_index(),
+    Index::new(1),
+    "D commits its LeaseGuard no-op (a fresh leader holds no inherited window to defer it)"
+  );
+
+  // The successor S: a fast 1.5× clock and a SHORT lease (ρ_S = 0.5 ⇒ 1+ρ_S = 3/2). It inherits an entry
+  // stamped with D's window `w_d` from a deposed leader (term 5), then campaigns term 6.
+  let cfg_s = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_secs(1),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(150));
+  let mut s = Endpoint::new(cfg_s, Instant::ORIGIN, 1, CountSm::default());
+  let mut s_log = VecLog::default();
+  let mut s_stable = NoopStable::default();
+  s.handle_message(
+    Instant::ORIGIN,
+    &mut s_log,
+    &mut s_stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(w_d),
+      ],
+      Index::ZERO,
+    )),
+  );
+  s.handle_storage(Instant::ORIGIN, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  let s0 = s.poll_timeout().unwrap();
+  s.handle_timeout(s0, &mut s_log, &mut s_stable);
+  s.handle_storage(s0, &mut s_log, &mut s_stable);
+  s.handle_message(
+    s0,
+    &mut s_log,
+    &mut s_stable,
+    3u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(s.role().is_leader());
+  s.handle_storage(s0, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  while s.poll_event().is_some() {}
+  s.handle_message(
+    s0,
+    &mut s_log,
+    &mut s_stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(6),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2),
+    )),
+  );
+  assert_eq!(
+    s.commit_index(),
+    Index::ZERO,
+    "S's inherited commit-wait holds its quorum-ready no-op"
+  );
+
+  // The SHARED real timeline: t = 0 is D's anchor stamp AND S's election. At real t, D-mono = d0 + 0.9·t
+  // (slow) and S-mono = s0 + 1.5·t (fast). Probe the single instant t* = 10s real.
+  const T_STAR_REAL_NS: u64 = 10_000_000_000;
+  let d_mono_at = d0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 9); // 0.9 · 10s = 9s
+  let s_mono_at = s0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 15); // 1.5 · 10s = 15s
+
+  // Witness guards (config-drift proofs, independent of the inflation): t*'s S-mono (15s) is PAST S's RAW wait
+  // `w_d` (~12.2s) but BELOW the (1+ρ_S)-inflated wait `w_d + w_d/2` (~18.3s) — so a RAW wait would have
+  // cleared S here (the stale read), while the inflation must still hold it.
+  let s_mono_elapsed = T_STAR_REAL_NS / 10 * 15;
+  assert!(
+    s_mono_elapsed >= w_d,
+    "t* must be past S's RAW inherited wait (the RED band)"
+  );
+  assert!(
+    s_mono_elapsed < w_d + w_d / 2,
+    "t* must be below S's (1+ρ_S)-inflated wait (the GREEN target)"
+  );
+
+  // Drive S past t*, then probe BOTH nodes at the same real instant.
+  s.handle_timeout(s_mono_at, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  let d_lease_live = d.lease_guard_read_live(Now::monotonic(d_mono_at), &d_log);
+  let s_committed_past_anchor = s.commit_index() > Index::ZERO;
+
+  // Non-vacuous: D's lease IS live at t* (else the safety property would hold trivially).
+  assert!(
+    d_lease_live,
+    "the deposed leader's lease is still live at t* = 10s real (D-mono 9s < Δ_D 10s)"
+  );
+  // THE SAFETY PROPERTY: a live inherited lease forbids the successor committing past the anchor.
+  // A RAW inherited wait clears on S at ~8.1s real — still inside D's lease — so the successor side
+  // must inflate it by (1+ρ_S) to ~12.2s real, strictly past D's ~11.1s real lease.
+  assert!(
+    !s_committed_past_anchor,
+    "heterogeneous-drift stale read: the fast successor committed past the inherited anchor while the \
+     deposed leader's lease is still live"
+  );
+}
+
+/// The FAILOVER WALL-ABSENT twin of the heterogeneous-drift witness. A fail-closed (wall-absent)
+/// inherited lease is covered ONLY by the mono-frame fallback `unwalled_commit_wait_until`, so a fast
+/// failover successor's PRECISE early-release would fire on its own clock before a slower deposed
+/// leader's lease expires. Same two nodes and shared timeline as the walled witness, but S is a FAILOVER
+/// node (ε_unc) inheriting a WALL-ABSENT entry, probed through `precise_release_ready` (which for a
+/// wall-absent-only inheritance reduces to the unwalled fallback — the walled floor is vacuously 0). At
+/// t* = 10s real D's lease is live; the RAW unwalled fallback would already permit the precise release
+/// (the stale read), while the successor-side (1+ρ_S) inflation of the unwalled arm still holds it.
+#[test]
+fn leaseguard_heterogeneous_drift_unwalled_precise_release_must_not_undercut_deposed_lease() {
+  use crate::{
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
+  };
+  use core::time::Duration;
+
+  // A realistic synchronized cluster-epoch wall for S's failover tier. The inherited entry is WALL-ABSENT
+  // (no walled floor), so the wall value only needs to be non-absent for the precise-release probe.
+  const W_EPOCH: u64 = 1_700_000_000_000_000_000;
+
+  // The deposed leader D (as in the walled witness): a slow 0.9× clock and a long ~11.1s real lease.
+  let cfg_d = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_secs(20),
+    Duration::from_secs(2),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_secs(10))
+  .with_clock_drift_bound(Duration::from_secs(1));
+  let w_d = cfg_d
+    .leaseguard_commit_wait_ns(ReadOnlyOption::LeaseGuard)
+    .expect("D's LeaseGuard window is valid");
+  let mut d = Endpoint::new(cfg_d, Instant::ORIGIN, 1, CountSm::default());
+  let mut d_log = VecLog::default();
+  let mut d_stable = NoopStable::default();
+  let d0 = d.poll_timeout().unwrap();
+  d.handle_timeout(d0, &mut d_log, &mut d_stable);
+  d.handle_storage(d0, &mut d_log, &mut d_stable);
+  d.handle_message(
+    d0,
+    &mut d_log,
+    &mut d_stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(d.role().is_leader());
+  d.handle_storage(d0, &mut d_log, &mut d_stable);
+  while d.poll_message().is_some() {}
+  d.handle_message(
+    d0,
+    &mut d_log,
+    &mut d_stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert_eq!(d.commit_index(), Index::new(1));
+
+  // The successor S: a fast 1.5× clock, a short lease (ρ_S = 0.5), AND a FAILOVER tier (ε_unc). It
+  // inherits a single WALL-ABSENT fail-closed entry stamped with D's window `w_d`, so ONLY the unwalled
+  // mono fallback covers that lease.
+  let cfg_s = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_secs(1),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(150))
+  .with_bounded_clock_uncertainty(Duration::from_millis(20));
+  let mut s = Endpoint::new(cfg_s, Instant::ORIGIN, 1, CountSm::default());
+  let mut s_log = VecLog::default();
+  let mut s_stable = NoopStable::default();
+  s.handle_message(
+    Instant::ORIGIN,
+    &mut s_log,
+    &mut s_stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(w_d),
+      ],
+      Index::ZERO,
+    )),
+  );
+  s.handle_storage(Instant::ORIGIN, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  // Elect S under a synchronized wall (a failover node's arming path expects one).
+  let s0 = s.poll_timeout().unwrap();
+  let s_elect = Now::synchronized(s0, Wall::from_nanos(W_EPOCH));
+  s.handle_timeout(s_elect, &mut s_log, &mut s_stable);
+  s.handle_storage(s_elect, &mut s_log, &mut s_stable);
+  s.handle_message(
+    s_elect,
+    &mut s_log,
+    &mut s_stable,
+    3u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(s.role().is_leader());
+  s.handle_storage(s_elect, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  while s.poll_event().is_some() {}
+
+  // Shared real timeline, t* = 10s. D-mono = d0 + 9s (0.9×); S-mono = s0 + 15s (1.5×). S's WALL is the
+  // real-rate synchronized clock, against which its fast mono drifts (the whole point).
+  const T_STAR_REAL_NS: u64 = 10_000_000_000;
+  let d_mono_at = d0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 9);
+  let s_probe = Now::synchronized(
+    s0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 15),
+    Wall::from_nanos(W_EPOCH + T_STAR_REAL_NS),
+  );
+
+  // Witness guards: t*'s S-mono (15s) is past S's RAW unwalled wait `w_d` (~12.2s) but below the
+  // (1+ρ_S)-inflated unwalled wait `w_d + w_d/2` (~18.3s).
+  let s_mono_elapsed = T_STAR_REAL_NS / 10 * 15;
+  assert!(
+    s_mono_elapsed >= w_d,
+    "t* must be past S's RAW unwalled wait (the RED band)"
+  );
+  assert!(
+    s_mono_elapsed < w_d + w_d / 2,
+    "t* must be below S's (1+ρ_S)-inflated unwalled wait (the GREEN target)"
+  );
+
+  let d_lease_live = d.lease_guard_read_live(Now::monotonic(d_mono_at), &d_log);
+  let s_would_precise_release = s.precise_release_ready(s_probe);
+
+  assert!(
+    d_lease_live,
+    "the deposed leader's lease is still live at t* = 10s real"
+  );
+  // The unwalled fallback is the SOLE cover for the fail-closed inherited lease. Its RAW length lets
+  // S's precise release fire here (the stale read); the (1+ρ_S) inflation of the unwalled arm must
+  // still hold it.
+  assert!(
+    !s_would_precise_release,
+    "heterogeneous-drift stale read (wall-absent tier): the fast failover successor's precise release \
+     would clear the fail-closed inherited lease while the deposed leader's lease is still live"
   );
 }
 
@@ -979,29 +1546,35 @@ fn leaseguard_failover_precise_anchor_waits_for_unwalled_failclosed_entry() {
     !ep.precise_release_ready(at(0)),
     "the fail-closed (wall-absent) inherited lease gates the precise release"
   );
-  // Even with the wall raced 1400ms past election (S + 2400ms, far past the walled deadline), the
-  // mono fallback still holds (d + 1400ms < d + 1500ms): the fail-closed lease is never skipped.
+  // Even with the wall raced 1400ms past election (S + 2400ms, far past the walled deadline), the mono
+  // fallback still holds (d + 1400ms < the inflated d + 1750ms): the fail-closed lease is never skipped.
   assert!(
     !ep.precise_release_ready(at(1_400_000_000)),
     "the mono-frame fallback still holds the fail-closed lease before its conservative deadline"
   );
-  // Once the mono fallback elapses (d + 1500ms) the precise anchor is satisfied (the unwalled fallback
-  // `unwalled_commit_wait_until` is NOT inflated — only walled entries gate the inherited serve).
+  // The unwalled fallback `unwalled_commit_wait_until` is INFLATED by this successor's own (1+ρ_S) — the
+  // same LENGTH pad as the walled arm: ceil(1500ms · (300+50)/300) = d + 1750ms. At the RAW 1500ms window
+  // the fail-closed lease is NOT yet releasable, so a faster successor cannot precise-release past it.
   assert!(
-    ep.precise_release_ready(at(1_500_000_000)),
-    "both the wall floor and the unwalled mono fallback are satisfied at d + 1500ms"
+    !ep.precise_release_ready(at(1_500_000_000)),
+    "the RAW unwalled window does not release the fail-closed lease — the (1+ρ_S) inflation still holds it"
   );
-  // The conservative CommitWait backstop fires once the mono fallback has elapsed; probed at d + 1750ms,
-  // UNDER A SYNCHRONIZED WALL (this is an ε_unc failover-tier node — the Option B wall-gate fail-closes a
-  // non-armed node's conservative clear on an ABSENT wall, so the contract is to supply the wall). The
-  // wall (W_E + 1750ms) is far past every WALLED inherited deadline, so the walled class is released; the
-  // unwalled mono fallback (d + 1500ms) has also elapsed, so the backstop commits the inherited entries +
-  // the no-op.
+  // At the inflated d + 1750ms both the wall floor and the unwalled mono fallback are satisfied.
+  assert!(
+    ep.precise_release_ready(at(1_750_000_000)),
+    "the wall floor and the INFLATED unwalled mono fallback are both satisfied at d + 1750ms"
+  );
+  // The conservative CommitWait backstop fires once the (inflated) mono fallback has elapsed; probed at
+  // d + 1750ms UNDER A SYNCHRONIZED WALL (this is an ε_unc failover-tier node — the Option B wall-gate
+  // fail-closes a non-armed node's conservative clear on an ABSENT wall, so the contract is to supply the
+  // wall). The wall (W_E + 1750ms) is far past every WALLED inherited deadline, so the walled class is
+  // released; the inflated unwalled mono fallback (d + 1750ms) has also elapsed, so the backstop commits
+  // the inherited entries + the no-op.
   ep.handle_timeout(at(1_750_000_000), &mut log, &mut stable);
   assert_eq!(
     ep.commit_index(),
     Index::new(3),
-    "released at the E′-inflated conservative mono deadline (no early skip of the fail-closed lease)"
+    "released at the (1+ρ_S)-inflated conservative mono deadline (no early skip of the fail-closed lease)"
   );
 }
 
@@ -1283,13 +1856,21 @@ fn leaseguard_inherited_window_defers_commit_even_for_a_safe_successor() {
     "a Safe successor must still defer commit while a deposed LeaseGuard lease may be live"
   );
 
-  // Released at now + the inherited window (350ms) — proving the wait keyed on the inherited window,
-  // not on the successor's own read mode.
+  // The wait keys on the inherited window (350ms) INFLATED by the universal assumed clock-rate bound —
+  // regardless of the successor's read mode, and NOT the raw window a legally faster successor would
+  // under-wait. Held at the raw 350ms:
   ep.handle_timeout(d + Duration::from_millis(350), &mut log, &mut stable);
   assert_eq!(
     ep.commit_index(),
+    Index::ZERO,
+    "not released at the RAW inherited window — the assumed-rate inflation holds it, whatever the read mode"
+  );
+  // Released at now + ceil(350ms · (1 + 1000/1e6)) = 350_350_000ns.
+  ep.handle_timeout(d + Duration::from_nanos(350_350_000), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
     Index::new(2),
-    "released at now + inherited max_lease_window, independent of the successor's read mode"
+    "released at now + the assumed-rate-inflated inherited window, independent of the successor's read mode"
   );
 }
 
@@ -2734,7 +3315,7 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
 
   // Drive the CommitWait timer at a monotonic instant within one heartbeat of `Instant::MAX`, with the wall
   // STILL below the floor (S < S + 140ms) so the walled lease vetoes the clear. The re-arm `now.mono() + HB`
-  // would saturate to `Instant::MAX` (`MAX − 50ms + 100ms`); the fix FAIL-STOPS instead. `handle_timeout`
+  // would saturate to `Instant::MAX` (`MAX − 50ms + 100ms`); the re-arm FAIL-STOPS instead. `handle_timeout`
   // must NOT panic (no saturated, perpetually-due CommitWait timer left behind).
   let near_max = Now::synchronized(
     Instant::from_origin(Duration::MAX - Duration::from_millis(50)),
@@ -2853,10 +3434,13 @@ fn failover_unprovable_floor_hold_is_counted() {
   );
 
   // The driver now drops the wall on the release path: drive WALL-ABSENT due ticks. Each holds fail-closed
-  // and is COUNTED; commit stays pinned (the walled lease is never undercut).
+  // and is COUNTED; commit stays pinned (the walled lease is never undercut). The first due tick is the
+  // knob-less (Safe + ε_unc) inherited-window inflation ceil(W · (1 + 1000/1e6)) = 100_100_000ns, not the
+  // bare W — a legally faster successor must not clear at the raw window.
+  const W_INFLATED: u64 = 100_100_000;
   let mono = |off: u64| Now::monotonic(d + Duration::from_nanos(off));
   for k in 1..=3u64 {
-    ep.handle_timeout(mono(W + (k - 1) * HB), &mut log, &mut stable);
+    ep.handle_timeout(mono(W_INFLATED + (k - 1) * HB), &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     assert_eq!(
       ep.commit_index(),
@@ -2869,6 +3453,89 @@ fn failover_unprovable_floor_hold_is_counted() {
       "each wall-absent commit-wait hold is counted — the otherwise-silent wedge is now observable"
     );
   }
+}
+
+/// The PRE-election dual of `failover_unprovable_floor_hold_is_counted`: a node that STARTS a campaign
+/// while holding a walled inherited floor it could not prove as leader — a walled obligation
+/// (`max_wall_plus_window != 0`, folded per-entry) with NO `bounded_clock_uncertainty` — is flagged at
+/// campaign time via `unprovable_floor_campaigns`, so the wedge is observable BEFORE the node wins and
+/// holds commit, not only after. A node WITH ε_unc, or with NO walled floor, counts nothing.
+#[test]
+fn campaign_under_unprovable_walled_floor_is_counted() {
+  use crate::{AppendEntries, Entry, EntryKind, Index, Message, Term};
+
+  const S: u64 = 1_700_000_000_000_000_000;
+  const W: u64 = 100_000_000;
+
+  // Build a 3-voter node — optionally with ε_unc, optionally fed a WALLED inherited entry (which folds
+  // `max_wall_plus_window` per-entry regardless of local tier) — then fire its election timeout so it
+  // campaigns. Pre-vote is off by default, so the timeout drives `become_candidate` directly. Returns the
+  // campaign counter after the campaign has started.
+  fn campaigns(with_eps: bool, walled_floor: bool) -> u64 {
+    let mut cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    if with_eps {
+      cfg = cfg.with_bounded_clock_uncertainty(Duration::from_millis(5));
+    }
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+    let mut log = VecLog::default();
+    let mut stable = NoopStable::default();
+
+    let mut entry = Entry::new(
+      Term::new(5),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    );
+    if walled_floor {
+      entry = entry.with_lease_window(W).with_wall_timestamp(S);
+    }
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(5),
+        2u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![entry],
+        Index::new(1),
+      )),
+    );
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(Now::monotonic(d), &mut log, &mut stable);
+    assert!(
+      ep.role().is_candidate(),
+      "the election timeout must have started a real campaign"
+    );
+    ep.unprovable_floor_campaigns()
+  }
+
+  assert_eq!(
+    campaigns(false, true),
+    1,
+    "a no-ε_unc node campaigning under a walled inherited floor is flagged pre-election"
+  );
+  assert_eq!(
+    campaigns(true, true),
+    0,
+    "ε_unc makes the floor provable — nothing is flagged"
+  );
+  assert_eq!(
+    campaigns(false, false),
+    0,
+    "no walled floor to prove — nothing is flagged"
+  );
 }
 
 /// FAILOVER regression (the absent-wall fail-OPEN): a NON-armed Safe+ε_unc successor driven with a
@@ -3502,8 +4169,8 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
 
-  // Elect near Instant::MAX (monotonic — basic LeaseGuard stamps no wall). The bare commit-wait
-  // `near_max + 100ms` saturates.
+  // Elect near Instant::MAX (monotonic — basic LeaseGuard stamps no wall). The successor-inflated
+  // commit-wait `near_max + ceil(100ms · (300+50)/300)` saturates (any nonzero window would).
   let near_max = Instant::from_origin(Duration::MAX - Duration::from_millis(50));
   let now = Now::monotonic(near_max);
   ep.handle_timeout(now, &mut log, &mut stable);
@@ -3515,10 +4182,10 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
     3u64,
     Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
-  // The saturated bare commit-wait fail-stops: the node poisons.
+  // The saturated commit-wait fail-stops: the node poisons.
   assert!(
     ep.is_poisoned(),
-    "a saturated BARE (basic LeaseGuard) commit-wait must fail-stop, not clear early"
+    "a saturated basic-LeaseGuard commit-wait must fail-stop, not clear early"
   );
   assert_eq!(
     ep.poison_reason(),
@@ -3659,10 +4326,10 @@ fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
 /// Regression (inconsistent recovered lease floors): a crafted/corrupt `SnapshotMeta` can carry a
 /// walled release floor (`max_wall_plus_window != 0`) with NO lease-window bound (`max_lease_window == 0`)
 /// — live folds can never separate them (a walled entry's window goes to BOTH). With `max_lease_window ==
-/// 0`, `failover_inflated_commit_wait` returns `Some(0)`, which (before the fix) marked the node
-/// E′-inflated with a ZERO wait and `commit_wait_until == None`, so the first commit passed IMMEDIATELY
-/// despite a walled lease to honor. The fix gates `inflated_candidate` on `max_lease_window > 0` AND
-/// fail-stops the inconsistency (`InconsistentLeaseFloor`), so the node poisons before any commit.
+/// 0`, `failover_inflated_commit_wait` returns `Some(0)`, which would mark the node E′-inflated with
+/// a ZERO wait and `commit_wait_until == None`, so the first commit passes IMMEDIATELY despite a
+/// walled lease to honor. `inflated_candidate` is therefore gated on `max_lease_window > 0` AND the
+/// inconsistency fail-stops (`InconsistentLeaseFloor`), so the node poisons before any commit.
 #[test]
 fn inconsistent_lease_floor_snapshot_fails_stop() {
   use crate::{
@@ -3953,8 +4620,8 @@ fn assert_inconsistent_lease_floor_fails_stop(
     Some(PoisonReason::InconsistentLeaseFloor)
   );
 
-  // A quorum ack must NOT advance commit — without the fix the commit-wait would clear (vacuously, or on the
-  // too-small floor's immediate wall expiry) and commit past the snapshot index before the window elapsed.
+  // A quorum ack must NOT advance commit — ungated, the commit-wait clears (vacuously, or on the
+  // too-small floor's immediate wall expiry) and commits past the snapshot index before the window elapsed.
   let before = ep.commit_index();
   ep.handle_message(
     at(0),
@@ -3993,9 +4660,9 @@ fn inconsistent_lease_floor_no_classified_floor_fails_stop() {
 /// The runtime inflation keys on `max_lease_window` — the MAX window INHERITED, possibly stamped by
 /// ANOTHER node's larger config — which config-time validation cannot bound (there is no cluster-wide
 /// config check, design §1). So the over-large case is gated at RUNTIME (`inherited_serve_armed` in
-/// `become_leader`: the serve is disarmed and the bare wait is used), NOT rejected here. This supersedes
-/// the earlier config-rejection test, which incorrectly checked the LOCAL window as if it bounded the
-/// inherited max.
+/// `become_leader`: the serve is disarmed while the commit-wait keeps its successor-side inflated LENGTH),
+/// NOT rejected here. This supersedes the earlier config-rejection test, which incorrectly checked the
+/// LOCAL window as if it bounded the inherited max.
 #[test]
 fn failover_config_with_inflated_wait_over_election_is_still_valid() {
   use crate::{Config, ReadOnlyOption};
@@ -4022,11 +4689,13 @@ fn failover_config_with_inflated_wait_over_election_is_still_valid() {
 }
 
 /// FAILOVER finding (heterogeneous-window runtime guard): when this node INHERITS a lease window so
-/// large that the E′-inflated conservative wait would NOT fit below the election timeout, the inherited
-/// serve is DISARMED (`failover_read_window` returns `None` even though the committed anchor's lease is
-/// live), and the commit-wait falls back to the BARE `max_lease_window` (the shipped conservative anchor)
-/// so the node still makes progress. The inflation keys on the inherited max — another node's larger
-/// config — which config validation cannot bound, so the guard lives at `become_leader`, not config time.
+/// large that the E′-inflated wait would NOT fit below the election timeout, the inherited SERVE is
+/// DISARMED (`failover_read_window` returns `None` even though the committed anchor's lease is live) and
+/// the E′ veto-SKIP permission is withheld. The commit-wait LENGTH, however, is STILL the successor-side
+/// (1+ρ_S) inflation of `max_lease_window` (pure safety) — it does NOT drop to the RAW window a faster
+/// successor would under-wait; the node simply stays wall-GOVERNED and releases at the inflated
+/// conservative deadline. The inflation keys on the inherited max — another node's larger config — which
+/// config validation cannot bound, so the guard lives at `become_leader`, not config time.
 #[test]
 fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
   use crate::{
@@ -4106,7 +4775,7 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
   assert_eq!(
     ep.commit_index(),
     Index::new(1),
-    "commit held at the inherited index during the (bare) wait"
+    "commit held at the inherited index during the wait"
   );
 
   // The inherited serve is DISARMED: even though the committed anchor's lease is live (now_wall + 2·ε_unc
@@ -4118,7 +4787,7 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
     "an oversized inherited window must DISARM the serve even while the anchor lease is live"
   );
 
-  // peer 3 acks the no-op at index 2 → quorum, so commit CAN advance once the (bare) wait lifts.
+  // peer 3 acks the no-op at index 2 → quorum, so commit CAN advance once the wait lifts.
   ep.handle_message(
     at(0),
     &mut log,
@@ -4134,28 +4803,36 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
     )),
   );
 
-  // The commit-wait uses the BARE max_lease_window (NOT the E′ inflation — that is the disarm), but it is
-  // WALL-GOVERNED (Option B): at the bare deadline d + W (wall S + 900ms, still below the floor
-  // S + W + 2·ε_unc = S + 940ms) the conservative clear is VETOED — commit holds — and the timer re-arms.
-  // (Driven under the synchronized wall: this is an ε_unc failover-tier node, and an absent wall fails
-  // closed for a non-armed node, so the contract is to supply the wall.)
+  // The serve disarm does NOT drop the commit-wait to the RAW window: the LENGTH is STILL the
+  // successor-side (1+ρ_S) inflation ceil(900ms · (300+50)/300) = d + 1050ms (only the E′ veto-SKIP
+  // permission is withheld — this node stays wall-GOVERNED). At the RAW 900ms window it is held (the
+  // inflated mono deadline is not due), so a faster successor cannot under-wait the inherited lease.
   ep.handle_timeout(at(W), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
     ep.commit_index(),
     Index::new(1),
-    "the bare mono deadline does NOT clear a still-live walled lease (held below the wall floor)"
+    "the RAW mono window does not clear the inherited lease — the (1+ρ_S) inflation holds it"
   );
-  // Once the wall passes the floor (S + 940ms), the re-armed conservative deadline (d + W + heartbeat =
-  // d + 1000ms) clears and commits — the release is governed by the WALL, not the bare d + 900ms mono
-  // deadline (which would have under-waited the 940ms wall floor). This proves the wait is NOT the
-  // inflated 1050ms (an inflated deadline would still be held at d + 1000ms) AND is wall-gated.
-  ep.handle_timeout(at(W + 100_000_000), &mut log, &mut stable);
+  // Even at d + 1000ms — where the BARE wait would have released (wall past the S + 940ms floor) — the
+  // commit is STILL held: the successor-inflated 1050ms deadline has not elapsed. This pins the LENGTH as
+  // the inflation, not the bare 900ms.
+  ep.handle_timeout(at(1_000_000_000), &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(1),
+    "still held at the old d + 1000ms wall-release — the successor-inflated 1050ms deadline governs"
+  );
+  // At the inflated deadline d + 1050ms the wall (S + 1050ms) is past the floor S + 940ms and the
+  // conservative mono deadline has elapsed, so commit releases — the LENGTH inflation governs even when
+  // the serve is disarmed.
+  ep.handle_timeout(at(1_050_000_000), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
     ep.commit_index(),
     Index::new(2),
-    "once the wall passes the floor the re-armed conservative deadline commits (wall-governed release)"
+    "released at the successor-inflated conservative deadline d + ceil(900ms · (300+50)/300) = 1050ms"
   );
 }
 
@@ -4285,7 +4962,9 @@ fn failover_tier_active_requires_leaseguard_timing_and_bounded_uncertainty() {
 /// the arming check compare a too-small value against the election timeout: with an election timeout above
 /// `u64::MAX` nanos and an inherited window forcing the exact inflation above `u64::MAX`, the clamp armed
 /// the serve while scheduling a wait SHORTER than the E′ bound, re-opening the mono-undercut. The fix
-/// returns `None` on overflow → the serve is disarmed and the bare wait is used.
+/// returns `None` on overflow. Because the successor-side commit-wait LENGTH inflation shares that
+/// overflow (`inflate_inherited_wait(u64::MAX)` is `None`), the node cannot schedule ANY sound wait — so
+/// it FAILS STOP (`CommitWaitUnrepresentable`) rather than arm a clamped-short wait, and serves nothing.
 ///
 /// The magnitudes are deliberately at the `u64` boundary (this is a totality guard, not a realistic
 /// deployment): Δ = 2ns, ε_drift = 1ns (inflation factor 3/2), inherited `max_lease_window = u64::MAX`
@@ -4364,19 +5043,29 @@ fn failover_serve_disarmed_when_inflation_overflows_u64() {
   ep.handle_storage(at(0), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
+  // FAIL-STOP: the successor-side inflation of the u64::MAX inherited window overflows u64, so no
+  // schedulable wait exists — the node poisons rather than arm a clamped-short wait. Its handlers return
+  // early, so commit never advances past the inherited index.
+  assert!(
+    ep.is_poisoned(),
+    "an overflowing inflation must fail-stop, not clamp"
+  );
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::CommitWaitUnrepresentable)
+  );
   assert_eq!(
     ep.commit_index(),
     Index::new(1),
-    "commit held at the inherited index during the (bare) wait — the wait is armed (role Leader)"
+    "a poisoned node holds commit at the inherited index (the clamped wait would have under-waited)"
   );
 
-  // The serve is DISARMED: the exact inflation overflows u64, so `failover_inflated_commit_wait` returns
-  // None and the serve does not arm — even though the lease is live and the election timeout (1268y) is
-  // far above the clamped u64::MAX the prior code would have (buggily) compared against. With the clamp
-  // bug this would return Some (an inherited serve backed by a wait ~292 years too short).
+  // A poisoned node serves nothing — the inherited serve is refused too (the E′ overflow also disarms it,
+  // even though the lease is live and the election timeout (1268y) is far above the clamped u64::MAX the
+  // prior code would have (buggily) compared against).
   assert!(
     ep.failover_read_window(at(0)).is_none(),
-    "an inflation overflowing u64 must DISARM the serve (fail closed), not arm with a clamped wait"
+    "an inflation overflowing u64 must fail closed — no serve backed by a clamped-short wait"
   );
 }
 

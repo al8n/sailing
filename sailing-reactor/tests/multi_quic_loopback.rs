@@ -173,6 +173,28 @@ async fn find_leader(groups: &[GroupHandle<u64, u64, CountSm>], what: &str) -> u
   }
 }
 
+/// Colocate `groups`' leadership onto node `to_node`, waiting until it settles there. The merge's
+/// all-source-voters barrier is observable only on the source LEADER's tracker, so `commit_merge`
+/// can only certify it when the absorbing target's leader also leads the source — the CRDB
+/// colocate-then-merge discipline. Transfer the source onto the target leader BEFORE freezing:
+/// a frozen source refuses a transfer, and moving the source (not the target) leaves the target's
+/// leadership pinned through the choreography.
+async fn colocate_onto(groups: &[GroupHandle<u64, u64, CountSm>], to_node: u64, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: colocation never settled onto node {to_node}"
+    );
+    let at = find_leader(groups, what).await;
+    if at as u64 + 1 == to_node {
+      return;
+    }
+    let _ = groups[at].transfer_leader(to_node).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+}
+
 /// The gate: a 3-node QUIC host carries groups 100 and 200 over ONE shared mTLS mesh; each group
 /// elects, commits through redirects, and serves linearizable reads, with the two groups' state
 /// machines strictly isolated. Groups are created immediately after spawn — the identity latch —
@@ -246,8 +268,8 @@ async fn engine_barrier_amortizes_ops_across_groups() {
   assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"w").await, 1);
   assert_eq!(submit_anywhere(std::slice::from_ref(&g200), b"w").await, 1);
 
-  let flushes0 = metrics.flushes();
-  let ops0 = metrics.ops_flushed();
+  let barriers0 = metrics.barriers();
+  let ops0 = metrics.ops_batched();
 
   let mut futs = Vec::new();
   for _ in 0..8 {
@@ -260,14 +282,14 @@ async fn engine_barrier_amortizes_ops_across_groups() {
     r.expect("every burst submit commits");
   }
 
-  let flushes1 = metrics.flushes();
-  let ops1 = metrics.ops_flushed();
-  assert!(flushes1 > 0, "the barrier ran");
+  let barriers1 = metrics.barriers();
+  let ops1 = metrics.ops_batched();
+  assert!(barriers1 > 0, "the barrier ran");
   assert!(
-    ops1 - ops0 > flushes1 - flushes0,
+    ops1 - ops0 > barriers1 - barriers0,
     "the burst amortized: {} ops rode {} barriers",
     ops1 - ops0,
-    flushes1 - flushes0
+    barriers1 - barriers0
   );
 }
 
@@ -562,7 +584,7 @@ async fn a_poisoned_group_leaves_co_hosted_groups_committing() {
   assert!(!g200.status().await.expect("status").is_poisoned);
 
   let out: Option<u64> = g200
-    .failover_query(|_fsm: &TrapSm, _limbo: &[sailing_proto::Entry], _win| Some(9))
+    .failover_query(|_fsm: &TrapSm, _win| Some(9))
     .await
     .expect("the failover query resolves");
   assert_eq!(out, None, "no serve window → normal-read fallback");
@@ -1397,4 +1419,175 @@ async fn forked_group_serves_and_snapshots_a_late_joiner() {
 
   // The sibling group is unaffected by the fork/join churn.
   assert_eq!(submit_anywhere(&g900, b"still").await, 2);
+}
+
+/// The T11 QUIC merge gate — the stream suite's absorb shape over the QUIC transport: freeze,
+/// parked commit, per-crank resolution, the union served everywhere, the source id refused
+/// forever on its terminal floor, and no leadership churn on the target through the whole
+/// choreography.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_absorbs_and_source_never_returns() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_960, 3);
+  let mut handles = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere::<CountSm>(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere::<CountSm>(&handles, 200, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a1").await, 1);
+  assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b3").await, 3);
+
+  // The direction rule makes the encoding-minimal id the survivor: group 100 is the target, group
+  // 200 the source that dissolves (200's LE encoding sorts strictly above 100's).
+  let t_leader = find_leader(&g100, "target pre-merge").await;
+  let t_term = g100[t_leader].status().await.expect("status").term;
+  // Colocate the source's leadership onto the target's leader so the absorb can certify the
+  // all-source-voters freeze barrier (the source is moved, so the target leader never churns).
+  colocate_onto(&g200, t_leader as u64 + 1, "source onto target leader").await;
+
+  // DirectionInverted is a property of the id pair, never transient — fail fast on it so a
+  // re-introduced direction bug is a pointed panic, not a 15s timeout. `map_merge_err` carries the
+  // variant's Debug form as the rejection reason.
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  'freeze: loop {
+    assert!(std::time::Instant::now() < deadline, "no freeze accepted");
+    for h in &handles {
+      match h.prepare_merge(200, 100).await {
+        Ok(_) => break 'freeze,
+        Err(DriverError::Rejected { reason }) if reason == inverted => {
+          panic!("the freeze is permanently inverted — source must encode above target")
+        }
+        Err(_) => {}
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+  'commit: loop {
+    assert!(std::time::Instant::now() < deadline, "no commit accepted");
+    for h in &handles {
+      if h.commit_merge(100, 200).await.is_ok() {
+        break 'commit;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // Every node's crank resolves its park: the union serves from the target on ALL nodes.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the union never served everywhere"
+    );
+    let mut counts = Vec::new();
+    for g in &g100 {
+      if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
+        counts.push(c);
+      }
+    }
+    if counts.len() == 3 && counts.iter().all(|&c| c == 5) {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // No leadership churn on the target: same leader, same term.
+  let status = g100[t_leader].status().await.expect("status");
+  assert_eq!(status.role, Role::Leader, "the target leader never moved");
+  assert_eq!(status.term, t_term, "the target's term never moved");
+
+  // The source id dies everywhere and its floor is terminal.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the source never tore down everywhere"
+    );
+    let mut gone = 0;
+    for g in &g200 {
+      if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
+        gone += 1;
+      }
+    }
+    if gone == 3 {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+  for (i, h) in handles.iter().enumerate() {
+    let id = i as u64 + 1;
+    match h
+      .create_group(200, config(id, vec![1, 2, 3]), 9, CountSm::default(), 9)
+      .await
+    {
+      Err(DriverError::Rejected { reason }) => {
+        assert!(
+          reason.contains("floor"),
+          "node {id}: the refusal must be the terminal floor, got: {reason}"
+        );
+      }
+      other => panic!("node {id}: a merged-away id must never re-admit, got {other:?}"),
+    }
+  }
+}
+
+/// A restore for a group the host holds NO stored state for fails closed instead of fabricating a
+/// blank incarnation: removing a group drops its in-memory stores, so a later restore of that id
+/// finds nothing to recover and returns `NoStoredState` rather than a silent empty `Ok`. The id is
+/// not resurrected, and the co-hosted live group keeps committing.
+#[tokio::test(flavor = "multi_thread")]
+async fn restore_without_stored_state_fails_closed() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:44380".parse().unwrap();
+  let (driver, handle) = bind_node::<CountSm>(&ca, 1, addr, Vec::new()).await;
+  tokio::spawn(driver.run());
+
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("the live co-hosted group admits");
+  handle
+    .create_group(200, config(1, vec![1]), 2, CountSm::default(), 0)
+    .await
+    .expect("the second group admits");
+  let g200 = handle.group(200);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g200), b"x").await, 1);
+  assert!(
+    handle.remove_group(200).await.expect("remove resolves"),
+    "the hosted removal dropped storage"
+  );
+  assert!(
+    handle.clear_tombstone(200).await.expect("clear resolves"),
+    "the removal left a tombstone to clear"
+  );
+
+  // The tombstone is cleared, so nothing but the ABSENT stores stands between this call and a
+  // restore. The removal dropped those in-memory stores, so the restore has nothing to recover:
+  // it fails closed rather than silently standing up a blank index-0 incarnation.
+  match handle
+    .restore_group(200, config(1, vec![1]), 2, CountSm::default(), 0)
+    .await
+  {
+    Err(DriverError::NoStoredState) => {}
+    other => panic!("expected NoStoredState for a group with no stored state, got {other:?}"),
+  }
+  assert!(
+    handle.group(200).status().await.is_err(),
+    "the group was not resurrected"
+  );
+
+  // The co-hosted live group is undisturbed by the refused restore.
+  let g100 = handle.group(100);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"y").await, 1);
 }

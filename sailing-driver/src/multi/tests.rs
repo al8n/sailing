@@ -174,7 +174,7 @@ fn lifecycle_commands_round_trip_their_replies() {
     match cmd_rx.try_recv().expect("the remove was enqueued") {
       MultiCommand::RemoveGroup { gid, reply, .. } => {
         assert_eq!(gid, 100);
-        reply.send(true).expect("the caller is awaiting");
+        reply.send(Ok(true)).expect("the caller is awaiting");
       }
       _ => panic!("expected a RemoveGroup"),
     }
@@ -406,5 +406,81 @@ fn fork_command_round_trips_its_payload_and_reply() {
       _ => panic!("expected a CreateGroupFromFork"),
     }
     fork.await.expect("the admission verdict resolves");
+  });
+}
+
+/// The three merge verbs round-trip their commands and replies: the addressed groups ride the
+/// command in verb order (`prepare_merge(source, target)` / `commit_merge(target, source)` /
+/// `rollback_merge(source)`), and the leader's immediate verdict resolves the caller.
+#[test]
+fn merge_verbs_round_trip_their_replies() {
+  futures_executor::block_on(async {
+    let (handle, cmd_rx, _event_tx, _lifecycle_tx, _teardown_tx) =
+      test_handle(InflightBudget::new(8, 64));
+
+    let mut prepare = Box::pin(handle.prepare_merge(100, 200));
+    assert!(matches!(
+      futures_util::poll!(prepare.as_mut()),
+      Poll::Pending
+    ));
+    match cmd_rx.try_recv().expect("the prepare was enqueued") {
+      MultiCommand::PrepareMerge {
+        source,
+        target,
+        reply,
+        ..
+      } => {
+        assert_eq!((source, target), (100, 200));
+        reply
+          .send(Ok(sailing_proto::Index::new(4)))
+          .expect("the caller is awaiting");
+      }
+      _ => panic!("expected a PrepareMerge"),
+    }
+    assert_eq!(prepare.await.unwrap(), sailing_proto::Index::new(4));
+
+    let mut commit = Box::pin(handle.commit_merge(200, 100));
+    assert!(matches!(
+      futures_util::poll!(commit.as_mut()),
+      Poll::Pending
+    ));
+    match cmd_rx.try_recv().expect("the commit was enqueued") {
+      MultiCommand::CommitMerge {
+        target,
+        source,
+        reply,
+        ..
+      } => {
+        assert_eq!((target, source), (200, 100));
+        reply
+          .send(Ok(sailing_proto::Index::new(9)))
+          .expect("the caller is awaiting");
+      }
+      _ => panic!("expected a CommitMerge"),
+    }
+    assert_eq!(commit.await.unwrap(), sailing_proto::Index::new(9));
+
+    let mut rollback = Box::pin(handle.rollback_merge(200, 100));
+    assert!(matches!(
+      futures_util::poll!(rollback.as_mut()),
+      Poll::Pending
+    ));
+    match cmd_rx.try_recv().expect("the rollback was enqueued") {
+      MultiCommand::RollbackMerge {
+        target,
+        source,
+        reply,
+        ..
+      } => {
+        assert_eq!((target, source), (200, 100));
+        reply
+          .send(Err(DriverError::Rejected {
+            reason: "not frozen".into(),
+          }))
+          .expect("the caller is awaiting");
+      }
+      _ => panic!("expected a RollbackMerge"),
+    }
+    assert!(matches!(rollback.await, Err(DriverError::Rejected { .. })));
   });
 }

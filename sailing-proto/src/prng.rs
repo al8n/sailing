@@ -37,11 +37,10 @@ impl rand_core::TryRng for Prng {
 
   #[inline]
   fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
-    let mut chunks = dst.chunks_exact_mut(8);
-    for chunk in &mut chunks {
-      chunk.copy_from_slice(&self.try_next_u64()?.to_le_bytes());
+    let (chunks, rem) = dst.as_chunks_mut::<8>();
+    for chunk in chunks {
+      *chunk = self.try_next_u64()?.to_le_bytes();
     }
-    let rem = chunks.into_remainder();
     if !rem.is_empty() {
       let bytes = self.try_next_u64()?.to_le_bytes();
       rem.copy_from_slice(&bytes[..rem.len()]);

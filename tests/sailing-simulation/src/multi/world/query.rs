@@ -49,6 +49,35 @@ impl MultiWorld {
       .collect()
   }
 
+  /// The AUTHORITATIVE hosting replicas of `gid`: non-parked AND caught up to the applied frontier
+  /// (tied for the furthest applied index among the non-parked). This is the admission set for the
+  /// per-key value floor. It carries [`leader_of`](Self::leader_of)'s parked exclusion — a reaped
+  /// replica is no longer a protocol participant — and adds the caught-up narrowing the value grain
+  /// needs: a parked or behind replica whose `applied()` predates a committed `Split`/`Merge` still
+  /// holds cells that reshape has since moved or reset (`LogSm::split`/`absorb` rewrite `applied()`
+  /// only, and only ON APPLY), so its record would resurrect a value the group no longer serves.
+  /// Only a replica at the applied frontier has certainly applied the group's latest committed
+  /// prefix, so its split-aware `applied()` matches the view the serve side reads. The applied
+  /// INDEX is the caught-up key, not the record length: the index stays monotone and comparable
+  /// across a reshape, where the record length (cells vanish or graft record-wide) does not.
+  pub(crate) fn authoritative_nodes(&self, gid: u64) -> Vec<u64> {
+    let live: Vec<u64> = self
+      .node_ids
+      .iter()
+      .copied()
+      .filter(|n| self.hosts[n].contains_group(&gid) && !self.parked.contains(&(*n, gid)))
+      .collect();
+    let frontier = live
+      .iter()
+      .map(|&n| self.applied_index_of(n, gid))
+      .max()
+      .unwrap_or(sailing_proto::Index::ZERO);
+    live
+      .into_iter()
+      .filter(|&n| self.applied_index_of(n, gid) == frontier)
+      .collect()
+  }
+
   /// Whether `gid`'s one-conf-change-in-flight gate is currently armed.
   pub(crate) fn conf_in_flight_of(&self, gid: u64) -> bool {
     self.groups.get(&gid).is_some_and(|m| m.conf_in_flight)
@@ -108,32 +137,6 @@ impl MultiWorld {
       })
       .max()
       .unwrap_or(0)
-  }
-
-  /// Replica `(node, gid)`'s COMMITTED keyed `(index, command)` sequence, read from the raw log
-  /// up to the replica's commit index through the non-faulting seam (the committed FRONTIER,
-  /// independent of apply lag — the per-key value floor must not be under-counted by a lagging
-  /// apply). Only `Normal` entries, decoded to the raw command exactly as the state machine
-  /// receives them.
-  pub(crate) fn committed_entries_of(&self, node: u64, gid: u64) -> AppliedLog {
-    use sailing_proto::Data as _;
-    let Some(ep) = self.hosts.get(&node).and_then(|h| h.group(&gid)) else {
-      return AppliedLog::default();
-    };
-    let commit = ep.commit_index();
-    let Some(log) = self.logs.get(&(node, gid)) else {
-      return AppliedLog::default();
-    };
-    log
-      .committed_entries_no_fault(commit)
-      .iter()
-      .filter(|e| e.kind() == sailing_proto::EntryKind::Normal)
-      .filter_map(|e| {
-        bytes::Bytes::decode_exact(e.data_bytes())
-          .ok()
-          .map(|cmd| (e.index().get(), cmd.to_vec()))
-      })
-      .collect()
   }
 
   /// Initiate a linearizable read on replica `(node, gid)` (the fuzzer's non-panicking entry):
@@ -218,6 +221,31 @@ impl MultiWorld {
     self.cross_talk_checked
   }
 
+  /// Async flush-phase witness: log stores made durable across the run (`0` under the sync default).
+  pub(crate) fn log_flushes(&self) -> u64 {
+    self.log_flushes
+  }
+
+  /// Async flush-phase witness: stable stores made durable across the run.
+  pub(crate) fn stable_flushes(&self) -> u64 {
+    self.stable_flushes
+  }
+
+  /// Seeded torn writes that stranded a REAL in-flight batch — the lost-fsync non-vacuity witness.
+  pub(crate) fn torn_writes_fired(&self) -> u64 {
+    self.torn_writes_fired
+  }
+
+  /// Crashes that rolled back a NON-EMPTY log-store fsync window (the crash landed mid-window).
+  pub(crate) fn crashes_with_log_inflight(&self) -> u64 {
+    self.crashes_with_log_inflight
+  }
+
+  /// Crashes that rolled back a NON-EMPTY stable-store fsync window.
+  pub(crate) fn crashes_with_stable_inflight(&self) -> u64 {
+    self.crashes_with_stable_inflight
+  }
+
   /// Group `gid`'s LIVE key population, ascending (the keyed workload's pick set; empty for an
   /// unknown gid).
   pub(crate) fn group_keys_of(&self, gid: u64) -> Vec<u16> {
@@ -298,7 +326,7 @@ impl MultiWorld {
       .map(|n| {
         let ep = self.hosts[&n].group(&gid).expect("hosting");
         std::format!(
-          "n{n}[{:?}{} term={} commit={} applied={} poison={} voters={:?}]",
+          "n{n}[{:?}{} term={} commit={} applied={} poison={} frozen={} merge_wait={} voters={:?}]",
           ep.role(),
           if self.parked.contains(&(n, gid)) {
             " PARKED"
@@ -309,6 +337,11 @@ impl MultiWorld {
           ep.commit_index().get(),
           ep.applied_index().get(),
           ep.is_poisoned(),
+          ep.is_frozen(),
+          // A parked CommitMerge apply: the drain holds at the merge entry until the container's
+          // per-crank merge service resolves it — invisible in commit/applied alone, and exactly
+          // the state a merge-liveness livelock needs named.
+          ep.pending_merge().is_some(),
           ep.conf_state().voters(),
         )
       })

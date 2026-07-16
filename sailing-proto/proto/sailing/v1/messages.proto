@@ -50,9 +50,9 @@ message Entry {
 }
 
 // Entry discriminant. Zero = Normal so the dominant case is the proto3 default.
-// The three merge kinds (5..=7) are RESERVED by the split milestone's LABEL_VERSION 3 bump so
-// the merge milestone adds no wire change: nothing encodes them yet, and a frame carrying one
-// rejects at conversion until that milestone maps them.
+// The three merge kinds (5..=7) were RESERVED by the split milestone's LABEL_VERSION 3 bump and
+// are mapped by the merge milestone — no wire change, as the reservation promised. ThawDischarged
+// (8) is added under the still-UNRELEASED LABEL_VERSION 3 — a new kind, not a version bump.
 enum EntryKind {
   ENTRY_KIND_NORMAL = 0;
   ENTRY_KIND_CONF_CHANGE = 1;
@@ -62,6 +62,7 @@ enum EntryKind {
   ENTRY_KIND_PREPARE_MERGE = 5;
   ENTRY_KIND_COMMIT_MERGE = 6;
   ENTRY_KIND_ROLLBACK_MERGE = 7;
+  ENTRY_KIND_THAW_DISCHARGED = 8;
 }
 
 // The payload of an ENTRY_KIND_SPLIT entry (rides Entry.data). G-free: `child` is the embedder's
@@ -78,6 +79,69 @@ message SplitPayload {
   bytes instruction = 4;
 }
 
+// The payload of an ENTRY_KIND_PREPARE_MERGE entry (rides Entry.data), proposed on the SOURCE
+// group's log: freeze this group so `target` can absorb it. G-free like SplitPayload — `target`
+// is the embedder's group id encoded by its Data impl (1..=1024 bytes, decode_exact).
+// `source_gen_after` is the source's lineage counter after the freeze applies (the one unified
+// monotone per-id counter). Deliberately NO lease/clock field: the freeze kills lease serving at
+// APPEND observation of this entry, so the merge choreography is clock-free end to end.
+message PrepareMergePayload {
+  bytes target = 1;
+  uint64 source_gen_after = 2;
+}
+
+// The payload of an ENTRY_KIND_COMMIT_MERGE entry (rides Entry.data), proposed on the TARGET
+// group's log: absorb the frozen `source` at exactly `freeze_index`. The absorbed state itself
+// never rides the entry — every replica extracts its LOCAL source replica at the freeze boundary
+// — so the wire cost is independent of FSM size. `source_gen_after` is the gen the source's
+// PrepareMerge set (the parked apply's abort comparator: a RollbackMerge that won the race on
+// the source's log moved the counter past it); `target_gen_after` is the target's own lineage
+// after the absorb (replay idempotence). `freeze_term` is the term of the source's PrepareMerge
+// entry: with `freeze_index` it names the freeze's LOG IDENTITY, so a parked host whose local
+// source log provably contains the committed freeze can advance that source's commit to the
+// boundary without a live source leader (0 = no identity carried; never advance).
+message CommitMergePayload {
+  bytes source = 1;
+  uint64 freeze_index = 2;
+  uint64 source_gen_after = 3;
+  uint64 target_gen_after = 4;
+  uint64 freeze_term = 5;
+}
+
+// The payload of an ENTRY_KIND_ROLLBACK_MERGE entry (rides Entry.data) — the merge's explicit
+// abort, in one of two log roles told apart by `source`:
+//
+//   - `source` PRESENT: the TARGET-side abort, proposed on the TARGET group's log so it is
+//     totally ordered against CommitMerge on ONE log (a source-side abort has no cross-log
+//     order against the target's commit, so observation timing would decide the race per
+//     host). `source_gen_after` names the freeze generation being abandoned;
+//     `target_gen_after` is the target's own lineage mint (the optimistic guard a split
+//     carries): the abort applies only at exactly its minted generation, so aborts and
+//     commits racing from one base resolve to one log-ordered winner on every replica.
+//   - `source` ABSENT: the SOURCE-side unfreeze, proposed on the source's own log as the
+//     container-relayed consequence of the target-side abort applying (log-borne so a restart
+//     re-derives the thaw). `source_gen_after` moves the source's lineage past the freeze
+//     generation; `target_gen_after` is 0 (absent). Byte-identical to the pre-abort encoding.
+message RollbackMergePayload {
+  uint64 source_gen_after = 1;
+  bytes source = 2;
+  uint64 target_gen_after = 3;
+}
+
+// The payload of an ENTRY_KIND_THAW_DISCHARGED entry (rides Entry.data), proposed on a merge
+// TARGET's log: a committed witness that some leader OBSERVED this target's outstanding thaw
+// obligation for `source` at freeze generation `generation` discharged (the source thawed past the
+// abandoned freeze, or was terminally merged). Every replica's apply clears the obligation for
+// exactly (source, generation) — so a replica that can never LOCALLY observe the source still
+// clears, instead of fencing compaction and blocking teardown forever. G-free like the other merge
+// payloads: `source` is the embedder's group id encoded by its Data impl (1..=1024 bytes,
+// decode_exact — always present). Minted only from a globally-valid discharge proof, so it never
+// clears a still-live obligation on a co-hosting holder. Rides LABEL_VERSION 3.
+message ThawDischargedPayload {
+  bytes source = 1;
+  uint64 generation = 2;
+}
+
 // Cluster membership. Each repeated field is a SET: elements are the embedder's
 // Data-encoded node ids, required strictly ascending by decoded value (duplicates and
 // disorder reject at conversion — one set has one accepted encoding).
@@ -87,6 +151,23 @@ message ConfState {
   repeated bytes voters_outgoing = 3;
   repeated bytes learners_next = 4;
   bool auto_leave = 5;
+}
+
+// The durable, unforgeable identity of a split's forked child — the provenance token carried in a
+// manufactured fork baseline's SnapshotMeta so a parked fork resolves REDUNDANT only against an
+// exact match, never against an independently-created / squatter / recreated group that merely
+// crossed the fork's applied/lineage thresholds by its own commits. All fields are properties of
+// the committed split entry (replica-identical, since the split rides the parent's totally-ordered
+// log): the group ids are their canonical Data encodings (1..=1024 bytes), parent_incarnation is
+// the parent's lineage after the split (parent_gen_after), and (split_index, split_term) locate the
+// split entry in the parent's log. Rides the (unreleased) group-tagged LABEL_VERSION.
+message ForkId {
+  bytes parent = 1;
+  uint64 parent_incarnation = 2;
+  uint64 split_index = 3;
+  uint64 split_term = 4;
+  bytes child = 5;
+  uint64 child_gen = 6;
 }
 
 // Snapshot metadata: the compaction boundary and the membership AT that boundary.
@@ -132,6 +213,11 @@ message SnapshotMeta {
   // container's replay guard from it. Zero (an unreshaped id) is absent on the wire —
   // byte-identical to a pre-P6 peer's meta. Rides LABEL_VERSION 3.
   uint64 shape_gen = 8;
+  // The forked child's provenance token when this snapshot is (or descends from) a fork baseline —
+  // a manufactured fork install writes it, the child's own later snapshots preserve it, and a peer
+  // installing one adopts it. ABSENT for every non-fork snapshot (byte-identical to a pre-provenance
+  // peer's meta). Rides the (unreleased this cycle) group-tagged LABEL_VERSION.
+  ForkId fork_id = 9;
 }
 
 // Log replication / heartbeat-with-entries.
@@ -212,6 +298,9 @@ message SnapshotResponse {
   bool reject = 3;
   uint64 match_index = 4;
   uint64 acked_through = 5;
+  // Mid-transfer progress ack: match-inert on the leader (drives chunk pacing only, never
+  // Progress). False (absent) on every final/redundancy ack.
+  bool progress = 6;
 }
 
 // Leader -> transfer target: campaign NOW (bypasses the pre-vote lease).

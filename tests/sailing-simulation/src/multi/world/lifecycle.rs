@@ -12,6 +12,14 @@ use super::*;
 /// joiner whose add never committed), which would otherwise linger and churn elections forever.
 const DEPARTED_GRACE_PASSES: u32 = 3;
 
+/// How many CONSECUTIVE times one gid's [`remove_group`](MultiWorld::remove_group) draw may abandon
+/// a fault-free teardown refusal (while `merge_choreography_active` reads false) before the world
+/// TRIPS it as a real teardown-gate tie. Generous on purpose: the append-pending residual it
+/// tolerates — a co-hosted source's stale log claim after the merge globally resolved — clears
+/// within a handful of cranks as the lagging replica catches up, so a transient never approaches the
+/// bound; a genuine world-predicate hole (a claim that never clears) refuses forever and still trips.
+pub(crate) const TEARDOWN_TIE_BUDGET: usize = 128;
+
 /// Harness-side registry entry for one logical group (one per group id, across incarnations).
 #[derive(Debug, Default)]
 pub(crate) struct GroupMeta {
@@ -43,6 +51,17 @@ pub(crate) struct GroupMeta {
   /// keyspace again — its record is empty, so nothing overlaps a live child's inherited
   /// history, and the conservation ledger's incarnation-qualified ids keep old verdicts exact).
   pub(crate) keys: BTreeSet<u16>,
+  /// Whether this group was MERGED AWAY (absorbed into a target): terminal — the id's admission
+  /// floor is `u64::MAX` in the product, so recreation is refused forever (the harness catalog
+  /// mirrors that refusal at [`MultiWorld::recreate_group`]). Implies `retired`.
+  pub(crate) merged: bool,
+  /// The transitive set of FOREIGN group tags whose cells legitimately ride this group's
+  /// record — its tag lineage: a fork child inherits its parent's tag (the baseline cells carry
+  /// it) plus the parent's own carried set, and a merge target inherits the source's tag plus
+  /// the source's carried set (the absorbed record arrives whole, inherited cells included).
+  /// The cross-talk sweep admits exactly these tags; everything else is a leak. Reset at
+  /// recreation — a fresh incarnation inherits nothing.
+  pub(crate) carried_tags: BTreeSet<u64>,
   /// The length of the fork-inherited applied baseline every replica of THIS incarnation opens
   /// its record with (`0` for a group not born of a fork). GROUP-level on purpose: the baseline
   /// is a property of the incarnation, not of any wiring path — a replica carries it however it
@@ -63,40 +82,161 @@ impl MultiWorld {
   /// stragglers drop silently, and Tier B covers that real code. Here the group-tagged bus
   /// stands in for the wire, so purging its `gid` entries (plus the unhosted-drop on anything
   /// later addressed to the gid) is the same observable semantics.
-  pub fn remove_group(&mut self, gid: u64) {
-    let meta = self
-      .groups
-      .get_mut(&gid)
-      .unwrap_or_else(|| panic!("remove_group: unknown group {gid}"));
-    assert!(!meta.retired, "remove_group: group {gid} already retired");
-    meta.retired = true;
-    meta.conf_in_flight = false;
-    meta.wired.clear();
-    meta.departed_streak.clear();
-    let generation = meta.generation;
+  ///
+  /// Returns `true` when the group retired; `false` when the removal was ABANDONED as a retryable
+  /// no-op — the container's teardown gate refused a hosting replica even fault-free (a real
+  /// embedder retries later). A no-op tears nothing down (the draw is burned but consumes no further
+  /// prng), so a caller that counts removals must gate on the return.
+  pub fn remove_group(&mut self, gid: u64) -> bool {
+    let generation = {
+      let meta = self
+        .groups
+        .get(&gid)
+        .unwrap_or_else(|| panic!("remove_group: unknown group {gid}"));
+      assert!(!meta.retired, "remove_group: group {gid} already retired");
+      meta.generation
+    };
 
-    // One final check against the still-hosted state, then freeze the checker into the archive
-    // (its cross-tick history remains inspectable; the live suite stops judging the gid).
+    // The removal CEILING — the max shape generation any hosting replica reached — captured while
+    // the replicas are still present (they vanish on teardown below); the catalog floor derived
+    // from it is applied only once the teardown lands.
+    let ceiling = self
+      .node_ids
+      .iter()
+      .filter_map(|&n| self.hosts[&n].group(&gid))
+      .map(sailing_proto::Endpoint::shape_gen)
+      .max()
+      .unwrap_or(0);
+
+    // One final check against the still-hosted state, then one last exact-term walk of the retiring
+    // replicas' durable logs (it extends the committed-config history through any install boundary
+    // the frozen archive could otherwise never witness — the absorb→observers-only→retire shape,
+    // where snapshot-installed replicas emit no ConfChanged). Both read the retiring durable logs,
+    // so they run BEFORE teardown and on the FULL view; the checker stays LIVE (not yet archived)
+    // until the teardown lands, so a fault-burned attempt re-runs them harmlessly (`check_or_panic`
+    // is the per-tick check and `certify_retiring_history` is a monotone, idempotent observer).
     let view = self.group_view(gid);
-    let mut checker = self
-      .checkers
-      .remove(&gid)
-      .expect("a live group has a checker");
-    checker.check_or_panic(&view);
-    self.retired.insert((gid, generation), checker);
-    self.pending_transitions.remove(&gid);
-    self.pending_new_installs.remove(&gid);
+    {
+      let checker = self
+        .checkers
+        .get_mut(&gid)
+        .expect("a live group has a checker");
+      checker.check_or_panic(&view);
+      crate::checker::certify_retiring_history(checker, &view);
+    }
 
+    // Tear every hosting replica down ATOMICALLY: all hosts or none. The container's per-node
+    // teardown gate refuses BEFORE any teardown (leaving that replica fully intact) and admits by
+    // REMOVING the endpoint, so probe every hosting node here, keeping the world stores until all
+    // admit; a refusal on ANY node then RESTORES the already-removed replicas from their retained
+    // durable stores (a crash-style rollback). A PARTIAL teardown — dropping some committed voters'
+    // durable logs while the group stays live — would strand the survivors below quorum and trip
+    // `commit_is_quorum_durable`, so the world never leaves one behind.
+    //
+    // The scan reads FAULT-FREE: the world plays an embedder with global, non-faulting
+    // knowledge, and its removal draws already exclude every participant its superset can see
+    // (`merge_choreography_active`, read off `active_freezes`/`durable_entries`, never the fault
+    // dice), so a transient fault must not fail-close a claim-free teardown into a partial one. A
+    // refusal that SURVIVES suppression is REAL but not necessarily a tie: only the container can
+    // tell a genuine claim on `gid` (leg 5, decoded off a co-hosted source's log) from a bystander's
+    // unrelated freeze, and the world's in-memory superset is NOT a superset during replication lag
+    // — a co-hosted source's stale log can still claim `gid` after the merge globally resolved and
+    // the book moved on. That append-pending residual is TRANSIENT (the lagging replica clears it
+    // within a handful of cranks), so a fault-free refusal with `merge_choreography_active` false is
+    // a retryable no-op, bounded so a genuine non-superset hole still trips.
+    let suspended: Vec<((u64, u64), (u16, u16))> = self
+      .logs
+      .iter_mut()
+      .map(|(k, log)| (*k, log.suspend_read_faults()))
+      .collect();
+    let mut torn_down: Vec<u64> = Vec::new();
+    let mut refused = None;
     for node in self.node_ids.clone() {
-      if self
+      if !self
         .hosts
         .get(&node)
         .is_some_and(|h| h.contains_group(&gid))
       {
-        self.drop_group_replica(gid, node);
+        continue;
+      }
+      match self.drop_group_endpoint(gid, node) {
+        Ok(()) => torn_down.push(node),
+        Err(refusal) => {
+          refused = Some((node, refusal));
+          break;
+        }
       }
     }
+    if refused.is_some() {
+      // Roll the atomic teardown back — restore every already-removed replica from its retained
+      // durable stores, so nothing was dropped.
+      for &node in &torn_down {
+        self.restore_group_replica(gid, node);
+      }
+    }
+    for (k, rates) in suspended {
+      if let Some(log) = self.logs.get_mut(&k) {
+        log.restore_read_faults(rates);
+      }
+    }
+    if let Some((node, refusal)) = refused {
+      if self.merge_choreography_active(gid) {
+        // A legitimately active choreography — the removal DRAW filters these upstream; a direct
+        // caller lands here. Not a tie: reset the streak and abandon.
+        self.teardown_tie_streak.remove(&gid);
+        return false;
+      }
+      let streak = self.teardown_tie_streak.entry(gid).or_insert(0);
+      *streak += 1;
+      assert!(
+        *streak <= TEARDOWN_TIE_BUDGET,
+        "remove_group: tearing down g{gid} on node {node} was refused {refusal:?} fault-free for \
+         {streak} consecutive draws with merge_choreography_active=false — a REAL teardown-gate tie \
+         the world's superset never covers, not a transient append-pending residual (seed={} \
+         tick={})",
+        self.seed,
+        self.tick_count,
+      );
+      return false;
+    }
+
+    // Every host admitted: reset the tie streak, purge the retained stores, and COMMIT the
+    // retirement. The embedder catalog floors what it permanently stops hosting — one past the
+    // removal ceiling. A reshaped id that later backs a RE-DERIVED merge-abort thaw obligation (a
+    // target replays its still-durable abort entry after a crash, but the source's stores are gone)
+    // discharges it off this floor (`!floor_admits(floor, expected)`) while unhosted, instead of
+    // wedging the target's compaction fence forever; the obligation is thus discharged before any
+    // recreate, so a gen-0 recreate squats harmlessly. A never-reshaped id (ceiling 0) takes NO
+    // floor, so the default (no-merge, no-split) profile stays byte-identical.
+    self.teardown_tie_streak.remove(&gid);
+    for &node in &torn_down {
+      self.purge_group_stores(gid, node);
+    }
+    if ceiling > 0 {
+      let floor = self.removal_floors.entry(gid).or_insert(0);
+      *floor = (*floor).max(ceiling.saturating_add(1));
+    }
+    {
+      let meta = self
+        .groups
+        .get_mut(&gid)
+        .expect("remove_group: the group was live above");
+      meta.retired = true;
+      meta.conf_in_flight = false;
+      meta.wired.clear();
+      meta.departed_streak.clear();
+    }
+    // Freeze the checker into the archive (its cross-tick history remains inspectable; the live
+    // suite stops judging the gid).
+    let checker = self
+      .checkers
+      .remove(&gid)
+      .expect("a live group has a checker");
+    self.retired.insert((gid, generation), checker);
+    self.pending_transitions.remove(&gid);
+    self.pending_new_installs.remove(&gid);
     self.bus.retain(|m| m.gid != gid);
+    true
   }
 
   /// Recreate a retired `gid` as the SAME logical group at `generation + 1`: fresh stores, fresh
@@ -108,12 +248,18 @@ impl MultiWorld {
       .groups
       .get_mut(&gid)
       .unwrap_or_else(|| panic!("recreate_group: unknown group {gid}"));
+    assert!(
+      !meta.merged,
+      "recreate_group: group {gid} was merged away — its floor is terminal (u64::MAX); \
+       the catalog never re-admits it"
+    );
     assert!(meta.retired, "recreate_group: group {gid} is not retired");
     meta.retired = false;
     meta.generation += 1;
     meta.learners.clear();
     meta.keys = (0..super::super::NUM_KEYS).collect();
     meta.fork_baseline = 0;
+    meta.carried_tags.clear();
     let voters = meta.voters.clone();
     assert!(
       self.checkers.insert(gid, Checker::new()).is_none(),
@@ -180,10 +326,12 @@ impl MultiWorld {
   /// Reconcile `gid`'s registry entry from the group's REAL committed state (the leader's
   /// runtime `conf_state()`), never propose-time bookkeeping — the single-group `VoprState`
   /// reconciliation, scoped per group:
-  ///   - keep the last-known sets while leaderless (don't thrash on a transient election) —
-  ///     but first COMPLETE an under-hosted group (see [`complete_under_hosted`]
-  ///     (Self::complete_under_hosted)): the resurrect arm below is leader-gated, and a group
-  ///     whose hosting replicas sit below its voter quorum can never produce the leader;
+  ///   - keep the last-known sets while leaderless (don't thrash on a transient election) — but
+  ///     first COMPLETE an under-hosted group (see [`complete_under_hosted`]
+  ///     (Self::complete_under_hosted)) AND still UNPARK its committed members: a quorum mis-parked
+  ///     by the sweep is leaderless precisely because its own voters were parked, and nothing else
+  ///     re-derives it back to a quorum (`complete_under_hosted` reads a parked replica as
+  ///     still-hosting), so the unpark pass must run here too, not only behind a leader;
   ///   - promote a wired joiner once it appears in the committed membership;
   ///   - sweep departed replicas: a hosting node absent from the committed membership for
   ///     [`DEPARTED_GRACE_PASSES`] settled passes is PARKED — delivery-isolated with state
@@ -201,7 +349,13 @@ impl MultiWorld {
       return;
     }
     if self.leader_of(gid).is_none() {
+      // Read the committed set for the unpark decision only; leave `meta` at its last-known values
+      // (don't thrash on a transient election). Completing the under-hosted set repairs torn-down
+      // voters; the unpark pass then re-derives a mis-parked quorum back to hosting.
+      let voters = self.committed_voters_of(gid);
+      let learners = self.committed_learners_of(gid);
       self.complete_under_hosted(gid);
+      self.unpark_committed_members(gid, &voters, &learners);
       return;
     }
     let voters = self.committed_voters_of(gid);
@@ -223,6 +377,7 @@ impl MultiWorld {
       .into_iter()
       .filter(|n| self.hosts[n].contains_group(&gid))
       .collect();
+    let choreography_active = self.merge_choreography_active(gid);
     {
       let parked = self.parked.clone();
       let meta = self.groups.get_mut(&gid).expect("registered group");
@@ -231,9 +386,12 @@ impl MultiWorld {
           meta.departed_streak.remove(&node);
           continue;
         }
-        if conf_in_flight {
-          // A change is still in flight (this joiner's add, or a removal about to land):
-          // don't count the pass — settle first.
+        if conf_in_flight || choreography_active {
+          // A conf-change is still in flight (this joiner's add, or a removal about to land), or a
+          // merge choreography still holds this group's participants put: don't count the pass. The
+          // contract keeps a frozen/claimed participant in place until it resolves, and the
+          // committed-view derivation can transiently misjudge a current member of one — parking a
+          // mis-derived voter of a frozen source is the freeze-wedge shape this guards against.
           meta.departed_streak.insert(node, 0);
           continue;
         }
@@ -245,10 +403,21 @@ impl MultiWorld {
       }
     }
 
-    // Unpark / resurrect committed members. A parked member rejoins with its retained state; a
-    // genuinely torn-down member (post self-removal, later re-added) re-wires as a fresh
-    // observer whose bootstrap excludes itself, so it cannot campaign until it learns its own
-    // membership from the log.
+    self.unpark_committed_members(gid, &voters, &learners);
+  }
+
+  /// Unpark / resurrect the committed members of `gid` (the single-group `reinstate` arm). A
+  /// parked member rejoins with its retained state; a genuinely torn-down member (post
+  /// self-removal, later re-added) re-wires as a fresh observer whose bootstrap excludes itself,
+  /// so it cannot campaign until it learns its own membership from the log. Runs on the LED and
+  /// the LEADERLESS paths alike: a quorum mis-parked by the sweep stays leaderless until this
+  /// un-parks it back to hosting.
+  fn unpark_committed_members(
+    &mut self,
+    gid: u64,
+    voters: &BTreeSet<u64>,
+    learners: &BTreeSet<u64>,
+  ) {
     let members: Vec<u64> = voters.iter().chain(learners.iter()).copied().collect();
     for member in members {
       if self.parked.remove(&(member, gid)) {
@@ -368,10 +537,58 @@ impl MultiWorld {
   }
 
   /// Tear down node `node`'s replica of `gid`: container removal + store/bookkeeping teardown.
-  /// The embedder acting on RemovedSelf / the catalog — the group itself lives on elsewhere.
+  /// The embedder acting on RemovedSelf / the catalog — the group itself lives on elsewhere. The
+  /// internal merge-teardown callers (the husk-dissolve and deferred-capture sweeps) tear down a
+  /// source the resolver already settled, where no participant refusal can stand — assert it away.
   pub(crate) fn drop_group_replica(&mut self, gid: u64, node: u64) {
+    self
+      .try_drop_group_replica(gid, node)
+      .expect("the world never tears down an unresolved merge participant");
+  }
+
+  /// Tear down node `node`'s replica of `gid`, RETURNING the container's participant refusal rather
+  /// than asserting it away — container removal, then (only on admission) the store/bookkeeping
+  /// cleanup. The strict [`drop_group_replica`](Self::drop_group_replica) wrapper keeps the assert
+  /// for the internal merge-teardown callers, whose sources are past any choreography;
+  /// [`remove_group`](Self::remove_group) drives the two halves separately (probe every host, then
+  /// commit or roll back) so its multi-host teardown is atomic.
+  pub(crate) fn try_drop_group_replica(
+    &mut self,
+    gid: u64,
+    node: u64,
+  ) -> Result<(), sailing_proto::RemoveError> {
+    self.drop_group_endpoint(gid, node)?;
+    self.purge_group_stores(gid, node);
+    Ok(())
+  }
+
+  /// Remove node `node`'s `gid` ENDPOINT from its container, RETAINING every world store — the
+  /// container half of a teardown. A refusal leaves the endpoint FULLY intact (the gate refuses
+  /// before any teardown), so the removal verb can probe a host without committing to it; on
+  /// admission the endpoint is gone but the durable stores remain, ready either for
+  /// [`purge_group_stores`](Self::purge_group_stores) (commit) or
+  /// [`restore_group_replica`](Self::restore_group_replica) (rollback).
+  fn drop_group_endpoint(&mut self, gid: u64, node: u64) -> Result<(), sailing_proto::RemoveError> {
     let host = self.hosts.get_mut(&node).expect("host exists");
-    host.remove_group(&gid);
+    // The teardown gate reads logs (the Claimed leg), never floors — an empty husk feed. `stores`
+    // is the seam the `Claimed` leg reads a freeze-pending source's log through, threaded exactly
+    // as the merge pump threads it.
+    let no_husks = BTreeSet::new();
+    let mut stores = super::merge::NodeStores {
+      node,
+      logs: &mut self.logs,
+      stables: &mut self.stables,
+      floored: &self.merge_floors,
+      removal_floors: &self.removal_floors,
+      husk_floors: &no_husks,
+    };
+    host.remove_group(&gid, &mut stores)?;
+    Ok(())
+  }
+
+  /// Drop node `node`'s retained `gid` stores and per-replica bookkeeping — the store half of a
+  /// teardown, run once the endpoint removal has committed.
+  fn purge_group_stores(&mut self, gid: u64, node: u64) {
     self.logs.remove(&(node, gid));
     self.stables.remove(&(node, gid));
     self.configs.remove(&(node, gid));
@@ -380,8 +597,49 @@ impl MultiWorld {
     self.snapshot_lineage.remove(&(node, gid));
     self.member_view.remove(&(node, gid));
     self.parked.remove(&(node, gid));
+    // The durable relay lineage is per-incarnation (a real driver's engine drops the group's
+    // `group_gen` on teardown): a fresh incarnation of this id must not inherit the retired one's
+    // relayed forks, or a later restart's guard would fold its legitimate new forks.
+    self.relayed_lineage.remove(&(node, gid));
     // `restarts` and `read_states` deliberately survive: a later re-wire of the same (node, gid)
     // must bump past the old incarnation, and ledger scan offsets index the monotone vec.
+  }
+
+  /// Restore node `node`'s `gid` replica from its RETAINED durable stores — the rollback half of an
+  /// atomic teardown (see [`remove_group`](Self::remove_group)), rebuilding the endpoint
+  /// [`drop_group_endpoint`](Self::drop_group_endpoint) removed while the store was kept. A
+  /// crash-style restart: in-flight (unflushed) store windows are discarded and the incarnation
+  /// bumps so the checker resets this replica's monotonicity baseline, exactly as
+  /// [`crash`](Self::crash) restores a rebooted node. The boot epoch is REUSED (the rollback is not
+  /// a reboot; no in-flight message was ever sent to distinguish from).
+  fn restore_group_replica(&mut self, gid: u64, node: u64) {
+    let epoch = self.boot_epochs.get(&node).copied().unwrap_or(0);
+    let config = self.configs[&(node, gid)].clone();
+    let now = self.now;
+    let seed = self.seed ^ node;
+    let log = self
+      .logs
+      .get_mut(&(node, gid))
+      .expect("retained replica log");
+    let stable = self
+      .stables
+      .get_mut(&(node, gid))
+      .expect("retained replica stable");
+    log.discard_inflight();
+    stable.discard_inflight();
+    let relayed = self.relayed_lineage.get(&(node, gid)).copied().unwrap_or(0);
+    let host = self.hosts.get_mut(&node).expect("host exists");
+    host
+      .restore_group(gid, config, now, seed, LogSm::new(), epoch, log, stable)
+      .unwrap_or_else(|e| {
+        panic!("remove_group rollback: restore of group {gid} on node {node}: {e:?}")
+      });
+    // Restore the container's relay guard from the durable relay lineage (a real driver's
+    // `raise_relay_guard(engine.group_gen)` after restore): the restart replay re-stages every
+    // already-materialized fork, and the guard must fold them to duplicates rather than re-relay —
+    // or, now, PARK them against a co-hosted child that lost its provenance to churn.
+    host.raise_relay_guard(&gid, relayed);
+    *self.restarts.entry((node, gid)).or_insert(0) += 1;
   }
 
   /// The committed LEARNER set of `gid`, read like [`committed_voters_of`](Self::committed_voters_of)

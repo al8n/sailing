@@ -23,7 +23,7 @@ fn add_recv_ack_advance_basic() {
   let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
 
   // Leader 1 adds a read at commit index 5 → round token t.
-  let t = ro.add_request(idx(5), ctx(b"ctx_a"), None, 1u64);
+  let t = ro.add_request(idx(5), ctx(b"ctx_a"), None, 1u64).unwrap();
   assert_eq!(ro.queue.len(), 1);
   assert!(ro.pending.contains_key(&t));
   assert!(ro.context_in_flight(b"ctx_a"));
@@ -51,7 +51,7 @@ fn add_recv_ack_advance_basic() {
 #[test]
 fn recv_ack_same_peer_twice_counts_once() {
   let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
-  let t = ro.add_request(idx(3), ctx(b"ctx_b"), None, 1u64);
+  let t = ro.add_request(idx(3), ctx(b"ctx_b"), None, 1u64).unwrap();
 
   ro.recv_ack(2u64, &t);
   let n1 = ro.recv_ack(2u64, &t); // duplicate
@@ -64,8 +64,10 @@ fn recv_ack_same_peer_twice_counts_once() {
 #[test]
 fn add_request_assigns_unique_round_tokens() {
   let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
-  let t1 = ro.add_request(idx(10), ctx(b"ctx_c"), None, 1u64);
-  let t2 = ro.add_request(idx(99), ctx(b"ctx_c"), Some(2u64), 1u64);
+  let t1 = ro.add_request(idx(10), ctx(b"ctx_c"), None, 1u64).unwrap();
+  let t2 = ro
+    .add_request(idx(99), ctx(b"ctx_c"), Some(2u64), 1u64)
+    .unwrap();
   assert_ne!(
     t1, t2,
     "the same user context must still get distinct round tokens"
@@ -81,9 +83,9 @@ fn add_request_assigns_unique_round_tokens() {
 #[test]
 fn advance_middle_confirms_all_earlier() {
   let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
-  let _t1 = ro.add_request(idx(1), ctx(b"r1"), None, 1u64);
-  let t2 = ro.add_request(idx(2), ctx(b"r2"), None, 1u64);
-  let t3 = ro.add_request(idx(3), ctx(b"r3"), None, 1u64);
+  let _t1 = ro.add_request(idx(1), ctx(b"r1"), None, 1u64).unwrap();
+  let t2 = ro.add_request(idx(2), ctx(b"r2"), None, 1u64).unwrap();
+  let t3 = ro.add_request(idx(3), ctx(b"r3"), None, 1u64).unwrap();
 
   // Advance t2 — must return r1 and r2 (FIFO), not r3.
   let confirmed = ro.advance(&t2);
@@ -113,10 +115,10 @@ fn last_pending_request_ctx() {
   let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
   assert!(ro.last_pending_request_ctx().is_none());
 
-  let t1 = ro.add_request(idx(1), ctx(b"first"), None, 1u64);
+  let t1 = ro.add_request(idx(1), ctx(b"first"), None, 1u64).unwrap();
   assert_eq!(ro.last_pending_request_ctx().unwrap(), &t1);
 
-  let t2 = ro.add_request(idx(2), ctx(b"second"), None, 1u64);
+  let t2 = ro.add_request(idx(2), ctx(b"second"), None, 1u64).unwrap();
   assert_eq!(ro.last_pending_request_ctx().unwrap(), &t2);
 }
 
@@ -135,7 +137,9 @@ fn reset_clears_state() {
 #[test]
 fn forwarded_request_has_req_from() {
   let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
-  let t = ro.add_request(idx(7), ctx(b"fwd"), Some(3u64), 1u64);
+  let t = ro
+    .add_request(idx(7), ctx(b"fwd"), Some(3u64), 1u64)
+    .unwrap();
   let s = &ro.pending[&t];
   assert_eq!(s.req_from, Some(3u64));
   assert_eq!(s.index, idx(7));
@@ -159,6 +163,19 @@ fn read_state_clone_and_eq() {
   assert_eq!(rs, rs2);
   let rs3 = ReadState::new(idx(11), Bytes::from_static(b"abc"));
   assert_ne!(rs, rs3);
+}
+
+/// A saturated round counter refuses a new read (`None`) rather than reuse a token: reuse would let
+/// a stale `HeartbeatResponse` echoing an earlier token confirm this fresh read. Seeded near the
+/// ceiling so the boundary is exercised without 2^64 mints.
+#[test]
+fn add_request_refuses_on_round_exhaustion() {
+  let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
+  ro.next_round = u64::MAX - 1;
+  // One token left (MAX-1) is still mintable.
+  assert!(ro.add_request(idx(1), ctx(b"a"), None, 1u64).is_some());
+  // Counter is now u64::MAX; the next mint would reuse, so it is refused.
+  assert!(ro.add_request(idx(2), ctx(b"b"), None, 1u64).is_none());
 }
 
 // Unused import suppressor.

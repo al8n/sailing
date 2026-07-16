@@ -294,6 +294,14 @@ pub struct ClusterView {
   pub seed: u64,
   /// The current tick/step number (for VOPR replay).
   pub tick: u64,
+  /// Whether the POSITIONAL applied-prefix agreement applies to this view (the default). A
+  /// group that has ABSORBED another via a merge sets `false`: an absorb re-introduces
+  /// own-tagged cells at replica-local resolution states, so no positional filter over the
+  /// records is lag-invariant any more — agreement is then judged as EQUAL-APPLIED ⇒
+  /// EQUAL-RECORD (states are a deterministic function of the applied index), with the absorb
+  /// point itself pinned byte-for-byte by the world's absorb-determinism check and convergence
+  /// pinned by the quiesce raw-record equality.
+  pub positional_agreement: bool,
   /// The cluster's REAL committed VOTER set — the authoritative quorum denominator for
   /// `commit_is_quorum_durable`, read from the leader's runtime `conf_state().voters()` (or the
   /// plurality committed config when leaderless). Threading the leader's view (rather than each
@@ -484,7 +492,7 @@ impl Checker {
   }
 
   /// Seed the quorum-durability floor at a FORK CHILD's manufactured snapshot baseline `index`,
-  /// so [`commit_is_quorum_durable`] judges only commits strictly above it. Called once at child
+  /// so `commit_is_quorum_durable` judges only commits strictly above it. Called once at child
   /// registration, before the first view is checked; a normally-created group's checker is never
   /// seeded and keeps the full axiom from index 0.
   ///
@@ -616,6 +624,9 @@ impl Checker {
 /// This is the core State Machine Safety property in prefix form. Removed nodes are skipped (their
 /// applied log stopped advancing at removal while the cluster continued).
 pub fn agreement(view: &ClusterView) -> Result<(), Violation> {
+  if !view.positional_agreement {
+    return equal_applied_agreement(view);
+  }
   let logs: Vec<&[(u64, Vec<u8>)]> = view.live().map(|n| n.applied_log.as_slice()).collect();
   let ids: Vec<u64> = view.live().map(|n| n.id).collect();
   let longest = logs.iter().map(|l| l.len()).max().unwrap_or(0);
@@ -669,6 +680,42 @@ pub fn agreement(view: &ClusterView) -> Result<(), Violation> {
 /// tail. Per-entry quorum durability of every committed index is enforced separately by
 /// [`commit_is_quorum_durable`]. (A snapshot-install follower has its applied watermark at the
 /// snapshot boundary with the entries compacted out of the log, so the snapshot boundary counts.)
+/// The merged-lineage agreement form: any two live replicas AT THE SAME APPLIED INDEX must
+/// hold the IDENTICAL applied cell MULTISET — the direct statement of apply determinism over
+/// what the product actually promises. The record's ORDER is a harness artifact there: a live
+/// fold appends each absorbed block at its resolution, while a crash-restore from the absorb
+/// capture replays around an already-embedded block, so equal states legitimately present
+/// their cells in different record orders. A replica that skipped a union outright still trips
+/// (its multiset lacks the absorbed cells); per-key ORDER stays enforced by the conservation
+/// walk's value-monotone histories.
+fn equal_applied_agreement(view: &ClusterView) -> Result<(), Violation> {
+  let sorted = |log: &[(u64, Vec<u8>)]| {
+    let mut v = log.to_vec();
+    v.sort();
+    v
+  };
+  let nodes: Vec<&NodeView> = view.live().collect();
+  for (i, a) in nodes.iter().enumerate() {
+    for b in nodes.iter().skip(i + 1) {
+      if a.applied == b.applied && sorted(&a.applied_log) != sorted(&b.applied_log) {
+        return Err(Violation::new(
+          "agreement",
+          std::format!(
+            "equal-applied divergence: node {} and node {} sit at applied={} with DIFFERENT \
+             records ({} vs {} cells)",
+            a.id,
+            b.id,
+            a.applied,
+            a.applied_log.len(),
+            b.applied_log.len(),
+          ),
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
 pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
   for n in view.nodes.iter() {
     let visible_high = n.visible_last.max(n.snapshot_last_index);
@@ -785,18 +832,22 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
     if c <= commit_floor {
       continue;
     }
-    // Pick the witness term, then check quorum-durability of `c`. When the committing node RETAINS `c`,
-    // use ITS term, so a (c, term A) commit while the quorum durably holds (c, term B) — a stale-tail /
-    // wrong-branch commit — still trips. When it does NOT retain `c` (volatile commit ahead of its own
-    // durable log, or it compacted `c` whose boundary term is not the entry term), it did not choose the
-    // term, so accept if `c` is quorum-durable at ANY term a holder retains (compacted = wildcard); a
-    // compacted-cover-only quorum is accepted (term-unobservable). `quorum_holds_committed`'s denominator
-    // excludes lower-term-branch and below-floor voters, so solo / under-replicated / losing-branch
-    // commits all still trip.
-    let committer_term = if c >= n.durable_first {
-      n.durable_term(c)
+    // Pick the witness term, then check quorum-durability of `c`. Witness the committing node's OWN term
+    // ONLY when it durably COMMITTED `c` (`c` within its durable HardState commit watermark): that is the
+    // term it chose, so a (c, term A) commit while the quorum durably holds (c, term B) — a stale-tail /
+    // wrong-branch commit — still trips. A node can RETAIN `c` in its durable log WITHOUT having committed
+    // it (an unflushed tail later superseded, e.g. a follower with an in-memory commit ahead of a stale
+    // durable branch); it did not choose that term, so witnessing it would demand a quorum at the wrong
+    // term and false-trip when `c` is legitimately quorum-durable at another. When the node did NOT durably
+    // commit `c` (volatile commit ahead of its durable commit, an uncommitted retained tail, or `c`
+    // compacted below the log), fall through to `None`: accept if `c` is quorum-durable at ANY term a
+    // holder retains (compacted = wildcard); a compacted-cover-only quorum is accepted (term-unobservable).
+    // `quorum_holds_committed`'s denominator excludes lower-term-branch and below-floor voters, so solo /
+    // under-replicated / losing-branch commits all still trip.
+    let committer_term = if c >= n.durable_first && c <= n.hardstate_commit {
+      n.durable_term(c) // n durably COMMITTED `c` → its term is the committed witness
     } else {
-      None // `c` is compacted on this node (boundary term ≠ entry term) → holder fallback
+      None // uncommitted stale tail, volatile-ahead, or compacted → holder-quorum fallback
     };
     let per_voter = || -> std::vec::Vec<_> {
       view
@@ -870,12 +921,12 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
 /// invariant: a node's in-memory `commit` must be `>=` the committed prefix it durably persisted —
 /// concretely, `commit >= min(durable HardState.commit, durable last_index)`.
 ///
-/// # Why this catches the commit-persistence bug
+/// # Why this catches a commit-persistence regression
 ///
 /// The durable `HardState.commit` is precisely the committed-prefix length the node had
-/// **acknowledged and persisted** before any crash. The bug was that `restart` rebuilt an
+/// **acknowledged and persisted** before any crash. A `restart` that rebuilds an
 /// empty / snapshot-only state machine — recovering `commit = 0` — *despite* a durable
-/// `HardState.commit > 0` and a durable log covering it. That trips this oracle the instant the
+/// `HardState.commit > 0` and a durable log covering it trips this oracle the instant the
 /// restarted node is observed: `commit (=0) < min(hs.commit, durable_last) (= hs.commit > 0)`.
 ///
 /// # Why it never false-positives
@@ -1159,6 +1210,244 @@ pub fn record_membership_observation(checker: &mut Checker, view: &ClusterView) 
       }
     }
   }
+
+  // DERIVE any committed conf-change the event-sourced history never recorded, decoding it from a
+  // hosting replica's durable log WHILE IT IS STILL PRESENT — the frozen/parked replica that carries
+  // the entry (a committed change it never applied, e.g. its own removal) may DEPART before the group
+  // retires, so a retirement-only walk would find its log already gone. Capturing per tick records the
+  // config permanently; the run-end walk then crosses it. Conservative (see `derive_unrecorded_conf_changes`).
+  derive_unrecorded_conf_changes(checker, view);
+}
+
+/// A retiring group's committed-config history FREEZES at archival, so an install whose boundary sits beyond
+/// [`complete_up_to`](Checker::complete_up_to) could never be witnessed by a later apply — a PERMANENT
+/// `skipped_unwitnessed` even when the truth is knowable. This one last exact-term walk of the retiring replicas'
+/// DURABLE logs certifies completeness through those boundaries, in two SOUND moves — neither folds a conf-change
+/// (the world has no decoder), and neither can FALSELY witness:
+///
+///   1. RECORD each retiring replica's CURRENT folded config at its last committed conf-change index, at that
+///      entry's exact term. `conf_state()` is the fold of every conf-change the replica applied, so it is the
+///      config in effect from that index onward — the piece a snapshot-installed observers-only replica (the
+///      absorb→observers→retire shape) emits no `ConfChanged` for, so the event-sourced history never saw it.
+///      Highest-term-wins / same-term-divergence ambiguation is applied exactly as the per-tick recorder does.
+///   2. RAISE `complete_up_to` across the GAP-FREE recorded prefix. A durable committed log proves commit reached
+///      its extent, so the step-function reference is complete up to the first index carrying an UNRECORDED
+///      conf-change. Only logs that CONNECT to the current frontier (`durable_first <= complete_up_to + 1`, no
+///      invisible hole below the log's first durable index) contribute, and the walk STOPS just before the first
+///      unrecorded conf-change — a genuine history gap the frozen archive rightly keeps as unwitnessed.
+///
+/// A pure observer of the archived checker: no PRNG, no node mutation.
+pub fn certify_retiring_history(checker: &mut Checker, view: &ClusterView) {
+  // 1. Record the final folded config at each unparked retiring replica's last committed conf-change.
+  for n in view.nodes.iter() {
+    if n.removed {
+      continue; // a parked replica carries a stale config — never the retiring truth
+    }
+    let Some(last_cc) = n
+      .durable_entries
+      .iter()
+      .filter(|e| e.is_conf_change && e.index <= n.commit)
+      .max_by_key(|e| e.index)
+    else {
+      continue;
+    };
+    let conf = n.conf_snapshot();
+    match checker.committed_config_history.get_mut(&last_cc.index) {
+      Some((et, ec, amb)) => {
+        if last_cc.term > *et {
+          *et = last_cc.term;
+          *ec = conf;
+          *amb = false;
+        } else if last_cc.term == *et && *ec != conf {
+          *amb = true;
+        }
+      }
+      None => {
+        checker
+          .committed_config_history
+          .insert(last_cc.index, (last_cc.term, conf, false));
+      }
+    }
+  }
+
+  // 1b. DERIVE any committed conf-change the event-sourced history still never recorded, decoding it
+  //     from the retiring group's own durable log and folding it forward, so the frontier walk can
+  //     cross it. This is what witnesses the fork-born install lineage: an install-suppressed replica
+  //     emits no `ConfChanged`, and the one lineage-free replica may have FROZEN below a committed
+  //     conf-change it never applied (its own removal), so neither move above records that config —
+  //     yet later installs legitimately reflect it, and without deriving it they never face a verdict.
+  derive_unrecorded_conf_changes(checker, view);
+
+  // 2. Raise the completeness frontier across the gap-free committed prefix, now that the retiring
+  //    replicas' freshly-recorded (and freshly-derived) configs help certify it.
+  certify_committed_prefix(checker);
+}
+
+/// The config in effect just BELOW `boundary`: the config of the greatest recorded, exact-term-PROVEN,
+/// unambiguous conf-change strictly below it — [`finalize_membership`]'s resolution rules (a
+/// higher-term non-ConfChange TOMBSTONES; anything weaker DECLINES) — else the genesis config. `None`
+/// when the nearest recorded conf-change is ambiguous or unprovable, so the derivation refuses to
+/// fold onto a guessed base.
+fn config_in_effect_below(checker: &Checker, boundary: u64) -> Option<ConfSnapshot> {
+  for (idx, (term_cc, conf, amb)) in checker.committed_config_history.range(..boundary).rev() {
+    match checker.committed_log_kind.get(idx) {
+      Some((term_log, CommittedKind::ConfChange)) if *term_log == *term_cc => {}
+      Some((term_log, CommittedKind::NonConfChange)) if *term_log >= *term_cc => continue,
+      _ => return None,
+    }
+    if *amb {
+      return None;
+    }
+    return Some(conf.clone());
+  }
+  checker.genesis_conf.clone()
+}
+
+/// Fill any committed ConfChange the event-sourced history NEVER recorded, by decoding it from the
+/// retiring group's own durable log and folding it forward from the config just below the frontier —
+/// so the frontier walk crosses it and the installs beyond it face a verdict rather than freezing
+/// unwitnessed forever. Sound because at retirement the committed log IS the authority the product
+/// applied from: the anti-circularity suppression that keeps a snapshot-installed replica out of LIVE
+/// install certification does NOT apply here — the config is DECODED FROM THE LOG, never adopted from
+/// a snapshot-installed `ConfState`. Conservative everywhere else: an undecodable, joint, or multi-op
+/// change, an unprovable/ambiguous base, or a committed-log conflict STOPS the walk (the existing
+/// fail-safe freeze), so only a cleanly-decoded SIMPLE change onto a non-joint base ever extends.
+///
+/// Runs PER TICK (from [`record_membership_observation`]) so the entry is decoded WHILE its holder
+/// still hosts — the frozen/parked replica carrying a committed conf-change it never applied (the
+/// fork-born install lineage's downstream removal) can DEPART before the group retires, leaving a
+/// retirement-only walk with the log already gone; the per-tick capture records the config
+/// permanently. Also runs at retirement (from [`certify_retiring_history`]) as a backstop.
+pub(crate) fn derive_unrecorded_conf_changes(checker: &mut Checker, view: &ClusterView) {
+  let mut idx = checker.complete_up_to + 1;
+  let Some(mut current) = config_in_effect_below(checker, idx) else {
+    return;
+  };
+  while let Some((term, kind)) = checker.committed_log_kind.get(&idx).copied() {
+    match kind {
+      CommittedKind::ConfChange => match checker.committed_config_history.get(&idx) {
+        // Already recorded and exact-term-proven: adopt it as the running config and walk on.
+        Some((rec_term, rec_conf, false)) if *rec_term == term => current = rec_conf.clone(),
+        // Recorded but ambiguous or off-term — cannot trust as a fold base; stop (fail-safe).
+        Some(_) => break,
+        // Never recorded: DERIVE it from the durable log and extend the history.
+        None => {
+          let Some(conf) = derive_simple_fold(view, idx, term, &current) else {
+            break;
+          };
+          checker
+            .committed_config_history
+            .insert(idx, (term, conf.clone(), false));
+          current = conf;
+        }
+      },
+      // An impossible-in-correct-Raft same-term conflict: trust nothing past it.
+      CommittedKind::Conflicted => break,
+      // A non-conf-change committed entry leaves the config unchanged.
+      CommittedKind::NonConfChange => {}
+    }
+    idx += 1;
+  }
+}
+
+/// Decode the committed ConfChange entry at `(idx, term)` from any retiring replica's durable log and
+/// fold it (as a SIMPLE, non-joint change — the shape every multi-world membership change takes) onto
+/// `current`. A committed `(index, term)` is a unique immutable entry, so any replica that still holds
+/// it carries the same bytes. `None` for anything the simple path cannot fold: no matching durable
+/// entry, a decode error, a joint / multi-op change, a joint `current`, or a fold that would empty the
+/// voter set — the caller then leaves the rest of the history unwitnessed.
+fn derive_simple_fold(
+  view: &ClusterView,
+  idx: u64,
+  term: u64,
+  current: &ConfSnapshot,
+) -> Option<ConfSnapshot> {
+  let entry = view
+    .nodes
+    .iter()
+    .flat_map(|n| n.durable_entries.iter())
+    .find(|e| e.index == idx && e.term == term && e.is_conf_change)?;
+  let cc =
+    sailing_proto::decode_conf_change_v2::<u64>(bytes::Bytes::from(entry.data.clone())).ok()?;
+  // A single Auto-transition change is the SIMPLE (non-joint) shape; a joint enter/leave needs the
+  // tracker's Progress machinery, out of a pure config walk's reach.
+  if cc.transition() != sailing_proto::ConfChangeTransition::Auto || cc.changes().len() != 1 {
+    return None;
+  }
+  // A simple change folds cleanly only onto a NON-JOINT base (`Changer::simple` rejects a joint prior).
+  if !current.voters_outgoing.is_empty() || !current.learners_next.is_empty() || current.auto_leave
+  {
+    return None;
+  }
+  let change = &cc.changes()[0];
+  let node = change.node();
+  let mut voters = current.voters.clone();
+  let mut learners = current.learners.clone();
+  // The config-only projection of `Changer::apply` on a non-joint tracker (make_voter / make_learner /
+  // remove): voter and learner are mutually exclusive, and a simple change touches exactly one node.
+  match change.ty() {
+    sailing_proto::ConfChangeType::AddNode => {
+      learners.remove(&node);
+      voters.insert(node);
+    }
+    sailing_proto::ConfChangeType::AddLearnerNode => {
+      voters.remove(&node);
+      learners.insert(node);
+    }
+    sailing_proto::ConfChangeType::RemoveNode => {
+      voters.remove(&node);
+      learners.remove(&node);
+    }
+  }
+  // A committed simple change never empties the voter set (`apply`'s `EmptyVoterSet` guard); refuse to
+  // mint an invalid config if a decode somehow implies one.
+  if voters.is_empty() {
+    return None;
+  }
+  Some(ConfSnapshot {
+    voters,
+    voters_outgoing: BTreeSet::new(),
+    learners,
+    learners_next: BTreeSet::new(),
+    auto_leave: false,
+  })
+}
+
+/// Raise [`complete_up_to`](Checker::complete_up_to) across the GAP-FREE prefix the DURABLE-COMMITTED log
+/// (`committed_log_kind`) proves committed, stopping just before the first index carrying an UNRECORDED
+/// conf-change — a genuine history gap the oracle rightly keeps unwitnessed (including a conf-change only
+/// snapshot-built replicas hold, which emits no `ConfChanged` and so may never have entered the config
+/// history). The per-tick recorder captured `committed_log_kind` at EVERY committed index before compaction
+/// removed it, so it retains a boundary only snapshot-built replicas reach — a walk of the live logs (their
+/// `durable_first` now above the boundary) would never connect to it and would leave the committed-final
+/// install one past the APPLIED frontier permanently unwitnessed. A gap-free committed prefix proves commit
+/// reached its extent, so the step-function reference is complete up to the first unrecorded conf-change.
+///
+/// SOUND for a LIVE checker too: the frontier rises ONLY across the gap-free committed prefix and STOPS at
+/// the first unrecorded conf-change, so a boundary beyond that extent stays unwitnessed and a genuine
+/// divergence at a witnessed index still trips — the frontier never blanket-widens. Monotone and idempotent
+/// (`complete_up_to` only rises). A pure observer: no PRNG, no node mutation.
+fn certify_committed_prefix(checker: &mut Checker) {
+  let base = checker.complete_up_to;
+  let mut extent = base;
+  while checker.committed_log_kind.contains_key(&(extent + 1)) {
+    extent += 1;
+  }
+  if extent <= base {
+    return;
+  }
+  let mut frontier = extent;
+  for idx in (base + 1)..=extent {
+    let unrecorded_conf = matches!(
+      checker.committed_log_kind.get(&idx),
+      Some((_, CommittedKind::ConfChange))
+    ) && !checker.committed_config_history.contains_key(&idx);
+    if unrecorded_conf {
+      frontier = idx.saturating_sub(1);
+      break;
+    }
+  }
+  checker.complete_up_to = base.max(frontier);
 }
 
 /// **snapshot-membership-coherent (VERDICT step)**: the run-end final pass. Compare EVERY observed install's
@@ -1217,6 +1506,13 @@ pub fn record_membership_observation(checker: &mut Checker, view: &ClusterView) 
 /// soundness hole). Idempotent: recomputes from the current history each call. A pure observer — no PRNG, no
 /// node mutation.
 pub fn finalize_membership(checker: &mut Checker) -> Result<(), Violation> {
+  // Extend the completeness frontier across the gap-free durable-committed prefix BEFORE judging, so a LIVE
+  // all-snapshot group — a merge target whose log-built witnesses have all departed, freezing `complete_up_to`
+  // below its committed extent — still witnesses an install whose boundary is committed-final. This is the
+  // same walk retirement runs, here for a group that never retires (so the retirement walk never fires). Sound:
+  // the frontier rises only across the gap-free prefix, so a boundary beyond it, or a divergence at a shared
+  // index, still fails.
+  certify_committed_prefix(checker);
   // Snapshot the observed installs so the loop can write the checker's counters without holding a borrow of
   // `observed_installs`. Sorted by (node, boundary) ⇒ a deterministic first-violation choice.
   let observed: Vec<((u64, u64), ConfSnapshot)> = checker
@@ -1228,8 +1524,22 @@ pub fn finalize_membership(checker: &mut Checker) -> Result<(), Violation> {
   let mut kind_unobservable = 0u64;
   for ((node_id, boundary), install_conf) in observed.iter() {
     // The history is certified complete only up to `complete_up_to` (the highest index a LOG-BUILT node has
-    // APPLIED, hence emitted every conf-change for). Beyond it the reference is not final — count it unwitnessed.
+    // APPLIED, hence emitted every conf-change for). Beyond it the reference is not final.
     if *boundary > checker.complete_up_to {
+      // An observed install boundary is a durable snapshot boundary, hence committed. If committed_log_kind
+      // holds committed entries ABOVE the frontier, the frontier stopped at a HOLE — indices compacted before
+      // any tick observed them, this boundary bridged by that snapshot — so the config there is committed but
+      // its reference is UNPROVABLE: a sound KIND-UNOBSERVABLE decline (the bounded compaction limit), not an
+      // un-converged completeness gap. A frontier that stopped at the END (no committed entry above it) is a
+      // genuine completeness gap the zero-tolerance still catches (SKIPPED — a converged run drives it to 0).
+      if checker
+        .committed_log_kind
+        .range((checker.complete_up_to + 1)..)
+        .next()
+        .is_some()
+      {
+        kind_unobservable += 1;
+      }
       continue;
     }
     // The FINAL committed config in effect at the BOUNDARY = the conf of the greatest SURVIVING conf-change
@@ -1343,6 +1653,16 @@ pub fn finalize_membership(checker: &mut Checker) -> Result<(), Violation> {
 /// any later DIFFERENT command applied at that index is a violation. Re-applying the SAME command
 /// (e.g. a follower replaying its durable log after restart) is fine.
 pub fn no_committed_rewrite(checker: &mut Checker, view: &ClusterView) -> Result<(), Violation> {
+  // The index-keyed high-water presumes each record position's `idx` is a coordinate in ONE
+  // log. An ABSORBED lineage's record interleaves the source's cells at SOURCE-log indexes
+  // (and a re-absorbed descendant can even return the group's own old indexes), so the keying
+  // is unsound there — the same class the fork milestone solved by aligning, which no filter
+  // survives once absorbs return own-tagged cells. The merged-lineage view ships raw and this
+  // leg stands down; the replacement set — equal-applied agreement, the absorb-determinism
+  // pin, union conservation, and the quiesce raw equality — carries the rewrite coverage.
+  if !view.positional_agreement {
+    return Ok(());
+  }
   // First pass: detect a conflict against the recorded high-water.
   for n in view.nodes.iter() {
     // A removed node's frozen applied log already agreed with the high-water while it was live;

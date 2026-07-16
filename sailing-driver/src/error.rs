@@ -41,6 +41,19 @@ pub enum DriverError<I> {
   /// The driver is shutting down (or already gone); no further operations will commit.
   #[error("driver is shutting down")]
   ShuttingDown,
+  /// A [`restore_group`](crate::MultiHandle::restore_group) named a group the host holds NO stored
+  /// state for: the in-memory engine never staged it (or it was torn down and its volatile state
+  /// died with the engine). The host fails closed rather than fabricating a blank index-0
+  /// incarnation that would masquerade as recovered state. A durable engine is the roadmap cure.
+  #[error("no stored state to restore for this group")]
+  NoStoredState,
+  /// A user query (or failover-query) closure PANICKED while running on the driver thread. The
+  /// panic is caught at the handle seam so the driver survives — on a multi host every other
+  /// co-located group keeps running — and the caller receives this instead of a silently dropped
+  /// channel (which would misreport as [`Self::ShuttingDown`]). Fix the closure: a query must not
+  /// panic.
+  #[error("the query closure panicked")]
+  QueryPanicked,
 }
 
 /// Why a driver `bind` did not start. Distinct from [`DriverError`] (a per-operation outcome): these

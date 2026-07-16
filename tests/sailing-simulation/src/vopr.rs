@@ -156,6 +156,41 @@ fn leaseguard_node_rate(drift_seed: u64, id: u64) -> (u64, u64) {
   ((delta_ns as i64 + k) as u64, delta_ns)
 }
 
+/// A deterministic per-node LeaseGuard timing pair `(Δ_i, ε_i)` for the HETEROGENEOUS-drift sub-mode, so
+/// `ρ_i = ε_i/Δ_i` VARIES across nodes. The uniform harness fixes one `ρ` for every node, which makes
+/// `ρ_S ≡ ρ_D` structurally and hides the heterogeneous-drift stale read (a `(1+ρ_S)`-fast successor
+/// under-waits a slower deposed leader's lease only when `ρ_S > ρ_D`). `Δ_i ∈ [200, 350]ms`,
+/// `ρ_i ∈ [0.10, 0.40]`; every pair passes the node-local validator (`ε_i < Δ_i`, and the window
+/// `Δ_i·(Δ_i+ε_i)/(Δ_i−ε_i) ≤ 817ms < 1000ms` election timeout). A PURE function of `(timing_seed, id)` so
+/// a founder and a mid-run joiner sharing an id agree, exactly like [`leaseguard_node_rate`].
+fn leaseguard_node_timing(timing_seed: u64, id: u64) -> (Duration, Duration) {
+  let mut p = FaultPrng::new(timing_seed ^ id.wrapping_mul(0xD1B5_4A32_D192_ED03));
+  let delta_ms = 200 + p.next_u64() % 151; // Δ_i ∈ 200..=350 ms
+  // ρ_i as an integer permille keeps ε_i exact: ε_i = ceil(Δ_i · ρ_i), clamped ≥ 1ms and < Δ_i.
+  let rho_permille = 100 + p.next_u64() % 301; // ρ_i ∈ [0.100, 0.400]
+  let eps_ms = (delta_ms * rho_permille)
+    .div_ceil(1000)
+    .clamp(1, delta_ms - 1);
+  (
+    Duration::from_millis(delta_ms),
+    Duration::from_millis(eps_ms),
+  )
+}
+
+/// The HETEROGENEOUS-drift per-node clock RATE: each node's rate is drawn within ITS OWN band
+/// `[(Δ_i−ε_i)/Δ_i, (Δ_i+ε_i)/Δ_i] = [1−ρ_i, 1+ρ_i]` from its own [`leaseguard_node_timing`] pair — never
+/// beyond the drift its OWN config assumes (so a surfaced stale read is a proto bug, not the harness
+/// injecting illegal skew). Because the bands differ per node, a fast high-`ρ` successor can legally
+/// outrun a slow low-`ρ` deposed leader's lease — the exact `ρ_S > ρ_D` case the uniform band cannot make.
+fn leaseguard_node_rate_hetero(timing_seed: u64, id: u64) -> (u64, u64) {
+  let (delta, eps) = leaseguard_node_timing(timing_seed, id);
+  let delta_ns = delta.as_nanos() as u64;
+  let eps_ns = eps.as_nanos() as u64;
+  let mut p = FaultPrng::new(timing_seed.rotate_left(17) ^ id.wrapping_mul(0x2545_F491_4F6C_DD1D));
+  let k = (p.next_u64() % (2 * eps_ns + 1)) as i64 - eps_ns as i64; // k ∈ [−ε_i, +ε_i] nanos
+  ((delta_ns as i64 + k) as u64, delta_ns)
+}
+
 /// Non-vacuity counters: a tally of what a single [`run_vopr`] actually EXERCISED.
 ///
 /// The seed sweep aggregates these across many seeds and asserts real coverage (e.g. some
@@ -172,6 +207,10 @@ pub struct VoprReport {
   /// the gated band assert that LeaseGuard-under-drift was ACTUALLY exercised, not just that the seeds
   /// happened not to draw it.
   pub drifted: bool,
+  /// Whether this run drew the HETEROGENEOUS-drift sub-mode: per-node LeaseGuard `(Δ_i, ε_i)` so `ρ_i`
+  /// varies across nodes (the uniform harness fixes one `ρ`, structurally hiding the `ρ_S > ρ_D` stale
+  /// read), each node's rate drawn within its OWN band. `false` for every other entry (uniform `Δ/ε`).
+  pub hetero: bool,
   /// Number of `tick`s actually executed across the whole run (main loop + calm windows + quiesce).
   pub ticks_run: u64,
   /// Number of `crash(id)` injections (each loses the fsync window and recovers from durable state).
@@ -762,7 +801,7 @@ impl ReadLedger {
 /// progress within a generous bound), or a quiesce failure (a fully-healed cluster failed to
 /// converge / apply the committed history).
 pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, false, false, None, false, false)
+  run_vopr_inner(seed, ticks, false, false, false, None, false, false, false)
 }
 
 /// Like [`run_vopr`] but additionally draws the proactive [`sailing_proto::LeaseRefresh`] sub-coin on
@@ -773,7 +812,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 /// that coverage. Only the dedicated lease-refresh coverage opts into the volume.
 #[cfg(test)]
 pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, true, false, false, None, false, false)
+  run_vopr_inner(seed, ticks, true, false, false, None, false, false, false)
 }
 
 /// Like [`run_vopr`] but additionally opts into mid-run READ-MODE migrations: the leader occasionally
@@ -784,7 +823,7 @@ pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
 /// migration coverage opts in; the read-linearizability oracle judges reads across each migration.
 #[cfg(test)]
 pub(crate) fn run_vopr_migrate(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, true, false, None, false, false)
+  run_vopr_inner(seed, ticks, false, true, false, None, false, false, false)
 }
 
 /// Like [`run_vopr`] but arms the seeded COLD-read fault on every node: a fraction of committed-range
@@ -795,7 +834,7 @@ pub(crate) fn run_vopr_migrate(seed: u64, ticks: usize) -> VoprReport {
 /// only the per-store read PRNG, so the master action/topology stream is unchanged.
 #[cfg(test)]
 pub(crate) fn run_vopr_cold(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, false, true, None, false, false)
+  run_vopr_inner(seed, ticks, false, false, true, None, false, false, false)
 }
 
 /// Like [`run_vopr_cold`] but additionally lowers `snapshot_threshold` to a MODERATE seed-derived value
@@ -821,6 +860,7 @@ pub(crate) fn run_vopr_cold_compacting(seed: u64, ticks: usize) -> VoprReport {
     false,
     true,
     Some(threshold),
+    false,
     false,
     false,
   )
@@ -849,6 +889,7 @@ pub(crate) fn run_vopr_joint_snapshot(seed: u64, ticks: usize) -> VoprReport {
     Some(threshold),
     true,
     false,
+    false,
   )
 }
 
@@ -872,7 +913,21 @@ pub(crate) fn run_vopr_failover_compacting(seed: u64, ticks: usize) -> VoprRepor
     Some(threshold),
     false,
     true,
+    false,
   )
+}
+
+/// Like [`run_vopr`] but FORCES the LeaseGuard drift sub-mode with HETEROGENEOUS per-node timing: each
+/// node draws its OWN validator-passing `(Δ_i, ε_i)` (so `ρ_i` varies) AND its own rate within its OWN
+/// band. The uniform harness fixes one `ρ` for every node — `ρ_S ≡ ρ_D` structurally — which is why the
+/// broad sweeps were blind to the heterogeneous-drift stale read (a `(1+ρ_S)`-fast successor under-waits a
+/// slower deposed leader's lease only when `ρ_S > ρ_D`). A SEPARATE entry (the `hetero_drift` flag) so
+/// every other entry stays byte-identical. The existing read-linearizability oracle judges every confirmed
+/// read unaided — a surfaced stale serve panics with seed+tick — so NO new oracle is added; the run
+/// staying read-linearizable IS the safety assertion.
+#[cfg(test)]
+pub(crate) fn run_vopr_hetero_drift(seed: u64, ticks: usize) -> VoprReport {
+  run_vopr_inner(seed, ticks, false, false, false, None, false, false, true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -885,6 +940,7 @@ fn run_vopr_inner(
   snapshot_threshold: Option<usize>,
   joint: bool,
   force_failover: bool,
+  hetero_drift: bool,
 ) -> VoprReport {
   // The single master PRNG. Every draw in the run comes from here (deterministic from `seed`).
   let mut prng = FaultPrng::new(seed ^ 0x564F_5052_5F5F_5631); // "VOPR__V1"
@@ -907,10 +963,16 @@ fn run_vopr_inner(
   // a single leader — without it a stale leader keeps `leader_count > 1` and the calm window cannot settle.
   // The master draw above still happens (so the stream stays aligned with a normal run); only the SELECTION
   // is overridden. Every other entry passes both flags `false`, so this is a transparent no-op for them.
+  // The HETEROGENEOUS-drift entry FORCES LeaseGuard + the drift sub-mode and swaps the per-node timing
+  // source to `leaseguard_node_timing`/`leaseguard_node_rate_hetero`. A dedicated sub-seed so nothing
+  // else observes it; only the `run_vopr_hetero_drift` entry passes `hetero_drift = true`.
+  let timing_seed = seed.rotate_left(44) ^ 0x4845_5445_524F_5632; // "HETEROV2"
   let read_mode = if force_failover {
     3
   } else if joint {
     1
+  } else if hetero_drift {
+    3
   } else {
     read_mode
   };
@@ -925,10 +987,14 @@ fn run_vopr_inner(
   //     otherwise never fire in a randomized run. Complementary per the failover design: drift keeps
   //     the basic-mode coverage, and the successor's own rate drift is irrelevant to the wall-LEVEL
   //     precise release (its window absorbs the predecessor's monotonic drift).
-  let failover = (read_mode == 3 && {
-    let mut p = FaultPrng::new(seed.rotate_left(24) ^ 0x4F46_4653_4554_5631); // "OFFSETV1"
-    (p.next_u64() & 1) == 1
-  }) || force_failover;
+  // The hetero-drift entry is a DRIFT sub-mode (no wall), so it forces `failover = false` and — via the
+  // short-circuit — draws no failover coin (its own dedicated stream). Every other entry keeps `!false`,
+  // so the coin is drawn exactly as before and their streams stay bit-identical.
+  let failover = !hetero_drift
+    && ((read_mode == 3 && {
+      let mut p = FaultPrng::new(seed.rotate_left(24) ^ 0x4F46_4653_4554_5631); // "OFFSETV1"
+      (p.next_u64() & 1) == 1
+    }) || force_failover);
   // ASYMMETRIC sub-coin + the per-resync violation factor: ONE dedicated stream (a fresh, unused
   // rotation), drawn ONLY when `failover` so non-failover AND offset runs keep their master/off_prng
   // streams bit-for-bit unchanged. The asymmetric path draws a BACKWARD-only contract violation; a stale
@@ -994,10 +1060,17 @@ fn run_vopr_inner(
         if failover_hetero && cfg.id() == non_armed_id {
           return cfg.with_bounded_clock_uncertainty(LEASEGUARD_EPS_UNC);
         }
+        // Uniform Δ/ε for every node by default; the hetero-drift sub-mode draws a per-node validated
+        // pair so ρ_i varies (the whole point — a fixed ρ hides the ρ_S > ρ_D stale read).
+        let (delta, eps) = if hetero_drift {
+          leaseguard_node_timing(timing_seed, cfg.id())
+        } else {
+          (LEASEGUARD_DELTA, LEASEGUARD_EPS)
+        };
         let cfg = cfg
           .with_read_only(sailing_proto::ReadOnlyOption::LeaseGuard)
-          .with_lease_duration(LEASEGUARD_DELTA)
-          .with_clock_drift_bound(LEASEGUARD_EPS)
+          .with_lease_duration(delta)
+          .with_clock_drift_bound(eps)
           .with_lease_refresh(lease_refresh);
         // The failover sub-mode arms the precise commit-anchor (ε_unc); the drift sub-mode leaves it off.
         if failover {
@@ -1021,8 +1094,14 @@ fn run_vopr_inner(
   // outlives a fast successor's wait in real time only if the Δ·(Δ+ε)/(Δ−ε) window is too short, which
   // the read-linearizability oracle catches).
   if drifted {
-    let drift_seed = seed.rotate_left(40) ^ 0x4452_4946_545F_5631; // "DRIF_TV1"
-    c.set_clock_drift(move |id| leaseguard_node_rate(drift_seed, id));
+    if hetero_drift {
+      // Per-node rate within each node's OWN [1−ρ_i, 1+ρ_i] band (never beyond the drift its config
+      // assumes), so a fast high-ρ successor can legally outrun a slow low-ρ deposed leader's lease.
+      c.set_clock_drift(move |id| leaseguard_node_rate_hetero(timing_seed, id));
+    } else {
+      let drift_seed = seed.rotate_left(40) ^ 0x4452_4946_545F_5631; // "DRIF_TV1"
+      c.set_clock_drift(move |id| leaseguard_node_rate(drift_seed, id));
+    }
   }
   // FAILOVER sub-mode: arm the synchronized-wall clock and draw the initial per-node offsets from a
   // dedicated offset sub-PRNG (re-drawn across the run by the re-sync schedule in the main loop). The
@@ -1090,6 +1169,7 @@ fn run_vopr_inner(
   let mut report = VoprReport {
     seed,
     drifted,
+    hetero: hetero_drift,
     failover,
     lease_refresh,
     final_cluster_size: size,

@@ -870,7 +870,7 @@ fn transfer_aborted_when_transferee_removed_by_conf_change() {
 /// NOT start the disruptive, lease-bypassing forced campaign — while one from the real leader still
 /// triggers it.
 ///
-/// FAILS-ON-OLD: without the `self.leader != Some(tn.leader())` guard, the non-leader `TimeoutNow`
+/// Without the `self.leader != Some(tn.leader())` guard, the non-leader `TimeoutNow`
 /// makes the node a real Candidate at a bumped term (a wrong peer disrupting the cluster).
 #[test]
 fn timeout_now_is_authenticated_against_current_leader() {
@@ -1022,4 +1022,82 @@ fn transfer_to_a_snapshot_target_sends_timeout_now() {
     ep.transfer.forced_handoff_this_term,
     "a transferee that caught up via snapshot must be sent TimeoutNow"
   );
+}
+
+/// A forced handoff already in flight THIS term refuses a RETARGET: a second `TimeoutNow` would
+/// authorize two peers to force-campaign at once (bypassing PreVote and the lease). The SAME target
+/// stays idempotent, and a fresh leadership term (`become_leader` resets the flag) admits a new
+/// transfer.
+///
+/// MUTATION: drop the `forced_handoff_this_term` guard in `transfer_leader` → the retarget to node 3
+/// succeeds, arming a second forced campaign in the same term.
+#[test]
+fn transfer_refuses_retarget_while_handoff_pending() {
+  use crate::{Index, Term};
+  let (mut ep, mut log, mut stable) = setup_leader_with_peer2_caught_up();
+
+  // Peer 2 is caught up (match == last), so the transfer sends TimeoutNow immediately and authorizes
+  // a forced campaign this term.
+  ep.transfer_leader(Instant::ORIGIN, &log, &stable, 2u64)
+    .expect("caught-up transfer succeeds");
+  assert!(
+    ep.transfer.forced_handoff_this_term,
+    "a caught-up transfer arms the forced-handoff flag"
+  );
+
+  // Retrying the SAME target is idempotent.
+  ep.transfer_leader(Instant::ORIGIN, &log, &stable, 2u64)
+    .expect("re-targeting the same node is idempotent Ok");
+
+  // A DIFFERENT target while the handoff is pending is refused.
+  let err = ep
+    .transfer_leader(Instant::ORIGIN, &log, &stable, 3u64)
+    .unwrap_err();
+  assert!(
+    matches!(err, TransferError::HandoffPending),
+    "a retarget mid-handoff must be refused; got {err:?}"
+  );
+
+  // A fresh leadership term clears the flag. Step node 1 down with a higher-term heartbeat, then
+  // re-elect it (pre_vote is off by default, so the timeout campaigns directly).
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![],
+      Index::ZERO,
+    )),
+  );
+  assert!(
+    ep.role().is_follower(),
+    "a higher-term heartbeat steps down"
+  );
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(3), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.role().is_leader(),
+    "node 1 is re-elected in a fresh term"
+  );
+  assert!(
+    !ep.transfer.forced_handoff_this_term,
+    "become_leader resets the forced-handoff flag"
+  );
+
+  // The retarget is admitted again now that a fresh term has begun.
+  ep.transfer_leader(d, &log, &stable, 3u64)
+    .expect("a transfer is admitted once a fresh leadership term clears the flag");
 }

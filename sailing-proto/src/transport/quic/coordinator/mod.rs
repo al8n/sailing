@@ -70,6 +70,13 @@ fn tracked_peer_count<I: Ord>(conf: &crate::ConfState<I>, me: &I) -> usize {
   peers.len()
 }
 
+/// Clamp horizon (~100 years) for mapping a crate [`Instant`] onto quinn's std clock. std
+/// `Instant + Duration` PANICS on overflow (the crate [`Instant`] saturates; std does not), so the
+/// elapsed is clamped to this before the add: a pathological `now` (e.g. a `Duration::MAX` deadline
+/// from public input) maps to a too-early — never panicking — quinn deadline, a harmless re-poll.
+const CLOCK_HORIZON: core::time::Duration =
+  core::time::Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 /// A consensus node speaking QUIC: the [`Endpoint`] composed with the quinn-proto bridge and an
 /// [`IdentitySource`] (`ID`, the provided [`Hello`] by default).
 ///
@@ -248,6 +255,13 @@ where
     self.endpoint.state_machine()
   }
 
+  /// Fail-stop the wrapped endpoint because a user QUERY closure panicked mid-read against its state
+  /// machine (see [`Endpoint::fail_stop_query_panicked`]). The driver caught the unwind to keep its
+  /// task alive and routes here so the endpoint stops serving possibly-torn replicated state.
+  pub fn fail_stop_query_panicked(&mut self) {
+    self.endpoint.fail_stop_query_panicked();
+  }
+
   /// `now` mapped onto quinn's `std::time::Instant` clock: the std anchor plus the crate-time
   /// elapsed since the crate anchor. The anchor is captured LAZILY on the first call, so
   /// `quinn_now(first_now) == std_base` regardless of the driver's epoch — a fixed anchor at
@@ -259,7 +273,9 @@ where
     let (base, std_base) = *self
       .clock_anchor
       .get_or_insert_with(|| (now, std::time::Instant::now()));
-    std_base + now.duration_since(base)
+    // `duration_since` already saturates, but std `Instant + Duration` panics on overflow — clamp
+    // the elapsed to the horizon so a pathological `now` maps to a re-poll, never a panic.
+    std_base + now.duration_since(base).min(CLOCK_HORIZON)
   }
 
   /// Reverse-map a quinn deadline back into crate time through the same anchor. `None` before

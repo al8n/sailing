@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ConfState, EntryKind, FloorStore, NoFloors};
+use crate::{ConfState, EntryKind, FloorStore, ForkId, NoFloors};
 
 fn empty_entry(term: u64, index: u64) -> Entry {
   Entry::new(
@@ -189,7 +189,7 @@ fn reads_are_visible_before_durability() {
   }
 
   let hs = HardState::initial().with_term(Term::new(3));
-  stable.submit_write(OpId::new(2), hs);
+  stable.submit_write(OpId::new(2), hs.clone());
   assert_eq!(
     stable.hard_state(),
     HardState::initial(),
@@ -232,14 +232,14 @@ fn one_flush_covers_every_group() {
       HardState::initial().with_term(Term::new(1)),
     );
   }
-  assert_eq!((eng.flushes(), eng.ops_flushed()), (0, 0));
+  assert_eq!((eng.barriers(), eng.ops_batched()), (0, 0));
 
   assert_eq!(
     eng.flush(),
     6,
     "one barrier covers all three groups' appends and writes"
   );
-  assert_eq!((eng.flushes(), eng.ops_flushed()), (1, 6));
+  assert_eq!((eng.barriers(), eng.ops_batched()), (1, 6));
 
   for gid in [1u64, 2, 3] {
     let (log, stable) = eng.stores(&gid).unwrap();
@@ -256,7 +256,7 @@ fn one_flush_covers_every_group() {
   }
 
   assert_eq!(eng.flush(), 0, "nothing staged: the barrier is a no-op");
-  assert_eq!((eng.flushes(), eng.ops_flushed()), (2, 6));
+  assert_eq!((eng.barriers(), eng.ops_batched()), (2, 6));
 }
 
 /// Stable completions are ORDERED (submit order) per group: two hard-state writes and a snapshot
@@ -415,6 +415,63 @@ fn snapshot_staging_round_trips() {
   );
 }
 
+/// The staging slot is owned by ONE snapshot identity, LINEAGE included. Two transfers colliding on
+/// `(last_index, last_term, conf)` AND `total_len` but belonging to DIFFERENT lineages are different bytes —
+/// `(index, term)` is not a content-identity across a fork boundary — so the second must RESET the slot, and
+/// a staged blob must never be handed out for another lineage's meta. Within one lineage, chunks still
+/// accumulate normally.
+///
+/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the fork's chunk EXTENDS the tokenless
+/// staging (`Ok(6)` instead of `Ok(0)`), and `take_staged_snapshot` hands the resulting MIXED blob
+/// (b"AAABBB" — half one lineage, half another) to whichever meta asks. Both assertions FAIL.
+#[test]
+fn snapshot_staging_never_mixes_two_lineages() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  assert!(eng.add_group(1));
+  let (_, stable) = eng.stores(&1).unwrap();
+
+  let tokenless = voter_meta(10, 2);
+  let token = ForkId::new(
+    Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    Bytes::from_static(&[9u8]),
+    1,
+  );
+  let forked = voter_meta(10, 2).with_fork_id(token);
+
+  assert_eq!(
+    stable.accept_snapshot_chunk(&tokenless, 6, 0, &Bytes::from_static(b"AAA")),
+    Ok(3),
+    "the tokenless transfer stages [0,3)"
+  );
+  assert_eq!(
+    stable.accept_snapshot_chunk(&forked, 6, 3, &Bytes::from_static(b"BBB")),
+    Ok(0),
+    "the fork's chunk RESETS the slot — it must never extend another lineage's staged bytes"
+  );
+  assert!(
+    stable.take_staged_snapshot(&tokenless).is_none(),
+    "the displaced lineage owns nothing"
+  );
+  assert!(
+    stable.take_staged_snapshot(&forked).is_none(),
+    "and the fork's own staging is still incomplete — no blob is fabricated from the other's bytes"
+  );
+
+  // The fork completes on its OWN bytes alone: same-lineage chunks accumulate exactly as before.
+  assert_eq!(
+    stable.accept_snapshot_chunk(&forked, 6, 0, &Bytes::from_static(b"BBB")),
+    Ok(6)
+  );
+  assert_eq!(
+    stable.take_staged_snapshot(&forked),
+    Some(Bytes::from_static(b"BBBBBB")),
+    "the installed blob is ONE lineage's bytes end to end"
+  );
+}
+
 /// `term` is TOTAL over the peer-controlled probe domain — out-of-domain indices answer
 /// `Ok(Term::ZERO)`, the boundary retains the compacted term — and `entries` is always `Ready`
 /// (a resident engine never defers). Compaction's read-view effect is immediate; its completion
@@ -527,6 +584,27 @@ fn boot_epochs_are_per_group_monotonic() {
   assert_eq!(eng.next_boot_epoch(&1), Some(3));
   assert_eq!(eng.next_boot_epoch(&2), Some(2));
   assert_eq!(eng.next_boot_epoch(&9), None, "no such group");
+}
+
+/// The boot-epoch counter is CHECKED: at `u64::MAX` it REFUSES (`None`) rather than wrapping to a
+/// colliding epoch. A wrapped epoch restarts at 0 and folds two incarnations onto one
+/// `(group, epoch)` identity for every gen-keyed observer — the identity fail-stop class the
+/// `OpId`/read-round ceilings also hold.
+#[test]
+fn next_boot_epoch_refuses_exhaustion() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  assert!(eng.add_group(1));
+  eng.set_boot_epochs_for_test(&1, u64::MAX);
+  assert_eq!(
+    eng.next_boot_epoch(&1),
+    None,
+    "a saturated counter refuses rather than wrapping onto a colliding identity"
+  );
+  assert_eq!(
+    eng.next_boot_epoch(&1),
+    None,
+    "the refusal is stable — the counter holds at its ceiling, never wrapping to 0"
+  );
 }
 
 /// `remove_group` is the teardown seam: the storage (including staged work) is dropped, the id is
@@ -658,7 +736,7 @@ mod engine_backed_cluster {
     now: Instant,
     /// `ea.flush()` calls that released at least one op (the effective barriers).
     a_effective_flushes: u64,
-    /// Total ops those barriers released (must mirror `ea.ops_flushed()`).
+    /// Total ops those barriers released (must mirror `ea.ops_batched()`).
     a_ops: u64,
   }
 
@@ -692,8 +770,8 @@ mod engine_backed_cluster {
         .unwrap();
         assert!(eb.add_group(g));
       }
-      let ca = a.on_conn_open(label(1, true), Instant::ORIGIN);
-      let cb = b.on_conn_open(label(2, false), Instant::ORIGIN);
+      let ca = a.on_dial_open(2, label(1, true), Instant::ORIGIN);
+      let cb = b.on_accept_open(label(2, false), Instant::ORIGIN);
       assert_eq!(ca, cb, "first allocation on both sides");
       World {
         a,
@@ -827,7 +905,7 @@ mod engine_backed_cluster {
     // barrier above released more, so completed ops strictly outnumber the barriers that
     // completed them.
     assert_eq!(
-      w.ea.ops_flushed(),
+      w.ea.ops_batched(),
       w.a_ops,
       "the engine's cumulative metric matches the harness's accounting"
     );

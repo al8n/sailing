@@ -165,10 +165,20 @@ pub(super) fn heal_one(w: &mut MultiWorld, prng: &mut FaultPrng, report: &mut Mu
 
 /// Crash a seed-picked node (a point event: it restores from durable state immediately, so it
 /// never counts against the sustained budget).
+///
+/// Under an async store mode HALF the crashes (seeded) are armed to land MID-SETTLE on the next
+/// tick — after a delivery submitted fresh appends but before the store flush — so they roll back a
+/// genuine in-flight fsync window, while the other half stay between-tick (durable-window) crashes:
+/// the "both in-flight and durable windows" the brief's crash suite needs. The mid-fsync draw is
+/// gated on the async mode so the sync profiles neither draw the extra PRNG nor change behavior.
 pub(super) fn crash_one(w: &mut MultiWorld, prng: &mut FaultPrng, report: &mut MultiVoprReport) {
   let nodes: BTreeSet<u64> = w.node_list().into_iter().collect();
   if let Some(victim) = pick_from(&nodes, prng) {
-    w.crash(victim);
+    if w.is_async_stores() && prng.next_u64().is_multiple_of(2) {
+      w.arm_mid_fsync_crash(victim);
+    } else {
+      w.crash(victim);
+    }
     report.crashes += 1;
   }
 }
@@ -244,30 +254,49 @@ pub(super) fn conf_change(w: &mut MultiWorld, prng: &mut FaultPrng, report: &mut
   let did = match roll {
     0 | 1 if !joinable.is_empty() => {
       let node = pick_from(&joinable, prng).expect("non-empty");
-      let ty = if roll == 0 {
-        sailing_proto::ConfChangeType::AddNode
-      } else {
-        sailing_proto::ConfChangeType::AddLearnerNode
-      };
-      w.wire_group_observer(gid, node);
-      let cc = sailing_proto::ConfChange::new(ty, node, bytes::Bytes::new());
-      if w.propose_conf_change(gid, cc).is_some() {
-        true
-      } else {
-        // Refused (a racing step-down / in-flight gate): abandon the orphan replica at once so
-        // it can never pin the group's quiesce.
-        w.abandon_wired(gid, node);
+      if w.merge_choreography_active(gid) {
+        // A merge participant must not grow mid-choreography: a virgin observer wired onto a
+        // frozen source or a parked target strands behind the held apply and WORLD-PARKS for the
+        // window (the lifecycle-churn discipline, extended from the remove/recreate draws to the
+        // grow draw). The node was still drawn off the prng, so non-merge profiles — which never
+        // see the predicate true — keep byte-identical schedules.
         false
+      } else {
+        let ty = if roll == 0 {
+          sailing_proto::ConfChangeType::AddNode
+        } else {
+          sailing_proto::ConfChangeType::AddLearnerNode
+        };
+        w.wire_group_observer(gid, node);
+        let cc = sailing_proto::ConfChange::new(ty, node, bytes::Bytes::new());
+        if w.propose_conf_change(gid, cc).is_some() {
+          true
+        } else {
+          // Refused (a racing step-down / in-flight gate): abandon the orphan replica at once so
+          // it can never pin the group's quiesce.
+          w.abandon_wired(gid, node);
+          false
+        }
       }
     }
     _ => match pick_from(&removable, prng) {
       Some(victim) => {
-        let cc = sailing_proto::ConfChange::new(
-          sailing_proto::ConfChangeType::RemoveNode,
-          victim,
-          bytes::Bytes::new(),
-        );
-        w.propose_conf_change(gid, cc).is_some()
+        if w.merge_choreography_active(gid) {
+          // A merge participant must not SHRINK mid-choreography (the lifecycle-churn discipline,
+          // extended from the grow draw to the remove draw): a RemoveNode on a frozen source or a
+          // claimed/parked target drops a voter the choreography still counts on — the victim
+          // self-removes-and-parks, and a frozen source pushed below quorum goes leaderless
+          // forever (the freeze wedge). The victim was still drawn off the prng, so non-merge
+          // profiles — which never see the predicate true — keep byte-identical schedules.
+          false
+        } else {
+          let cc = sailing_proto::ConfChange::new(
+            sailing_proto::ConfChangeType::RemoveNode,
+            victim,
+            bytes::Bytes::new(),
+          );
+          w.propose_conf_change(gid, cc).is_some()
+        }
       }
       None => false,
     },
@@ -359,21 +388,38 @@ pub(super) fn create_group_action(
   report.groups_created += 1;
 }
 
-/// Retire a seed-picked live group — never the last live one (the world must keep committing).
+/// Retire a seed-picked live group — never the last live one (the world must keep committing),
+/// and never an unresolved merge-choreography participant: the embedder contract keeps a
+/// choreography's groups in place until it resolves (this action plays the embedder, exactly as
+/// it plays the catalog's tombstone refusal at recreation). Removing a frozen/claimed source
+/// orphans every parked commit naming it — the parked replicas are log-complete, so the
+/// absent-source arm's snapshot route (built for log-behind stragglers) never fires and the
+/// park stands forever; removing a mid-commit target strands its frozen source with no abort
+/// relay left to thaw it. The exclusion narrows only merge-profile draws: without merge
+/// actions no group ever has choreography state, so other profiles' pick sequences are
+/// untouched.
 pub(super) fn remove_group_action(
   w: &mut MultiWorld,
   prng: &mut FaultPrng,
   report: &mut MultiVoprReport,
 ) {
-  let live: BTreeSet<u64> = w.live_groups().into_iter().collect();
+  let live: BTreeSet<u64> = w
+    .live_groups()
+    .into_iter()
+    .filter(|g| !w.merge_choreography_active(*g))
+    .collect();
   if live.len() <= 1 {
     return;
   }
   let Some(gid) = pick_from(&live, prng) else {
     return;
   };
-  w.remove_group(gid);
-  report.groups_removed += 1;
+  // A refusal that survives the world's superset filter (an append-pending residual after a merge
+  // globally resolved) abandons the draw as a retryable no-op; the pick already burned the prng, so
+  // the schedule stays deterministic and only a committed teardown counts.
+  if w.remove_group(gid) {
+    report.groups_removed += 1;
+  }
 }
 
 /// Propose a SPLIT of a seed-picked live group: mint a fresh child id, pick a split point
@@ -418,6 +464,123 @@ pub(super) fn split_group(w: &mut MultiWorld, st: &mut MState, prng: &mut FaultP
   }
 }
 
+/// Prune the pending-merge book down to entries still awaiting an OBSERVED resolution: the
+/// source must still be live (an absorbed source left via merge registration; a rolled-back
+/// source that later retired left via lifecycle), and the world must not have drained a
+/// `MergeAborted` for the pair past its booking mark. Retiring on the OBSERVATION — never on a
+/// rollback's propose-accept — keeps an accepted-but-uncommitted abort's pair drivable at
+/// quiesce instead of silently forgotten while its source is still frozen.
+pub(super) fn prune_merge_book(w: &MultiWorld, st: &mut MState) {
+  st.pending_merges.retain(|s, pm| {
+    w.live_groups().contains(s) && w.merge_abort_observations(pm.target, *s) <= pm.abort_mark
+  });
+}
+
+/// Propose a merge FREEZE of a seed-picked live source into an equal-voter-set live sibling —
+/// the harness pairing filter (split children are colocated by construction, so the reshape
+/// churn keeps minting mergeable pairs). Every landed refusal arm is a legitimate no-op tick;
+/// an accepted freeze enters the pending book the commit/rollback actions draw from.
+pub(super) fn prepare_merge_action(
+  w: &mut MultiWorld,
+  st: &mut MState,
+  prng: &mut FaultPrng,
+  report: &mut MultiVoprReport,
+) {
+  prune_merge_book(w, st);
+  let live: Vec<u64> = w.live_groups();
+  // ORIENT every pair down the id order: the direction rule refuses a claim unless the source's
+  // canonical `Data` encoding sorts strictly ABOVE the target's, so pairing arbitrarily would let
+  // half of every draw refuse `DirectionInverted` and halve merge coverage. `u64`'s `Data` encoding
+  // is `to_le_bytes`, so this compares the exact byte strings the container does. Keeping only the
+  // oriented direction of each unordered pair (source encodes above target) covers the same
+  // mergeable pairs, one canonical orientation each.
+  let candidates: Vec<(u64, u64)> = live
+    .iter()
+    .flat_map(|&a| live.iter().map(move |&b| (a, b)))
+    .filter(|&(source, target)| source.to_le_bytes() > target.to_le_bytes())
+    .filter(|&(source, _)| !st.pending_merges.contains_key(&source))
+    .filter(|&(source, target)| {
+      let sv = w.group_voters(source);
+      !sv.is_empty() && sv == w.group_voters(target)
+    })
+    .collect();
+  if candidates.is_empty() {
+    return;
+  }
+  let (source, target) = candidates[(prng.next_u64() % candidates.len() as u64) as usize];
+  if let Some(Ok(_)) = w.propose_prepare_merge(source, target) {
+    st.pending_merges.insert(
+      source,
+      PendingMerge {
+        target,
+        saw_frozen: false,
+        abort_mark: w.merge_abort_observations(target, source),
+      },
+    );
+    report.merges_prepared += 1;
+  }
+}
+
+/// Propose the merge ABSORB for a seed-picked pending freeze. Refusals — leader churn, the
+/// local source still catching up to frozen-applied, an earlier commit already parked — no-op;
+/// a later draw retries. On acceptance the source's accepted history folds into the target's
+/// expected set (the absorb carries it; expected is a superset bound, so folding early is
+/// sound even if a rollback later wins the race).
+pub(super) fn commit_merge_action(
+  w: &mut MultiWorld,
+  st: &mut MState,
+  prng: &mut FaultPrng,
+  report: &mut MultiVoprReport,
+) {
+  prune_merge_book(w, st);
+  let sources: Vec<u64> = st.pending_merges.keys().copied().collect();
+  if sources.is_empty() {
+    return;
+  }
+  let source = sources[(prng.next_u64() % sources.len() as u64) as usize];
+  let target = st.pending_merges[&source].target;
+  if !w.live_groups().contains(&target) {
+    // A dead target with a live booked source is the STRANDED class — keep the pair booked so
+    // the quiesce teeth can attribute it; dropping it here erased the evidence.
+    return;
+  }
+  if let Some(Ok(_)) = w.propose_commit_merge(target, source) {
+    let moved: Vec<Vec<u8>> = st.expected.get(&source).cloned().unwrap_or_default();
+    if !moved.is_empty() {
+      st.expected.entry(target).or_default().extend(moved);
+    }
+    report.merges_committed += 1;
+  }
+}
+
+/// Propose the merge ABORT for a seed-picked pending freeze — deliberately able to RACE an
+/// already-accepted commit: the source's log settles the race, and the parked applies must all
+/// take the same side (the union verdict and the absorb-determinism check judge the outcome).
+/// The book entry is NOT retired on the accept: an abort that never commits leaves the source
+/// frozen, so the pair stays booked until the world OBSERVES a resolution (a `MergeAborted`
+/// drained past the booking mark, or the source absorbed away) — see [`prune_merge_book`].
+pub(super) fn rollback_merge_action(
+  w: &mut MultiWorld,
+  st: &mut MState,
+  prng: &mut FaultPrng,
+  report: &mut MultiVoprReport,
+) {
+  prune_merge_book(w, st);
+  let sources: Vec<u64> = st.pending_merges.keys().copied().collect();
+  if sources.is_empty() {
+    return;
+  }
+  let source = sources[(prng.next_u64() % sources.len() as u64) as usize];
+  let target = st.pending_merges[&source].target;
+  if !w.live_groups().contains(&target) {
+    // Keep the stranded pair booked for the quiesce teeth (see `commit_merge_action`).
+    return;
+  }
+  if let Some(Ok(_)) = w.propose_rollback_merge(target, source) {
+    report.merges_rolled_back += 1;
+  }
+}
+
 /// Recreate a seed-picked retired gid as the SAME logical group at gen+1.
 pub(super) fn recreate_group_action(
   w: &mut MultiWorld,
@@ -427,7 +590,16 @@ pub(super) fn recreate_group_action(
   if w.live_groups().len() >= MAX_LIVE_GROUPS {
     return; // recreation also counts against the bounded working set
   }
-  let retired: BTreeSet<u64> = w.retired_groups().into_iter().collect();
+  // A merged-away gid is fenced by its terminal floor — the catalog (this action) never
+  // re-offers it; the world verb enforces the same refusal by panic (harness contract). A gid
+  // some live park still NAMES as its source is equally off the menu: recreating it as a
+  // fresh incarnation would plant a log that can never satisfy the park's freeze identity —
+  // the parked host would wait on it forever, mistaking the newborn for the absorbed.
+  let retired: BTreeSet<u64> = w
+    .retired_groups()
+    .into_iter()
+    .filter(|g| !w.is_merged(*g) && !w.merge_choreography_active(*g))
+    .collect();
   let Some(gid) = pick_from(&retired, prng) else {
     return;
   };

@@ -132,6 +132,15 @@ pub struct Status<I> {
   pub precise_releases: u64,
   /// Failover-tier commit-waits HELD because the inherited walled-lease floor was unprovable.
   pub unprovable_floor_holds: u64,
+  /// Campaigns this node STARTED while holding a walled inherited-lease floor it could not prove as
+  /// leader — the PRE-election signal that a win would wedge commit (`0` with a wall capability or no
+  /// walled floor).
+  pub unprovable_floor_campaigns: u64,
+  /// Whether the group is FROZEN by an in-flight merge (refusing proposals, conf changes,
+  /// transfers, and reads until the merge resolves or rolls back).
+  pub frozen: bool,
+  /// The group's lineage counter (incarnation ⊔ shape): bumped by every applied split and merge.
+  pub shape_gen: u64,
 }
 
 /// A cheaply-cloneable, `Send + Sync` handle to submit operations and observe events.
@@ -258,6 +267,18 @@ where
   /// The closure runs ON the driver thread, against the FSM, only after a `ReadIndex`
   /// confirmation AND the apply watermark covering the confirmed index — the linearizability
   /// point. The FSM never leaves the driver thread; the closure (and its result) cross instead.
+  ///
+  /// # Closure contract
+  ///
+  /// The closure MUST NOT capture state aliased with a replicated state machine such that its
+  /// destructor can tear that state, and MUST NOT panic in `Drop`. The driver runs the closure — and
+  /// drops it, used or not — under `catch_unwind`, so a `Drop` that mutates FSM-aliased state and
+  /// panics is CAUGHT: on a single-group host it fail-stops this endpoint (its one endpoint IS its
+  /// plane). The panic is [`QueryPanicked`](DriverError::QueryPanicked) to this caller. (On a multi
+  /// host ANY such caught panic — for a hosted group OR a not-hosted one — cannot be attributed to a
+  /// single group, so it fail-stops the WHOLE plane — see the multi `query` — which is why the contract
+  /// is stated for the whole read family, not just this endpoint.) A panicking `Drop` is an abort-level
+  /// Rust anti-pattern regardless; well-behaved closures never trip this.
   pub async fn query<Out, Q>(&self, f: Q) -> Result<Out, DriverError<I>>
   where
     Out: Send + 'static,
@@ -266,7 +287,16 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = futures_channel::oneshot::channel();
     let complete = Box::new(move |res: Result<&F, DriverError<I>>| {
-      let _ = tx.send(res.map(f));
+      // The user closure runs on the driver thread; a panic here would unwind the driver and take
+      // it (and, on a multi host, every co-located group) down. Catch it so the plane survives and
+      // this caller fails with `QueryPanicked`. AssertUnwindSafe is sound for the CATCH — the driver
+      // observes only the returned value — but interior mutability (a `Cell`, atomics, a lock in the
+      // FSM) means the closure could have TORN replicated state mid-read, so the outcome reports the
+      // catch to the driver, which fail-stops the group rather than serve possibly-divergent state.
+      let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| res.map(f)));
+      let panicked = caught.is_err();
+      let _ = tx.send(caught.unwrap_or_else(|_| Err(DriverError::QueryPanicked)));
+      crate::shared::CompletionOutcome::caught(panicked)
     });
     self.send(Command::Query {
       complete,
@@ -275,18 +305,68 @@ where
     rx.await.map_err(|_| DriverError::ShuttingDown)?
   }
 
-  /// Run an inherited-read query during the post-election failover commit-wait, awaiting its result.
+  /// Run a CHECKED inherited-read query during the post-election failover commit-wait, awaiting its
+  /// result — the coarse-but-SAFE mode.
   ///
   /// Under the LeaseGuard failover tier, a freshly elected leader may serve a linearizable read on the
   /// INHERITED committed prefix BEFORE its own commit-wait lifts — provided the read's key was not
-  /// written in the limbo region `(index, limbo_upper]` (the proto is key-agnostic; the closure owns
-  /// the command format). The closure runs ON the driver thread against the FSM and the limbo entries,
-  /// returning `Some(out)` to serve or `None` to decline (e.g. its key IS in limbo). The call resolves
-  /// to `Ok(None)` when there is no serve window — off the failover tier, the commit-wait already
-  /// lifted (read normally), the inherited lease expired, or not the leader — or the closure declined;
-  /// the caller then falls back to [`query`](Self::query). The FSM and the limbo entries never leave the
-  /// driver thread; the closure (and its result) cross instead.
+  /// written in the limbo region `(index, limbo_upper]`. This CHECKED form discharges that obligation
+  /// the coarse way documented on [`FailoverReadWindow`](sailing_proto::FailoverReadWindow): it serves
+  /// ONLY when the limbo region is EMPTY, so the closure never inspects limbo and cannot serve stale by
+  /// omission. The closure runs ON the driver thread against the FSM and the window, returning
+  /// `Some(out)` to serve or `None` to decline. The call resolves to `Ok(None)` when there is no serve
+  /// window (off the failover tier, the commit-wait already lifted, the inherited lease expired, or not
+  /// the leader), when the limbo region is NON-empty (the coarse mode declines rather than risk a stale
+  /// read), or when the closure declined; the caller then falls back to [`query`](Self::query). For
+  /// per-key limbo inspection use [`failover_query_unchecked`](Self::failover_query_unchecked) and
+  /// discharge its proof obligation yourself. The FSM never leaves the driver thread; the closure (and
+  /// its result) cross instead.
+  ///
+  /// The closure obeys the same destructor/`Drop`-panic contract as [`query`](Self::query) — a
+  /// declined failover read still DROPS the closure under `catch_unwind`, so a `Drop` that tears
+  /// FSM-aliased state and panics fail-stops just as a served one does.
   pub async fn failover_query<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
+  where
+    Out: Send + 'static,
+    Q: FnOnce(&F, FailoverReadWindow) -> Option<Out> + Send + 'static,
+  {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = futures_channel::oneshot::channel();
+    let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
+      // Catch a user-closure panic (see `query`): the plane survives, the caller gets QueryPanicked,
+      // and the reported outcome fail-stops the group (a torn read could have diverged its FSM).
+      let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::shared::apply_checked_failover(res, f)
+      }));
+      let panicked = caught.is_err();
+      let _ = tx.send(caught.unwrap_or_else(|_| Err(DriverError::QueryPanicked)));
+      crate::shared::CompletionOutcome::caught(panicked)
+    });
+    self.send(Command::FailoverWindow {
+      complete,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Run an UNCHECKED inherited-read query during the post-election failover commit-wait, awaiting its
+  /// result — the primitive form that hands the closure the limbo region.
+  ///
+  /// The closure runs ON the driver thread against the FSM, the limbo entries `(index, limbo_upper]`, and
+  /// the window, returning `Some(out)` to serve or `None` to decline. The call resolves to `Ok(None)`
+  /// when there is no serve window (off the failover tier, the commit-wait already lifted, the inherited
+  /// lease expired, or not the leader) or the closure declined; the caller then falls back to
+  /// [`query`](Self::query).
+  ///
+  /// PROOF OBLIGATION (the API cannot verify it): the closure MUST return `None` when its key was written
+  /// in the limbo region. A closure that ignores the limbo slice — e.g. `|fsm, _limbo, _win|
+  /// Some(fsm.get(k))` — compiles and can serve a STALE inherited read, violating the inherited-read
+  /// linearizability proof. Prefer the checked [`failover_query`](Self::failover_query) unless the
+  /// closure genuinely inspects limbo per key. The FSM and the limbo entries never leave the driver
+  /// thread; the closure (and its result) cross instead.
+  ///
+  /// The closure obeys the same destructor/`Drop`-panic contract as [`query`](Self::query).
+  pub async fn failover_query_unchecked<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
   where
     Out: Send + 'static,
     Q: FnOnce(&F, &[Entry], FailoverReadWindow) -> Option<Out> + Send + 'static,
@@ -294,7 +374,14 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = futures_channel::oneshot::channel();
     let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
-      let _ = tx.send(res.map(|opt| opt.and_then(|(fsm, limbo, win)| f(fsm, limbo, win))));
+      // Catch a user-closure panic (see `query`): the plane survives, the caller gets QueryPanicked,
+      // and the reported outcome fail-stops the group (a torn read could have diverged its FSM).
+      let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::shared::apply_unchecked_failover(res, f)
+      }));
+      let panicked = caught.is_err();
+      let _ = tx.send(caught.unwrap_or_else(|_| Err(DriverError::QueryPanicked)));
+      crate::shared::CompletionOutcome::caught(panicked)
     });
     self.send(Command::FailoverWindow {
       complete,

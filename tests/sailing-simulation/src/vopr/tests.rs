@@ -1,5 +1,44 @@
 use super::*;
 
+/// The HETEROGENEOUS-drift sub-mode, end-to-end: each node draws its OWN validator-passing `(Δ_i, ε_i)`
+/// so `ρ_i` VARIES across nodes, and its own rate within its OWN band — the regime the uniform harness
+/// cannot produce. A single fixed `ρ` makes `ρ_S ≡ ρ_D`, which structurally hid the heterogeneous-drift
+/// stale read: a `(1+ρ_S)`-fast successor under-waits a slower deposed leader's lease only when
+/// `ρ_S > ρ_D`, impossible when every node shares one `ρ`. Each seed runs the full adversarial schedule
+/// (crash + partition + lossy network + membership churn) under per-node-heterogeneous drift and must
+/// complete WITHOUT a read-linearizability panic — the run completing IS the safety assertion; the
+/// EXISTING oracle judges every confirmed read unaided (no new oracle), and a stale cross-leader serve
+/// would trip it with seed+tick — AND confirm reads, proving the oracle actually judged reads under this
+/// regime rather than merely that the machinery is present.
+///
+/// The cross-leader SUPERSEDED-serve path (where the stale read surfaces) is schedule-rare — the uniform
+/// drift coverage pins hand-picked seeds (573, 586) found via a 0..700 sweep — so this band asserts the
+/// regime is read-linearizable and non-vacuous at the read level; the deterministic proto witnesses
+/// `leaseguard_heterogeneous_drift_successor_must_not_undercut_deposed_lease` (and its wall-absent twin)
+/// prove the exact `ρ_S > ρ_D` stale read the oracle here would catch — the read the successor-side
+/// inflation closes. A deep hetero sweep (e.g. via the `drift_sweep` example) reaches the superseded path for the
+/// cross-leader coverage.
+#[test]
+fn vopr_hetero_drift_read_linearizable() {
+  for seed in [0u64, 1, 2] {
+    let r = run_vopr_hetero_drift(seed, 1_500);
+    assert!(
+      r.hetero && r.drifted && !r.failover,
+      "seed {seed}: expected the HETEROGENEOUS-drift sub-mode (report={r:?})"
+    );
+    assert!(
+      r.reads_confirmed > 0,
+      "hetero-drift seed {seed} confirmed no reads — the read-linearizability oracle never judged a \
+       drifted read under per-node-heterogeneous ρ (report={r:?})"
+    );
+    assert!(
+      r.committed > 0 && r.partitions > 0,
+      "hetero-drift seed {seed} was vacuous — it must commit load AND partition a node so the \
+       heterogeneous drifted clocks meet leadership churn (report={r:?})"
+    );
+  }
+}
+
 /// A FNV-1a checksum of a slice of bytes — used to fingerprint a whole run's applied state so the
 /// determinism test can assert two runs are bit-identical (not just that the reports match).
 fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
@@ -146,9 +185,9 @@ fn vopr_exercises_leaseguard_under_drift() {
   // the superseded path too, but this assertion is specifically the rate-drift cross-leader case). Re-
   // derive from the `drift_sweep` example's `SUPERSEDED-SERVE ... drifted=true` lines if they fall to
   // zero — the seeds are schedule-sensitive, so any change to the per-round message flow (heartbeat
-  // rounds, replication fan-out) can move which seeds reach the path; the current pair came from a
-  // 0..1024 sweep at this tick count.
-  let superseded: u64 = [540u64, 560]
+  // rounds, replication fan-out, leader-transfer handoffs) can move which seeds reach the path; the
+  // current pair came from a 0..700 sweep at this tick count.
+  let superseded: u64 = [573u64, 586]
     .iter()
     .map(|&seed| {
       let r = run_vopr(seed, 2_000);
@@ -801,12 +840,12 @@ fn value_oracle_floor_folds_applied_after_compaction() {
      the state machine) — exactly the value the committed-only floor missed"
   );
 
-  // The committed-ONLY fold over ALL NODES (the pre-fix floor): because EVERY node compacted the entry
-  // out of its live log, no node contributes V_COMPACTED to a committed-only fold, so the CLUSTER-WIDE
-  // committed-only v_inv is strictly below V_COMPACTED. This is the all-nodes under-count that caused the
-  // bug — a committed-only oracle would have recorded this stale floor and passed a stale read. (If even
-  // one node still retained the value in its live slice, this fold would recover it; that is why the
-  // fixture drives EVERY node to compact.)
+  // The committed-ONLY fold over ALL NODES: because EVERY node compacted the entry out of its live
+  // log, no node contributes V_COMPACTED to a committed-only fold, so the CLUSTER-WIDE committed-only
+  // v_inv is strictly below V_COMPACTED. This all-nodes under-count is why the oracle's floor must
+  // read the APPLIED state and not the committed log — a committed-only oracle records this stale
+  // floor and passes a stale read. (If even one node still retained the value in its live slice, this
+  // fold would recover it; that is why the fixture drives EVERY node to compact.)
   let committed_only_fold: u64 = c
     .node_ids()
     .into_iter()
@@ -1424,8 +1463,9 @@ fn conf_change_applied_in_fsync_pump_is_recorded() {
     c.total_conf_changed() > 0,
     "the conf-change must commit + apply through the pump (the shared drain counts it)"
   );
-  // The shared drain recorded the applied conf-change as a committed-config transition — pre-fix the pump
-  // dropped `ConfChanged`, leaving this empty while the oracle's watermark still advanced (a stale reference).
+  // The shared drain recorded the applied conf-change as a committed-config transition. A pump that
+  // drops `ConfChanged` leaves this empty while the oracle's watermark still advances — the oracle
+  // would then resolve against a stale reference config.
   assert!(
     !c.view().committed_transitions.is_empty(),
     "the pump must record the applied conf-change in the committed-config transitions (no drain cherry-picks)"

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  AppendEntries, AppendResponse, Heartbeat, HeartbeatResponse, InstallSnapshot, ReadIndex,
+  AppendEntries, AppendResponse, ForkId, Heartbeat, HeartbeatResponse, InstallSnapshot, ReadIndex,
   ReadIndexResponse, ReadOnlyOption, RequestVote, SnapshotResponse, TimeoutNow, VoteResponse,
   conf::ConfState,
 };
@@ -916,6 +916,38 @@ fn install_snapshot_encoded_len_agrees_with_encoder() {
       .with_read_only(ReadOnlyOption::LeaseGuard)
       .with_shape_gen(u64::MAX),
     ),
+    (
+      // A fork baseline: the nested ForkId with every inner field PRESENT.
+      "fork_id, all inner fields present",
+      SnapshotMeta::new(
+        Index::new(1),
+        Term::new(1),
+        ConfState::from_voters([1u64, 2, 3]),
+      )
+      .with_shape_gen(5)
+      .with_fork_id(ForkId::new(
+        Bytes::from_static(&[7u8, 8]),
+        9,
+        Index::new(11),
+        Term::new(4),
+        Bytes::from_static(&[200u8]),
+        3,
+      )),
+    ),
+    (
+      // A first-incarnation fork: child_gen 0 is a proto3-default → ABSENT inside the nested ForkId.
+      "fork_id, child_gen absent",
+      SnapshotMeta::new(Index::new(1), Term::new(1), ConfState::from_voters([1u64])).with_fork_id(
+        ForkId::new(
+          Bytes::from_static(&[42u8]),
+          1,
+          Index::new(1),
+          Term::new(1),
+          Bytes::from_static(&[43u8]),
+          0,
+        ),
+      ),
+    ),
   ];
 
   for (term_raw, leader, offset, total) in [
@@ -972,7 +1004,7 @@ fn encoder_is_byte_identical_to_encode_message() {
     Term::new(6),
     ConfState::new([1u64, 2, 3, 4, 5], [9u64], [1u64, 2, 3], [7u64], true),
   );
-  // SAME identity as `meta_a` (equal last_index/last_term/conf) but DIFFERENT bounds: `identity_eq`
+  // SAME identity as `meta_a` (equal coordinate, both tokenless) but DIFFERENT bounds: `identity_eq`
   // matches yet the encoded body differs, so the cache (keyed on the FULL meta) must miss and re-encode.
   let meta_a_bounded = meta_a.clone().with_max_lease_window(123_456);
   // A genuinely different (superseding) meta.
@@ -1240,9 +1272,7 @@ fn split_payload_rejects_out_of_bound_child() {
 }
 
 #[test]
-fn split_entry_kind_round_trips_and_merge_kinds_stay_reserved() {
-  use buffa::Message as _;
-
+fn split_entry_kind_round_trips_and_merge_kinds_map() {
   // A Split entry rides the ordinary AppendEntries envelope.
   let entry = Entry::new(
     Term::new(2),
@@ -1259,14 +1289,312 @@ fn split_entry_kind_round_trips_and_merge_kinds_stay_reserved() {
     Index::new(8),
   )));
 
-  // The merge entry kinds are RESERVED in this LABEL_VERSION bump (their pb values are pinned so
-  // the merge milestone adds no wire change), but nothing encodes them yet: a frame carrying one
-  // rejects at conversion exactly like an unknown kind, and the version fence owns mixed versions.
+  // The merge kinds were RESERVED by the split milestone's LABEL_VERSION bump (pb values 5..=7);
+  // the merge milestone maps them, so a merge entry rides AppendEntries exactly like Split — no
+  // wire change, as the reservation promised.
   for kind in [
-    pb::EntryKind::PrepareMerge,
-    pb::EntryKind::CommitMerge,
-    pb::EntryKind::RollbackMerge,
+    EntryKind::PrepareMerge,
+    EntryKind::CommitMerge,
+    EntryKind::RollbackMerge,
+    EntryKind::ThawDischarged,
   ] {
+    let entry = Entry::new(
+      Term::new(2),
+      Index::new(9),
+      kind,
+      Bytes::from_static(b"payload"),
+    );
+    rt(Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1,
+      Index::new(8),
+      Term::new(2),
+      std::vec![entry],
+      Index::new(8),
+    )));
+  }
+}
+
+/// The pinned wire bytes of one `PrepareMergePayload` — proto3 fields in ascending order:
+/// `target` (1, bytes), `source_gen_after` (2, varint). Small and fixed-shape: the freeze rides
+/// the entry kind; no lease/clock field exists anywhere in the merge choreography (clock-free).
+const GOLDEN_PREPARE_MERGE_PAYLOAD: &[u8] = &[
+  0x0A, 0x01, 0x2B, // target = [0x2b]
+  0x10, 0x03, // source_gen_after = 3
+];
+
+/// The pinned wire bytes of one `CommitMergePayload` — proto3 fields in ascending order:
+/// `source` (1, bytes), `freeze_index` (2, varint), `source_gen_after` (3, varint),
+/// `target_gen_after` (4, varint), `freeze_term` (5, varint — with `freeze_index`, the freeze's
+/// log identity; an additive tail, so the pre-identity prefix is byte-identical). The absorbed
+/// state itself never rides the entry — every replica extracts its LOCAL source at the freeze
+/// boundary — so the wire cost is independent of FSM size, exactly like Split.
+const GOLDEN_COMMIT_MERGE_PAYLOAD: &[u8] = &[
+  0x0A, 0x01, 0x2A, // source = [0x2a]
+  0x10, 0x09, // freeze_index = 9
+  0x18, 0x03, // source_gen_after = 3
+  0x20, 0x05, // target_gen_after = 5
+  0x28, 0x02, // freeze_term = 2
+];
+
+/// The pinned wire bytes of one SOURCE-role `RollbackMergePayload` (the relayed unfreeze):
+/// `source_gen_after` (1, varint) alone — `source` and `target_gen_after` are proto-absent, so
+/// this role's bytes are IDENTICAL to before the target-side abort role existed.
+const GOLDEN_ROLLBACK_MERGE_PAYLOAD: &[u8] = &[
+  0x08, 0x04, // source_gen_after = 4
+];
+
+/// The pinned wire bytes of one TARGET-role `RollbackMergePayload` (the abort): proto3 fields in
+/// ascending order — `source_gen_after` (1, varint), `source` (2, bytes), `target_gen_after`
+/// (3, varint).
+const GOLDEN_ROLLBACK_MERGE_ABORT_PAYLOAD: &[u8] = &[
+  0x08, 0x03, // source_gen_after = 3
+  0x12, 0x01, 0x2A, // source = [0x2a]
+  0x18, 0x05, // target_gen_after = 5
+];
+
+#[test]
+fn prepare_merge_payload_round_trips_and_pins_bytes() {
+  let p = PrepareMergePayload::new(Bytes::from_static(b"\x2b"), 3);
+  let mut buf = Vec::new();
+  encode_prepare_merge_payload(&p, &mut buf);
+  assert_eq!(buf, GOLDEN_PREPARE_MERGE_PAYLOAD, "wire bytes are pinned");
+  let d = decode_prepare_merge_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  assert!(
+    decode_prepare_merge_payload(Bytes::from_static(b"\xff\xff")).is_err(),
+    "garbage rejects"
+  );
+  // A truncated frame rejects rather than decoding a partial payload.
+  assert!(
+    decode_prepare_merge_payload(Bytes::from_static(&GOLDEN_PREPARE_MERGE_PAYLOAD[..2])).is_err(),
+    "a truncated payload rejects"
+  );
+}
+
+#[test]
+fn commit_merge_payload_round_trips_and_pins_bytes() {
+  let p = CommitMergePayload::new(
+    Bytes::from_static(b"\x2a"),
+    Index::new(9),
+    Term::new(2),
+    3,
+    5,
+  );
+  let mut buf = Vec::new();
+  encode_commit_merge_payload(&p, &mut buf);
+  assert_eq!(buf, GOLDEN_COMMIT_MERGE_PAYLOAD, "wire bytes are pinned");
+  let d = decode_commit_merge_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  assert!(
+    decode_commit_merge_payload(Bytes::from_static(b"\xff\xff")).is_err(),
+    "garbage rejects"
+  );
+  assert!(
+    decode_commit_merge_payload(Bytes::from_static(&GOLDEN_COMMIT_MERGE_PAYLOAD[..2])).is_err(),
+    "a truncated payload rejects"
+  );
+}
+
+#[test]
+fn rollback_merge_payload_round_trips_and_pins_bytes() {
+  // The SOURCE role (the relayed unfreeze): bytes unchanged from before the abort role existed.
+  let p = RollbackMergePayload::unfreeze(4);
+  assert!(p.is_unfreeze());
+  let mut buf = Vec::new();
+  encode_rollback_merge_payload(&p, &mut buf);
+  assert_eq!(buf, GOLDEN_ROLLBACK_MERGE_PAYLOAD, "wire bytes are pinned");
+  let d = decode_rollback_merge_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  assert!(
+    decode_rollback_merge_payload(Bytes::from_static(b"\xff\xff")).is_err(),
+    "garbage rejects"
+  );
+  // The one-field payload's truncation shape: a dangling tag with no varint body.
+  assert!(
+    decode_rollback_merge_payload(Bytes::from_static(&GOLDEN_ROLLBACK_MERGE_PAYLOAD[..1])).is_err(),
+    "a truncated payload rejects"
+  );
+
+  // The TARGET role (the abort): names its source and carries the target's lineage mint.
+  let p = RollbackMergePayload::abort(Bytes::from_static(b"\x2a"), 3, 5);
+  assert!(!p.is_unfreeze());
+  let mut buf = Vec::new();
+  encode_rollback_merge_payload(&p, &mut buf);
+  assert_eq!(
+    buf, GOLDEN_ROLLBACK_MERGE_ABORT_PAYLOAD,
+    "wire bytes are pinned"
+  );
+  let d = decode_rollback_merge_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  // Truncating inside the source field's bytes rejects rather than yielding a partial id.
+  assert!(
+    decode_rollback_merge_payload(Bytes::from_static(
+      &GOLDEN_ROLLBACK_MERGE_ABORT_PAYLOAD[..4]
+    ))
+    .is_err(),
+    "a truncated payload rejects"
+  );
+  // An over-bound source encoding rejects like every group tag; EMPTY is the source role, so
+  // only the upper bound applies here.
+  let oversized =
+    RollbackMergePayload::abort(Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]), 1, 1);
+  let mut buf = Vec::new();
+  encode_rollback_merge_payload(&oversized, &mut buf);
+  assert!(
+    decode_rollback_merge_payload(Bytes::from(buf)).is_err(),
+    "an over-bound source encoding rejects"
+  );
+}
+
+/// The pinned wire bytes of one `ThawDischargedPayload` — proto3 fields in ascending order:
+/// `source` (1, bytes), `generation` (2, varint). A new merge kind under LABEL_VERSION 3, so its
+/// vector is pinned like the others; the unrelated merge vectors above are untouched.
+const GOLDEN_THAW_DISCHARGED_PAYLOAD: &[u8] = &[
+  0x0A, 0x01, 0x2A, // source = [0x2a]
+  0x10, 0x03, // generation = 3
+];
+
+#[test]
+fn thaw_discharged_payload_round_trips_and_pins_bytes() {
+  let p = ThawDischargedPayload::new(Bytes::from_static(b"\x2a"), 3);
+  let mut buf = Vec::new();
+  encode_thaw_discharged_payload(&p, &mut buf);
+  assert_eq!(buf, GOLDEN_THAW_DISCHARGED_PAYLOAD, "wire bytes are pinned");
+  let d = decode_thaw_discharged_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  assert!(
+    decode_thaw_discharged_payload(Bytes::from_static(b"\xff\xff")).is_err(),
+    "garbage rejects"
+  );
+  // Truncating inside the source field's bytes rejects rather than yielding a partial id.
+  assert!(
+    decode_thaw_discharged_payload(Bytes::from_static(&GOLDEN_THAW_DISCHARGED_PAYLOAD[..2]))
+      .is_err(),
+    "a truncated payload rejects"
+  );
+  // The source is ALWAYS present (a witness names one source): an empty source rejects like a
+  // commit-merge's, and an over-bound one rejects like every group tag.
+  let empty = ThawDischargedPayload::new(Bytes::new(), 1);
+  let mut buf = Vec::new();
+  encode_thaw_discharged_payload(&empty, &mut buf);
+  assert!(
+    decode_thaw_discharged_payload(Bytes::from(buf)).is_err(),
+    "an empty source rejects"
+  );
+  let oversized = ThawDischargedPayload::new(Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]), 1);
+  let mut buf = Vec::new();
+  encode_thaw_discharged_payload(&oversized, &mut buf);
+  assert!(
+    decode_thaw_discharged_payload(Bytes::from(buf)).is_err(),
+    "an over-bound source encoding rejects"
+  );
+}
+
+#[test]
+fn merge_payloads_reject_out_of_bound_group_ids() {
+  // An absent/empty group id is never a merge participant; over the group-tag wire bound rejects
+  // like any group tag (the propose side never encodes one, so a committed violation is corrupt).
+  let empty = PrepareMergePayload::new(Bytes::new(), 1);
+  let mut buf = Vec::new();
+  encode_prepare_merge_payload(&empty, &mut buf);
+  assert!(
+    decode_prepare_merge_payload(Bytes::from(buf)).is_err(),
+    "an empty target rejects"
+  );
+  let oversized = PrepareMergePayload::new(Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]), 1);
+  let mut buf = Vec::new();
+  encode_prepare_merge_payload(&oversized, &mut buf);
+  assert!(
+    decode_prepare_merge_payload(Bytes::from(buf)).is_err(),
+    "an over-bound target encoding rejects"
+  );
+
+  let empty = CommitMergePayload::new(Bytes::new(), Index::new(1), Term::new(1), 1, 1);
+  let mut buf = Vec::new();
+  encode_commit_merge_payload(&empty, &mut buf);
+  assert!(
+    decode_commit_merge_payload(Bytes::from(buf)).is_err(),
+    "an empty source rejects"
+  );
+  let oversized = CommitMergePayload::new(
+    Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]),
+    Index::new(1),
+    Term::new(1),
+    1,
+    1,
+  );
+  let mut buf = Vec::new();
+  encode_commit_merge_payload(&oversized, &mut buf);
+  assert!(
+    decode_commit_merge_payload(Bytes::from(buf)).is_err(),
+    "an over-bound source encoding rejects"
+  );
+}
+
+#[test]
+fn merge_entries_fit_the_append_frame_budget() {
+  // The merge payloads are a handful of varints plus ONE bounded group tag, so a merge entry's
+  // frame cost is payload + ENTRY_WIRE_OVERHEAD_MAX — the existing accounting, unchanged, and
+  // far under the per-frame entry budget even at the maximum group-id encoding.
+  let worst_target = Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN]);
+  let mut buf = Vec::new();
+  encode_prepare_merge_payload(
+    &PrepareMergePayload::new(worst_target.clone(), u64::MAX),
+    &mut buf,
+  );
+  let prepare = Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::PrepareMerge,
+    Bytes::from(buf),
+  );
+  let mut buf = Vec::new();
+  encode_commit_merge_payload(
+    &CommitMergePayload::new(
+      worst_target,
+      Index::new(u64::MAX - 1),
+      Term::new(u64::MAX),
+      u64::MAX,
+      u64::MAX,
+    ),
+    &mut buf,
+  );
+  let commit = Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::CommitMerge,
+    Bytes::from(buf),
+  );
+  let mut buf = Vec::new();
+  encode_rollback_merge_payload(
+    &RollbackMergePayload::abort(
+      Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN]),
+      u64::MAX,
+      u64::MAX,
+    ),
+    &mut buf,
+  );
+  let rollback = Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::RollbackMerge,
+    Bytes::from(buf),
+  );
+  for e in [prepare, commit, rollback] {
+    let cost = super::entry_frame_cost(&e);
+    assert_eq!(cost, e.data().len() + ENTRY_WIRE_OVERHEAD_MAX);
+    assert!(cost <= super::APPEND_FRAME_ENTRY_BUDGET);
+  }
+}
+
+#[test]
+fn unknown_entry_kind_rejects() {
+  use buffa::Message as _;
+
+  // An UNKNOWN pb kind value (beyond the mapped 0..=8) still rejects at conversion — the
+  // reservation arm is gone, the unknown-value fence is not.
+  for kind in [buffa::EnumValue::Unknown(9), buffa::EnumValue::Unknown(255)] {
     let ae = pb::AppendEntries {
       term: 2,
       leader_id: {
@@ -1279,7 +1607,7 @@ fn split_entry_kind_round_trips_and_merge_kinds_stay_reserved() {
       entries: std::vec![pb::Entry {
         term: 2,
         index: 9,
-        kind: buffa::EnumValue::Known(kind),
+        kind,
         ..Default::default()
       }],
       leader_commit: 8,
@@ -1293,7 +1621,7 @@ fn split_entry_kind_round_trips_and_merge_kinds_stay_reserved() {
     msg.encode(&mut buf);
     assert!(
       decode_message::<u64>(Bytes::from(buf)).is_err(),
-      "a reserved merge entry kind rejects at conversion until the merge milestone maps it"
+      "an unknown entry kind rejects at conversion"
     );
   }
 }
@@ -1342,5 +1670,95 @@ fn snapshot_meta_shape_gen_round_trips() {
   assert_eq!(
     a, b,
     "shape_gen 0 encodes absent (byte-identical to before)"
+  );
+}
+
+#[test]
+fn snapshot_meta_fork_id_round_trips() {
+  let conf = ConfState::from_voters(std::vec![1u64, 2, 3]);
+  let fork_id = ForkId::new(
+    Bytes::from_static(&[10u8, 20, 30]),
+    7,
+    Index::new(42),
+    Term::new(4),
+    Bytes::from_static(&[99u8]),
+    2,
+  );
+  let meta =
+    SnapshotMeta::new(Index::new(1), Term::new(1), conf.clone()).with_fork_id(fork_id.clone());
+  let m = Message::InstallSnapshot(InstallSnapshot::new(
+    Term::new(1),
+    1,
+    meta,
+    Bytes::from_static(b"blob"),
+  ));
+  let mut buf = Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(
+    back.snapshot().fork_id(),
+    Some(&fork_id),
+    "the whole ForkId (parent/child bytes, incarnation, split index+term, child gen) round-trips"
+  );
+
+  // A non-fork snapshot carries no token: absent on the wire, byte-identical to a pre-provenance
+  // peer's meta.
+  let plain = SnapshotMeta::new(Index::new(1), Term::new(1), conf);
+  assert_eq!(plain.fork_id(), None);
+  let mut a = Vec::new();
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1,
+      plain,
+      Bytes::from_static(b"blob"),
+    )),
+    &mut a,
+  );
+  let Message::InstallSnapshot(back_plain) = decode_message::<u64>(Bytes::from(a)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(
+    back_plain.snapshot().fork_id(),
+    None,
+    "an absent ForkId decodes as None"
+  );
+}
+
+#[test]
+fn snapshot_response_progress_flag_round_trips() {
+  let m = Message::SnapshotResponse(
+    SnapshotResponse::new(Term::new(2), 7, false, Index::new(0))
+      .with_acked_through(64)
+      .with_progress(true),
+  );
+  let mut buf = Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::SnapshotResponse(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert!(back.progress(), "the progress flag must round-trip");
+  assert_eq!(back.acked_through(), 64);
+
+  let mut c = Vec::new();
+  let mut d = Vec::new();
+  encode_message(
+    &Message::SnapshotResponse(SnapshotResponse::new(Term::new(2), 7, false, Index::new(9))),
+    &mut c,
+  );
+  encode_message(
+    &Message::SnapshotResponse(
+      SnapshotResponse::new(Term::new(2), 7, false, Index::new(9)).with_progress(false),
+    ),
+    &mut d,
+  );
+  assert_eq!(
+    c, d,
+    "a false progress flag must be absent on the wire — final acks are byte-identical"
   );
 }

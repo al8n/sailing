@@ -28,7 +28,7 @@ use super::{
 use crate::{
   CheapClone, Config, CreateGroupError, Data, Endpoint, Event, FloorStore, GroupControl, GroupId,
   GroupStores, Index, Instant, LogStore, Message, MultiRaft, NodeId, Now, ProposeError,
-  StableStore, StateMachine, StorageProgress,
+  RemoveError, StableStore, StateMachine, StorageProgress,
   multi::validate_floor,
   transport::{
     ClusterId, CoalescedEntry,
@@ -203,9 +203,10 @@ where
   /// then the tombstone, then the container: `generation` — the id's incarnation under the
   /// single-incarnation contract, 0 unless the embedder reshapes ids — is compared against the
   /// persisted admission floor read through `floors`, and an under-floor incarnation is refused
-  /// before anything volatile is consulted (the durable fence outranks in-session state; the
-  /// coordinator itself does not otherwise consume `generation` yet — the driver records it
-  /// after the `Ok`, and the split milestone consumes it at this layer). The driver hands its
+  /// before anything volatile is consulted (the durable fence outranks in-session state). The
+  /// ADMITTED generation then SEEDS the container's lineage counter — the created incarnation
+  /// mints strictly above its floor, so it can never repeat a fenced predecessor's generations —
+  /// and the driver records the same value in its engine after the `Ok`. The driver hands its
   /// engine as `floors`; the deterministic sim and proto-level embedders hand their own store —
   /// durability is the store-owner's job. A tombstoned id still REFUSES creation at ANY
   /// generation until an explicit [`clear_tombstone`](Self::clear_tombstone) consents to
@@ -244,7 +245,9 @@ where
       return Err(CreateGroupError::SplitReserved);
     }
     let key = gid.cheap_clone();
-    self.multi.create_group(gid, config, now, seed, fsm)?;
+    self
+      .multi
+      .create_group(gid, generation, config, now, seed, fsm)?;
     self.purge_unknown_signal(&key);
     // A fresh group can widen the tracked-peer union; raise the connection cap now rather than at
     // the next pump, so accepts arriving in the gap are not statelessly refused.
@@ -343,6 +346,7 @@ where
     fsm: F,
     snapshot: bytes::Bytes,
     read_only: Option<crate::ReadOnlyOption>,
+    fork_id: Option<crate::ForkId>,
     boot_epoch: u64,
     generation: u64,
     floors: &impl FloorStore<G>,
@@ -367,7 +371,8 @@ where
     }
     let key = gid.cheap_clone();
     self.multi.create_group_from_fork(
-      gid, generation, config, now, seed, fsm, snapshot, read_only, boot_epoch, log, stable,
+      gid, generation, config, now, seed, fsm, snapshot, read_only, fork_id, boot_epoch, log,
+      stable,
     )?;
     self.purge_unknown_signal(&key);
     // Same cap-raise as `create_group`: the forked group widens the tracked-peer union.
@@ -392,12 +397,30 @@ where
   /// group is unsound without epochs (matching the NodeId reuse rules). Across a restart the
   /// tombstone is gone; the embedder's placement catalog is the persistent record of what must
   /// not live here.
-  pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F>> {
+  ///
+  /// REFUSES every UNRESOLVED merge participant (inherited verbatim from the container's teardown
+  /// gate: [`OwesThaw`](RemoveError::OwesThaw), [`Frozen`](RemoveError::Frozen),
+  /// [`MergeParked`](RemoveError::MergeParked), [`SpokenFor`](RemoveError::SpokenFor),
+  /// [`Claimed`](RemoveError::Claimed)) — nothing is torn down and the id is NOT tombstoned, so a
+  /// refused removal is a clean no-op the caller retries once the choreography resolves. The gate
+  /// runs FIRST, before any side-state is cleared. `stores` is the per-group seam the container reads
+  /// a freeze-pending source's log through (the `Claimed` leg's append-pending window).
+  pub fn remove_group<L, S, St>(
+    &mut self,
+    gid: &G,
+    stores: &mut St,
+  ) -> Result<Option<Endpoint<I, F>>, RemoveError>
+  where
+    St: GroupStores<G, L, S>,
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let removed = self.multi.remove_group(gid, stores)?;
     self.quiesce_intents.remove(gid);
     self.controls.retain(|(g, _)| g != gid);
     self.retired.insert(gid.cheap_clone());
     self.purge_unknown_signal(gid);
-    self.multi.remove_group(gid)
+    Ok(removed)
   }
 
   /// Lift `gid`'s tombstone, returning whether one existed. The EXPLICIT re-admission consent —
@@ -426,6 +449,24 @@ where
   #[must_use]
   pub fn is_retired(&self, gid: &G) -> bool {
     self.retired.contains(gid)
+  }
+
+  /// Fail-stop the addressed group because a user QUERY closure panicked mid-read against its state
+  /// machine, LATCHING the poison for the lifecycle tail (see
+  /// [`MultiRaft::fail_stop_query_panicked`]). A driver caught the unwind to keep its plane and every
+  /// co-located group alive, then routes here so this group joins the poison surface
+  /// ([`poll_poisoned`](Self::poll_poisoned)) and stops serving possibly-torn replicated state.
+  pub fn fail_stop_query_panicked(&mut self, gid: &G) {
+    self.multi.fail_stop_query_panicked(gid);
+  }
+
+  /// Fail-stop EVERY hosted group because a completion caught a user-closure(-drop) panic that names
+  /// no group — the verdict a refusal addressed to a group this host does not carry reports (see
+  /// [`MultiRaft::fail_stop_plane_unattributable_panic`] for why an unattributable tear is PLANE-fatal
+  /// and why that is the safe trade). Every group poisons and surfaces on the lifecycle tail
+  /// ([`poll_poisoned`](Self::poll_poisoned)), so the plane fails LOUDLY, never silently.
+  pub fn fail_stop_plane_unattributable_panic(&mut self) {
+    self.multi.fail_stop_plane_unattributable_panic();
   }
 
   /// Drain the next UNKNOWN-GROUP placement signal: `(group, authenticated sender)` for
@@ -715,6 +756,12 @@ where
     if !self.multi.contains_group(group) {
       return None;
     }
+    // A locally-tombstoned child could never materialize its fork here (admission refuses
+    // `Retired`), so refuse the split at propose — the entry is never appended. The floor leg
+    // fences a below-floor incarnation; this leg fences a removed one, beside it.
+    if self.retired.contains(child) {
+      return Some(Err(crate::SplitError::ChildRetired));
+    }
     if let Err(e) = validate_floor(floors.floor(child), child_gen) {
       return Some(Err(match e {
         CreateGroupError::BelowFloor { floor } => crate::SplitError::BelowFloor { floor },
@@ -728,6 +775,154 @@ where
     let _ = self.multi.flush_appends(group, now, log, stable);
     self.pump(now.mono());
     Some(r)
+  }
+
+  /// Propose a merge FREEZE of `source` into `target` (see [`MultiRaft::prepare_merge`] for the
+  /// container gates), replicating immediately. The source's log resolves through the caller's
+  /// `stores` seam — the container's claimed-target gate reads co-hosted claimants' logs, not
+  /// just the source's own. The coordinator adds the merge's floor leg through the caller's
+  /// `floors` seam: a participant whose CURRENT incarnation sits below its persisted admission
+  /// floor is a stale survivor of a fenced incarnation — refused BEFORE anything is appended,
+  /// exactly as the split delegator fences its child. `None` if no group `source` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn prepare_merge<L, S, St>(
+    &mut self,
+    source: &G,
+    now: impl Into<Now>,
+    stores: &mut St,
+    target: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    St: GroupStores<G, L, S>,
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.multi.contains_group(source) {
+      return None;
+    }
+    if let Err(e) = self.merge_floor_check(source, target, floors) {
+      return Some(Err(e));
+    }
+    let now: Now = now.into();
+    let r = self.multi.prepare_merge(source, now, stores, target)?;
+    if let Some((log, stable)) = stores.stores(source) {
+      let _ = self.multi.flush_appends(source, now, log, stable);
+    }
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Propose the merge ABSORB on `target` (see [`MultiRaft::commit_merge`]), replicating
+  /// immediately, with the same per-call floor leg as
+  /// [`prepare_merge`](Self::prepare_merge). `None` if no group `target` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn commit_merge<L, S>(
+    &mut self,
+    target: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    source: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.multi.contains_group(target) {
+      return None;
+    }
+    if let Err(e) = self.merge_floor_check(source, target, floors) {
+      return Some(Err(e));
+    }
+    let now: Now = now.into();
+    let r = self.multi.commit_merge(target, now, log, stable, source)?;
+    let _ = self.multi.flush_appends(target, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Propose the merge ABORT on `target` (see [`MultiRaft::rollback_merge`]): the target-side
+  /// abort entry, totally ordered against `CommitMerge` on the target's own log, replicating
+  /// immediately. No floor leg: aborting is always legitimate on groups this host still runs.
+  /// `None` if no group `target` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn rollback_merge<L, S>(
+    &mut self,
+    target: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    source: &G,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self
+      .multi
+      .rollback_merge(target, now, log, stable, source)?;
+    let _ = self.multi.flush_appends(target, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// The merge verbs' floor leg: BOTH participants' current incarnations must clear their
+  /// persisted admission floors — an under-floor participant is a fenced incarnation's stale
+  /// survivor, and anchoring a merge on it would resurrect exactly what the floor buried.
+  fn merge_floor_check(
+    &self,
+    source: &G,
+    target: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Result<(), crate::MergeError<I>> {
+    for gid in [source, target] {
+      let floor = floors.floor(gid);
+      if !crate::floor_admits(floor, self.multi.group_gen(gid)) {
+        return Err(crate::MergeError::BelowFloor { floor });
+      }
+    }
+    Ok(())
+  }
+
+  /// Resolve every parked merge that local facts now decide (see
+  /// [`MultiRaft::service_merge_applies`]) — called once per crank by the driver after the
+  /// per-group storage drains. On a resolved ABSORB or a husk RETIREMENT the coordinator TOMBSTONES
+  /// the source id: its straggler frames drop silently from here on (the P5 wire story, unchanged),
+  /// while the terminal floor the DRIVER persists from the returned resolutions is what makes the
+  /// refusal survive restarts. Aborted resolutions touch nothing here — the source group is still live.
+  pub fn service_merge_applies<L, S, St>(
+    &mut self,
+    now: impl Into<Now>,
+    stores: &mut St,
+  ) -> Vec<crate::MergeResolution<G>>
+  where
+    St: crate::GroupStores<G, L, S> + FloorStore<G>,
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let resolutions = self.multi.service_merge_applies(now, stores);
+    for r in &resolutions {
+      // A `Merged` source (absorbed) and a `Retired` source (husk dissolved) both LEAVE the container
+      // terminally floored — tombstone each id. `Aborted` leaves both groups live. `CaptureFailed`
+      // also removed the source endpoint, but does NOT floor it — its stores are preserved for a
+      // restart re-park — so it is NOT tombstoned here: a terminal refusal would fence exactly the
+      // incarnation the restart must restore.
+      let source = match r {
+        crate::MergeResolution::Merged { source, .. }
+        | crate::MergeResolution::Retired { source } => source,
+        crate::MergeResolution::Aborted { .. } | crate::MergeResolution::CaptureFailed { .. } => {
+          continue;
+        }
+      };
+      self.quiesce_intents.remove(source);
+      self.controls.retain(|(g, _)| g != source);
+      self.retired.insert(source.cheap_clone());
+      self.purge_unknown_signal(source);
+    }
+    resolutions
   }
 
   /// The next committed, relay-ready fork from any hosted group (see
@@ -759,6 +954,12 @@ where
   /// tail accepted the peeked event.
   pub fn poll_split_conflict(&mut self) -> Option<(G, G)> {
     self.multi.poll_split_conflict()
+  }
+
+  /// Drain the next FAIL-STOPPED group id (see [`MultiRaft::poll_poisoned`]); the driver surfaces
+  /// it on its lifecycle tail for the placement brain. Best-effort, like the other observations.
+  pub fn poll_poisoned(&mut self) -> Option<G> {
+    self.multi.poll_poisoned()
   }
 
   /// Initiate a linearizable read on `group`; the resulting `ReadState` surfaces via
@@ -843,7 +1044,7 @@ where
 
   /// Pop one outbound datagram (destination + owned bytes), or `None` when the queue is empty. The
   /// driver drains this to exhaustion after every `handle_*` call — the drain-end chokepoint where
-  /// the crank's batched heartbeats ship (one coalesced frame per peer, see [`Self::pump`]), so
+  /// the crank's batched heartbeats ship (one coalesced frame per peer, see `pump`), so
   /// every call's beats leave with that call's transmit drain.
   pub fn poll_transmit(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
     self.ship_heartbeats();

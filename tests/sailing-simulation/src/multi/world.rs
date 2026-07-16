@@ -13,11 +13,12 @@ use super::{
 };
 use crate::{
   AppliedLog, Checker, DurableEntry, LogSm, MemLog, MemStable, NetworkFaults, StorageFaults,
-  checker, network::NetPrng,
+  StoreMode, checker, network::NetPrng,
 };
 use core::time::Duration;
 use sailing_proto::{
-  Config, Event, Instant, LogStore, Message, MultiRaft, Outgoing, ReadState, StableStore,
+  Config, Event, ForkId, Instant, LogStore, Message, MultiRaft, Outgoing, ProgressState, ReadState,
+  StableStore,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -106,6 +107,13 @@ pub struct MultiWorld {
   /// Per-node crash counter — the durable boot epoch handed to `restore_group` so a restarted
   /// node's forwarded-read tokens are unique across incarnations.
   boot_epochs: BTreeMap<u64, u64>,
+  /// Per-`(node, parent)` DURABLE relay lineage — the max `parent_gen_after` of the parent's forks
+  /// this node has MATERIALIZED. The container's live relay guard is reset to the (possibly
+  /// lagging) durable snapshot meta on restart, so — exactly as a real driver restores it from
+  /// `engine.group_gen` (bumped in its fork drain) via `raise_relay_guard` — the restore path feeds
+  /// this back so a replayed split folds to a duplicate no-op instead of re-materializing (or, now,
+  /// PARKING against) an already-relayed child.
+  relayed_lineage: BTreeMap<(u64, u64), u64>,
   /// Per-`(node, gid)` confirmed `ReadState`s in confirmation order. Monotone and NEVER removed
   /// on replica teardown, so the read ledger's scan offsets stay valid across re-wiring.
   read_states: BTreeMap<(u64, u64), Vec<ReadState>>,
@@ -128,17 +136,28 @@ pub struct MultiWorld {
   /// the construction default — leaves the library's demand-driven threshold untouched, so a
   /// world without the override is byte-identical to one predating the seam.
   snapshot_threshold: Option<usize>,
+  /// Whether every replica the world wires constructs its `Config` with pre-vote on — the
+  /// removed-replica disruption cure's prevention layer, set per-group by the reshaping profiles.
+  /// `false` — the construction default — applies `with_pre_vote(false)`, which equals the library
+  /// default, so a world that never sets it is byte-identical to one predating the seam.
+  pre_vote: bool,
+  /// Whether every replica the world wires constructs its `Config` with check-quorum on — the
+  /// prevention layer's leader-side half, defaulted and applied exactly like [`pre_vote`](Self::pre_vote).
+  check_quorum: bool,
   /// The instruction-conservation ledger: per-`(ledger id, key)` write histories recorded from
   /// the replicas' RAW applied records (see `conserve_sweep`), judged per recorded split by
   /// [`finalize_conservation_or_panic`](Self::finalize_conservation_or_panic).
   conservation: ConservationLedger,
-  /// Per-`(ledger id, key)` last recorded value — the recorder's dedupe AND its ONLY walk
-  /// state. Values are globally unique and strictly increase per `(group, key)` (the fuzzer's
-  /// monotone counter), so "strictly above the last recorded" admits each cell exactly once, in
-  /// write order, no matter how many replicas' full re-walks present it. Deliberately NO
-  /// positional resume watermark rides beside it: `LogSm::split` and a crash restore both move
-  /// cells to positions an earlier sweep already passed (see `conserve_sweep`).
-  cons_last: BTreeMap<(u64, u16), u64>,
+  /// Per-`(ledger id, key)` the SET of recorded values — the recorder's dedupe AND its ONLY walk
+  /// state. Values are globally unique, so a value already in the set is a re-presentation to
+  /// skip and a fresh one is a new cell to record, in first-encounter order, no matter how many
+  /// replicas' full re-walks present it. A SET rather than a monotone high-water mark because a
+  /// MERGE folds a source's cells under the TARGET's ledger id, and an absorbed cell's value can
+  /// sit BELOW the target's own — a mark would drop it as stale though it is a distinct cell of a
+  /// different lineage (see `conserve_sweep`). Deliberately NO positional resume watermark rides
+  /// beside it: `LogSm::split` and a crash restore both move cells to positions an earlier sweep
+  /// already passed.
+  cons_recorded: BTreeMap<(u64, u16), BTreeSet<u64>>,
   /// Every committed split the world REGISTERED (child materialized), in registration order —
   /// the conservation verdict's work list.
   splits: BTreeMap<u64, split::SplitRecord>,
@@ -168,6 +187,90 @@ pub struct MultiWorld {
   /// (the child id retired, or recreated past the fork's generation): no materialization, the
   /// parent's fence lifted, mirroring the product's `SplitRefused` resolution.
   split_refused: u64,
+  /// Every registered merge (first resolution anywhere), in registration order — the union
+  /// verdict's work list plus the absorb-determinism reference record (see
+  /// `multi/world/merge.rs`).
+  merges: Vec<merge::MergeRecord>,
+  /// Per-host TERMINAL merge floors `(node, source)` — recorded when a source's deferred
+  /// teardown lands (the world's engine-floor model; the service's absent-arm discriminator).
+  merge_floors: BTreeSet<(u64, u64)>,
+  /// Per-gid NON-TERMINAL admission floor persisted when the world permanently stops hosting a
+  /// RESHAPED id — the embedder catalog's `removal_floor` discipline (one past the id's removal
+  /// ceiling). Cluster-wide by construction (the catalog is one fact, not per host): a target
+  /// that later re-derives a torn-down source's abort-thaw obligation discharges it off this floor
+  /// (`!floor_admits(floor, expected)`) while the source is unhosted, before any recreate. `0`/absent
+  /// for an id that never reshaped, so the default (no-merge, no-split) profile is byte-identical.
+  removal_floors: BTreeMap<u64, u64>,
+  /// Deferred merge-source teardowns `(node, source, target, capture boundary)` awaiting the
+  /// target capture's durability on that host (the one-barrier batch model; see
+  /// `sweep_merge_teardowns`).
+  pending_merge_teardowns: Vec<(u64, u64, u64, sailing_proto::Index)>,
+  /// The embedder's own record of every freeze it has proposed: `source -> target`, set at each
+  /// accepted `prepare_merge` (last-wins, since one source freezes toward one target at a time). The
+  /// world plays the embedder, which knows its merge intentions, so this is the truthful source of a
+  /// frozen source's CLAIMED TARGET — the mirror the `merge_choreography_active` predicate reads to
+  /// keep a claimed target off the removal draws (the container's `Claimed` gate). Never cleared:
+  /// a stale entry is inert, filtered at read by whether the named source's freeze is still active.
+  active_freezes: BTreeMap<u64, u64>,
+  /// Merged resolutions observed across all hosts (every per-host resolution counts).
+  merges_resolved: u64,
+  /// Aborted resolutions observed across all hosts.
+  merges_aborted: u64,
+  /// CaptureFailed resolutions observed across all hosts: a consumed source whose union could not be
+  /// made durable (absorb refused, or capture faulted). The absorb-capable/non-faulting sim FSM never
+  /// produces one; a non-zero count is the wedge worth reporting, not chasing.
+  merges_capture_failed: u64,
+  /// Per-`(target, source)` MONOTONE count of `Event::MergeAborted` observations drained across
+  /// the run — the abort clock the fuzzer's pending-merge book retires against: a pair booked at
+  /// clock `c` is resolved-by-abort once the clock reads past `c` (the absorb side retires via
+  /// merge registration instead). A count, not a set, because the same pair can legitimately
+  /// freeze, abort, and re-freeze across a run.
+  merge_aborts_observed: BTreeMap<(u64, u64), u64>,
+  /// Per-gid count of CONSECUTIVE teardown-gate refusals a `remove_group` draw has abandoned while
+  /// `merge_choreography_active` read false — the append-pending-residual escalation counter (see
+  /// [`remove_group`](Self::remove_group)). Reset on any successful teardown or a live-choreography
+  /// read; a transient replication lag clears within a handful of cranks (the streak never grows),
+  /// so passing [`TEARDOWN_TIE_BUDGET`](lifecycle::TEARDOWN_TIE_BUDGET) means a genuine
+  /// non-superset hole that refuses forever — and still trips.
+  teardown_tie_streak: BTreeMap<u64, usize>,
+  /// The write mode every replica store the world wires is constructed under. `Sync` — the
+  /// construction default, byte-identical to a world predating the seam — is commit-on-submit;
+  /// `Async` runs the stores through the staged-write fsync-loss window (submit → `flush` →
+  /// durable; a `crash`/rollback `discard_inflight` drops the un-flushed tail), which is what makes
+  /// the randomized crash campaign actually EXERCISE lost-fsync durability (persist-vote-before-grant,
+  /// append-before-ack, commit persistence, the reshaping lineage across a crash). Set once from the
+  /// profile before any group is wired ([`set_store_mode`](Self::set_store_mode)) and PRESERVED
+  /// across every store-creating (re)wire path (create/observer/recreate/resurrect/fork-child) via
+  /// the [`fresh_stores`](Self::fresh_stores) chokepoint; the crash/rollback restores inherit it for
+  /// free by reusing the retained store objects.
+  store_mode: StoreMode,
+  /// Async flush-phase witness: log stores made durable across the run (`0` under the sync default —
+  /// the flush phase never runs). Nonzero proves the multi tick now fsync-flushes (the second cause
+  /// the crash suite was vacuous for).
+  log_flushes: u64,
+  /// Async flush-phase witness: stable stores made durable across the run.
+  stable_flushes: u64,
+  /// Seeded torn writes (fsync failures) that stranded a REAL in-flight batch across the run — the
+  /// lost-fsync coverage's non-vacuity witness. `0` under the sync default.
+  torn_writes_fired: u64,
+  /// Crashes that rolled back a NON-EMPTY log-store fsync window (`discard_inflight` dropped a
+  /// staged tail) — proof the crash campaign lands mid-window rather than only post-flush. `0`
+  /// under the sync default (nothing is ever in flight).
+  crashes_with_log_inflight: u64,
+  /// Crashes that rolled back a NON-EMPTY stable-store fsync window. `0` under the sync default.
+  crashes_with_stable_inflight: u64,
+  /// A node armed to crash MID-SETTLE on the next tick (see [`arm_mid_fsync_crash`](Self::arm_mid_fsync_crash)):
+  /// the tick's settle loop crashes it AFTER a delivery sub-step submitted fresh appends but BEFORE
+  /// the store flush, so `discard_inflight` rolls back a genuine replication window — a crash at an
+  /// arbitrary instant, not only at the fully-durable tick boundary an ordinary [`crash`](Self::crash)
+  /// models. Consumed (taken) by the next tick. `None` for a between-ticks (durable-window) crash.
+  pending_mid_crash: Option<u64>,
+  /// The per-`(node, gid)` LINEAGE LEDGER (see [`oracles::LineageLedger`]): attributes every applied
+  /// command, installed snapshot, and endpoint `fork_id` to a lineage and holds the durable state
+  /// single-lineage (chimera), the within-lineage quorum byte-identical (phantom), and every
+  /// admitted transfer terminating (wedge). Fed by the per-tick lineage sweep and the install-event
+  /// drain, judged at run end by [`finalize_lineage_or_panic`](Self::finalize_lineage_or_panic).
+  lineage: oracles::LineageLedger,
 }
 
 impl MultiWorld {
@@ -201,20 +304,41 @@ impl MultiWorld {
       net_duplicated: 0,
       configs: BTreeMap::new(),
       restarts: BTreeMap::new(),
+      relayed_lineage: BTreeMap::new(),
       boot_epochs: BTreeMap::new(),
       read_states: BTreeMap::new(),
       member_view: BTreeMap::new(),
       parked: BTreeSet::new(),
       cross_talk_checked: 0,
       snapshot_threshold: None,
+      pre_vote: false,
+      check_quorum: false,
       conservation: ConservationLedger::new(),
-      cons_last: BTreeMap::new(),
+      cons_recorded: BTreeMap::new(),
       splits: BTreeMap::new(),
       pending_splits: BTreeMap::new(),
       splits_applied: 0,
       split_stale: 0,
       split_conflicts: 0,
       split_refused: 0,
+      merges: Vec::new(),
+      merge_floors: BTreeSet::new(),
+      removal_floors: BTreeMap::new(),
+      pending_merge_teardowns: Vec::new(),
+      active_freezes: BTreeMap::new(),
+      merges_resolved: 0,
+      merges_aborted: 0,
+      merges_capture_failed: 0,
+      merge_aborts_observed: BTreeMap::new(),
+      teardown_tie_streak: BTreeMap::new(),
+      store_mode: StoreMode::Sync,
+      log_flushes: 0,
+      stable_flushes: 0,
+      torn_writes_fired: 0,
+      crashes_with_log_inflight: 0,
+      crashes_with_stable_inflight: 0,
+      pending_mid_crash: None,
+      lineage: oracles::LineageLedger::new(),
     }
   }
 
@@ -223,6 +347,44 @@ impl MultiWorld {
   /// replicas keep the config they were built under.
   pub fn set_snapshot_threshold(&mut self, threshold: Option<usize>) {
     self.snapshot_threshold = threshold;
+  }
+
+  /// Set whether replicas construct with pre-vote on (`false` restores the library default).
+  /// Applies at replica CONSTRUCTION — call before creating groups; already-wired replicas keep
+  /// the config they were built under.
+  pub fn set_pre_vote(&mut self, on: bool) {
+    self.pre_vote = on;
+  }
+
+  /// Set whether replicas construct with check-quorum on (`false` restores the library default).
+  /// Applies at replica CONSTRUCTION, exactly like [`set_pre_vote`](Self::set_pre_vote).
+  pub fn set_check_quorum(&mut self, on: bool) {
+    self.check_quorum = on;
+  }
+
+  /// Set the [`StoreMode`](crate::StoreMode) every replica the world wires is constructed under
+  /// (`Sync` restores the default). Applies at replica CONSTRUCTION — call before creating groups;
+  /// already-wired replicas keep the store they were built with, and crash/rollback restores reuse
+  /// the retained store, so the mode is preserved for a replica's whole life once set.
+  pub fn set_store_mode(&mut self, mode: StoreMode) {
+    self.store_mode = mode;
+  }
+
+  /// A fresh `(log, stable)` store pair for `(node, gid)` in the world's configured
+  /// [`StoreMode`](crate::StoreMode) — the ONE chokepoint every store-creating wire path calls, so
+  /// the mode is preserved on create/observer/recreate/resurrect/fork-child alike. Async seeds each
+  /// store from the world seed folded with the node and gid so co-located replicas' fault schedules
+  /// decorrelate; the seed only governs the pre-`reroll_storage` window, since installing a fault
+  /// rate reseeds the store's fault PRNG.
+  fn fresh_stores(&self, node: u64, gid: u64) -> (MemLog, MemStable<u64>) {
+    if self.store_mode.is_async() {
+      (
+        MemLog::new_async(self.seed ^ node ^ gid.rotate_left(32)),
+        MemStable::new_async(self.seed.rotate_left(32) ^ node ^ gid.rotate_left(32)),
+      )
+    } else {
+      (MemLog::new(), MemStable::new())
+    }
   }
 
   /// Add node `id` as an empty container host (no groups). Panics if the id already exists.
@@ -281,12 +443,22 @@ impl MultiWorld {
       Some(t) => config.with_snapshot_threshold(t),
       None => config,
     };
+    // The prevention-layer knobs land at the SAME chokepoint, so every construction path
+    // (create/recreate/observer/resurrect, and crash restores via the retained `configs` entry)
+    // carries them. Both `false` — the default profiles — applies the library default, keeping the
+    // built config byte-identical to a world predating the seam.
+    let config = config
+      .with_pre_vote(self.pre_vote)
+      .with_check_quorum(self.check_quorum);
+    // Fresh stores in the world's configured mode (async for the merge profiles' fsync-loss
+    // window). Built before the host borrow so it never straddles the `&self` `fresh_stores` read.
+    let (log, stable) = self.fresh_stores(node, gid);
     let host = self
       .hosts
       .get_mut(&node)
       .unwrap_or_else(|| panic!("wire_replica: node {node} was never added"));
-    self.logs.insert((node, gid), MemLog::new());
-    self.stables.insert((node, gid), MemStable::new());
+    self.logs.insert((node, gid), log);
+    self.stables.insert((node, gid), stable);
     self.configs.insert((node, gid), config.clone());
     self.member_view.insert((node, gid), is_member);
     // Bump the replica incarnation on EVERY (re)wire: a member re-added after a teardown starts
@@ -299,7 +471,7 @@ impl MultiWorld {
     // identical election timeouts and split votes forever (the single-group harness seeds each
     // Endpoint by node id for the same reason).
     host
-      .create_group(gid, config, self.now, self.seed ^ node, LogSm::new())
+      .create_group(gid, 0, config, self.now, self.seed ^ node, LogSm::new())
       .unwrap_or_else(|e| panic!("wire_replica: admission of group {gid} on node {node}: {e:?}"));
   }
 
@@ -364,11 +536,41 @@ impl MultiWorld {
 
   /// True if every hosting node's ORACLE-ALIGNED applied sequence for `gid` agrees as a prefix
   /// of the longest — the State Machine Safety core, scoped to one group. Alignment (see
-  /// [`aligned_applied`](Self::aligned_applied)) is what keeps the prefix NOTION valid across a
+  /// `aligned_applied`) is what keeps the prefix NOTION valid across a
   /// split: raw records stop being prefix-related the moment one replica's `fsm.split` removes
   /// the moved cells mid-record while a lagging peer still holds them; a group that never split
   /// is compared byte-for-byte as before.
   pub fn agreement_holds(&self, gid: u64) -> bool {
+    // The merged-lineage form: equal-applied replicas must hold identical RAW records (see
+    // `ClusterView::positional_agreement` for why no positional filter survives an absorb).
+    if self.group_absorbed(gid) {
+      let replicas: Vec<(u64, AppliedLog)> = self
+        .node_ids
+        .iter()
+        .filter(|n| self.hosts[n].contains_group(&gid))
+        .map(|&n| {
+          (
+            self.hosts[&n]
+              .group(&gid)
+              .map_or(0, |ep| ep.applied_index().get()),
+            self.applied_of(n, gid),
+          )
+        })
+        .collect();
+      let sorted = |log: &AppliedLog| {
+        let mut v = log.clone();
+        v.sort();
+        v
+      };
+      for (i, a) in replicas.iter().enumerate() {
+        for b in replicas.iter().skip(i + 1) {
+          if a.0 == b.0 && sorted(&a.1) != sorted(&b.1) {
+            return false;
+          }
+        }
+      }
+      return true;
+    }
     let logs: Vec<AppliedLog> = self
       .node_ids
       .iter()
@@ -470,11 +672,35 @@ impl MultiWorld {
 
       let any_new = self.drain_outgoing_all();
       let delivered = self.deliver_due();
+      // A crash armed to land MID-SETTLE fires HERE — after this sub-step's deliveries submitted
+      // fresh appends into the async stores but BEFORE the flush below makes them durable — so
+      // `discard_inflight` rolls back a genuine, non-empty replication window (a crash at an
+      // arbitrary instant, the "in-flight (pre-flush)" window; an ordinary `crash` between ticks
+      // sees only the durable post-flush window). Taken so it fires exactly once, on the first
+      // settle sub-step, where the just-delivered appends are still un-flushed.
+      if let Some(victim) = self.pending_mid_crash.take() {
+        self.crash(victim);
+      }
+      // Async stores only: make the in-flight (visible-but-unflushed) window durable BEFORE draining
+      // completions — the fsync completing between driver sub-steps, the exact analogue of
+      // `Cluster::tick`'s in-loop `flush_all` and the model the store docs specify ("flush() each
+      // step, before draining completions"). In-loop (fine-grained), NOT once-per-tick: a
+      // once-per-tick flush fires every deferred ack in one batch at the tick boundary and only then
+      // processes this tick's higher-term truncations, so a follower's already-fired lower-term ack
+      // escapes `scrub_acks_above` and a deposed leader sees a phantom durable quorum — a stale-ack
+      // artifact of the coarse schedule, not a product fault. Fine-grained flushing keeps each ack's
+      // window one sub-step wide, matching the proven single-group model. Gated on the WORLD mode so
+      // a default (sync) world skips the phase entirely (byte-identical); a store manually set async
+      // in a sync world (a targeted test) is deliberately left un-driven.
+      if self.store_mode.is_async() {
+        self.flush_async_stores();
+      }
       let storage_produced = self.drain_storage_all();
       let forked = self.pump_forks();
-      progressed |= any_new || delivered || storage_produced || forked;
+      let merged = self.pump_merges();
+      progressed |= any_new || delivered || storage_produced || forked || merged;
 
-      if !any_new && !delivered && !storage_produced && !forked {
+      if !any_new && !delivered && !storage_produced && !forked && !merged {
         break;
       }
     }
@@ -503,7 +729,122 @@ impl MultiWorld {
       self.pending_new_installs.entry(gid).or_default().clear();
       self.cross_talk_sweep(gid);
       self.conserve_sweep(gid);
+      self.lineage_sweep(gid);
     }
+  }
+
+  /// Feed the [`LineageLedger`](oracles::LineageLedger) this group's observable lineage state:
+  /// every live replica's aligned committed record under its endpoint `fork_id` (content +
+  /// phantom-quorum), and every in-flight snapshot transfer's liveness cursor (wedge). A parked
+  /// replica is a reaped non-participant (the `leader_of`/quorum-denominator rule), so it is not a
+  /// witness here either. Installs are fed separately at the `SnapshotInstalled` event (the chimera
+  /// decision point). Pure observer — reads only public accessors and world bookkeeping.
+  fn lineage_sweep(&mut self, gid: u64) {
+    let (seed, tick, generation) = (self.seed, self.tick_count, self.generation_of(gid));
+    let nodes = self.node_ids.clone();
+    // Content + phantom-quorum: only for a group whose FSM applied record is APPEND-ONLY, and
+    // collect first (immutable reads) before feeding (mutates the ledger). A MERGE absorb re-bases
+    // the target's record non-monotonically — the same index's committed bytes change as the union
+    // folds in — so `(index → bytes)` is not a stable committed history there and the per-index
+    // leg would read a legitimate re-base as a phantom; a merge-involved group's cross-replica
+    // agreement is the positional/equal-applied agreement oracle's business
+    // (`ClusterView::positional_agreement`). A SPLIT is phantom-safe: it only REMOVES a moved key's
+    // cells from the aligned record and re-tags inherited cells under the CHILD's DISTINCT lineage
+    // key. One-gid-one-lineage holds in the world, so the lineage key never partitions here — its
+    // teeth are the two-lineage squatter scenario, which feeds the ledger directly.
+    if self.record_is_append_only(gid) {
+      let mut content: Vec<(u64, Option<ForkId>, AppliedLog)> = Vec::new();
+      for &node in &nodes {
+        if self.parked.contains(&(node, gid)) {
+          continue;
+        }
+        let Some(ep) = self.hosts[&node].group(&gid) else {
+          continue;
+        };
+        let lineage = ep.fork_id();
+        content.push((node, lineage, self.aligned_applied(node, gid)));
+      }
+      for (node, lineage, applied) in &content {
+        self.lineage.observe_content(
+          seed,
+          tick,
+          (*node, gid, generation),
+          lineage.as_ref(),
+          applied,
+        );
+      }
+    }
+    // Wedge: the highest-term leader's in-flight snapshot transfers. Feed EVERY candidate peer each
+    // sweep — `Some` for a reachable peer in the leader's `Snapshot` state, `None` otherwise — so a
+    // leader change, an election gap, or a partition clears a stale cursor instead of accruing a
+    // false wedge (a partition is not a wedge).
+    let leader = self.leader_of(gid);
+    // One wedge observation per peer: `(peer, in-flight (match, chunk cursor), refusal count)`.
+    type TransferObs = (u64, Option<(u64, u64)>, u64);
+    let mut xfers: Vec<TransferObs> = Vec::new();
+    for &peer in &nodes {
+      let in_flight = leader.and_then(|l| {
+        if l == peer {
+          return None;
+        }
+        let lep = self.hosts.get(&l)?.group(&gid)?;
+        let pr = lep.peer_progress(&peer)?;
+        match pr.state {
+          ProgressState::Snapshot { acked_through, .. } => {
+            // A parked replica is delivery-isolated for its group (the departed sweep's
+            // patient-observation model), so a transfer toward it cannot progress and is not a
+            // wedge — the same exemption as a partitioned or muted peer.
+            let reachable = !self.isolated.contains(&l)
+              && !self.isolated.contains(&peer)
+              && !self.parked.contains(&(peer, gid))
+              && !self.muted.contains(&(l, peer, gid))
+              && !self.muted.contains(&(peer, l, gid));
+            reachable.then_some((pr.match_index.get(), acked_through))
+          }
+          _ => None,
+        }
+      });
+      let refused = self
+        .hosts
+        .get(&peer)
+        .and_then(|h| h.group(&gid))
+        .map_or(0, |e| e.refused_cross_lineage_install_count());
+      xfers.push((peer, in_flight, refused));
+    }
+    for (peer, in_flight, refused) in xfers {
+      self
+        .lineage
+        .observe_transfer(seed, tick, gid, peer, in_flight, refused);
+    }
+  }
+
+  /// Whether `gid`'s FSM applied record is APPEND-ONLY this instant — the precondition for the
+  /// lineage ledger's per-index phantom-quorum leg (see `lineage_sweep`). A merge (freeze, park,
+  /// absorb, or a merged-away husk) re-bases or folds records non-monotonically, so `(index →
+  /// bytes)` stops being a stable committed history; a split is phantom-safe and is NOT excluded.
+  fn record_is_append_only(&self, gid: u64) -> bool {
+    !(self.group_absorbed(gid)
+      || self.is_merged(gid)
+      || self.group_frozen(gid)
+      || self.merge_choreography_active(gid)
+      || self.group_merge_parked(gid))
+  }
+
+  /// The run-end LINEAGE LEDGER verdict — chimera, phantom-quorum, and wedge — panicking with the
+  /// oracle detail + seed for replay. Run beside the membership and conservation finalizers so
+  /// every VOPR seed faces it. See `oracles::LineageLedger`.
+  pub fn finalize_lineage_or_panic(&self, seed: u64) {
+    self.lineage.finalize_or_panic(seed);
+  }
+
+  /// Applied cells the lineage ledger's phantom-quorum leg judged — its non-vacuity witness.
+  pub fn lineage_cells_judged(&self) -> u64 {
+    self.lineage.cells_judged()
+  }
+
+  /// Snapshot installs the lineage ledger's chimera leg examined — its non-vacuity witness.
+  pub fn lineage_installs_observed(&self) -> u64 {
+    self.lineage.installs_observed()
   }
 
   /// Render the membership oracle's run-end VERDICT for every checker this world ever built:
@@ -629,6 +970,11 @@ impl MultiWorld {
     // judges an inherited cell; the few own-tagged cells the floor may skip on a shrunk record
     // would pass the tag assert anyway — under-coverage there, never a false positive.
     let baseline = self.groups.get(&gid).map_or(0, |m| m.fork_baseline);
+    let carried = self
+      .groups
+      .get(&gid)
+      .map(|m| m.carried_tags.clone())
+      .unwrap_or_default();
     for node in self.node_ids.clone() {
       if !self.hosts[&node].contains_group(&gid) {
         continue;
@@ -638,8 +984,14 @@ impl MultiWorld {
       // A crash-restore can legitimately SHRINK the applied prefix (apply outruns the batched
       // commit persist); clamp, and re-sweeping a replayed suffix is harmless (same entries).
       let start = (*hw).max(baseline).min(applied.len());
-      let checked =
-        oracles::assert_no_cross_talk(self.seed, self.tick_count, node, gid, &applied[start..]);
+      let checked = oracles::assert_no_cross_talk(
+        self.seed,
+        self.tick_count,
+        node,
+        gid,
+        &carried,
+        &applied[start..],
+      );
       *hw = applied.len();
       self.cross_talk_checked += checked;
     }
@@ -681,8 +1033,15 @@ impl MultiWorld {
       };
       // The checker's applied-record legs (positional agreement, the index-keyed rewrite
       // high-water) get the ORACLE-ALIGNED record — see `aligned_applied` for why the raw
-      // record stops fitting both notions once the group splits.
-      let applied_log = self.aligned_applied(node, gid);
+      // record stops fitting both notions once the group splits. A group that ABSORBED via a
+      // merge instead ships the RAW record under the equal-applied agreement form (see
+      // `ClusterView::positional_agreement`): an absorb re-introduces own-tagged cells at
+      // replica-local resolution states, so no positional filter stays lag-invariant.
+      let applied_log = if self.group_absorbed(gid) {
+        self.applied_of(node, gid)
+      } else {
+        self.aligned_applied(node, gid)
+      };
       let cs = ep.conf_state();
       nodes.push(checker::NodeView {
         id: node,
@@ -713,6 +1072,7 @@ impl MultiWorld {
       });
     }
     checker::ClusterView {
+      positional_agreement: !self.group_absorbed(gid),
       seed: self.seed,
       tick: self.tick_count,
       committed_voters: {
@@ -829,6 +1189,19 @@ impl MultiWorld {
             || cs.learners().contains(&node)
             || cs.learners_next().contains(&node);
           self.member_view.insert((node, gid), is_member);
+          // The lineage ledger's install observation — the chimera decision point: a fork-lineage
+          // snapshot installing over a replica that already holds committed content of ANOTHER
+          // lineage is the cross-lineage fusion the door gate refuses. A pristine adopter or a
+          // same-token retransfer is legitimate and does not trip.
+          let (seed, tick) = (self.seed, self.tick_count);
+          let generation = self.generation_of(gid);
+          self.lineage.observe_install(
+            seed,
+            tick,
+            (node, gid, generation),
+            meta.fork_id(),
+            meta.last_index().get(),
+          );
           self.pending_new_installs.entry(gid).or_default().push((
             node,
             meta.last_index().get(),
@@ -883,6 +1256,14 @@ impl MultiWorld {
         Event::SplitApplied(_) => {}
         Event::SplitStale(_) => {
           self.split_stale += 1;
+        }
+        Event::MergeAborted(ma) => {
+          // The abort clock (see `merge_aborts_observed`): the fuzzer book retires a booked
+          // pair on OBSERVED resolution, and the abort side's observation is exactly this
+          // apply-point event on a target replica.
+          if let Ok(source) = <u64 as sailing_proto::Data>::decode_exact(ma.source()) {
+            *self.merge_aborts_observed.entry((gid, source)).or_insert(0) += 1;
+          }
         }
         _ => {}
       }
@@ -1054,6 +1435,52 @@ impl MultiWorld {
     any_new |= self.drain_outgoing_all();
     any_new
   }
+
+  /// Flush every hosted store's staged in-flight window to durable state, tallying the flush-phase
+  /// non-vacuity witnesses (flush counts, and torn writes that stranded a REAL batch, summed into
+  /// world-running totals so a store purged mid-run does not lose its tally). Only ever called when
+  /// the world's [`StoreMode`](crate::StoreMode) is async, so every hosted store is async.
+  ///
+  /// A store is flushed only when it holds an in-flight window: an empty flush would clone the whole
+  /// log for nothing (a big constant on a long log) and roll the torn PRNG on a batch it cannot tear.
+  fn flush_async_stores(&mut self) {
+    for node in self.node_ids.clone() {
+      let gids: Vec<u64> = self.hosts[&node].group_ids().copied().collect();
+      for gid in gids {
+        if let Some(log) = self.logs.get_mut(&(node, gid))
+          && log.has_inflight()
+        {
+          let torn_before = log.torn_writes();
+          log.flush();
+          self.log_flushes += 1;
+          self.torn_writes_fired += log.torn_writes() - torn_before;
+        }
+        if let Some(stable) = self.stables.get_mut(&(node, gid))
+          && stable.has_inflight()
+        {
+          let torn_before = stable.torn_writes();
+          stable.flush();
+          self.stable_flushes += 1;
+          self.torn_writes_fired += stable.torn_writes() - torn_before;
+        }
+      }
+    }
+  }
+
+  /// Arm node `node` to crash MID-SETTLE on the next [`tick`](Self::tick) instead of now: the tick's
+  /// settle loop crashes it after a delivery sub-step submitted fresh appends but before the store
+  /// flush, so the crash rolls back a genuine, non-empty replication fsync window (the "in-flight
+  /// (pre-flush)" crash the brief asks for, complementing the durable-window [`crash`](Self::crash)).
+  /// Only meaningful under an async store mode — a sync store never holds an in-flight window.
+  pub(crate) fn arm_mid_fsync_crash(&mut self, node: u64) {
+    self.pending_mid_crash = Some(node);
+  }
+
+  /// Whether the world wires async stores (the merge profiles) — the fuzzer gates the mid-fsync
+  /// crash draw on this so the sync profiles neither draw the extra PRNG nor change behavior.
+  pub(crate) fn is_async_stores(&self) -> bool {
+    self.store_mode.is_async()
+  }
 }
 
 #[cfg(test)]
@@ -1061,5 +1488,6 @@ mod tests;
 
 mod faults;
 mod lifecycle;
+mod merge;
 mod query;
 mod split;

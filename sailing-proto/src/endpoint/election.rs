@@ -294,6 +294,16 @@ where
     if !self.tracker.is_voter(&self.config.id()) {
       return;
     }
+    // THE MERGE-PARK SAFETY PIN: a replica whose parked apply has left its voter set superseded
+    // by a committed-unapplied `ConfChange` must never campaign — a win on that stale
+    // configuration truncates committed entries (a below-floor read). Stay a follower and defer
+    // leadership to a peer whose apply is current; the park resolves (absorb or snapshot-
+    // supersede) and this node campaigns normally after. A park over plain entries (no config
+    // change above it) leaves membership current, so this does NOT wedge a group whose only
+    // up-to-date replicas are parked mid-merge — they still elect.
+    if self.merge_park_membership_superseded(log) {
+      return;
+    }
     // Election safety at term exhaustion: `Term::next()` SATURATES at u64::MAX, so a node already at the
     // maximum term cannot advance. Campaigning anyway would clear `voted_for` and record a self-vote in
     // the SAME term — a SECOND vote in a term we may already have voted in — breaking one-vote-per-term
@@ -314,6 +324,10 @@ where
       self.poison(PoisonReason::LogTerm);
       return;
     };
+    // A campaign proceeding under a walled inherited floor this node cannot prove as leader would, on a
+    // win, HOLD commit (the conservative veto) until a wall capability is configured or leadership is
+    // transferred away — warn and count that pre-election so the wedge is not silent until after the win.
+    self.note_campaign_floor_provability();
     self.term = next_term;
     // All pending work from the previous term is now stale (spec §7). Clear before recording
     // the self-vote below so old completions that arrive later are harmlessly ignored.
@@ -378,6 +392,11 @@ where
     if !self.tracker.is_voter(&self.config.id()) {
       return false;
     }
+    // The merge-park safety pin (mirrors become_candidate): a parked replica whose voter set is
+    // superseded by a committed-unapplied `ConfChange` must not even probe — it must never lead.
+    if self.merge_park_membership_superseded(log) {
+      return false;
+    }
     // Term exhaustion (mirrors become_candidate): a pre-vote advertises `self.term.next()`, which
     // SATURATES at u64::MAX. At the max term a successful pre-vote could not lead to a real campaign
     // (`become_candidate` refuses to advance there), so don't probe at all — stay put.
@@ -397,6 +416,9 @@ where
       self.poison(PoisonReason::LogTerm);
       return false;
     };
+    // Same pre-election signal as the real candidacy: a pre-vote probe under an unprovable walled floor
+    // still warrants the operator warning and counter (a won probe becomes a real campaign that wedges).
+    self.note_campaign_floor_provability();
     let me = self.config.id();
     let voter_peers: Vec<_> = self.peers().filter(|p| self.tracker.is_voter(p)).collect();
     for peer in voter_peers {
@@ -516,22 +538,56 @@ where
     // `clock_drift_bound` must NOT reach the E′ proof with unbounded values; it returns `None` and the
     // caller's veto fails closed. Needs NO `bounded_clock_uncertainty` — E′ is a pure lease-timing bound.
     let (delta, drift) = self.leaseguard_timing()?;
-    let delta_ns = delta.as_nanos();
-    if delta_ns == 0 {
+    // CHECKED, never saturating: the E′ proof needs the deadline ≥ `max_lease_window·(1+ρ)` EXACTLY. A
+    // clamped-short product would wrongly set `commit_wait_inflated`, skip the fail-closed veto, and let
+    // a successor clear early. Any overflow (a ceil above `u64`) FAILS the proof (`None`). Shared with the
+    // successor-side LENGTH inflation so the two can never round differently at the mono-undercut boundary.
+    Self::inflate_by_rational(
+      self.lease_guard.max_lease_window,
+      delta.as_nanos().checked_add(drift.as_nanos())?,
+      delta.as_nanos(),
+    )
+  }
+
+  /// Ceil-inflate `window` (nanos) by the exact rational `num/denom`, computed in `u128` (the products
+  /// exceed `u64`). `None` iff `denom` is `0` or the exact result does not fit a schedulable `u64`. NEVER
+  /// clamps or saturates: a clamped-short wait would let a fast successor clear early and undercut a
+  /// deposed leader's lease, so the caller must fail closed instead. Ceiling division rounds UP, which
+  /// only ever over-waits — safe at the strict mono-undercut boundary.
+  fn inflate_by_rational(window: u64, num: u128, denom: u128) -> Option<u64> {
+    if denom == 0 {
       return None;
     }
-    // CHECKED arithmetic (NOT saturating): the safety bound needs the deadline ≥ `max_lease_window·(1+ρ)`
-    // EXACTLY. A `saturating_mul` overflow would clamp the product and divide back to a PLAUSIBLE but
-    // too-SHORT `u64`, wrongly setting `commit_wait_inflated` and skipping the fail-closed veto — a
-    // successor clearing early and undercutting a serve. So any overflowing add/mul FAILS the proof
-    // (`None`). CEILING division (rounding UP only ever over-waits — safe against the strict mono-undercut boundary).
-    let sum = delta_ns.checked_add(drift.as_nanos())?;
-    let inflated = u128::from(self.lease_guard.max_lease_window)
-      .checked_mul(sum)?
-      .div_ceil(delta_ns);
-    // EXACT, never clamped: a value above `u64::MAX` is unschedulable as a `from_nanos` wait → fail
-    // closed (`None`) so the caller does not arm a wait backed by a too-short bound.
-    u64::try_from(inflated).ok()
+    u64::try_from(u128::from(window).checked_mul(num)?.div_ceil(denom)).ok()
+  }
+
+  /// The SUCCESSOR-SIDE inflation `ceil(window·(Δ_S+ε_S)/Δ_S) = window·(1+ρ_S)` of an inherited
+  /// commit-wait window (nanos), keyed on THIS successor's OWN configured timing `(Δ_S, ε_S)`. The
+  /// inherited window is stamped from the APPENDING leader's config yet consumed on the SUCCESSOR's
+  /// monotonic clock; a legally `(1+ρ_S)`-fast successor would clear a RAW wait in less REAL time than a
+  /// deposed leader's lease on that window lasts (the bare bound is safe only when `ρ_S ≤ ρ_D`). Padding
+  /// the LENGTH by this node's own `(1+ρ_S)` makes the monotonic clear land no earlier, in real time,
+  /// than the window elapses at the fastest admissible rate — for EVERY drift pair. A KNOB-LESS successor
+  /// (Safe / LeaseBased, or an invalid LeaseGuard pair) has no own `(Δ_S, ε_S)`, so it inflates by the
+  /// UNIVERSAL assumed clock-rate bound (`assumed_clock_rate_bound_ppm`) — NEVER the raw window it would
+  /// under-wait, and NEVER the off-mode lease knobs (mirroring E′'s fail-closed refusal to read them).
+  /// A pure LENGTH bound applied UNCONDITIONALLY, distinct from the E′ veto-SKIP permission (which stays
+  /// wall-proof-gated). `None` iff the exact ceil overflows a schedulable `u64` — the caller FAILS CLOSED
+  /// (poison), never the raw (under-waiting) window.
+  fn inflate_inherited_wait(&self, window: u64) -> Option<u64> {
+    let Some((delta, drift)) = self.leaseguard_timing() else {
+      // A knob-less successor has no validated `(Δ_S, ε_S)`, but must still inflate: the raw window a
+      // legally faster successor would under-wait is unsafe, and refusing leadership would wedge the
+      // supported mixed Safe + LeaseGuard topology. Inflate by the UNIVERSAL assumed rate `ppm/1e6` as
+      // the exact rational `(1_000_000 + ppm)/1_000_000` (never the possibly-stale off-mode lease knobs).
+      let ppm = u128::from(self.config.assumed_clock_rate_bound_ppm());
+      return Self::inflate_by_rational(window, 1_000_000 + ppm, 1_000_000);
+    };
+    Self::inflate_by_rational(
+      window,
+      delta.as_nanos().checked_add(drift.as_nanos())?,
+      delta.as_nanos(),
+    )
   }
 
   pub(crate) fn become_leader<L: LogStore, S: StableStore<NodeId = I>>(
@@ -582,6 +638,7 @@ where
     // a fresh leader term has authorized no forced handoff yet, so the LeaseBased read shortcut is
     // available again once a fresh quorum lease forms. (A `TimeoutNow` sent later this term re-arms it.)
     self.transfer.forced_handoff_this_term = false;
+    self.transfer.forced_handoff_target = None;
     // Clear the candidate/follower election_deadline unconditionally; it will be re-armed
     // below only if check_quorum is enabled. Without this clear, a CQ-disabled leader would
     // inherit the stale candidate election_deadline (arm_heartbeat_timer no longer clears it).
@@ -609,6 +666,26 @@ where
     // must reserve none — the tail's own apply stages (and reserves) the forks it carries.
     self.split.pending_split_index = last;
     self.split.pending_split_child = Bytes::new();
+    // Mirror for commit-merges: an inherited unapplied CommitMerge in the tail will PARK this
+    // leader's apply when it commits; hold the membership fence until the tail applies.
+    self.merge.pending_commit_index = last;
+    // Mirror for rollbacks: an inherited unapplied RollbackMerge (a target-role abort) bumps this
+    // group's `shape_gen` when it applies, so hold the merge verbs' lineage fence until the tail
+    // applies — a truncated abort re-elected here must not leave `pending_rollback_index` stale-high
+    // and wedge every future merge. The fresh-leader window it opens is already covered by the
+    // commit fence above (a fresh leader refuses merges until its tail drains regardless).
+    self.merge.pending_rollback_index = last;
+    // The abort-relay thaw guard re-seats the OPPOSITE way — to ZERO, not to `last`. The fences
+    // above hold an inherited tail (assume-in-flight is the SAFE bias); a thaw guard biased that
+    // way would refuse to re-append and leave a source wedged if the previous leader's thaw was
+    // appended then truncated before it committed. A fresh source leader must be free to re-drive
+    // the thaw, so it starts with none in flight — the guard suppresses only this leader's own
+    // duplicate, never an inherited one.
+    self.merge.thaw_pending_index = Index::ZERO;
+    // The witness idempotence guard re-seats the SAME way as the thaw guard, and for the same
+    // reason: a `ThawDischarged` appended then truncated before it committed must be re-appendable
+    // by this fresh leader if it still holds the obligation, so it starts with none in flight.
+    self.merge.witness_pending_index = Index::ZERO;
     self.tracker.reset_progress(
       last.next(),
       self.config.max_inflight_msgs(),
@@ -636,15 +713,20 @@ where
     // LeaseGuard reads: a node rolled to Safe/LeaseBased (or holding an invalid LeaseGuard config)
     // that committed new entries while a deposed LeaseGuard leader's lease was still live would
     // recreate the stale read. TWO conservative bounds, with no cross-node clock comparison and no
-    // assumption about any other node's config:
+    // assumption beyond each node honoring its OWN configured rate bound (ε is rate-proportional
+    // provisioning — mono clocks are rate-bounded hardware — NOT an absolute step bound):
     //   • TIME anchor = THIS election's `now` — a lower bound on every inherited entry's creation
     //     time (this node replicated them all before winning the election).
     //   • WINDOW bound = `max_lease_window` — the MAX of every inherited entry's SELF-DESCRIBING
-    //     `lease_window` (its appending leader's own exact `Δ·(Δ+ε)/(Δ−ε)`). So whatever window any
-    //     deposed leader actually used is carried in the entries it created and covered exactly, even
-    //     under heterogeneous per-node config. `0` on a cluster that never ran LeaseGuard (every
+    //     `lease_window` (its appending leader's own exact `Δ·(Δ+ε)/(Δ−ε)`) — INFLATED on arming by THIS
+    //     successor's own `(1+ρ_S)` (`inflate_inherited_wait`). The inherited window is a REAL-TIME length
+    //     consumed on the SUCCESSOR's monotonic clock, so a legally `(1+ρ_S)`-fast successor would clear
+    //     the RAW window in less real time than a slower deposed leader's lease lasts (the bare bound is
+    //     safe only when `ρ_S ≤ ρ_D`). The `(1+ρ_S)` pad closes that heterogeneous-drift gap for EVERY
+    //     drift pair, on this node's own clock. `0` on a cluster that never ran LeaseGuard (every
     //     `lease_window` is 0) ⇒ no wait, so Safe/LeaseBased clusters are unaffected.
-    // (`leaseguard_timing` gates STAMPING new entries and serving lease reads, NOT this wait.)
+    // (`leaseguard_timing` gates STAMPING new entries and serving lease reads; here it also supplies this
+    // successor's `ρ_S` for the LENGTH inflation.)
     // FAILOVER-tier E′ inflation, gated on the SERVE being ARMED this term. The inherited-read SERVE
     // (`failover_read_window`) duals the PRECISE wall floor `s_c + W_c + 2·ε_unc`, so for it to be
     // linearizable EVERY electable successor's commit-past-c must be ≥ that floor — including via THIS
@@ -658,7 +740,8 @@ where
     // E′ alone.
     //
     // BUT the inflated wait keys on `max_lease_window` — the MAX window INHERITED, possibly stamped by
-    // ANOTHER node's larger config — which config validation cannot bound (no cluster-wide config check).
+    // ANOTHER node's larger config — which config validation cannot bound (there is no cluster-wide config
+    // check); cross-leader safety instead rests on each node honoring its own configured rate bound.
     // So ARM the serve (and the inflation) ONLY when a valid active failover tier is configured AND the
     // EXACT inflated wait both fits a schedulable `u64` nanos (`failover_inflated_commit_wait` is `Some`)
     // AND stays strictly below the election timeout (else the first failover commit could not land before
@@ -720,9 +803,14 @@ where
       && self.lease_guard.max_lease_window > 0
       && horizon_passable
       && e_prime_fits;
-    let commit_wait_window = inflated
-      .filter(|_| inflated_candidate)
-      .unwrap_or(self.lease_guard.max_lease_window);
+    // The inherited base wait LENGTH is ALWAYS the successor-side `(1+ρ_S)` inflation of the inherited
+    // window (walled max and wall-absent fallback alike) — pure safety, ungated by any wall proof. The E′
+    // `inflated` value above governs only the SEPARATE veto-SKIP permission (`inflated_candidate`, still
+    // gated on `wall_proves_floor`). `None` ⇒ the exact inflation is unschedulable (> `u64`) ⇒ fail
+    // closed via the poison below, NEVER the raw window (which a faster successor would under-wait).
+    let commit_wait_window = self.inflate_inherited_wait(self.lease_guard.max_lease_window);
+    let unwalled_wait_window =
+      self.inflate_inherited_wait(self.lease_guard.max_unwalled_lease_window);
     // `Instant::add` SATURATES (`now.mono() + window` clamps at `Instant::MAX`). A monotonic instant
     // within `commit_wait_window` of the ceiling would store a deadline at the saturated max — a real wait
     // SHORTER than the window. Such a too-short wait must NOT be treated as E′-inflated or serve-armed: the
@@ -733,21 +821,29 @@ where
     // fails closed). Astronomically unreachable (`now.mono()` ≈ `Duration::MAX` ≈ 5.8·10¹¹ years), kept
     // TOTAL for any input. The other commit-wait deadlines that saturate (`unwalled_commit_wait_until`, the
     // veto re-arm) only ever clamp LATER (`now >= MAX` is then ~never), holding LONGER — safe.
-    let deadline_exact = now
-      .mono()
-      .since_origin()
-      .checked_add(Duration::from_nanos(commit_wait_window))
-      .is_some();
+    let deadline_exact = commit_wait_window.is_some_and(|w| {
+      now
+        .mono()
+        .since_origin()
+        .checked_add(Duration::from_nanos(w))
+        .is_some()
+    });
     self.lease_guard.commit_wait_inflated = inflated_candidate && deadline_exact;
     // The SERVE additionally requires a valid active failover tier (ε_unc) and a passable horizon.
     self.lease_guard.inherited_serve_armed = armed_candidate && deadline_exact;
-    // If there is a commit-wait to schedule but its deadline is NOT exactly representable, the stored
-    // `now.mono() + window` saturates to `Instant::MAX` — a wait SHORTER than the window that would clear
-    // the commit-wait early and commit before a deposed leader's lease window elapsed (a stale read, basic
-    // LeaseGuard AND failover, regardless of the now-suppressed flags). The deadline cannot be scheduled,
-    // so FAIL-STOP: poison. A poisoned node's `handle_message`/`handle_timeout` return early, so it never
-    // advances commit — it holds rather than under-wait. Unreachable by any real monotonic clock.
+    // If there is a walled commit-wait to schedule but it is NOT exactly representable — the successor-side
+    // inflation overflowed `u64` (unschedulable as a `from_nanos` wait), OR `now.mono() + window` saturates
+    // to `Instant::MAX` — a raw/clamped wait would be SHORTER than the window and clear before a deposed
+    // leader's lease elapsed (a stale read, basic LeaseGuard AND failover). Never clamp: FAIL-STOP. A
+    // poisoned node's `handle_message`/`handle_timeout` return early, so it never advances commit — it holds
+    // rather than under-wait. Unreachable by any real config/clock.
     if self.lease_guard.max_lease_window > 0 && !deadline_exact {
+      self.poison(PoisonReason::CommitWaitUnrepresentable);
+    }
+    // The wall-absent (unwalled) arm is inflated the same way. Its DEADLINE saturating is safe (it only
+    // ever holds LONGER — see above), but an inflation that overflows `u64` is unschedulable, so FAIL-STOP
+    // rather than fall back to the raw (under-waiting) fallback window.
+    if self.lease_guard.max_unwalled_lease_window > 0 && unwalled_wait_window.is_none() {
       self.poison(PoisonReason::CommitWaitUnrepresentable);
     }
     // A BARE-wait ε_unc successor (no E′ inflation) relies SOLELY on the wall-gate to bound an inherited
@@ -790,17 +886,20 @@ where
     {
       self.poison(PoisonReason::InconsistentLeaseFloor);
     }
-    self.lease_guard.commit_wait_until = (self.lease_guard.max_lease_window > 0)
-      .then(|| now.mono() + Duration::from_nanos(commit_wait_window));
+    self.lease_guard.commit_wait_until = commit_wait_window
+      .filter(|_| self.lease_guard.max_lease_window > 0)
+      .map(|w| now.mono() + Duration::from_nanos(w));
     // FAILOVER-tier PRECISE commit-anchor (consumed by `maybe_advance_commit`'s precise early-release).
     // Pin, immutable for this term: the WALL-frame release floor = `max_wall_plus_window` (max over
     // WALLED inherited entries of `wall_timestamp + lease_window`), and the MONO-frame fallback deadline
-    // = `now + max_unwalled_lease_window` for any WALL-ABSENT (fail-closed) inherited lease entry. Both
-    // inert (`0` / `None`) on a cluster with no such inherited entry, so off-tier the shipped
-    // conservative anchor above governs unchanged.
+    // = `now + `(the SUCCESSOR-INFLATED `max_unwalled_lease_window`) for any WALL-ABSENT (fail-closed)
+    // inherited lease entry — the same `(1+ρ_S)` LENGTH inflation as the walled arm, so a faster successor
+    // cannot precise-release past a wall-absent lease early. Both inert (`0` / `None`) on a cluster with no
+    // such inherited entry, so off-tier the shipped conservative anchor above governs unchanged.
     self.lease_guard.inherited_release_deadline = self.lease_guard.max_wall_plus_window;
-    self.lease_guard.unwalled_commit_wait_until = (self.lease_guard.max_unwalled_lease_window > 0)
-      .then(|| now.mono() + Duration::from_nanos(self.lease_guard.max_unwalled_lease_window));
+    self.lease_guard.unwalled_commit_wait_until = unwalled_wait_window
+      .filter(|_| self.lease_guard.max_unwalled_lease_window > 0)
+      .map(|w| now.mono() + Duration::from_nanos(w));
     // FAILOVER-tier INHERITED-READ serve anchors (consumed by `failover_read_window`). Pinned ONCE here,
     // immutable for the term — `log.last_index()` and `commit` both drift during the term, so neither
     // may stand in later (§4). `limbo_upper` = the election tail (captured BEFORE the no-op below, which

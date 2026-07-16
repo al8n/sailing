@@ -53,6 +53,21 @@ impl StateMachine for CountSm {
     self.count -= give;
     Some(Self { count: give })
   }
+
+  /// Absorb support for the merge suites: fold the source's units back in — the union's total
+  /// is exactly the two counters' sum, which is what the merge assertions pin.
+  fn absorb(&mut self, source: Self) -> bool {
+    self.count += source.count;
+    true
+  }
+
+  fn supports_split(&self) -> bool {
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
+    true
+  }
 }
 
 /// A counting state machine whose apply FAILS on the magic `b"BOOM"` payload. An FSM apply error
@@ -252,7 +267,7 @@ impl StableStore for MemStable {
   type Error = std::convert::Infallible;
 
   fn hard_state(&self) -> HardState<u64> {
-    self.hs
+    self.hs.clone()
   }
 
   fn submit_write(&mut self, id: OpId, hard_state: HardState<u64>) {

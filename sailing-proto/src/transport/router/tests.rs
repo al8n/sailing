@@ -67,7 +67,7 @@ fn pump(router: &mut R, id: ConnId, peer: &mut Conn<u64, Labeled<Passthrough>>) 
 fn binds_peer_on_validation_and_routes() {
   let mut router = R::new();
   let id = ConnId(1);
-  router.register(id, acceptor(10), Instant::ORIGIN); // local node 10 accepts
+  router.register_accept(id, acceptor(10), Instant::ORIGIN); // local node 10 accepts
   let mut peer = Conn::new(dialer(7)); // remote node 7 dials
   pump(&mut router, id, &mut peer);
   assert_eq!(router.conn_of(&7), Some(id), "peer 7 is bound to its conn");
@@ -85,7 +85,7 @@ fn binds_peer_on_validation_and_routes() {
 fn decodes_inbound_messages_with_their_peer() {
   let mut router = R::new();
   let id = ConnId(1);
-  router.register(id, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id, acceptor(10), Instant::ORIGIN);
   let mut peer = Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
 
@@ -114,7 +114,7 @@ fn route_to_unknown_peer_is_dropped() {
 fn eof_clears_the_peer_route() {
   let mut router = R::new();
   let id = ConnId(1);
-  router.register(id, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id, acceptor(10), Instant::ORIGIN);
   let mut peer = Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
   assert_eq!(router.conn_of(&7), Some(id));
@@ -136,12 +136,12 @@ fn newer_connection_wins_duplicate_peer() {
   let mut router = R::new();
   // Two connections both validate as peer 7; the second registered wins.
   let (id1, id2) = (ConnId(1), ConnId(2));
-  router.register(id1, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id1, acceptor(10), Instant::ORIGIN);
   let mut peer1 = Conn::new(dialer(7));
   pump(&mut router, id1, &mut peer1);
   assert_eq!(router.conn_of(&7), Some(id1));
 
-  router.register(id2, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id2, acceptor(10), Instant::ORIGIN);
   let mut peer2 = Conn::new(dialer(7));
   pump(&mut router, id2, &mut peer2);
   assert_eq!(router.conn_of(&7), Some(id2), "newer conn wins");
@@ -153,8 +153,8 @@ fn older_connection_validating_late_does_not_evict_newer() {
   let mut router = R::new();
   let (id1, id2) = (ConnId(1), ConnId(2));
   // Both registered up front; the NEWER one (id2) completes its handshake first and binds.
-  router.register(id1, acceptor(10), Instant::ORIGIN);
-  router.register(id2, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id1, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id2, acceptor(10), Instant::ORIGIN);
   let mut peer1 = Conn::new(dialer(7));
   let mut peer2 = Conn::new(dialer(7));
   pump(&mut router, id2, &mut peer2);
@@ -176,7 +176,7 @@ fn internal_removals_surface_via_poll_conn_closed() {
   // A faulted connection (garbage hello) is removed AND reported with its fault.
   let mut router = R::new();
   let id = ConnId(1);
-  router.register(id, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id, acceptor(10), Instant::ORIGIN);
   let mut out = Vec::new();
   let _ = router.handle_conn_data(id, &[0xFF; 32], false, Instant::ORIGIN, &mut out);
   assert_eq!(
@@ -191,12 +191,12 @@ fn internal_removals_surface_via_poll_conn_closed() {
 fn duplicate_eviction_surfaces_via_poll_conn_closed() {
   let mut router = R::new();
   let (id1, id2) = (ConnId(1), ConnId(2));
-  router.register(id1, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id1, acceptor(10), Instant::ORIGIN);
   let mut peer1 = Conn::new(dialer(7));
   pump(&mut router, id1, &mut peer1);
   assert_eq!(router.conn_of(&7), Some(id1));
 
-  router.register(id2, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id2, acceptor(10), Instant::ORIGIN);
   let mut peer2 = Conn::new(dialer(7));
   pump(&mut router, id2, &mut peer2);
   assert_eq!(router.conn_of(&7), Some(id2));
@@ -209,7 +209,7 @@ fn unvalidated_conns_are_reaped_after_the_handshake_deadline() {
   use crate::transport::TransportError;
   use core::time::Duration;
   let mut router = R::new();
-  router.register(ConnId(1), acceptor(10), Instant::ORIGIN);
+  router.register_accept(ConnId(1), acceptor(10), Instant::ORIGIN);
   // Before the deadline: nothing reaped.
   router.reap_handshakes(Instant::ORIGIN + Duration::from_secs(9));
   assert_eq!(router.poll_conn_closed(), None);
@@ -223,17 +223,72 @@ fn unvalidated_conns_are_reaped_after_the_handshake_deadline() {
 }
 
 #[test]
+fn a_validated_conn_probes_when_idle_and_is_reaped_when_silent() {
+  use crate::transport::TransportError;
+  use core::time::Duration;
+  let mut router = R::new();
+  let id = ConnId(1);
+  router.register_accept(id, acceptor(10), Instant::ORIGIN);
+  let mut peer = Conn::new(dialer(7));
+  pump(&mut router, id, &mut peer); // validates peer 7 at ORIGIN
+  assert_eq!(router.conn_of(&7), Some(id));
+  assert!(
+    router.next_liveness_deadline().is_some(),
+    "validation arms the liveness clock"
+  );
+
+  // At the probe deadline (before the idle timeout) the connection emits a probe and is NOT reaped.
+  let probe_at = Instant::ORIGIN + Duration::from_millis(1000);
+  router.service_liveness(probe_at);
+  assert_eq!(router.poll_conn_closed(), None, "a probe is not a reap");
+  assert_eq!(
+    router.conn_of(&7),
+    Some(id),
+    "the probed connection survives"
+  );
+  // The probe reaches the wire as an empty coalesced frame the peer decodes to zero messages.
+  let probe_bytes: Vec<u8> = router
+    .poll_transmit()
+    .into_iter()
+    .find(|(cid, _)| *cid == id)
+    .map(|(_, bytes)| bytes)
+    .unwrap_or_default();
+  assert!(!probe_bytes.is_empty(), "the probe was queued for the peer");
+  let mut got = Vec::new();
+  peer.handle_data(&probe_bytes, false, probe_at).unwrap();
+  peer.poll_decoded(&mut got).unwrap();
+  assert!(got.is_empty(), "the probe decodes to zero messages");
+
+  // Now the peer goes SILENT: no bytes reach the router past the idle timeout, so the connection is
+  // reaped as a blackhole. (Received bytes would have restarted the silence deadline.)
+  let idle_at = probe_at + Duration::from_millis(3001);
+  assert!(
+    router
+      .next_liveness_deadline()
+      .is_some_and(|d| d <= idle_at),
+    "the silence deadline is due at the idle horizon"
+  );
+  router.service_liveness(idle_at);
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((id, Some(TransportError::IdleTimeout))),
+    "a validated connection silent past the idle timeout is reaped"
+  );
+  assert_eq!(router.conn_of(&7), None, "the route is dropped");
+}
+
+#[test]
 fn duplicate_conn_id_registration_is_rejected_not_replaced() {
   use crate::transport::TransportError;
   let mut router = R::new();
   let id = ConnId(1);
-  router.register(id, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id, acceptor(10), Instant::ORIGIN);
   let mut peer = Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
   assert_eq!(router.conn_of(&7), Some(id), "original conn validated");
 
   // A second registration under the SAME id: rejected + reported; the original is untouched.
-  router.register(id, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id, acceptor(10), Instant::ORIGIN);
   assert_eq!(
     router.poll_conn_closed(),
     Some((id, Some(TransportError::DuplicateConnId))),
@@ -318,7 +373,7 @@ fn data_for_an_unknown_conn_is_ignored() {
 fn route_that_trips_the_outbound_cap_drops_the_route() {
   let mut router: PeerRouter<u64, HugeBuffered> = PeerRouter::new();
   let id = ConnId(1);
-  router.register(id, HugeBuffered { ident: enc(7) }, Instant::ORIGIN);
+  router.register_accept(id, HugeBuffered { ident: enc(7) }, Instant::ORIGIN);
   // One inbound read validates peer 7 (the record reports its identity immediately).
   let mut out = Vec::new();
   router
@@ -353,7 +408,7 @@ fn owner_close_notifies_once_and_is_absent_safe() {
   use crate::transport::TransportError;
   let mut router = R::new();
   let id = ConnId(1);
-  router.register(id, acceptor(10), Instant::ORIGIN);
+  router.register_accept(id, acceptor(10), Instant::ORIGIN);
   let mut peer = Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
   assert_eq!(router.conn_of(&7), Some(id), "validated and bound");
@@ -373,4 +428,112 @@ fn owner_close_notifies_once_and_is_absent_safe() {
   // A close of a never-registered id queues nothing either.
   router.close(ConnId(99), None);
   assert_eq!(router.poll_conn_closed(), None);
+}
+
+#[test]
+fn a_hello_claiming_our_own_id_is_rejected() {
+  use crate::transport::TransportError;
+  let mut router = R::new();
+  router.set_local_id(1);
+  let id = ConnId(1);
+  router.register_accept(id, acceptor(1), Instant::ORIGIN);
+  let mut peer = Conn::new(dialer(1)); // the peer claims OUR id
+  pump(&mut router, id, &mut peer);
+  assert_eq!(
+    router.conn_of(&1),
+    None,
+    "a self-claiming hello never binds"
+  );
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((id, Some(TransportError::SelfIdentity))),
+    "the connection is closed as a self-identity fault"
+  );
+}
+
+#[test]
+fn a_dialed_conn_reaching_the_wrong_peer_is_rejected() {
+  use crate::transport::TransportError;
+  let mut router = R::new();
+  router.set_local_id(1);
+  let id = ConnId(1);
+  router.register_dial(id, 2, dialer(1), Instant::ORIGIN); // dial EXPECTING peer 2
+  let mut peer = Conn::new(acceptor(3)); // but the socket reaches peer 3
+  pump(&mut router, id, &mut peer);
+  assert_eq!(router.conn_of(&3), None, "the wrong peer is never bound");
+  assert_eq!(router.conn_of(&2), None, "nor the expected peer");
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((id, Some(TransportError::UnexpectedPeer))),
+    "a dialed connection that authenticates as the wrong peer is closed"
+  );
+}
+
+/// The duplicate-peer tie-break keeps the connection DIALED BY the LOWER id. Here the local node
+/// (id 1) is the lower, so its DIAL to peer 2 survives even when a later ACCEPT from peer 2 binds.
+/// A bare newer-id rule keeps the later ACCEPT instead — a choice the two ends do not compute
+/// alike, so a simultaneous mutual dial can keep the sockets the other side closed and lose both.
+/// This is the local half of that symmetric decision; the two-node mutual dial is exercised e2e by
+/// the driver loopback suites.
+#[test]
+fn the_lower_id_dialers_connection_wins_a_mixed_duplicate() {
+  let now = Instant::ORIGIN;
+  let mut router = R::new();
+  router.set_local_id(1);
+  // The DIAL to peer 2 validates and binds first (the older id).
+  router.register_dial(ConnId(1), 2, dialer(1), now);
+  let mut dialed_peer = Conn::new(acceptor(2));
+  pump(&mut router, ConnId(1), &mut dialed_peer);
+  assert_eq!(router.conn_of(&2), Some(ConnId(1)), "the dial binds peer 2");
+
+  // Then an ACCEPT from the SAME peer 2 validates (the newer id) — the mixed-provenance tie-break.
+  router.register_accept(ConnId(2), acceptor(1), now);
+  let mut accepted_peer = Conn::new(dialer(2));
+  pump(&mut router, ConnId(2), &mut accepted_peer);
+  assert_eq!(
+    router.conn_of(&2),
+    Some(ConnId(1)),
+    "we are the lower id, so our DIAL survives over the newer ACCEPT"
+  );
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((ConnId(2), None)),
+    "the evicted accept surfaces as a clean close"
+  );
+}
+
+/// The mirror arm: when the local node is the HIGHER id, the surviving duplicate is the one PEER
+/// dialed (our ACCEPT), not our own dial. Binding the accept first makes it the older id, so under
+/// the bare newer-id rule our later dial would win — the opposite of the symmetric decision the two
+/// ends must compute alike. This pins the `we_are_lower == false` half that the loopback e2e cannot
+/// red-prove (it self-heals via redial).
+#[test]
+fn the_higher_id_keeps_the_peer_dialed_connection_in_a_mixed_duplicate() {
+  let now = Instant::ORIGIN;
+  let mut router = R::new();
+  router.set_local_id(3);
+  // Peer 2 dialed us: our ACCEPT validates and binds first (the older id).
+  router.register_accept(ConnId(1), acceptor(3), now);
+  let mut accepted_peer = Conn::new(dialer(2));
+  pump(&mut router, ConnId(1), &mut accepted_peer);
+  assert_eq!(
+    router.conn_of(&2),
+    Some(ConnId(1)),
+    "the accept binds peer 2"
+  );
+
+  // Then OUR DIAL to the SAME peer 2 validates (the newer id) — the mixed-provenance tie-break.
+  router.register_dial(ConnId(2), 2, dialer(3), now);
+  let mut dialed_peer = Conn::new(acceptor(2));
+  pump(&mut router, ConnId(2), &mut dialed_peer);
+  assert_eq!(
+    router.conn_of(&2),
+    Some(ConnId(1)),
+    "peer 2 is the lower id, so the connection IT dialed (our accept) survives over our newer dial"
+  );
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((ConnId(2), None)),
+    "our evicted dial surfaces as a clean close"
+  );
 }

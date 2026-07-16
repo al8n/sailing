@@ -3,7 +3,7 @@
 use crate::{CheapClone, Entry, Index, ReadOnlyOption, Term, conf::ConfState};
 use bytes::Bytes;
 use core::time::Duration;
-use std::{sync::Arc, vec::Vec};
+use std::{boxed::Box, sync::Arc, vec::Vec};
 
 /// AppendEntries / heartbeat-with-entries (log replication).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -442,6 +442,90 @@ impl<I: CheapClone> HeartbeatResponse<I> {
   }
 }
 
+/// The durable, unforgeable identity of a split's forked child — the provenance token that
+/// distinguishes the REAL fork of a parent from any independently-created, squatter, or recreated
+/// group that merely happens to occupy the child id and cross the fork's applied/lineage
+/// thresholds by its OWN commits. Minted from the committed split entry's coordinates (all
+/// replica-identical, since the split rides the parent's totally-ordered log), persisted in the
+/// child's manufactured baseline [`SnapshotMeta`], and carried through snapshot transfer and
+/// restart. A group that never installed a fork baseline carries NO `ForkId` — so a parked fork
+/// resolves redundant only against an EXACT match, and everything else parks conservatively (the
+/// staged blob is the child partition's only local copy).
+///
+/// The group ids are stored as their canonical `Data` encodings (never re-decoded/re-encoded here),
+/// keeping the token generic-free while matching byte-for-byte across replicas. A blob digest would
+/// harden this further against a re-fork at identical coordinates, but any distinct split already
+/// differs in `(split_index, split_term)`, so it is deferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkId {
+  parent: Bytes,
+  parent_incarnation: u64,
+  split_index: Index,
+  split_term: Term,
+  child: Bytes,
+  child_gen: u64,
+}
+
+impl ForkId {
+  /// Construct a fork identity from its committed split coordinates. `parent`/`child` are the
+  /// group ids' canonical `Data` encodings; `parent_incarnation` is the parent's lineage AFTER the
+  /// split (its `parent_gen_after`), and `(split_index, split_term)` locate the split entry in the
+  /// parent's log — together an unforgeable fingerprint of exactly one committed split.
+  pub fn new(
+    parent: Bytes,
+    parent_incarnation: u64,
+    split_index: Index,
+    split_term: Term,
+    child: Bytes,
+    child_gen: u64,
+  ) -> Self {
+    Self {
+      parent,
+      parent_incarnation,
+      split_index,
+      split_term,
+      child,
+      child_gen,
+    }
+  }
+
+  /// The parent group id's canonical `Data` encoding.
+  #[inline(always)]
+  pub fn parent(&self) -> &Bytes {
+    &self.parent
+  }
+
+  /// The parent's lineage after the split (its `parent_gen_after`).
+  #[inline(always)]
+  pub const fn parent_incarnation(&self) -> u64 {
+    self.parent_incarnation
+  }
+
+  /// The split entry's index in the parent's log.
+  #[inline(always)]
+  pub const fn split_index(&self) -> Index {
+    self.split_index
+  }
+
+  /// The split entry's term.
+  #[inline(always)]
+  pub const fn split_term(&self) -> Term {
+    self.split_term
+  }
+
+  /// The child group id's canonical `Data` encoding.
+  #[inline(always)]
+  pub fn child(&self) -> &Bytes {
+    &self.child
+  }
+
+  /// The child's incarnation under the unified lineage counter (0 at a first-incarnation fork).
+  #[inline(always)]
+  pub const fn child_gen(&self) -> u64 {
+    self.child_gen
+  }
+}
+
 /// Metadata describing a snapshot (the logical "header" without the raw blob).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotMeta<I> {
@@ -475,10 +559,24 @@ pub struct SnapshotMeta<I> {
   /// counter for incarnation and shape (a split's `parent_gen_after`, a fork child's `child_gen`,
   /// a reshaping catalog's incarnation). Carried so a node restoring this snapshot knows its
   /// lineage without replaying the split entries the snapshot subsumed. `0` (an unreshaped id) is
-  /// absent on the wire — byte-identical to a pre-P6 peer's meta. Like the lease/read-mode
-  /// bounds, EXCLUDED from [`identity_eq`](Self::identity_eq): boundary metadata, not transfer
-  /// identity.
+  /// absent on the wire — byte-identical to a pre-P6 peer's meta. Like the lease/read-mode bounds —
+  /// and UNLIKE [`fork_id`](Self::fork_id) — EXCLUDED from [`identity_eq`](Self::identity_eq): it is
+  /// the boundary's POSITION within a lineage, folded from the same subsumed prefix, so it can
+  /// neither separate two snapshots that already agree on lineage and coordinate nor join two that
+  /// disagree. The token, not the counter, is the lineage discriminator.
   shape_gen: u64,
+  /// The forked child's provenance token when this snapshot IS (or descends from) a fork baseline —
+  /// the durable [`ForkId`] a manufactured fork install writes, preserved by the child's own later
+  /// snapshots and adopted by a peer that installs one. `None` for every non-fork snapshot, so it is
+  /// absent on the wire (byte-identical to a pre-provenance peer's meta). UNLIKE the lease/read-mode
+  /// bounds and `shape_gen`, it IS part of [`identity_eq`](Self::identity_eq) — the LINEAGE
+  /// DISCRIMINATOR. `(last_index, last_term, conf)` is NOT a content-identity across a fork boundary:
+  /// Log Matching holds only WITHIN one lineage, so a manufactured fork baseline and a colliding
+  /// tokenless (or differently-forked) snapshot are DIFFERENT bytes at the SAME coordinate. They must
+  /// never share a transfer, a staging buffer, or a durability verdict. BOXED because it is present
+  /// only on the rare fork baseline, so it must not inflate every `SnapshotMeta` (and thus every
+  /// `Message::InstallSnapshot`) by its full size.
+  fork_id: Option<Box<ForkId>>,
 }
 
 impl<I> SnapshotMeta<I> {
@@ -494,6 +592,7 @@ impl<I> SnapshotMeta<I> {
       max_unwalled_lease_window: 0,
       read_only: None,
       shape_gen: 0,
+      fork_id: None,
     }
   }
 
@@ -545,6 +644,15 @@ impl<I> SnapshotMeta<I> {
     self
   }
 
+  /// Set the forked child's provenance token. A builder, so the common 3-arg [`new`](Self::new)
+  /// stays `None` (absent on the wire) for every non-fork snapshot.
+  #[inline(always)]
+  #[must_use]
+  pub fn with_fork_id(mut self, fork_id: ForkId) -> Self {
+    self.fork_id = Some(Box::new(fork_id));
+    self
+  }
+
   /// The last log index covered by this snapshot.
   #[inline(always)]
   pub const fn last_index(&self) -> Index {
@@ -563,12 +671,26 @@ impl<I> SnapshotMeta<I> {
     &self.conf
   }
 
-  /// Whether two snapshots share the same TRANSFER IDENTITY — equal `(last_index, last_term, conf)`. The
-  /// LeaseGuard / read-mode bounds are EXCLUDED: a later snapshot at the same boundary may carry a higher
-  /// monotone bound yet is the same underlying snapshot, so it must CONTINUE an in-flight transfer, not
-  /// restart it. Used by the receiver and the store staging to key a chunked transfer by its real identity
-  /// rather than the boundary index alone (so a different snapshot at the same `last_index` cannot reuse a
-  /// prior transfer's staged bytes).
+  /// Whether two snapshots share the same TRANSFER IDENTITY — equal `(last_index, last_term, conf)` AND the
+  /// same lineage token ([`fork_id`](Self::fork_id)). This is the "are these the same BYTES" question every
+  /// snapshot-identity boundary asks: the receiver's pending-install dedup, the chunk continuation, the store
+  /// staging's ownership, the sender's re-read consistency check, and the deferred install's durable-evidence
+  /// fallback. A different snapshot must never reuse a prior transfer's staged bytes, dedup against a pending
+  /// install, or be declared durable on another snapshot's fsync.
+  ///
+  /// The LINEAGE TOKEN is identity because `(last_index, last_term, conf)` is NOT a content-identity ACROSS a
+  /// fork boundary: Log Matching holds only WITHIN one lineage, so a manufactured fork baseline and a
+  /// colliding tokenless (or differently-forked) snapshot are DIFFERENT state with DIFFERENT bytes at the same
+  /// coordinate. `None` vs `Some` differ for that same reason — an independent collider that happened to commit
+  /// the coordinates is a distinct lineage, not the fork. Within one lineage the token is STABLE (a child's own
+  /// later captures preserve it), so requiring it never splits a transfer that ought to continue.
+  ///
+  /// EXCLUDED, and why neither can make two DIFFERENT states look identical:
+  /// - the LeaseGuard / read-mode bounds are MONOTONE folds over the subsumed entries: two captures of the
+  ///   SAME state at the SAME boundary may legitimately carry DIFFERENT bounds (a later one folds higher), so
+  ///   including them would RESTART an in-flight transfer that must CONTINUE.
+  /// - `shape_gen` is the boundary's POSITION in the lineage, folded from that same subsumed prefix — it
+  ///   cannot separate two snapshots that already agree on lineage and coordinate.
   pub fn identity_eq(&self, other: &Self) -> bool
   where
     I: PartialEq,
@@ -576,6 +698,7 @@ impl<I> SnapshotMeta<I> {
     self.last_index == other.last_index
       && self.last_term == other.last_term
       && self.conf == other.conf
+      && self.fork_id == other.fork_id
   }
 
   /// The max LeaseGuard commit-wait window (nanos) over the subsumed entries, or `0` if unset.
@@ -609,6 +732,12 @@ impl<I> SnapshotMeta<I> {
   #[inline(always)]
   pub const fn shape_gen(&self) -> u64 {
     self.shape_gen
+  }
+
+  /// The forked child's provenance token, or `None` for a non-fork snapshot (the common case).
+  #[inline(always)]
+  pub fn fork_id(&self) -> Option<&ForkId> {
+    self.fork_id.as_deref()
   }
 }
 
@@ -700,13 +829,15 @@ pub struct SnapshotResponse<I> {
   reject: bool,
   match_index: Index,
   acked_through: u64,
+  progress: bool,
 }
 
 impl<I: CheapClone> SnapshotResponse<I> {
-  /// Construct (with `acked_through == 0` — a legacy/final ack). Use [`with_acked_through`] for a
-  /// mid-transfer progress ack.
+  /// Construct (with `acked_through == 0` and `progress == false` — a legacy/final ack). Use
+  /// [`with_acked_through`] + [`with_progress`] for a mid-transfer progress ack.
   ///
   /// [`with_acked_through`]: Self::with_acked_through
+  /// [`with_progress`]: Self::with_progress
   pub const fn new(term: Term, from: I, reject: bool, match_index: Index) -> Self {
     Self {
       term,
@@ -714,6 +845,7 @@ impl<I: CheapClone> SnapshotResponse<I> {
       reject,
       match_index,
       acked_through: 0,
+      progress: false,
     }
   }
 
@@ -721,6 +853,16 @@ impl<I: CheapClone> SnapshotResponse<I> {
   #[must_use]
   pub const fn with_acked_through(mut self, acked_through: u64) -> Self {
     self.acked_through = acked_through;
+    self
+  }
+
+  /// Mark this ack as a mid-transfer PROGRESS report. A progress ack is MATCH-INERT on the leader:
+  /// it drives chunk pacing and the resume cursor, but never moves `match_index`, never exits
+  /// Snapshot state, and never feeds the commit quorum — only an install/redundancy ack (a durable
+  /// log-state assertion) may. `false` (absent on the wire) on every final/redundancy ack.
+  #[must_use]
+  pub const fn with_progress(mut self, progress: bool) -> Self {
+    self.progress = progress;
     self
   }
 
@@ -752,6 +894,13 @@ impl<I: CheapClone> SnapshotResponse<I> {
   #[inline(always)]
   pub const fn acked_through(&self) -> u64 {
     self.acked_through
+  }
+
+  /// Whether this is a mid-transfer PROGRESS ack — match-inert on the leader (see
+  /// [`with_progress`](Self::with_progress)).
+  #[inline(always)]
+  pub const fn progress(&self) -> bool {
+    self.progress
   }
 }
 

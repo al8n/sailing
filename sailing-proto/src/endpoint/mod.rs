@@ -16,6 +16,7 @@ use std::{
 // `impl` blocks that operate on the `Endpoint` defined here.
 mod election;
 mod membership;
+mod merge;
 mod persistence;
 mod read_index;
 mod read_mode;
@@ -25,11 +26,63 @@ mod snapshot;
 mod split;
 mod transfer;
 
+pub(crate) use merge::MergeWindow;
+pub use merge::PendingMergeApply;
+
 /// The max ENTRY COUNT a single committed-range read requests (apply, replication, the restart scans).
 /// The store's byte cap is PAYLOAD-only, so a backlog of zero-payload entries (no-ops, empty/conf) would
 /// let an owned store materialize O(backlog) structs despite it; bounding the requested range WIDTH caps
 /// the count regardless of payload. The caller's loop re-reads the remainder.
 pub(crate) const MAX_READ_BATCH_ENTRIES: u64 = 8192;
+
+/// The per-crank apply budget: at most one read-batch's worth of committed entries is applied per
+/// `apply_committed` call. WHY: the drain is otherwise unbounded in PASSES — the per-pass FETCH is
+/// byte/count-capped, but a node with a huge committed backlog (catch-up, a post-snapshot tail, a
+/// commit burst) re-fetches until `applied == commit`, monopolizing its crank. On a multi host every
+/// co-located group's dispatch waits (the container cranks groups serially); on any host the crank's
+/// timers/IO wait. Applying at most one budget per crank bounds that head-of-line cost; the remainder
+/// is re-driven to completion via the storage-progress signal (`ApplyDrain::BudgetCut` → MorePending).
+/// Sized to one read batch — the 1 MiB byte cap already bounds the per-crank PAYLOAD.
+pub(crate) const APPLY_BUDGET_ENTRIES: u64 = MAX_READ_BATCH_ENTRIES;
+
+/// The exclusive upper bound of the next apply fetch: the drain requests `applied.next()..span`, so
+/// the span caps the fetch at `MAX_READ_BATCH_ENTRIES` indices AND at the per-crank apply allowance
+/// still unspent (`APPLY_BUDGET_ENTRIES - applied_this_call`), clamped to `commit.next()`. Capping the
+/// FETCH by the remaining allowance — not only the boundary check that follows it — makes the budget a
+/// HARD per-crank bound: a byte-cap-shortened first batch can no longer let the next fetch pull a full
+/// batch PAST the budget (the un-capped fetch let one crank apply up to `APPLY_BUDGET_ENTRIES +
+/// MAX_READ_BATCH_ENTRIES - 1`). When the allowance is spent the span is empty (`applied.next()`); the
+/// caller's boundary check has by then already cut the drain at exactly the budget.
+pub(crate) fn apply_read_span(applied: Index, commit: Index, applied_this_call: u64) -> Index {
+  let allowance = APPLY_BUDGET_ENTRIES.saturating_sub(applied_this_call);
+  let width = MAX_READ_BATCH_ENTRIES.min(allowance);
+  commit.next().min(Index::new(
+    applied.get().saturating_add(width).saturating_add(1),
+  ))
+}
+
+/// How an [`Endpoint::apply_committed`] drain ended (consumed by the storage-progress derivation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyDrain {
+  /// `applied == commit` (or the node poisoned): nothing further to do.
+  Drained,
+  /// The per-crank budget elapsed with committed entries still unapplied — an IMMEDIATE
+  /// re-crank makes progress. The ONLY variant that must surface as storage MorePending.
+  BudgetCut,
+  /// Blocked on something a re-crank cannot advance: a parked merge apply (the container's
+  /// merge service resolves it), a cold log read (the store's storage-ready completion
+  /// re-drives), or a committed entry not yet readable. NEVER reported as MorePending —
+  /// reporting it would busy-spin the driver loop against an external wait.
+  Waiting,
+}
+
+/// Per-dispatch cap on the conflict-term walk in [`Endpoint::find_conflict_by_term`]. That walk is
+/// steered by a PEER-supplied reject hint (`hint_term`); a crafted low term (e.g. `0`) would otherwise
+/// force a full `first_index..=hint_index` scan of synchronous, possibly-cold `log_term` reads in ONE
+/// message dispatch. The hint is advisory, so a walk cut short returns the best-so-far index and the
+/// search still converges: each reject strictly lowers the probed prev index, so it terminates in
+/// `ceil(D / CONFLICT_WALK_BUDGET)` extra round-trips instead of blocking the dispatch on an O(D) scan.
+pub(crate) const CONFLICT_WALK_BUDGET: u32 = 1024;
 
 /// The role of a node in its current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
@@ -160,6 +213,16 @@ pub enum PoisonReason {
   /// the same entry against the same FSM, so this is a deterministic cluster-wide fail-stop —
   /// never silent divergence between replicas that forked and replicas that did not.
   SplitUnsupported,
+  /// A committed merge entry's payload failed to decode — a `PrepareMerge`/`CommitMerge`/
+  /// `RollbackMerge` whose bytes won't parse, or whose group id is outside the wire bound.
+  /// Committed-corrupt, mirroring `SplitDecode`.
+  MergeDecode,
+  /// A committed `CommitMerge` entry was resolved against a state machine whose `absorb`
+  /// returned `false` (the defaulted unsupported verdict). Every replica folds the same entry
+  /// against the same FSM, so this is a deterministic cluster-wide fail-stop — never silent
+  /// divergence between replicas that absorbed and replicas that did not (mirror
+  /// [`SplitUnsupported`](Self::SplitUnsupported)).
+  MergeUnsupported,
   /// The `Changer` rejected a committed, validly-decoded `ConfChange`.
   ConfChangeApply,
   /// A snapshot blob failed to decode as `F::Snapshot` (install or restart).
@@ -190,6 +253,15 @@ pub enum PoisonReason {
   /// snapshot blob, so this is a durability-contract violation or disk corruption; fail-stop rather
   /// than bootstrap from the static config and serve a log whose committed prefix is gone.
   OrphanedLog,
+  /// On restart the durable hard state claims a lineage ([`crate::HardState::lineage`]) that the durable
+  /// snapshot slot contradicts — an adopted/forked log beside a token-less or differently-forked
+  /// snapshot, or beside no snapshot at all (the log's baseline evidence is gone). Coordinate
+  /// reconciliation across that mismatch would marry two lineages' artifacts into one state, so
+  /// fail-stop. Unreachable through the receive path (the fork-provenance gate refuses every write
+  /// that could produce it); reaching it means storage corruption, a store durability-order
+  /// violation, or a crash inside the fork constructor's two-write window — all resolved by
+  /// placement (re-materialize the replica), which the fork's durability barrier keeps safe.
+  LineageMismatch,
   /// Recovered LeaseGuard floors are STRUCTURALLY self-contradictory — a cheap defense-in-depth fail-stop
   /// against a BUG in our own fold (CFT model: a `SnapshotMeta` from a correct leader over reliable storage
   /// is FAITHFUL, so this never fires in correct operation; forged-but-consistent floors are a Byzantine /
@@ -236,6 +308,35 @@ pub enum PoisonReason {
   /// the pre-upgrade election_timeout, or Some(ZERO) if it never enforced)`. Native nodes never hit this
   /// (genesis is `Recorded`), so it only guards a pre-format upgrade done via plain `restart`.
   LegacyLeaseUnrecoverable,
+  /// The storage op-id counter is exhausted: `mint_op_id` reached the saturating ceiling of
+  /// [`OpId::next`](crate::OpId), so the next mint would hand out a DUPLICATE id. A duplicate aliases
+  /// the pending-write map and lets an older completion satisfy a newer op's durability watermark
+  /// (`opid >= term_persist_opid`) — marking a term durable off a stale write. Fail-stop rather than
+  /// reuse. Unreachable by legitimate use (2^64 submissions per incarnation); reachable only from a
+  /// crafted/corrupt seed.
+  OpIdExhausted,
+  /// A read-correlation token counter is exhausted — the leader's Safe-read round counter
+  /// (`ReadOnly::next_round`) or a follower's forwarded-read token counter
+  /// (`ForwardedReads::next_token`). Both keep every in-flight read on a UNIQUE token so a
+  /// stale/duplicated `HeartbeatResponse`/`ReadIndexResponse` echoing an earlier token cannot confirm
+  /// a later read (a linearizability break). Reusing a token would reopen exactly that hazard, so
+  /// fail-stop. Unreachable by legitimate use (2^64 reads per incarnation).
+  ReadRoundExhausted,
+  /// The CheckQuorum lease-round counter (`check_quorum_lease.lease_round`) is exhausted. Each
+  /// heartbeat bumps it so the read lease is renewed only by a `HeartbeatResponse` echoing the CURRENT
+  /// round; reusing a round would let a stale earlier-round response keep an isolated leader's lease
+  /// alive (a stale-read break). Fail-stop rather than reuse. Unreachable (2^64 heartbeats).
+  LeaseRoundExhausted,
+  /// A user QUERY closure panicked while running ON the driver thread against this group's state
+  /// machine, and the driver caught the unwind. The closure borrows only `&F`, but interior
+  /// mutability (a `Cell`, atomics, a lock inside the FSM) means the panic could have TORN the
+  /// replicated state mid-read; continuing to serve risks silent divergence from replicas that
+  /// never ran the closure. A driver caught the panic to keep its plane alive, then invokes
+  /// [`fail_stop_query_panicked`](Endpoint::fail_stop_query_panicked) so this group fail-stops
+  /// rather than serve possibly-torn state — the fail-stop doctrine arm of the apply/decode
+  /// poisons (a pre-catch process crash + replay would have healed the FSM; the catch must not
+  /// trade that for possible divergence).
+  QueryPanicked,
 }
 
 impl PoisonReason {
@@ -254,6 +355,8 @@ impl PoisonReason {
       Self::SetReadModeDecode => "set_read_mode_decode",
       Self::SplitDecode => "split_decode",
       Self::SplitUnsupported => "split_unsupported",
+      Self::MergeDecode => "merge_decode",
+      Self::MergeUnsupported => "merge_unsupported",
       Self::ConfChangeApply => "conf_change_apply",
       Self::SnapshotDecode => "snapshot_decode",
       Self::SnapshotRestore => "snapshot_restore",
@@ -262,11 +365,16 @@ impl PoisonReason {
       Self::InvalidConfState => "invalid_conf_state",
       Self::SnapshotRebaseline => "snapshot_rebaseline",
       Self::OrphanedLog => "orphaned_log",
+      Self::LineageMismatch => "lineage_mismatch",
       Self::InconsistentLeaseFloor => "inconsistent_lease_floor",
       Self::WallHorizonUnrepresentable => "wall_horizon_unrepresentable",
       Self::CommitWaitUnrepresentable => "commit_wait_unrepresentable",
       Self::LogExhausted => "log_exhausted",
       Self::LegacyLeaseUnrecoverable => "legacy_lease_unrecoverable",
+      Self::OpIdExhausted => "op_id_exhausted",
+      Self::ReadRoundExhausted => "read_round_exhausted",
+      Self::LeaseRoundExhausted => "lease_round_exhausted",
+      Self::QueryPanicked => "query_panicked",
     }
   }
 }
@@ -493,16 +601,19 @@ pub(crate) enum Pending<I> {
 /// Cap on the number of distinct read contexts a follower may hold in-flight to its leader at once
 /// (the [`ForwardedReads`] set). A follower inserts a context before forwarding and removes it only
 /// on the matching `ReadIndexResponse`; if the request or its response is dropped while the leader stays
-/// stable, distinct retry contexts would otherwise accumulate without bound. At the cap the oldest
-/// in-flight context is evicted FIFO. Kept independent of `max_inflight_msgs` (the leader's per-peer
-/// replication window) because the two limits are unrelated; 256 is the same generous default.
+/// stable, distinct retry contexts would otherwise accumulate without bound. At the cap the follower
+/// rejects the NEW read with `TooManyInFlight` (back-pressure, never eviction — evicting an accepted
+/// read would strand it, and a reused context could then complete the wrong one). Kept independent of
+/// `max_inflight_msgs` (the leader's per-peer replication window) because the two limits are
+/// unrelated; 256 is the same generous default.
 const MAX_FORWARDED_READS: usize = 256;
 
 /// Upper bound on a LEADER's combined in-flight read backlog — deferred reads awaiting the
 /// current-term no-op (`pending_reads`) plus reads awaiting heartbeat-quorum confirmation
 /// (`read_only`). A partitioned leader never drains this backlog, so without the cap a spammy or
 /// looping client could drive unbounded `Bytes` retention. Beyond the cap a local read is rejected
-/// with `TooManyInFlight` and a forwarded read is dropped (the follower can re-issue).
+/// with `TooManyInFlight` and a forwarded read is DECLINED with a rejecting `ReadIndexResponse` (the
+/// follower clears its slot and can re-issue once the backlog drains).
 const MAX_LEADER_READS: usize = 256;
 
 /// The reads this node (as a FOLLOWER) has forwarded to its current leader and is still awaiting a
@@ -556,14 +667,18 @@ impl ForwardedReads {
   /// Record a NEW forwarded read for user `context` and return its fresh internal token (sent to the
   /// leader as the `ReadIndex` context and echoed back in the `ReadIndexResponse`). The caller has already
   /// verified `!contains_context(context)` (dedup) AND `!is_full()` (back-pressure).
-  fn push(&mut self, context: Bytes) -> Bytes {
+  ///
+  /// Returns `None` iff the per-incarnation token counter is exhausted: reusing a `next_token` value
+  /// would let a stale `ReadIndexResponse` echoing an earlier forward complete a later read at a wrong
+  /// index. The caller fail-stops rather than reuse. Unreachable by legitimate use (2^64 forwards).
+  fn push(&mut self, context: Bytes) -> Option<Bytes> {
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&self.boot_epoch.to_be_bytes());
     buf[8..].copy_from_slice(&self.next_token.to_be_bytes());
-    self.next_token += 1;
+    self.next_token = self.next_token.checked_add(1)?;
     let token = Bytes::copy_from_slice(&buf);
     self.order.push_back((token.clone(), context));
-    token
+    Some(token)
   }
 
   /// Remove the forwarded read identified by `token` (the echoed correlator), returning its user
@@ -755,8 +870,9 @@ struct LeaseGuardState {
   commit_wait_until: Option<Instant>,
   /// The MAX LeaseGuard commit-wait window (`Entry::lease_window`, nanos) over every entry this node
   /// has ever held — the SELF-DESCRIBING cross-leader safety bound. `become_leader` sizes its
-  /// commit-wait at `now + max_lease_window`, which covers ANY deposed leader's lease on an inherited
-  /// entry (each carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`), no assumption about other configs.
+  /// commit-wait at `now + max_lease_window` INFLATED by this node's OWN rate bound, which covers ANY
+  /// deposed leader's lease on an inherited entry (each carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`),
+  /// assuming only that each node honors its OWN configured rate bound.
   /// Monotonically non-decreasing in memory (a stale-HIGH value is safe — it only over-waits): raised
   /// on `submit_append` over appended entries and on snapshot install over `SnapshotMeta`; carried
   /// through compaction (into the created `SnapshotMeta`) and recomputed at restart from the durable
@@ -817,6 +933,16 @@ struct LeaseGuardState {
   /// review surfaced). A wall-PRESENT, not-yet-released
   /// hold is NORMAL (it lifts when the wall passes the floor) and is NOT counted here.
   unprovable_floor_holds: u64,
+  /// FAILOVER-tier observability: how many times this node STARTED a campaign (a pre-vote probe or a real
+  /// candidacy) while holding a walled inherited-lease floor it could not prove as leader — a walled
+  /// obligation (`max_wall_plus_window != 0`) with no `bounded_clock_uncertainty` to wall-gate it. The
+  /// PRE-election dual of [`unprovable_floor_holds`](Endpoint::unprovable_floor_holds): were this node to
+  /// win, the conservative veto would HOLD commit until a wall capability is configured or leadership is
+  /// transferred away, so this counter fires BEFORE the wedge rather than only after it. Pure in-memory
+  /// metric — never persisted, never on the wire, reset to `0` on construction and restart, read only via
+  /// [`unprovable_floor_campaigns`](Endpoint::unprovable_floor_campaigns). `0` for a node with ε_unc
+  /// configured, with no inherited walled floor, or off the failover tier.
+  unprovable_floor_campaigns: u64,
   /// FAILOVER-tier inherited-read serve anchor — the election TAIL, captured ONCE at
   /// [`become_leader`](Endpoint::become_leader) as `log.last_index()` BEFORE the leader's own no-op (which
   /// would otherwise inflate it). Immutable for the term (`log.last_index()` drifts as the leader
@@ -904,6 +1030,13 @@ struct Transfer<I> {
   /// leader. (The `lead_transferee` gate covers the lagging-transfer window BEFORE `TimeoutNow` is
   /// sent; this flag covers everything AFTER it, including post-abort.)
   forced_handoff_this_term: bool,
+  /// The node a forced handoff (`TimeoutNow`) was aimed at THIS term, or `None` if none was sent.
+  /// Retained even after `lead_transferee` clears on abort, because the forced campaign it authorized
+  /// can still fire: re-transferring to the SAME node is harmless (one campaigner), but retargeting to
+  /// a DIFFERENT node while this is set would authorize a SECOND forced campaign — refused with
+  /// [`TransferError::HandoffPending`](crate::TransferError::HandoffPending). Reset alongside
+  /// `forced_handoff_this_term` in `become_leader`.
+  forced_handoff_target: Option<I>,
   /// Target of an in-progress leader transfer, or `None` if no transfer is active.
   ///
   /// Set by `transfer_leader`; cleared on any leadership change (term bump step-down,
@@ -965,7 +1098,7 @@ where
   /// performed, and this field is cleared — so a missed completion can no longer wedge future
   /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
   /// this field to `None`.
-  pending_compact: Option<(OpId, Index)>,
+  pending_compact: Option<(OpId, crate::SnapshotMeta<I>)>,
   /// Per-peer deadline before which the full `InstallSnapshot` blob is NOT re-sent to a
   /// `Snapshot`-state peer. A deferred install legitimately takes many heartbeat intervals (blob
   /// fsync + apply), so resending on EVERY response would re-transmit a large snapshot tens of
@@ -975,6 +1108,19 @@ where
   /// dropped blob is still retried within one election timeout of the next response (liveness).
   /// Entries clear when the peer leaves `Snapshot` state and on leadership change.
   snapshot_resend_after: BTreeMap<I, Instant>,
+  /// Diagnostic: how many times `send_snapshot_chunk` refused to emit a chunk because the snapshot
+  /// METADATA alone (a `ConfState` too large) left no room for a data byte under the frame limit (a
+  /// `ChunkSend::Unsendable` outcome). With the propose-time `MembershipTooLargeToSnapshot` gate this
+  /// should never advance in native operation; a CLIMBING value flags a peer permanently wedged in
+  /// `Snapshot` on an oversized meta (e.g. a config that predates the gate). Saturating.
+  unsendable_meta_frames: u64,
+  /// Diagnostic: how many `InstallSnapshot`s the fork-provenance gate refused — a foreign-lineage
+  /// snapshot into a token-bearing replica, or a token-bearing snapshot into a replica that already
+  /// holds committed content of another (token-less) lineage. Refusals are silent on the wire (the
+  /// sender is authenticated, merely mis-lineaged — the standing-conflict posture, resolved by
+  /// placement), so a CLIMBING value is the local signal distinguishing a lineage conflict from a
+  /// slow transfer. Saturating.
+  refused_cross_lineage_installs: u64,
 }
 
 // Hand-written so the impl does not require `F::Snapshot: Debug` (its only bound is `Data`, which is
@@ -998,6 +1144,11 @@ where
       .field("snapshot_recv", &self.snapshot_recv)
       .field("pending_compact", &self.pending_compact)
       .field("snapshot_resend_after", &self.snapshot_resend_after)
+      .field("unsendable_meta_frames", &self.unsendable_meta_frames)
+      .field(
+        "refused_cross_lineage_installs",
+        &self.refused_cross_lineage_installs,
+      )
       .finish()
   }
 }
@@ -1056,8 +1207,9 @@ struct Reads<I> {
   /// `read_context_in_flight` guard: a duplicate forward for an in-flight context is rejected with
   /// `DuplicateContext` instead of being silently coalesced (or unboundedly re-forwarded), so the
   /// originator is never left waiting on a confirmation the first forward already owns. Removed on
-  /// the matching `ReadIndexResponse`, FIFO-evicted at [`MAX_FORWARDED_READS`] (so dropped reads cannot
-  /// grow it without bound), and cleared wholesale on any term change or leader change (a read
+  /// the matching `ReadIndexResponse`, bounded at [`MAX_FORWARDED_READS`] by BACK-PRESSURE (a full set
+  /// rejects the new read with `TooManyInFlight` rather than evicting an accepted one, so dropped reads
+  /// cannot grow it without bound), and cleared wholesale on any term change or leader change (a read
   /// forwarded to a now-stale leader must not block re-issuing it to the new one).
   forwarded_reads: ForwardedReads,
   /// The index of the last appended `SetReadMode` entry — the one-in-flight guard for read-mode
@@ -1114,6 +1266,14 @@ where
   /// only via [`lease_refreshes`](Self::lease_refreshes). A positive value proves the proactive path actually
   /// re-anchored, so a configured refresh mode cannot pass a test vacuously.
   lease_refreshes: u64,
+  /// Failover wall-stamp degradation counter (sibling of [`cold_read_defers`](Self::cold_read_defers)).
+  /// Bumped each time [`lease_wall_stamp`](Self::lease_wall_stamp) runs under an ACTIVE failover tier but
+  /// the supplied [`Now`] carries no synchronized wall (`Wall::ABSENT` — the driver clock's documented
+  /// over-bound / transient-NTP-loss fold): the stamp degrades to `0` (fail-closed to Safe) instead of
+  /// emitting a falsely-fresh wall. `0` on a healthy synchronized-clock feed; a steadily climbing value
+  /// flags a degraded time source. Pure in-memory metric — never persisted, never on the wire, reset to
+  /// `0` on construction and restart, read only via [`wall_stamp_degradations`](Self::wall_stamp_degradations).
+  wall_stamp_degradations: u64,
   /// The pending output queues (outbound messages + application events).
   outputs: Outputs<I, F>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
@@ -1158,6 +1318,9 @@ where
   /// The committed-split state: staged pending forks (with their apply-derived blobs), the fork
   /// durability barrier over this endpoint's snapshots, and the group's lineage counter.
   split: split::SplitState<I, F>,
+  /// The merge state: the append-observed pending freeze, the applied `Frozen` fold, and the
+  /// parked `CommitMerge` awaiting the container's resolution.
+  merge: merge::MergeState,
   /// The leader's CheckQuorum read-lease (LeaseBased) round state.
   check_quorum_lease: CheckQuorumLease<I>,
   /// The leader-transfer state (forced-handoff flag + transferee target + abort deadline).
@@ -1241,6 +1404,8 @@ where
         pending_install: None,
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
+        unsendable_meta_frames: 0,
+        refused_cross_lineage_installs: 0,
       },
       rng,
       votes: BTreeMap::new(),
@@ -1258,6 +1423,7 @@ where
         unwalled_commit_wait_until: None,
         precise_releases: 0,
         unprovable_floor_holds: 0,
+        unprovable_floor_campaigns: 0,
         // Inherited-read serve anchors — armed only at become_leader.
         limbo_upper: Index::ZERO,
         committed_anchor_wall: 0,
@@ -1271,6 +1437,7 @@ where
       },
       cold_read_defers: 0,
       lease_refreshes: 0,
+      wall_stamp_degradations: 0,
       outputs: Outputs {
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
@@ -1304,7 +1471,8 @@ where
         lease_vote_fence_until: None,
       },
       pending_conf_index: Index::ZERO,
-      split: split::SplitState::new(0),
+      split: split::SplitState::new(0, None),
+      merge: merge::MergeState::default(),
       reads: Reads {
         read_only: ReadOnly::new(read_only_opt),
         // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.
@@ -1326,6 +1494,7 @@ where
       transfer: Transfer {
         // No forced handoff authorized yet.
         forced_handoff_this_term: false,
+        forced_handoff_target: None,
         lead_transferee: None,
         transfer_deadline: None,
       },
@@ -1438,6 +1607,19 @@ where
     self.lease_guard.unprovable_floor_holds
   }
 
+  /// How many times this node STARTED a campaign while holding a walled inherited-lease floor it could
+  /// not prove as leader — a walled obligation (`max_wall_plus_window != 0`) with no bounded
+  /// clock-uncertainty to wall-gate it. Read-only observability (see [`commit_index`](Self::commit_index));
+  /// never persisted, reset to `0` on restart, `0` with ε_unc configured, with no inherited walled floor,
+  /// or off the failover tier. Unlike its POST-election sibling
+  /// [`unprovable_floor_holds`](Self::unprovable_floor_holds) — which climbs only after a win wedges commit
+  /// — this fires at campaign time, BEFORE the node can wedge, so an operator can act by configuring a wall
+  /// capability or transferring leadership away.
+  #[inline(always)]
+  pub const fn unprovable_floor_campaigns(&self) -> u64 {
+    self.lease_guard.unprovable_floor_campaigns
+  }
+
   /// Cold-read wedge counter: how many times `apply_committed` deferred on a cold
   /// ([`EntriesRead::Pending`](crate::EntriesRead::Pending)) committed-range read. `0` for a
   /// fully-resident store; a steadily climbing value flags a store that returns `Pending` for a range
@@ -1458,6 +1640,15 @@ where
     self.lease_refreshes
   }
 
+  /// Failover wall-stamp degradation counter: how many times an active-failover-tier stamp fell back
+  /// to `0` because the supplied [`Now`] carried no synchronized wall (`Wall::ABSENT`). `0` on a
+  /// healthy clock feed; a climbing value flags a degraded time source. Diagnostic only — a wall loss
+  /// degrades the read path to Safe, it never poisons.
+  #[inline(always)]
+  pub const fn wall_stamp_degradations(&self) -> u64 {
+    self.wall_stamp_degradations
+  }
+
   /// The current applied index — the highest log index this node has applied to its
   /// state machine. Always `applied <= commit_index()`.
   ///
@@ -1472,6 +1663,24 @@ where
   #[inline]
   pub const fn state_machine(&self) -> &F {
     &self.fsm
+  }
+
+  /// Diagnostic count of snapshot chunks refused because the metadata (an oversized `ConfState`) left
+  /// no room for a data byte under the transport frame limit. Native `propose_conf_change` refuses such
+  /// a membership up front, so a CLIMBING value flags a peer permanently wedged in `Snapshot` on a
+  /// config that predates that gate — otherwise indistinguishable from a slow install.
+  #[inline]
+  pub const fn unsendable_snapshot_meta_count(&self) -> u64 {
+    self.snapshot.unsendable_meta_frames
+  }
+
+  /// Diagnostic count of `InstallSnapshot`s refused by the fork-provenance gate (a cross-lineage
+  /// snapshot into a replica that is token-bearing, or that already holds committed content of
+  /// another lineage). Refusals are silent on the wire, so a CLIMBING value is what distinguishes a
+  /// standing lineage conflict — resolved by placement — from a merely slow transfer.
+  #[inline]
+  pub const fn refused_cross_lineage_install_count(&self) -> u64 {
+    self.snapshot.refused_cross_lineage_installs
   }
 
   /// Next outbound message, if any.
@@ -1552,6 +1761,28 @@ where
           "stale-minted split no-op'd"
         );
       }
+      Event::MergeFrozen(e) => {
+        tracing::info!(
+          target: "sailing::consensus",
+          index = e.index().get(),
+          gen_after = e.gen_after(),
+          "group frozen by a merge"
+        );
+      }
+      Event::Merged(e) => {
+        tracing::info!(target: "sailing::consensus", index = e.index().get(), "merge absorbed");
+      }
+      Event::MergeAborted(e) => {
+        tracing::info!(target: "sailing::consensus", index = e.index().get(), "merge aborted");
+      }
+      Event::MergeRolledBack(e) => {
+        tracing::info!(
+          target: "sailing::consensus",
+          index = e.index().get(),
+          gen_after = e.gen_after(),
+          "merge rolled back; group thawed"
+        );
+      }
     }
   }
 
@@ -1593,7 +1824,15 @@ where
   /// Mint a unique, monotonically-increasing operation id for a storage submission.
   fn mint_op_id(&mut self) -> OpId {
     let id = self.next_op_id;
-    self.next_op_id = self.next_op_id.next();
+    let next = id.next();
+    // `OpId::next` saturates its `seq`, so once the counter reaches the ceiling advancing is a
+    // no-op (`next == id`) and every later mint returns the SAME id. A duplicate op-id aliases the
+    // pending-write map and lets an older completion satisfy a newer op's durability watermark. Poison
+    // the moment the pre-increment id is already saturated — one id early, before any duplicate escapes.
+    if next == id {
+      self.poison(PoisonReason::OpIdExhausted);
+    }
+    self.next_op_id = next;
     id
   }
 
@@ -1622,6 +1861,16 @@ where
   #[inline(always)]
   pub const fn poison_reason(&self) -> Option<PoisonReason> {
     self.poison.poison_reason
+  }
+
+  /// Fail-stop this group because a user QUERY closure panicked mid-read against its state machine.
+  /// Invoked by a driver that CAUGHT the unwind (keeping its plane and any co-located groups alive):
+  /// the closure borrows only `&F`, but interior mutability could have torn replicated state, so
+  /// fail-stop beats risking silent divergence from replicas that never ran the closure. This is the
+  /// [`QueryPanicked`](PoisonReason::QueryPanicked) fail-stop doctrine arm of the apply/decode
+  /// poisons; a caught panic must not trade the heal a pre-catch crash + replay would have given.
+  pub fn fail_stop_query_panicked(&mut self) {
+    self.poison(PoisonReason::QueryPanicked);
   }
 
   /// The armed deadline for the given timer kind, regardless of whether it is serviceable now.
@@ -1727,14 +1976,19 @@ where
   /// `ε_unc ≥ Δ`) would still emit nonzero `wall_timestamp`s, which a VALID successor would fold into
   /// `max_wall_plus_window` and trust as an inherited-read / release horizon — a rejected config seeding
   /// the failover tier. FAIL-CLOSED: if the tier is active but the caller supplied no wall
-  /// (`Now::monotonic`), this returns `0` and the read path degrades to Safe — never a falsely-fresh
-  /// stamp. The `debug_assert` makes that misconfiguration LOUD in test/debug builds.
-  pub(crate) fn lease_wall_stamp(&self, now: Now) -> u64 {
+  /// (`Now::monotonic`, or the driver clock's `Wall::ABSENT` over-bound / transient-NTP-loss fold),
+  /// this stamps `0` and the read path degrades to Safe — never a falsely-fresh stamp. A missing wall
+  /// is a LEGITIMATE transient runtime condition, NOT a misconfiguration, so it must not panic a debug
+  /// build (the driver deliberately produces `Wall::ABSENT`); it is counted via
+  /// [`wall_stamp_degradations`](Self::wall_stamp_degradations) so a degraded clock feed stays observable.
+  pub(crate) fn lease_wall_stamp(&mut self, now: Now) -> u64 {
     if self.config.failover_tier_valid(self.reads.active_read_mode) {
-      debug_assert!(
-        !now.wall().is_absent(),
-        "LeaseGuard failover tier is active but the caller supplied no synchronized wall (Now::monotonic)"
-      );
+      // `Wall::ABSENT.as_nanos()` is already `0`, so this is release-behavior-neutral; the count is
+      // the only added effect (and the reason for taking `&mut self`).
+      if now.wall().is_absent() {
+        self.wall_stamp_degradations = self.wall_stamp_degradations.saturating_add(1);
+        return 0;
+      }
       now.wall().as_nanos()
     } else {
       0
@@ -1750,8 +2004,9 @@ where
   ///
   /// The `window < election_timeout` bound is a LIVENESS guard (a fresh leader commits before a
   /// follower could depose it). Cross-leader SAFETY (covering a deposed leader's lease) rests on the
-  /// per-entry SELF-DESCRIBING window (a successor waits the inherited MAX), needing no assumption
-  /// about any other node's config. Gated HERE, not only in the optional `Config::validate`, so an
+  /// per-entry SELF-DESCRIBING window (a successor waits the inherited MAX, inflated by its OWN rate
+  /// bound), needing no assumption beyond each node honoring its OWN configured rate bound. Gated HERE,
+  /// not only in the optional `Config::validate`, so an
   /// unvalidated config degrades to Safe. Returns `(Δ, ε)` for the read gate's same-leader check.
   pub(crate) fn leaseguard_timing(&self) -> Option<(Duration, Duration)> {
     self
@@ -1945,6 +2200,12 @@ where
   #[cfg(test)]
   pub(crate) fn mint_op_id_for_test(&mut self) -> OpId {
     self.mint_op_id()
+  }
+
+  /// Seed the op-id counter so the exhaustion fail-stop can be exercised without 2^64 mints.
+  #[cfg(test)]
+  pub(crate) fn set_next_op_id_for_test(&mut self, id: OpId) {
+    self.next_op_id = id;
   }
 
   /// Feed an inbound message. Runs the universal term pre-pass then dispatches.
@@ -2163,7 +2424,10 @@ where
         if heartbeat_due && self.lease_guard.lease_refresh_wanted {
           self.lease_guard.lease_refresh_wanted = false;
           let last = log.last_index();
+          // A pending or applied merge freeze suppresses the refresh: re-anchoring would re-arm
+          // lease serving on a group the freeze just killed it for (formation is killed too).
           if self.leaseguard_timing().is_some()
+            && !self.merge_freeze_active()
             && self.transfer.lead_transferee.is_none()
             && last == self.commit
             && !self.lease_guard_read_live(now, log)
@@ -2191,6 +2455,8 @@ where
           && mode != LeaseRefresh::Off
           && self.lease_guard.read_since_anchor
           && self.leaseguard_timing().is_some()
+          // The proactive refresh is lease FORMATION — a pending or applied freeze kills it.
+          && !self.merge_freeze_active()
           && self.transfer.lead_transferee.is_none()
           && log.last_index() == self.commit
         {
@@ -2397,12 +2663,20 @@ where
   /// This matches the policy of `on_install_snapshot` and the ConfChange Changer-reject arm.
   /// A bare `break` is used ONLY for the benign "committed entry not yet readable" case (the
   /// log slice is empty), which is transient and retried on the next `handle_*`.
-  fn apply_committed<L: LogStore>(&mut self, log: &L)
+  fn apply_committed<L: LogStore>(&mut self, log: &L) -> ApplyDrain
   where
     F::Snapshot: Data,
   {
     if self.poison.poisoned {
-      return;
+      return ApplyDrain::Drained;
+    }
+    // A PARKED CommitMerge holds the whole drain at its entry: the absorb needs another group's
+    // state machine, which only the container holds — the per-crank merge service resolves it
+    // and the drain resumes on the next call. Nothing else about the node stops (elections,
+    // replication, read confirmation all continue); only apply waits. A re-crank cannot advance
+    // it (only the container's service can), so it is `Waiting`, never re-driven as MorePending.
+    if self.merge.pending_apply.is_some() {
+      return ApplyDrain::Waiting;
     }
     // Bound BOTH the per-pass payload bytes AND the entry COUNT so a COLD/disk store returning
     // `Ready(Owned(..))` materializes a bounded amount per call instead of the whole unapplied backlog (a
@@ -2412,37 +2686,41 @@ where
     // `applied.next()`, so a short prefix just costs another pass; the in-memory borrowed path is unaffected
     // (a small range comes back in one pass).
     const APPLY_READ_MAX_BYTES: u64 = 1 << 20;
+    // Entries applied by THIS call, accumulated across the (byte-capped) batches, so the per-crank
+    // budget is a bound on the whole call — not per batch (a short byte-capped batch would slip it).
+    let mut applied_this_call: u64 = 0;
     while self.applied < self.commit {
       // Halt the drain the moment the node poisons (including a poison set EARLIER in the same
       // dispatch, e.g. by a storage completion processed just before this call): once fail-stopped,
       // the user FSM must not be re-invoked with further applies.
       if self.poison.poisoned {
-        return;
+        return ApplyDrain::Drained;
       }
       // ONE byte-capped range fetch per pass (was one call per index), iterated BY REFERENCE (no
       // per-entry clone). A conforming store returns a CONTIGUOUS prefix starting at `applied.next()`
       // (the LogStore::entries contract), capped at `APPLY_READ_MAX_BYTES`; a short prefix is re-fetched
       // by the outer while. An empty slice is the benign "committed entry not yet in the read view" case
       // → break and retry next tick; an Err is a fatal committed-range read fault → poison.
-      // Cap the requested range at MAX_READ_BATCH_ENTRIES indices (the entry-count bound).
-      let read_end = self.commit.next().min(Index::new(
-        self
-          .applied
-          .get()
-          .saturating_add(MAX_READ_BATCH_ENTRIES + 1),
-      ));
+      // Cap the requested range at MAX_READ_BATCH_ENTRIES indices AND at the per-crank apply
+      // allowance still unspent, so the budget is a HARD bound: a byte-cap-shortened batch can never
+      // let this fetch pull a full batch past it. The boundary check below then cuts at exactly the
+      // budget (never mid-batch — the span guarantees the batch cannot exceed the allowance).
+      let read_end = apply_read_span(self.applied, self.commit, applied_this_call);
       let batch = match log.entries(self.applied.next()..read_end, APPLY_READ_MAX_BYTES) {
-        Ok(EntriesRead::Ready(e)) if e.is_empty() => break,
+        // The committed entry is not yet in the read view: a benign transient. A re-crank cannot
+        // advance it (the store must land it first), so `Waiting`, never re-driven as MorePending.
+        Ok(EntriesRead::Ready(e)) if e.is_empty() => return ApplyDrain::Waiting,
         Ok(EntriesRead::Ready(e)) => e,
         // Present but cold: stop applying this pass and retry on the next pump (the store signals
-        // storage-ready when the range lands). A cold defer is not a fault — never poison.
+        // storage-ready when the range lands). A cold defer is not a fault — never poison, and a
+        // re-crank cannot advance it until the store resolves, so `Waiting`, never MorePending.
         Ok(EntriesRead::Pending) => {
           self.cold_read_defers = self.cold_read_defers.saturating_add(1);
-          break;
+          return ApplyDrain::Waiting;
         }
         Err(_) => {
           self.poison(PoisonReason::LogRead);
-          break;
+          return ApplyDrain::Drained;
         }
       };
       for entry in &*batch {
@@ -2575,7 +2853,196 @@ where
                 voters,
                 read_only,
                 index: idx,
+                // The split entry's term: with `idx` it locates this committed split in the log —
+                // the replica-identical coordinates the container mints the child's ForkId from.
+                split_term: entry.term(),
               });
+            }
+          }
+          EntryKind::PrepareMerge => {
+            // A committed PrepareMerge whose payload won't decode is corrupt — mirror Split.
+            let payload = match crate::wire::decode_prepare_merge_payload(entry.data_bytes()) {
+              Ok(p) => p,
+              Err(_) => {
+                self.poison(PoisonReason::MergeDecode);
+                break;
+              }
+            };
+            // The freeze fold: full Frozen semantics start HERE (apply-time, the membership
+            // doctrine's shape); the lease kill has been live since this entry's APPEND. The
+            // gen bump is a max-fold so a restart replay re-walks the same values idempotently;
+            // no lineage guard mirrors SplitStale here — a second freeze cannot be proposed
+            // while one is pending or applied (the propose gates), so a committed PrepareMerge
+            // is never a stale mint. The named target is RETAINED as the freeze's claim: only
+            // that target's commit may ever absorb this generation (the resolve arm verifies).
+            self.merge.frozen = true;
+            self.merge.freeze_index = Some(idx);
+            self.merge.freeze_term = Some(entry.term());
+            self.merge.freeze_pending = None;
+            self.merge.frozen_for = Some(payload.target_bytes());
+            self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
+            // The event carries the post-freeze counter so the driver can mirror this lineage
+            // move into its engine record the crank it applies (INV-LINEAGE).
+            self
+              .outputs
+              .events
+              .push_back(Event::MergeFrozen(crate::MergeFrozen::new(
+                idx,
+                self.split.shape_gen,
+              )));
+          }
+          EntryKind::CommitMerge => {
+            // A committed CommitMerge whose payload won't decode is corrupt — mirror Split.
+            let payload = match crate::wire::decode_commit_merge_payload(entry.data_bytes()) {
+              Ok(p) => p,
+              Err(_) => {
+                self.poison(PoisonReason::MergeDecode);
+                break;
+              }
+            };
+            // THE LINEAGE GUARD (the SplitStale shape): a commit applies only at exactly its
+            // minted target generation. A stale mint means a same-base competitor won the log
+            // race below this entry — a target-side abort (the merge is abandoned; parks never
+            // form), an earlier absorb (a replayed duplicate), or a concurrent target split —
+            // and the guard inputs are the target's own log-determined counter, so every
+            // replica no-ops the same entry identically. Snapshot-compaction-safe by the same
+            // token: `shape_gen` rides the snapshot meta, so a replica restored past the
+            // competitor still sees the moved counter.
+            if Some(payload.target_gen_after()) != self.split.shape_gen.checked_add(1) {
+              self
+                .outputs
+                .events
+                .push_back(Event::MergeAborted(crate::MergeAborted::new(
+                  idx,
+                  payload.source_bytes(),
+                  self.split.shape_gen,
+                )));
+            } else if self.abandoned_matches(&payload.source_bytes(), payload.source_gen_after()) {
+              // THE SAME-MERGE ABORT BELT: this target already owes THIS `(source, freeze
+              // generation)` an aborted-merge thaw, so the same merge's abort is committed BELOW
+              // this entry (the obligation is set at that abort's apply, and apply is in log order).
+              // The commit is DEAD even though its mint is fresh: parking it would stop the drain at
+              // the aborted freeze generation, which the thaw pass then drives the source PAST — a
+              // permanent wedge. Do NOT park and do NOT bump the lineage; emit `MergeAborted` like
+              // the aborted-park resolution. Uniform across replicas: the abort precedes this entry
+              // in the SAME log, so every replica's `abandoned` at this apply is identical (a pure
+              // function of the log prefix). The `commit_merge` gate refuses the common re-propose
+              // at propose; this belt covers the in-flight order the gate cannot see.
+              self
+                .outputs
+                .events
+                .push_back(Event::MergeAborted(crate::MergeAborted::new(
+                  idx,
+                  payload.source_bytes(),
+                  self.split.shape_gen,
+                )));
+            } else {
+              // PARK: the endpoint cannot apply this entry alone — the absorbed half lives in
+              // another group's endpoint, which only the container holds. Record the pending
+              // apply and STOP the drain at `idx - 1` (`applied` last advanced to the previous
+              // entry); the container's per-crank service resolves it from local facts and the
+              // drain resumes on the next call. Volatile by design: a restart re-encounters the
+              // entry and re-parks deterministically.
+              self.merge.pending_apply = Some(merge::PendingMergeApply::new_parked(
+                payload.source_bytes(),
+                payload.freeze_index(),
+                payload.freeze_term(),
+                payload.source_gen_after(),
+                payload.target_gen_after(),
+                idx,
+              ));
+              // Only the container's merge service can advance a park — a re-crank cannot — so
+              // `Waiting`, never re-driven as MorePending.
+              return ApplyDrain::Waiting;
+            }
+          }
+          EntryKind::RollbackMerge => {
+            // A committed RollbackMerge whose payload won't decode is corrupt — mirror Split.
+            let payload = match crate::wire::decode_rollback_merge_payload(entry.data_bytes()) {
+              Ok(p) => p,
+              Err(_) => {
+                self.poison(PoisonReason::MergeDecode);
+                break;
+              }
+            };
+            if payload.is_unfreeze() {
+              // The SOURCE-role thaw (this group was the frozen source; the entry rides its
+              // own log as the container-relayed consequence of the target-side abort).
+              // Leases are NOT resurrected: they re-form from live traffic. The pending kill
+              // is RE-DERIVED rather than cleared: a thaw proposed while a freeze was still
+              // pending shares its fate through truncation, but a LATER freeze may already
+              // sit above this entry in the suffix — scanning keeps the append-observed
+              // invariant exact instead of trusting a single-flag lifecycle.
+              self.merge.frozen = false;
+              self.merge.freeze_index = None;
+              self.merge.freeze_term = None;
+              self.merge.frozen_for = None;
+              self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
+              match Self::scan_freeze_pending(log, idx) {
+                Ok(fp) => self.merge.freeze_pending = fp,
+                Err(reason) => {
+                  self.poison(reason);
+                  break;
+                }
+              }
+              // Post-thaw counter rides the event — the driver's engine mirror (INV-LINEAGE).
+              self
+                .outputs
+                .events
+                .push_back(Event::MergeRolledBack(crate::MergeRolledBack::new(
+                  idx,
+                  self.split.shape_gen,
+                )));
+            } else if Some(payload.target_gen_after()) == self.split.shape_gen.checked_add(1) {
+              // The TARGET-role abort at its live mint: the merge attempt named in the payload
+              // is dead on THIS log, totally ordered against its CommitMerge — a later commit
+              // from the same base no-ops at its own lineage guard, everywhere identically.
+              // The bump is that guard's kill; it rides the snapshot meta like every lineage
+              // move, so compaction cannot resurrect the aborted attempt. The source's thaw is
+              // a DERIVED consequence: this records the abandoned merge durably (re-set by this
+              // very entry's replay, exactly like `frozen_for`), and the container's per-crank
+              // service drives the source-side `RollbackMerge` on the source's own log from it —
+              // never an independent source decision. A park cannot be pending here — a parked
+              // commit stops this drain below us, so an abort entry only ever applies once the
+              // park resolved.
+              debug_assert!(self.merge.pending_apply.is_none());
+              self.split.shape_gen = self.split.shape_gen.max(payload.target_gen_after());
+              self.note_abandoned(payload.source_bytes(), payload.source_gen_after(), idx);
+              self
+                .outputs
+                .events
+                .push_back(Event::MergeAborted(crate::MergeAborted::new(
+                  idx,
+                  payload.source_bytes(),
+                  self.split.shape_gen,
+                )));
+            }
+            // A TARGET-role abort with a stale mint lost its race (the merge resolved, or a
+            // competing reshape won the base): a silent deterministic no-op — the winner
+            // already surfaced the definitive event, and no thaw is relayed (an absorbed
+            // source no longer exists to thaw; a live one is covered by re-proposing).
+          }
+          EntryKind::ThawDischarged => {
+            // A committed witness that some leader OBSERVED this target's obligation for the named
+            // source discharged. A PURE gen-exact map clear — no `shape_gen` move, no park/fence
+            // interaction (it is FSM-non-mutating, so an entry above a surviving freeze is legal and
+            // a frozen target-holder still discharges through it). Clears the obligation iff still
+            // held at EXACTLY the witnessed generation: a STALE witness (the source re-froze at a
+            // higher generation for a fresh merge, or this is a replayed duplicate) no-ops on the
+            // gen-exact match, so the fresh obligation is untouched. Uniform on every replica — the
+            // leader that minted it clears HERE too, and a replica that can never LOCALLY observe the
+            // source (unhosted, floor 0/non-terminal, lineage unknown) clears here and NOWHERE else.
+            let payload = match crate::wire::decode_thaw_discharged_payload(entry.data_bytes()) {
+              Ok(p) => p,
+              // A committed witness whose payload won't decode is corrupt — mirror the other merge
+              // kinds' committed-corrupt fail-stop.
+              Err(_) => {
+                self.poison(PoisonReason::MergeDecode);
+                break;
+              }
+            };
+            if self.abandoned_matches(&payload.source_bytes(), payload.generation()) {
+              self.clear_abandoned(&payload.source_bytes());
             }
           }
           EntryKind::SetReadMode => {
@@ -2805,8 +3272,22 @@ where
           }
         }
         self.applied = idx;
+        applied_this_call += 1;
+      }
+      // Batch boundary: the per-crank budget elapsed with committed entries still unapplied. Cut the
+      // drain HERE (a boundary-only check — never mid-batch: the fetch is already paid and the boundary
+      // keeps the loop shape intact) and let the storage-progress signal re-crank. A poison mid-batch is
+      // NOT a budget cut — it makes no progress on a re-crank, which the `BudgetCut` contract requires —
+      // so it falls through to the top-of-loop `poisoned → Drained` instead.
+      if !self.poison.poisoned
+        && applied_this_call >= APPLY_BUDGET_ENTRIES
+        && self.applied < self.commit
+      {
+        return ApplyDrain::BudgetCut;
       }
     }
+    // The `while` exited because `applied == commit` (or never entered): the backlog is fully applied.
+    ApplyDrain::Drained
   }
 }
 

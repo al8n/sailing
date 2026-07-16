@@ -53,8 +53,8 @@ impl World {
     let mut b = coord(2);
     // Node 1 dials node 2; node 2 accepts. Each coordinator assigns its own ConnId; with a single
     // connection both counters yield the same first id.
-    let ca = a.on_conn_open(label(1, true), Instant::ORIGIN);
-    let cb = b.on_conn_open(label(2, false), Instant::ORIGIN);
+    let ca = a.on_dial_open(2, label(1, true), Instant::ORIGIN);
+    let cb = b.on_accept_open(label(2, false), Instant::ORIGIN);
     assert_eq!(ca, cb, "first allocation on both sides");
     World {
       a,
@@ -252,7 +252,7 @@ fn conn_id_exhaustion_panics_instead_of_wrapping() {
   let mut c = coord(1);
   c.next_conn_id = u64::MAX;
   // This open hands out ConnId(u64::MAX) and must refuse to wrap the successor.
-  let _ = c.on_conn_open(label(1, true), Instant::ORIGIN);
+  let _ = c.on_dial_open(2, label(1, true), Instant::ORIGIN);
 }
 
 /// The coordinator/driver counterpart of `flush_appends_is_idempotent_for_a_probe_peer`: the driver
@@ -372,7 +372,7 @@ fn restart_and_restart_migrating_rebuild_a_follower() {
 #[test]
 fn driver_initiated_close_is_not_echoed() {
   let mut c = coord(1);
-  let id = c.on_conn_open(label(1, true), Instant::ORIGIN);
+  let id = c.on_dial_open(2, label(1, true), Instant::ORIGIN);
   c.on_conn_close(id);
   assert_eq!(
     c.poll_conn_closed(),
@@ -397,6 +397,41 @@ fn unvalidated_conn_reaped_surfaces_via_poll_conn_closed() {
       Some(crate::transport::TransportError::NotValidated)
     )),
     "an un-validated connection past the deadline is reaped and reported"
+  );
+}
+
+/// `poll_timeout` SCHEDULES the router's handshake deadline, not just the endpoint's own timers —
+/// so a driver whose endpoint has no near wake still wakes to reap a silent half-open socket. A
+/// large election timeout pushes the endpoint's own next wake far past the 10s handshake deadline,
+/// standing in for a genuinely timerless observer: the handshake deadline is then the only near
+/// wake, and must be the value `poll_timeout` returns or nothing ever reaps and the socket pins
+/// `max_conns`.
+#[test]
+fn poll_timeout_schedules_the_router_handshake_deadline() {
+  let cfg =
+    crate::Config::try_new(1u64, std::vec![1, 2], Duration::from_secs(100), HEARTBEAT).unwrap();
+  let mut c: Coord = StreamCoordinator::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  // Register an inbound connection that never completes its handshake (no settle).
+  let _id = c.on_dial_open(2, label(1, true), Instant::ORIGIN);
+
+  let handshake = Instant::ORIGIN + Duration::from_secs(10);
+  assert_eq!(
+    c.poll_timeout(),
+    Some(handshake),
+    "poll_timeout must fold in the router handshake deadline when the endpoint's timer is later"
+  );
+
+  // Firing housekeeping AT that scheduled deadline reaps the silent conn and surfaces the close.
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  c.handle_timeout(handshake, &mut log, &mut stable);
+  assert_eq!(
+    c.poll_conn_closed(),
+    Some((
+      ConnId(1),
+      Some(crate::transport::TransportError::NotValidated)
+    )),
+    "the conn scheduled by poll_timeout is reaped exactly at its deadline"
   );
 }
 

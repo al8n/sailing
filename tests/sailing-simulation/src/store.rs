@@ -284,6 +284,11 @@ pub struct MemLog {
   /// Count of COLD (`EntriesRead::Pending`) reads returned — interior-mutable (the read is `&self`) so the
   /// cold-fetch coverage can assert non-vacuity. `0` unless `cold_fetch_per_mille > 0`.
   cold_reads: Cell<u64>,
+  /// Count of TORN writes (a seeded `torn_write` fsync failure at `flush`) that STRANDED a
+  /// non-empty in-flight batch — the lost-fsync coverage's non-vacuity signal. A tear on an empty
+  /// batch is a no-op and is NOT counted (it would inflate the witness without exercising the
+  /// lost-fsync path). `0` unless `torn_write_per_mille > 0` in async mode.
+  torn_writes: u64,
 }
 
 impl MemLog {
@@ -339,9 +344,35 @@ impl MemLog {
     self.faults.cold_fetch_per_mille = rate;
   }
 
+  /// Suspend BOTH read-fault rates (`transient_read` and `cold_fetch`) — zero them, returning the
+  /// prior `(transient, cold)` pair — WITHOUT reseeding the read PRNG, so a bracketed fault-free read
+  /// leaves the fault schedule exactly where it was (unlike `set_faults`, which reseeds). Both
+  /// surface as a FAIL-CLOSED read to a `LogStore::entries` scan (`transient_read` an `Err`,
+  /// `cold_fetch` a `Pending`), so a caller that must read its own bookkeeping WITHOUT rolling the
+  /// dice against it brackets the read with this. Pair with [`restore_read_faults`](Self::restore_read_faults).
+  pub fn suspend_read_faults(&mut self) -> (u16, u16) {
+    (
+      core::mem::replace(&mut self.faults.transient_read_per_mille, 0),
+      core::mem::replace(&mut self.faults.cold_fetch_per_mille, 0),
+    )
+  }
+
+  /// Restore the `(transient, cold)` rates previously taken by [`suspend_read_faults`](Self::suspend_read_faults).
+  pub fn restore_read_faults(&mut self, rates: (u16, u16)) {
+    self.faults.transient_read_per_mille = rates.0;
+    self.faults.cold_fetch_per_mille = rates.1;
+  }
+
   /// Total COLD (`EntriesRead::Pending`) reads returned so far — the cold-fetch coverage non-vacuity signal.
   pub fn cold_reads(&self) -> u64 {
     self.cold_reads.get()
+  }
+
+  /// Total TORN writes (seeded fsync failures that stranded a non-empty in-flight batch) so far —
+  /// the lost-fsync coverage's non-vacuity signal. `0` unless `torn_write_per_mille > 0` in async
+  /// mode.
+  pub fn torn_writes(&self) -> u64 {
+    self.torn_writes
   }
 
   /// Async mode: make the in-flight (already-visible) appends DURABLE by snapshotting the visible
@@ -365,6 +396,11 @@ impl MemLog {
     // do not advance the durable snapshot, fire no completions, and leave the writes in flight
     // (visible state intact; retried on the next flush, lost on a crash before then).
     if self.prng.chance_per_mille(self.faults.torn_write_per_mille) {
+      // Count only a tear that stranded REAL writes: an empty-batch tear loses nothing and would
+      // inflate the non-vacuity witness without exercising the lost-fsync path.
+      if !self.in_flight.is_empty() {
+        self.torn_writes += 1;
+      }
       return;
     }
     // Normal flush: snapshot visible → durable, then release the deferred completions in order.
@@ -703,6 +739,10 @@ pub struct MemStable<I> {
   /// Optional staging-capacity cap (bytes); a `total_len` beyond it fails `accept_snapshot_chunk`,
   /// modeling an in-RAM store that runs out of room.
   staging_cap: Option<usize>,
+  /// Count of TORN writes (a seeded `torn_write` fsync failure at `flush`) that STRANDED a
+  /// non-empty in-flight batch — the lost-fsync coverage's non-vacuity signal (see
+  /// [`MemLog::torn_writes`]). `0` unless `torn_write_per_mille > 0` in async mode.
+  torn_writes: u64,
 }
 
 /// Which completion an in-flight (async, not-yet-flushed) stable-store write owes at `flush`.
@@ -731,6 +771,7 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
       cold_snapshot_reads: Cell::new(0),
       snapshot_staging: None,
       staging_cap: None,
+      torn_writes: 0,
     }
   }
 
@@ -782,6 +823,13 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
     self.cold_snapshot_reads.get()
   }
 
+  /// Total TORN writes (seeded fsync failures that stranded a non-empty in-flight batch) so far —
+  /// the lost-fsync coverage's non-vacuity signal. `0` unless `torn_write_per_mille > 0` in async
+  /// mode.
+  pub fn torn_writes(&self) -> u64 {
+    self.torn_writes
+  }
+
   /// Async mode: make the in-flight (already-visible) writes DURABLE by snapshotting the visible
   /// state into the durable snapshot and releasing each deferred completion in submission order.
   /// Models the fsync for the in-flight window completing between driver iterations.
@@ -801,6 +849,10 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
     // do not advance the durable snapshot, fire no completions, and leave the writes in flight
     // (visible state intact; retried on the next flush, lost on a crash before then).
     if self.prng.chance_per_mille(self.faults.torn_write_per_mille) {
+      // Count only a tear that stranded REAL writes (see [`MemLog::flush`]).
+      if !self.in_flight.is_empty() {
+        self.torn_writes += 1;
+      }
       return;
     }
     // Normal flush: snapshot visible → durable, then release the deferred completions in order.

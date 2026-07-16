@@ -213,6 +213,10 @@ pub(crate) fn kind_str(k: EntryKind) -> &'static str {
     EntryKind::Empty => "empty",
     EntryKind::SetReadMode => "set-read-mode",
     EntryKind::Split => "split",
+    EntryKind::PrepareMerge => "prepare-merge",
+    EntryKind::CommitMerge => "commit-merge",
+    EntryKind::RollbackMerge => "rollback-merge",
+    EntryKind::ThawDischarged => "thaw-discharged",
   }
 }
 

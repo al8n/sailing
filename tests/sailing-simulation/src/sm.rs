@@ -69,6 +69,28 @@ impl StateMachine for LogSm {
     Some(Self { applied: child })
   }
 
+  /// THE SIM'S UNION CONTRACT: append the absorbed source's record onto this one's tail —
+  /// order preserved, indices untouched (absorbed cells keep their SOURCE-log indices, exactly
+  /// as inherited fork cells keep parent indices). A pure append of two deterministic records
+  /// at a log-fixed boundary, so every replica resolving the same commit absorbs identically;
+  /// the conservation walk re-admits the cells under the TARGET's ledger id in this order (a
+  /// contiguous run trailing the target's own cells), which is what `assert_union` judges.
+  fn absorb(&mut self, source: Self) -> bool {
+    self.applied.extend(source.applied);
+    true
+  }
+
+  // Type-constant capability gates consulted at propose. This FSM CAN split and absorb; the
+  // per-instruction `None`/`false` verdicts above stay the apply-time determinism backstop (a
+  // malformed `Split` instruction still fail-stops via `PoisonReason::SplitUnsupported`).
+  fn supports_split(&self) -> bool {
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
+    true
+  }
+
   fn snapshot(&self) -> Result<Bytes, Self::Error> {
     let mut buf: Vec<u8> = Vec::new();
     // entry count

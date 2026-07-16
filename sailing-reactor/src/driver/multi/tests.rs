@@ -42,3 +42,122 @@ fn an_observer_seed_names_the_remote_voters_not_its_own_id() {
     "the config's own id is the HOST identity, not solicitor authorization"
   );
 }
+
+/// A target with a PARKED merge is never quiesce-eligible: the park is resolved by the
+/// per-crank merge service, which a quiesced group would never reach. Driven through the real
+/// container + engine (public API only): two single-voter groups, freeze → parked commit, then
+/// the idle predicate — and after the service resolves, the merged target settles idle again.
+#[test]
+fn a_parked_merge_blocks_quiescence() {
+  use sailing_proto::{GroupEngine, Instant, MultiRaft, StateMachine};
+
+  #[derive(Default)]
+  struct Sm(u64);
+  impl StateMachine for Sm {
+    type Command = bytes::Bytes;
+    type Response = u64;
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+    fn apply(&mut self, _: sailing_proto::Index, _: bytes::Bytes) -> Result<u64, Self::Error> {
+      self.0 += 1;
+      Ok(self.0)
+    }
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.0)
+    }
+    fn restore(&mut self, s: u64) -> Result<(), Self::Error> {
+      self.0 = s;
+      Ok(())
+    }
+    fn absorb(&mut self, source: Self) -> bool {
+      self.0 += source.0;
+      true
+    }
+    fn supports_absorb(&self) -> bool {
+      true
+    }
+  }
+
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut multi: MultiRaft<u64, u64, Sm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  for gid in [1u64, 2] {
+    assert!(engine.add_group(gid));
+    multi
+      .create_group(
+        gid,
+        0,
+        Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap(),
+        now,
+        7,
+        Sm::default(),
+      )
+      .unwrap();
+    // Elect the single voter: campaign, then flush+drain until the no-op applies.
+    let d = multi.group(&gid).unwrap().poll_timeout().unwrap();
+    let (log, stable) = engine.stores(&gid).unwrap();
+    multi.handle_timeout(&gid, d, log, stable).unwrap();
+    for _ in 0..4 {
+      engine.flush();
+      let (log, stable) = engine.stores(&gid).unwrap();
+      let _ = multi.handle_storage(&gid, d, log, stable).unwrap();
+    }
+    assert!(multi.group(&gid).unwrap().role().is_leader());
+  }
+  // The direction rule makes the encoding-minimal id the survivor: group 1 is the target, group 2
+  // the source that dissolves (2's LE encoding sorts strictly above 1's).
+  assert!(
+    super::group_idle(multi.group(&1).unwrap()),
+    "the target is idle before the merge"
+  );
+
+  multi
+    .prepare_merge(&2, now, &mut engine, &1)
+    .unwrap()
+    .unwrap();
+  for _ in 0..4 {
+    engine.flush();
+    let (log, stable) = engine.stores(&2).unwrap();
+    let _ = multi.handle_storage(&2, now, log, stable).unwrap();
+  }
+  assert!(multi.group(&2).unwrap().is_frozen());
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    multi
+      .commit_merge(&1, now, log, stable, &2)
+      .unwrap()
+      .unwrap();
+  }
+  for _ in 0..4 {
+    engine.flush();
+    let (log, stable) = engine.stores(&1).unwrap();
+    let _ = multi.handle_storage(&1, now, log, stable).unwrap();
+  }
+  let target = multi.group(&1).unwrap();
+  assert!(target.pending_merge().is_some(), "parked");
+  assert!(
+    !super::group_idle(target),
+    "a parked merge is never quiesce-eligible"
+  );
+
+  // The service resolves it: the first pass seals the park's abort window (a leader no-op at
+  // the coordinate after the parked entry), the drain commits the seal, the next pass absorbs;
+  // once the resumed drain settles, the merged target is idle again.
+  let mut resolved = multi.service_merge_applies(now, &mut engine);
+  for _ in 0..4 {
+    engine.flush();
+    let (log, stable) = engine.stores(&1).unwrap();
+    let _ = multi.handle_storage(&1, now, log, stable).unwrap();
+  }
+  resolved.extend(multi.service_merge_applies(now, &mut engine));
+  assert_eq!(resolved.len(), 1);
+  for _ in 0..4 {
+    engine.flush();
+    let (log, stable) = engine.stores(&1).unwrap();
+    let _ = multi.handle_storage(&1, now, log, stable).unwrap();
+  }
+  assert!(
+    super::group_idle(multi.group(&1).unwrap()),
+    "the merged target settles idle after the resolution"
+  );
+}

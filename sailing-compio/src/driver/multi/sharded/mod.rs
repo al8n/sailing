@@ -1,11 +1,11 @@
-//! The sharded thread-per-core multi-raft host: K PARALLEL PLANES, each a complete
+//! The sharded thread-per-shard multi-raft host: K PARALLEL PLANES, each a complete
 //! [`CompioMultiStreamDriver`] on its own core, behind one group-routing
 //! [`ShardedMultiHandle`].
 //!
 //! # The plane model
 //!
 //! Every core runs a FULL compio multi-group driver — its own fused coordinator, its own
-//! [`GroupEngine`](sailing_proto::GroupEngine) (a per-core WAL barrier: zero cross-core fsync
+//! [`GroupEngine`](sailing_proto::GroupEngine) (a per-core batch barrier: zero cross-core barrier
 //! contention), and its own TCP listener on a per-shard port — hosting the disjoint subset of
 //! groups a cluster-wide-consistent [`ShardMap`] assigns it. Because every node runs the SAME
 //! map (same K, same mapping), group `g`'s replicas always talk `shard(g)` ↔ `shard(g)`: the
@@ -161,7 +161,7 @@ where
 /// solicitation for a group lands on the WRONG plane here, and a catalog-backed factory (the
 /// natural embedder shape — catalogs are not plane-aware) would materialize it there; a later
 /// correctly-routed create then leaves TWO local replicas of the group under this node's ONE
-/// identity, on independent WAL barriers — one voter that can ack and vote twice. With the
+/// identity, on independent batch barriers — one voter that can ack and vote twice. With the
 /// guard the decline falls into the driver's ordinary path: no build, no create, and the
 /// solicitation surfaces as [`LifecycleEvent::UnknownGroup`] on the shared tail, so the
 /// embedder OBSERVES the skew instead of the cluster silently splitting a group. The contract
@@ -180,7 +180,16 @@ where
   G: GroupId,
 {
   fn materialize(&mut self, group: &G, from: &I) -> Option<GroupBlueprint<I>> {
-    if self.map.shard(group) != self.plane {
+    let shard = self.map.shard(group);
+    // The whole fail-closed guarantee rests on a custom `ShardMap` closure being DETERMINISTIC:
+    // `shard(group)` must be stable. Probe it here (debug/test only) so a nondeterministic map
+    // trips at the decline site instead of silently hosting a group on the wrong plane.
+    debug_assert_eq!(
+      shard,
+      self.map.shard(group),
+      "the shard map returned different shards for the same group (it must be deterministic)"
+    );
+    if shard != self.plane {
       // Fail closed BEFORE the embedder's catalog is even asked: a group that does not belong
       // to this plane must never materialize here, whatever the inner factory would say.
       return None;
@@ -254,6 +263,15 @@ pub enum SpawnError {
     /// The failed plane.
     shard: usize,
   },
+  /// The OS refused to create one plane's thread (the process hit its thread or address-space
+  /// limit). Surfaced instead of the panic a bare `thread::spawn` would raise at bind time.
+  #[error("shard {shard}: the plane thread could not be spawned")]
+  Thread {
+    /// The shard whose thread creation failed.
+    shard: usize,
+    /// The OS thread-spawn error.
+    source: std::io::Error,
+  },
 }
 
 /// One plane's bind verdict, shipped from its thread during [`ShardedCompioHost::spawn`]: the
@@ -276,14 +294,14 @@ fn shard_addr(base: SocketAddr, shard: usize) -> Option<SocketAddr> {
 /// The builder for the sharded host: K planes, each a complete [`CompioMultiStreamDriver`] on
 /// its own `std::thread` + compio runtime, behind one [`ShardedMultiHandle`].
 ///
-/// # The plane model (read the [module docs](self) first)
+/// # The plane model (read the module docs first)
 ///
 /// - K independent meshes: plane `i` listens on `listen base port + i` and dials every peer's
 ///   `base port + i` — the ADDRESSING contract mirrors the [`ShardMap`]'s: every node of the
 ///   cluster runs the same K, the same map, and the same port convention (or the same explicit
 ///   per-shard lists), so `shard(g)` on one node always reaches `shard(g)` on another.
 /// - Per-plane engines: each plane owns its own [`GroupEngine`](sailing_proto::GroupEngine) —
-///   K independent durability barriers, no cross-core fsync contention, observable per plane
+///   K independent batch barriers, no cross-core barrier contention, observable per plane
 ///   through [`ShardedMultiHandle::engine_metrics`].
 /// - Per-plane multi semantics unchanged: coalescing, quiescence, tombstones, lifecycle
 ///   surfacing, and factories all run inside each plane exactly as on a single multi driver;
@@ -463,49 +481,63 @@ where
         });
       let staging_cap = self.snapshot_staging_cap;
       let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<Verdict<G, I, F>>();
-      let thread = std::thread::spawn(move || {
-        let runtime = match compio::runtime::Runtime::new() {
-          Ok(runtime) => runtime,
-          Err(source) => {
-            let _ = verdict_tx.send(Err(SpawnError::Runtime { shard, source }));
-            return;
-          }
-        };
-        runtime.block_on(async move {
-          // The record layers are built HERE, on the plane's thread: the returned factories
-          // are `Rc` and must never cross threads.
-          let (dialer, acceptor) = match (record_layers)(shard) {
-            Ok(pair) => pair,
+      let thread = match std::thread::Builder::new()
+        .name(format!("sailing-shard-{shard}"))
+        .spawn(move || {
+          let runtime = match compio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
             Err(source) => {
-              let _ = verdict_tx.send(Err(SpawnError::RecordLayers { shard, source }));
+              let _ = verdict_tx.send(Err(SpawnError::Runtime { shard, source }));
               return;
             }
           };
-          let bound = CompioMultiStreamDriver::bind_with_tails(
-            addr, peers, dialer, acceptor, driver_cfg, tails,
-          )
-          .await;
-          let (mut driver, handle) = match bound {
-            Ok(pair) => pair,
-            Err(source) => {
-              let _ = verdict_tx.send(Err(SpawnError::Bind { shard, source }));
+          runtime.block_on(async move {
+            // The record layers are built HERE, on the plane's thread: the returned factories
+            // are `Rc` and must never cross threads.
+            let (dialer, acceptor) = match (record_layers)(shard) {
+              Ok(pair) => pair,
+              Err(source) => {
+                let _ = verdict_tx.send(Err(SpawnError::RecordLayers { shard, source }));
+                return;
+              }
+            };
+            let bound = CompioMultiStreamDriver::bind_with_tails(
+              addr, peers, dialer, acceptor, driver_cfg, tails,
+            )
+            .await;
+            let (mut driver, handle) = match bound {
+              Ok(pair) => pair,
+              Err(source) => {
+                let _ = verdict_tx.send(Err(SpawnError::Bind { shard, source }));
+                return;
+              }
+            };
+            if let Some(cap) = staging_cap {
+              driver = driver.with_snapshot_staging_cap(cap);
+            }
+            if let Some(factory) = factory {
+              driver = driver.with_boxed_group_factory(factory);
+            }
+            let metrics = driver.engine_metrics();
+            if verdict_tx.send(Ok((handle, metrics))).is_err() {
+              // The spawner unwound (another plane failed): stop before running.
               return;
             }
-          };
-          if let Some(cap) = staging_cap {
-            driver = driver.with_snapshot_staging_cap(cap);
+            driver.run().await;
+          });
+        }) {
+        Ok(thread) => thread,
+        Err(source) => {
+          // The OS refused a new thread (thread/address-space limit). Unwind the planes already
+          // spawned — dropping each verdict receiver disconnects its plane, which then exits and
+          // joins — and surface the typed refusal instead of the panic `thread::spawn` would raise.
+          for (verdict_rx, thread) in planes {
+            drop(verdict_rx);
+            let _ = thread.join();
           }
-          if let Some(factory) = factory {
-            driver = driver.with_boxed_group_factory(factory);
-          }
-          let metrics = driver.engine_metrics();
-          if verdict_tx.send(Ok((handle, metrics))).is_err() {
-            // The spawner unwound (another plane failed): stop before running.
-            return;
-          }
-          driver.run().await;
-        });
-      });
+          return Err(SpawnError::Thread { shard, source });
+        }
+      };
       planes.push((verdict_rx, thread));
     }
 
@@ -656,6 +688,10 @@ where
   /// Recover a group from ITS MAPPED PLANE's engine and await the admission verdict.
   /// `generation` forwards to the plane command unchanged, as on
   /// [`create_group`](Self::create_group).
+  ///
+  /// Each plane is a `CompioMultiStreamDriver` over an IN-MEMORY engine, so this reconnects a group
+  /// within the SAME live process — NOT a recovery from durable storage across a process crash (the
+  /// sharded host is no more crash-durable than one plane).
   pub async fn restore_group(
     &self,
     gid: G,
@@ -694,6 +730,59 @@ where
       .await
   }
 
+  /// Propose a merge FREEZE of `source` into `target` on THEIR SHARED PLANE. v1 constraint,
+  /// refused HERE — typed, before any command crosses a channel: `shard(source) ==
+  /// shard(target)`, because the absorb is an in-container hand-off inside one plane's driver
+  /// (the plane cannot even see the other group). Same-plane merges are the per-plane
+  /// [`MultiHandle::prepare_merge`] contract verbatim.
+  pub async fn prepare_merge(
+    &self,
+    source: G,
+    target: G,
+  ) -> Result<sailing_proto::Index, DriverError<I>> {
+    let plane = self.map.shard(&source);
+    if self.map.shard(&target) != plane {
+      return Err(DriverError::Rejected {
+        reason: sailing_proto::MergeError::<I>::CrossPlane.to_string(),
+      });
+    }
+    self.shards[plane].prepare_merge(source, target).await
+  }
+
+  /// Propose the merge ABSORB on `target`'s plane, with the same cross-plane refusal as
+  /// [`prepare_merge`](Self::prepare_merge) — checked before any propose, on every verb, so no
+  /// half of the choreography can ever land on a plane the other half cannot reach.
+  pub async fn commit_merge(
+    &self,
+    target: G,
+    source: G,
+  ) -> Result<sailing_proto::Index, DriverError<I>> {
+    let plane = self.map.shard(&target);
+    if self.map.shard(&source) != plane {
+      return Err(DriverError::Rejected {
+        reason: sailing_proto::MergeError::<I>::CrossPlane.to_string(),
+      });
+    }
+    self.shards[plane].commit_merge(target, source).await
+  }
+
+  /// Propose the merge ABORT on `target`'s plane — the abort rides the TARGET's log — with the
+  /// same cross-plane refusal as the other merge verbs (the abort's relay must reach the
+  /// source inside the same plane's container).
+  pub async fn rollback_merge(
+    &self,
+    target: G,
+    source: G,
+  ) -> Result<sailing_proto::Index, DriverError<I>> {
+    let plane = self.map.shard(&target);
+    if self.map.shard(&source) != plane {
+      return Err(DriverError::Rejected {
+        reason: sailing_proto::MergeError::<I>::CrossPlane.to_string(),
+      });
+    }
+    self.shards[plane].rollback_merge(target, source).await
+  }
+
   /// Remove a group from its mapped plane, awaiting whether it was hosted (the removal
   /// tombstones the id ON THAT PLANE, exactly the per-plane multi semantics).
   pub async fn remove_group(&self, gid: G) -> Result<bool, DriverError<I>> {
@@ -723,16 +812,19 @@ where
 
   /// One plane's [`MultiHandle`] — the ESCAPE HATCH for plane-scoped work (status polls against
   /// a known plane, plane-local shutdown in tests). Group-keyed operations issued here bypass
-  /// the shard map: a create on the wrong plane would host a replica no other node ever dials,
-  /// so lifecycle mutations should ride the sharded surface unless the caller re-derives the
-  /// map itself. Manual creates also bypass the shard guard — it covers only factory
-  /// materialization, and this handle is the deliberate opt-out.
+  /// BOTH the shard map AND the shard guard, so the dragons are specific: a manual `create_group`
+  /// on the WRONG plane hosts a replica no correctly-mapped peer ever dials, and — because it skips
+  /// the guard that exists to catch exactly this — a later correctly-routed create can leave TWO
+  /// local replicas of one group under this node's ONE identity: the double-vote shape a plane's
+  /// factory guard fails closed to prevent. Keep to the map: issue lifecycle mutations on the
+  /// sharded surface unless the caller re-derives `shard(group)` itself. The hatch stays open by
+  /// design; the hazard is the caller's to hold.
   #[must_use]
   pub fn shard_handle(&self, shard: usize) -> Option<&MultiHandle<G, I, F>> {
     self.shards.get(shard)
   }
 
-  /// One plane's engine counters (its own durability barrier + quiesced-group gauge) — the
+  /// One plane's engine counters (its own batch barrier + quiesced-group gauge) — the
   /// per-plane observability that makes the independent barriers visible.
   #[must_use]
   pub fn engine_metrics(&self, shard: usize) -> Option<&EngineMetrics> {

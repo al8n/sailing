@@ -443,7 +443,7 @@ fn tracked_peer_count_spans_joint_config_and_learners() {
   assert_eq!(super::tracked_peer_count(&joint, &5u64), 5);
 }
 
-/// FAILS-ON-OLD: with the connection-cap floor computed once at construction, a committed
+/// With the connection-cap floor computed once at construction, a committed
 /// membership change that grows the tracked peer set outruns the cap — the floor must grow WITH
 /// the membership, or the new member's legitimate mesh connections are refused.
 #[test]
@@ -500,17 +500,17 @@ fn committed_membership_growth_raises_the_connection_cap() {
   assert_eq!(w.b.effective_max_connections(), 6);
 }
 
-/// FAILS-ON-OLD (FIX 2: `drain_bridge` must forward the full `Now` to `handle_message`): a
+/// `drain_bridge` must forward the FULL `Now` to `handle_message`: a
 /// network-driven election over QUIC, with EVERY coordinator hop driven by a SYNCHRONIZED `Now`,
 /// must preserve the synchronized wall onto the elected leader's term-current no-op (Empty) entry.
 /// The winning `VoteResponse` rides a QUIC stream into `drain_bridge`, which decodes it and calls
 /// `endpoint.handle_message` → `become_leader` → `append_leader_noop`, stamping
 /// `lease_wall_stamp(now)`. Under the FAILOVER tier that stamp is `now.wall().as_nanos()`.
 ///
-/// MUTATION (revert FIX 2 — `drain_bridge(now.mono(), ..)`): the decoded `VoteResponse` reaches
+/// MUTATION (`drain_bridge(now.mono(), ..)`): the decoded `VoteResponse` reaches
 /// `handle_message` with the wall STRIPPED (`Now::monotonic`), so the failover tier's
-/// `lease_wall_stamp` debug-asserts the absent wall and PANICS the election (and, with the assert
-/// compiled out, the no-op would stamp `0`, also failing the `== W` assertion).
+/// `lease_wall_stamp` fails closed — it stamps `0` (counting a `wall_stamp_degradations`) rather than
+/// the synchronized wall, failing the `== W` assertion below.
 #[test]
 fn quic_election_preserves_synchronized_wall_on_leader_noop() {
   use crate::{EntryKind, Index, LogStore, Now, Wall};
@@ -1036,5 +1036,23 @@ fn poll_timeout_uses_the_quic_deadline_for_a_non_voter() {
     d,
     Some(now),
     "it is the future quic deadline, not the immediate (pending-work) value"
+  );
+}
+
+/// `quinn_now` maps a crate `Instant` onto quinn's std clock through a lazily-captured anchor. A
+/// pathological `now` (`Instant::from_origin(Duration::MAX)`, reachable from public deadline input)
+/// must NOT panic the std `Instant + Duration` — the horizon clamp maps it to a too-far, never
+/// earlier, deadline.
+#[test]
+fn quinn_now_clamps_a_pathological_now_without_panicking() {
+  let ca = TestClusterCa::generate();
+  let c = cluster(7);
+  let mut coord = coord(&ca, 1, c);
+  // Anchor on a normal first `now` (returns the std base), then map `Duration::MAX`.
+  let base = coord.quinn_now(Instant::ORIGIN);
+  let pathological = coord.quinn_now(Instant::from_origin(Duration::MAX));
+  assert!(
+    pathological >= base,
+    "the clamped quinn deadline is not earlier than the anchor"
   );
 }

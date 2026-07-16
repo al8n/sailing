@@ -13,7 +13,7 @@ use bytes::Bytes;
 use std::vec::Vec;
 
 mod multi;
-pub use multi::{GroupControl, GroupStores, MultiStreamCoordinator};
+pub use multi::{GroupControl, MultiStreamCoordinator};
 // Shared with the QUIC multi coordinator alone (the stream one reaches them as module siblings),
 // so the re-export is dead weight in a tcp-without-quic build.
 #[cfg(feature = "quic")]
@@ -112,24 +112,41 @@ where
     }
   }
 
-  /// Register a freshly opened connection (the driver dialed or accepted a socket), returning the
-  /// coordinator-assigned [`ConnId`] the driver must key its socket by. Ids are allocated by an
-  /// internal counter, making the uniqueness/monotonicity the duplicate-peer tie-break relies on
-  /// hold by construction. `now` starts the handshake deadline — a connection that never validates
-  /// is reaped and reported closed.
+  /// Register a freshly DIALED connection (the driver dialed `expected`), returning the
+  /// coordinator-assigned [`ConnId`] the driver keys its socket by. The expectation is enforced: a
+  /// hello authenticating as any other id closes the connection ([`super::TransportError::UnexpectedPeer`]).
+  pub fn on_dial_open(&mut self, expected: I, record: R, now: Instant) -> ConnId {
+    let me = self.endpoint.id();
+    self.router.set_local_id(me);
+    let id = self.alloc_conn_id();
+    self.router.register_dial(id, expected, record, now);
+    id
+  }
+
+  /// Register a freshly ACCEPTED connection (the driver accepted an inbound socket — no dial
+  /// expectation), returning the coordinator-assigned [`ConnId`] the driver keys its socket by.
+  pub fn on_accept_open(&mut self, record: R, now: Instant) -> ConnId {
+    let me = self.endpoint.id();
+    self.router.set_local_id(me);
+    let id = self.alloc_conn_id();
+    self.router.register_accept(id, record, now);
+    id
+  }
+
+  /// Allocate the next [`ConnId`] from the internal monotonic counter, making the
+  /// uniqueness/monotonicity the duplicate-peer tie-break relies on hold by construction.
   ///
   /// # Panics
   ///
   /// Panics if the `u64` id space is exhausted (~10^19 opens — unreachable in practice, but a
   /// silent release-mode wrap would reuse a live id and break the uniqueness guarantee the
   /// tie-break relies on, so it is checked).
-  pub fn on_conn_open(&mut self, record: R, now: Instant) -> ConnId {
+  fn alloc_conn_id(&mut self) -> ConnId {
     let id = ConnId(self.next_conn_id);
     self.next_conn_id = self
       .next_conn_id
       .checked_add(1)
       .expect("connection id space exhausted");
-    self.router.register(id, record, now);
     id
   }
 
@@ -379,9 +396,26 @@ where
     self.router.poll_transmit()
   }
 
-  /// The endpoint's next timer deadline.
+  /// The next timer deadline: the min of the endpoint's own timers and the router's next handshake
+  /// deadline. Folding the handshake deadline is what lets a TIMERLESS endpoint (an observer with no
+  /// election or heartbeat timer) still wake to reap a silent half-open connection in
+  /// [`handle_timeout`](Self::handle_timeout); without it that endpoint never schedules a wake, so a
+  /// silent socket pins `max_conns` until some distant driver fallback fires.
+  ///
+  /// This deliberately folds ONLY the handshake deadline, NOT the router's validated-connection
+  /// liveness (idle probe/reap) that `MultiStreamCoordinator::transport_timeout` folds: a
+  /// single-group host never quiesces, so its always-armed election timer already detects a leader's
+  /// silence and campaigns — a transport idle reap would be redundant here, so the single coordinator
+  /// stays inert to the router's liveness deadlines (they arm but are never serviced).
   pub fn poll_timeout(&self) -> Option<Instant> {
-    self.endpoint.poll_timeout()
+    match (
+      self.endpoint.poll_timeout(),
+      self.router.next_handshake_deadline(),
+    ) {
+      (Some(a), Some(b)) => Some(a.min(b)),
+      (a, None) => a,
+      (None, b) => b,
+    }
   }
 
   /// Drain the next application event (committed entry, read-state, …).
@@ -410,6 +444,13 @@ where
   /// Read-only access to the application state machine.
   pub const fn state_machine(&self) -> &F {
     self.endpoint.state_machine()
+  }
+
+  /// Fail-stop the wrapped endpoint because a user QUERY closure panicked mid-read against its state
+  /// machine (see [`Endpoint::fail_stop_query_panicked`]). The driver caught the unwind to keep its
+  /// task alive and routes here so the endpoint stops serving possibly-torn replicated state.
+  pub fn fail_stop_query_panicked(&mut self) {
+    self.endpoint.fail_stop_query_panicked();
   }
 
   /// Read-only access to the wrapped consensus endpoint, for introspection a driver needs that the

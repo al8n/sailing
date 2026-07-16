@@ -56,6 +56,7 @@ fn cv(seed: u64, tick: u64, nodes: Vec<NodeView>) -> ClusterView {
     .map(|n| n.id)
     .collect();
   ClusterView {
+    positional_agreement: true,
     seed,
     tick,
     committed_voters: if voters.is_empty() {
@@ -205,9 +206,12 @@ fn commit_is_quorum_durable_detects_solo_commit() {
 #[test]
 fn commit_is_quorum_durable_detects_nonquorum_volatile_commit() {
   // A volatile commit that is NOT quorum-durable must trip even though the lagging durable commit alone
-  // looks fine. Node 0 has volatile commit=5 (durable commit only 4) and is the ONLY voter holding index
-  // 5 → 1 of 3 durable copies, below quorum. The volatile commit is what the node applies and serves, so
-  // checking only the durable commit (4) would miss it.
+  // looks fine. Node 0 has volatile commit=5 while its durable commit watermark is only 4, so it RETAINS
+  // index 5 in its durable log WITHOUT having durably committed it. The oracle therefore does not witness
+  // node 0's own term for index 5 (it did not choose it) and falls to the holder-quorum fallback, which
+  // finds no term durably held by a voter quorum for index 5 (node 0 is the sole holder) → trip. The
+  // volatile commit is what the node applies and serves, so checking only the durable commit (4) would
+  // miss it.
   let mut n0 = healthy_node(0, 5, 5); // volatile commit=5, durably holds 5
   n0.hardstate_commit = 4; // ...but the durable commit watermark lags (unflushed)
   n0.applied = 4;
@@ -217,7 +221,7 @@ fn commit_is_quorum_durable_detects_nonquorum_volatile_commit() {
   let v = commit_is_quorum_durable(&view, 0).unwrap_err();
   assert_eq!(v.oracle, "commit_is_quorum_durable");
   assert!(
-    v.detail.contains("only 1 of 3 voter durable logs"),
+    v.detail.contains("no term holds a durable quorum"),
     "{}",
     v.detail
   );
@@ -301,6 +305,7 @@ fn commit_is_quorum_durable_uses_authoritative_voter_set_not_self_view() {
   n3.is_voter = false;
   n3.is_leader = false;
   let view = ClusterView {
+    positional_agreement: true,
     seed: 4,
     tick: 336,
     committed_voters: Some(BTreeSet::from([0, 1, 2])),
@@ -334,6 +339,7 @@ fn commit_is_quorum_durable_keeps_teeth_with_authoritative_voter_set() {
   n3.is_voter = false;
   n3.is_leader = false;
   let view = ClusterView {
+    positional_agreement: true,
     seed: 4,
     tick: 1,
     committed_voters: Some(BTreeSet::from([0, 1, 2])),
@@ -388,6 +394,7 @@ fn fork_grown_node(id: u64) -> NodeView {
 /// only the given replicas materialized (absent siblings have no store pair yet, so no view).
 fn fork_view(nodes: Vec<NodeView>) -> ClusterView {
   ClusterView {
+    positional_agreement: true,
     seed: 7,
     tick: 95,
     committed_voters: Some(BTreeSet::from([3, 4, 5, 6])),
@@ -1293,7 +1300,7 @@ fn snapshot_membership_coherent_compacted_kind_at_committed_final_index_is_a_sou
 
 #[test]
 fn snapshot_membership_coherent_un_witnessed_snapshot_boundary_does_not_corroborate() {
-  // STRICT trust (R10 FINDING 1): an UN-independently-witnessed snapshot boundary is NO proof. A ConfChange
+  // STRICT trust: an UN-independently-witnessed snapshot boundary is NO proof. A ConfChange
   // compacted INTO a snapshot at its own index leaves no standalone log entry (committed_log_kind missing), and
   // the snapshot's boundary term is itself unwitnessed — NO committed retained log entry attests it, so
   // snapshot_boundary_coherent would skip it. The resolver must NOT let such a boundary self-corroborate the
@@ -1330,7 +1337,7 @@ fn snapshot_membership_coherent_un_witnessed_snapshot_boundary_does_not_corrobor
 
 #[test]
 fn snapshot_membership_coherent_stale_lower_term_record_is_not_trusted() {
-  // STRICT trust (R10 FINDING 2): a committed-log record at the resolving index with a LOWER term than the
+  // STRICT trust: a committed-log record at the resolving index with a LOWER term than the
   // recorded ConfChange is stale (the higher-term ConfChange superseded it) and is NOT exact-term proof — the
   // transition must NOT be trusted via it. The install is a sound kind-unobservable decline.
   let mut ck = Checker::new();
@@ -1357,7 +1364,7 @@ fn snapshot_membership_coherent_stale_lower_term_record_is_not_trusted() {
 
 #[test]
 fn snapshot_membership_coherent_same_term_non_confchange_tombstones_not_trusts() {
-  // STRICT trust (R10 FINDING 2): a committed-log record at the resolving index that is a non-ConfChange at the
+  // STRICT trust: a committed-log record at the resolving index that is a non-ConfChange at the
   // SAME term as the recorded ConfChange is the committed entry there (committed entries are immutable, so the
   // recorded ConfChange transition is stale) — the config does NOT change at that index ⇒ TOMBSTONE (walk past),
   // NEVER trust the stale ConfChange. The install is then compared against the PRIOR (genesis) config.
@@ -1500,4 +1507,363 @@ fn check_or_panic_message_contains_seed_tick() {
     .unwrap_or_default();
   assert!(msg.contains("seed=2882343476"), "{msg}"); // 0xABCD_1234
   assert!(msg.contains("tick=999"), "{msg}");
+}
+
+/// The absorb→observers-only→retire shape (seed-2 class): a group absorbs via a forced snapshot,
+/// shrinks to observers through a conf-change its snapshot-installed replicas emit no
+/// `ConfChanged` for, then retires. The observers-only install lands beyond the completeness
+/// watermark against a history that never recorded its config, so the frozen archive counts it
+/// unwitnessed forever. `certify_retiring_history` — the one last exact-term walk of the retiring
+/// durable logs at archival — records the folded config and raises the watermark through the
+/// boundary, so the install is JUDGED (compared), not silently skipped.
+#[test]
+fn certify_retiring_history_witnesses_the_absorb_observers_retire_install() {
+  let mut ck = Checker::new();
+  // Pre-absorb: log-built voters {0,1,2}, genesis captured, complete_up_to raised to 5.
+  let pre: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 5, 5);
+      n.conf_voters = [0, 1, 2].into_iter().collect();
+      n
+    })
+    .collect();
+  record_membership_observation(&mut ck, &cv(2, 1, pre));
+
+  // The observers-only install: a snapshot lands at boundary 8 with the shrunk config {0}. Its
+  // removing conf-change at index 8 was applied only by snapshot-installed replicas, so the
+  // event-sourced history never recorded it, and the boundary sits beyond complete_up_to (5).
+  let install_view = with_install(cv(2, 2, std::vec![]), 0, 8, conf(&[0], &[]));
+  record_membership_observation(&mut ck, &install_view);
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "the install lands beyond the completeness watermark against an unrecorded config"
+  );
+
+  // Retire: the retiring replicas' durable logs are committed through 8, carrying the
+  // observers-only conf-change at index 8, their folded conf_state() = {0}. The world records the
+  // committed-log kind, then the retire walk records the config and raises the watermark.
+  let retiring: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 8, 8);
+      n.durable_entries[7].is_conf_change = true; // index 8: the observers-only change
+      n.conf_voters = [0].into_iter().collect();
+      n.conf_changed = 1;
+      n.installed_snapshot = true; // post-absorb: emits no ConfChanged, so record raises nothing
+      n
+    })
+    .collect();
+  let retire_view = cv(2, 3, retiring);
+  record_membership_observation(&mut ck, &retire_view);
+  certify_retiring_history(&mut ck, &retire_view);
+
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "the retire walk certified the history through the boundary"
+  );
+  assert!(
+    ck.membership_comparisons() >= 1,
+    "the install was JUDGED against the folded config {{0}}, not merely un-counted"
+  );
+}
+
+/// Zero-tolerance stays: the retire walk certifies ONLY the gap-free prefix. An install beyond the
+/// retiring replicas' durable committed extent has no proof, so it remains unwitnessed — the walk
+/// never blanket-blesses, it extends completeness exactly as far as the durable logs prove.
+#[test]
+fn certify_retiring_history_leaves_a_genuine_gap_unwitnessed() {
+  let mut ck = Checker::new();
+  let pre: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 5, 5);
+      n.conf_voters = [0, 1, 2].into_iter().collect();
+      n
+    })
+    .collect();
+  record_membership_observation(&mut ck, &cv(7, 1, pre));
+
+  // An install at boundary 30 — far beyond anything the retiring replicas commit.
+  let install_view = with_install(cv(7, 2, std::vec![]), 0, 30, conf(&[0], &[]));
+  record_membership_observation(&mut ck, &install_view);
+
+  // The retiring replicas commit only through 8: the walk can prove no more.
+  let retiring: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 8, 8);
+      n.conf_voters = [0].into_iter().collect();
+      n.installed_snapshot = true;
+      n
+    })
+    .collect();
+  let retire_view = cv(7, 3, retiring);
+  record_membership_observation(&mut ck, &retire_view);
+  certify_retiring_history(&mut ck, &retire_view);
+
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "an install beyond the durable committed extent stays unwitnessed — no false witness"
+  );
+}
+
+/// Encode a single-change conf-change entry payload for the derivation tests.
+fn encode_cc(
+  transition: sailing_proto::ConfChangeTransition,
+  ty: sailing_proto::ConfChangeType,
+  node: u64,
+) -> Vec<u8> {
+  let cc = sailing_proto::ConfChangeV2::new(
+    transition,
+    std::vec![sailing_proto::ConfChangeSingle::new(ty, node)],
+    bytes::Bytes::new(),
+  );
+  let mut buf = Vec::new();
+  sailing_proto::encode_conf_change_v2(&cc, &mut buf);
+  buf
+}
+
+/// Set up the fork-born retire shape whose committed conf-change at index 6 the event-sourced history
+/// NEVER recorded: genesis {0,1,2}; the install lineage commits `RemoveNode 2 -> {0,1}` at index 6 but
+/// emits no `ConfChanged` (snapshot-derived), so `committed_log_kind[6]` is a ConfChange yet its config
+/// is unrecorded and the frontier stays at 5; an install lands at boundary 6 with `install_conf`. The
+/// retire view is the one lineage-free replica, FROZEN at commit 5 (one short of index 6, so its
+/// `conf_snapshot` records nothing there) but still carrying the uncommitted conf-change entry — the
+/// sole witness of that config's CONTENT. Returns the checker and the retire view (not yet certified).
+fn fork_born_retire_shape(cc6: Vec<u8>, install_conf: ConfSnapshot) -> (Checker, ClusterView) {
+  let mut ck = Checker::new();
+  let pre: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 5, 5);
+      n.conf_voters = [0, 1, 2].into_iter().collect();
+      n
+    })
+    .collect();
+  record_membership_observation(&mut ck, &cv(0, 1, pre));
+
+  let committed6: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 6, 6);
+      n.durable_entries[5] = DurableEntry {
+        index: 6,
+        term: 1,
+        data: cc6.clone(),
+        is_conf_change: true,
+      };
+      n.conf_voters = [0, 1].into_iter().collect();
+      n.installed_snapshot = true; // snapshot-derived: emits no ConfChanged, never raises the frontier
+      n
+    })
+    .collect();
+  record_membership_observation(&mut ck, &cv(0, 2, committed6));
+
+  let install_view = with_install(cv(0, 3, std::vec![]), 0, 6, install_conf);
+  record_membership_observation(&mut ck, &install_view);
+
+  let mut frozen = healthy_node(0, 5, 6); // commit 5, durable log reaches the uncommitted index 6
+  frozen.durable_entries[5] = DurableEntry {
+    index: 6,
+    term: 1,
+    data: cc6,
+    is_conf_change: true,
+  };
+  frozen.conf_voters = [0, 1, 2].into_iter().collect();
+  let retire_view = cv(0, 4, std::vec![frozen]);
+  record_membership_observation(&mut ck, &retire_view);
+  (ck, retire_view)
+}
+
+/// The seed-10 g259 survivor, unit-isolated: the walk must DERIVE the config of a committed
+/// conf-change no live replica ever recorded a ConfState for — decoding it from a hosting replica's
+/// durable log and folding it. Seeded directly (bypassing `record_membership_observation`, whose own
+/// per-tick call would derive it immediately): before the walk index 6's config is absent; after, it
+/// is the fold `{0,1,2}` −RemoveNode(2)→ `{0,1}`.
+#[test]
+fn the_walk_derives_an_unrecorded_committed_conf_change() {
+  let mut ck = Checker::new();
+  ck.genesis_conf = Some(conf(&[0, 1, 2], &[]));
+  ck.complete_up_to = 5;
+  ck.committed_log_kind
+    .insert(6, (1, CommittedKind::ConfChange));
+  let mut frozen = healthy_node(0, 5, 6); // commit 5, durable log carries the uncommitted index 6
+  frozen.durable_entries[5] = DurableEntry {
+    index: 6,
+    term: 1,
+    data: encode_cc(
+      sailing_proto::ConfChangeTransition::Auto,
+      sailing_proto::ConfChangeType::RemoveNode,
+      2,
+    ),
+    is_conf_change: true,
+  };
+  let view = cv(0, 1, std::vec![frozen]);
+
+  assert!(
+    !ck.committed_config_history.contains_key(&6),
+    "index 6's config is unrecorded before the walk"
+  );
+  derive_unrecorded_conf_changes(&mut ck, &view);
+  assert_eq!(
+    ck.committed_config_history.get(&6).map(|(_, c, _)| c
+      .voters
+      .iter()
+      .copied()
+      .collect::<Vec<u64>>()),
+    Some(std::vec![0, 1]),
+    "the walk decoded RemoveNode 2 and folded genesis {{0,1,2}} -> {{0,1}}"
+  );
+}
+
+/// End to end: with the config derived PER TICK, an install past the (once-unrecorded) conf-change is
+/// WITNESSED against the derived reference at the run-end pass — not skipped, not merely declined.
+#[test]
+fn a_derived_config_witnesses_the_install() {
+  let cc6 = encode_cc(
+    sailing_proto::ConfChangeTransition::Auto,
+    sailing_proto::ConfChangeType::RemoveNode,
+    2,
+  );
+  let (mut ck, _view) = fork_born_retire_shape(cc6, conf(&[0, 1], &[]));
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "the per-tick-derived config witnessed the install"
+  );
+  assert!(
+    ck.membership_comparisons() >= 1,
+    "the install was JUDGED against the derived config {{0,1}}, not merely declined"
+  );
+}
+
+/// Teeth: the derived config is a real REFERENCE, not a blanket bless — an install whose membership
+/// does NOT match it still trips the divergence arm. Here the install adopted {0,2} where the derived
+/// committed config at the boundary is {0,1}: node 2 is a phantom voter, node 1 a missing joiner.
+#[test]
+fn a_derived_config_still_trips_a_divergent_install() {
+  let cc6 = encode_cc(
+    sailing_proto::ConfChangeTransition::Auto,
+    sailing_proto::ConfChangeType::RemoveNode,
+    2,
+  );
+  let (mut ck, retire_view) = fork_born_retire_shape(cc6, conf(&[0, 2], &[]));
+  certify_retiring_history(&mut ck, &retire_view);
+  let v = finalize_membership(&mut ck).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("phantom voters {2}") && v.detail.contains("missing joiners {1}"),
+    "{}",
+    v.detail
+  );
+}
+
+/// Conservatism: a gap conf-change the pure simple fold CANNOT derive (here a JOINT / non-`Auto`
+/// change) is NEVER guessed — the walk leaves its config unrecorded. The install past it is then a
+/// sound KIND-UNOBSERVABLE decline: its snapshot boundary proves committed, but the config reference
+/// is unprovable, so the accounting TOLERATES it (never a false witness, never a hard skip).
+#[test]
+fn an_undecodable_gap_change_declines_the_install() {
+  let cc6 = encode_cc(
+    sailing_proto::ConfChangeTransition::Implicit, // joint entry — not a simple fold
+    sailing_proto::ConfChangeType::RemoveNode,
+    2,
+  );
+  let (mut ck, _view) = fork_born_retire_shape(cc6, conf(&[0, 1], &[]));
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.membership_comparisons(),
+    0,
+    "the joint config was never guessed — the install is not witnessed"
+  );
+  assert_eq!(
+    ck.kind_unobservable_installs(),
+    1,
+    "the boundary is bridged but its config reference is unprovable — a sound decline"
+  );
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "a bridged, unprovable boundary is a tolerated decline, not a hard completeness gap"
+  );
+}
+
+/// A LIVE all-snapshot-derived group (the merge-target shape, group 110): its log-built witnesses
+/// all departed before applying far, freezing `complete_up_to` below the durable-committed extent,
+/// so an install whose boundary is committed-final but past the applied frontier was silently
+/// skipped and the run-end accounting tripped though the config CONVERGED. `finalize_membership`
+/// now runs the gap-free committed-prefix walk itself (retirement is not the only caller), raising
+/// the frontier across the committed extent so the install is WITNESSED against the config there.
+#[test]
+fn finalize_witnesses_a_live_all_snapshot_install_within_the_committed_extent() {
+  let mut ck = Checker::new();
+  // An early log-built voter set genesis {0,1,2} and the committed-config prefix, but its APPLIED
+  // frontier froze at 5 (it departed / became snapshot-derived before applying further). Its durable
+  // COMMITTED log still reached 15, so the per-tick recorder persisted committed_log_kind gap-free
+  // 1..=15 (all Normal). `complete_up_to` stays 5.
+  let mut early = healthy_node(0, 15, 15);
+  early.applied = 5;
+  early.conf_voters = [0, 1, 2].into_iter().collect();
+  record_membership_observation(&mut ck, &cv(6, 1, std::vec![early]));
+
+  // The install: a snapshot lands at boundary 10 embedding the genesis {0,1,2} — beyond the applied
+  // watermark (5) but WITHIN the gap-free committed extent (15).
+  let install_view = with_install(cv(6, 2, std::vec![]), 1, 10, conf(&[0, 1, 2], &[]));
+  record_membership_observation(&mut ck, &install_view);
+
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "the live-finalize walk certifies the committed prefix through the boundary — witnessed, not skipped"
+  );
+  assert!(
+    ck.membership_comparisons() >= 1,
+    "the install is JUDGED against the genesis {{0,1,2}}, not merely un-counted"
+  );
+}
+
+/// Zero-tolerance stays for a live group too: the live walk certifies ONLY the gap-free committed
+/// prefix. An install one index PAST the durable-committed extent has no proof, so it remains
+/// unwitnessed — the frontier stops at the extent, never blanket-widens.
+#[test]
+fn finalize_leaves_a_live_boundary_past_the_committed_extent_unwitnessed() {
+  let mut ck = Checker::new();
+  let mut early = healthy_node(0, 15, 15);
+  early.applied = 5;
+  early.conf_voters = [0, 1, 2].into_iter().collect();
+  record_membership_observation(&mut ck, &cv(6, 1, std::vec![early]));
+
+  // Boundary 16 — one past the gap-free committed extent (15). The walk proves no more than 15.
+  let install_view = with_install(cv(6, 2, std::vec![]), 1, 16, conf(&[0, 1, 2], &[]));
+  record_membership_observation(&mut ck, &install_view);
+
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "a boundary one past the durable committed extent stays unwitnessed — the frontier stops at the extent"
+  );
+}
+
+/// The widened frontier must not paper over a real corruption: an install WITHIN the newly-certified
+/// committed extent whose ConfState DIVERGES from the config in effect there still trips the verdict.
+#[test]
+fn finalize_still_trips_a_divergent_live_install_within_the_committed_extent() {
+  let mut ck = Checker::new();
+  let mut early = healthy_node(0, 15, 15);
+  early.applied = 5;
+  early.conf_voters = [0, 1, 2].into_iter().collect();
+  record_membership_observation(&mut ck, &cv(6, 1, std::vec![early]));
+
+  // The install at boundary 10 (witnessed by the widened frontier) carries a phantom voter 3 the
+  // committed genesis {0,1,2} never had — a genuine divergence the walk must still catch.
+  let install_view = with_install(cv(6, 2, std::vec![]), 1, 10, conf(&[0, 1, 2, 3], &[]));
+  record_membership_observation(&mut ck, &install_view);
+
+  let v = finalize_membership(&mut ck).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(v.detail.contains("phantom voters {3}"), "{}", v.detail);
 }

@@ -920,7 +920,7 @@ fn duplicate_follower_read_index_is_rejected_then_clears() {
 /// rejecting `ReadIndexResponse` (not silently dropped), so the forwarding follower can clear its
 /// `forwarded_reads` strand and re-issue the read.
 ///
-/// FAILS-ON-OLD: with the bare `return` at capacity the leader sends nothing; the follower never
+/// With a bare `return` at capacity the leader sends nothing; the follower never
 /// learns and its `forwarded_reads` entry is stranded (the context stays a `DuplicateContext`).
 #[test]
 fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
@@ -1141,7 +1141,7 @@ fn read_index_candidate_reports_no_leader() {
 /// node suppresses `poll_event`, so a `ReadState` would never arrive; returning `Ok(())` would
 /// strand the caller waiting on a confirmation that can never come.
 ///
-/// FAILS-ON-OLD: the old `if self.poisoned { return Ok(()) }` short-circuit returns `Ok`.
+/// An `if self.poisoned { return Ok(()) }` short-circuit returns `Ok` instead, stranding the caller.
 #[test]
 fn poisoned_read_index_reports_poisoned_not_ok() {
   use crate::{PoisonReason, ReadIndexError};
@@ -1166,8 +1166,8 @@ fn poisoned_read_index_reports_poisoned_not_ok() {
 /// its CURRENT leader. An unsolicited / wrong-leader response emits NO `ReadState`; the legitimate response
 /// emits exactly one; a delayed duplicate (after the context cleared) emits nothing.
 ///
-/// FAILS-ON-OLD: `on_read_index_response` removed-and-emitted unconditionally, so a spoofed or
-/// duplicate response would surface a `ReadState` the application would treat as linearizable.
+/// An `on_read_index_response` that removes-and-emits unconditionally lets a spoofed or
+/// duplicate response surface a `ReadState` the application would treat as linearizable.
 #[test]
 fn read_index_response_validation_rejects_unsolicited_and_duplicate() {
   use crate::{AppendEntries, Config, Index, Instant, Message, ReadIndexResponse, Term};
@@ -1305,7 +1305,7 @@ fn read_index_response_validation_rejects_unsolicited_and_duplicate() {
 /// leader stays stable must NOT grow `forwarded_reads` without bound: each new distinct context is
 /// FIFO-bounded at `MAX_FORWARDED_READS`.
 ///
-/// FAILS-ON-OLD: the unbounded `BTreeSet` grew one entry per dropped read.
+/// An unbounded `BTreeSet` here grows one entry per dropped read, without limit.
 #[test]
 fn forwarded_reads_is_bounded() {
   use crate::{AppendEntries, Config, Index, Instant, Message, Term};
@@ -1379,7 +1379,7 @@ fn forwarded_reads_is_bounded() {
 /// validating only the payload would let that spoofed response complete a read the application then
 /// treats as linearizable.
 ///
-/// FAILS-ON-OLD: if `on_read_index_response` checks only `self.leader != Some(response.from())` (ignoring
+/// If `on_read_index_response` checks only `self.leader != Some(response.from())` (ignoring
 /// the envelope `from`), the spoofed message at step (a) completes the read and a ReadState leaks.
 #[test]
 fn read_index_response_requires_matching_envelope_sender() {
@@ -1494,7 +1494,7 @@ fn read_index_response_requires_matching_envelope_sender() {
 /// `MAX_LEADER_READS`: the first `MAX_LEADER_READS` distinct-context reads are accepted, and the
 /// next one is rejected with `TooManyInFlight`. The backlog never exceeds the cap.
 ///
-/// FAILS-ON-OLD: with the `if self.leader_reads_at_capacity() { return Err(..TooManyInFlight) }`
+/// With the `if self.leader_reads_at_capacity() { return Err(..TooManyInFlight) }`
 /// check removed from the `read_index` leader branch, the cap+1 read returns `Ok` and
 /// `pending_reads` grows past `MAX_LEADER_READS`.
 #[test]
@@ -1797,4 +1797,31 @@ fn do_leader_read_entry_guards_on_a_poisoned_node() {
     ep.poll_event().is_none(),
     "no ReadState event on a poisoned node"
   );
+}
+
+/// A saturated forward-token counter refuses a new forwarded read (`None`) rather than reuse a token:
+/// reuse would let a stale `ReadIndexResponse` echoing an earlier forward complete a later read at a
+/// wrong index. Seeded near the ceiling so the boundary is exercised without 2^64 forwards.
+#[test]
+fn forwarded_reads_push_refuses_on_token_exhaustion() {
+  let mut fr = ForwardedReads::new(7);
+  fr.next_token = u64::MAX - 1;
+  // The last token (MAX-1) is still mintable; the set is nowhere near its capacity cap.
+  assert!(fr.push(bytes::Bytes::from_static(b"a")).is_some());
+  // The counter is now u64::MAX; the next push would reuse, so it is refused.
+  assert!(fr.push(bytes::Bytes::from_static(b"b")).is_none());
+}
+
+/// A saturated CheckQuorum lease-round counter fail-stops in `broadcast_heartbeat` rather than reuse a
+/// round: reuse would let a stale earlier-round `HeartbeatResponse` renew an isolated leader's read
+/// lease (a stale-read break).
+///
+/// MUTATION: revert broadcast_heartbeat's `checked_add` to `+= 1` → the round wraps to 0 and the leader
+/// keeps broadcasting with no poison.
+#[test]
+fn broadcast_heartbeat_fail_stops_on_lease_round_exhaustion() {
+  let (mut ep, _log, _stable, d) = make_leader_with_current_term_commit();
+  ep.check_quorum_lease.lease_round = u64::MAX;
+  ep.broadcast_heartbeat(crate::Now::monotonic(d));
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::LeaseRoundExhausted));
 }

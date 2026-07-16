@@ -31,7 +31,7 @@ use sailing_proto::{
 
 use sailing_driver::{
   Command, Handle, Node, Status, jittered,
-  shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
+  shared::{CompletionOutcome, InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
   validate_and_capture_eps,
 };
 
@@ -483,8 +483,12 @@ where
     self.coord.endpoint().unprovable_floor_holds()
   }
 
-  /// Drive consensus until shutdown (or until every `Handle` clone has dropped and the buffered
-  /// commands drained).
+  /// Drive consensus until an exit, then tear down. `run` returns `()` with NO reason on any of
+  /// three conditions: a `shutdown()` command, every `Handle` clone dropping (the command channel
+  /// disconnects and the buffered commands drain), or the endpoint POISONING (an unrecoverable
+  /// storage/apply fault). The untyped exit cannot distinguish a clean shutdown from a poison
+  /// fail-stop; teardown fails parked work with the right verdict (`Poisoned` or `ShuttingDown`)
+  /// either way. A typed `run() -> Result` exit is future work.
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 
@@ -492,6 +496,10 @@ where
     let now = self.clock.now();
     self.reconcile_peer_links(now.mono());
     let mut poisoned = self.pump(now).await;
+    // The previous `handle_storage` verdict, carried into the next deadline fold: a budget-cut
+    // apply drain over already-durable committed entries leaves BOTH store queues empty, so the
+    // stores' live `has_pending` state alone cannot re-drive it.
+    let mut storage_more_pending = false;
 
     while !poisoned {
       let now = self.clock.now();
@@ -570,11 +578,14 @@ where
         (!self.conns.is_empty()).then(|| std::time::Instant::now() + HOUSEKEEPING_INTERVAL);
       // An already-due instant when EITHER store still has a completion queued — derived from the
       // stores' LIVE state here, so it catches storage queued by a command (the loop-top fairness
-      // drain OR the selected command) as well as a budget cutoff, not just the prior
-      // `handle_storage`. So the timer fires immediately and the loop re-drives `handle_storage`
-      // next pass WITHOUT sleeping.
+      // drain OR the selected command) as well as a store-queue budget cutoff, not just the prior
+      // `handle_storage` — OR when that prior call reported `MorePending`: a budget-cut apply
+      // drain over already-durable committed entries leaves both queues empty, so only the carried
+      // verdict can re-drive it. Either way the timer fires immediately and the loop re-drives
+      // `handle_storage` next pass WITHOUT sleeping.
       let storage_redrive =
-        (self.log.has_pending() || self.stable.has_pending()).then(std::time::Instant::now);
+        (self.log.has_pending() || self.stable.has_pending() || storage_more_pending)
+          .then(std::time::Instant::now);
       let deadline = self
         .coord
         .poll_timeout()
@@ -696,9 +707,10 @@ where
         Wake::Storage => {}
         Wake::StorageClosed => self.storage_closed = true,
       }
-      self
+      storage_more_pending = self
         .coord
-        .handle_storage(now, &mut self.log, &mut self.stable);
+        .handle_storage(now, &mut self.log, &mut self.stable)
+        .is_more_pending();
       poisoned = self.pump(now).await;
     }
 
@@ -709,8 +721,19 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
     }
     self.routing.fail_all(&DriverError::ShuttingDown);
-    // Dropping every Conn aborts its tasks; queued frames are discarded (consensus
-    // retransmission re-drives them — see close_conn for why bounded teardown wins).
+    // Nothing survives to fail-stop: the driver is stopping, the sweeps above have failed all parked work
+    // with its typed verdict, and the endpoint dies with the driver — a swept completion's dropped guard
+    // can have torn only the state machine going down with it. Drain the latch the sweeps may have set; a
+    // dropped `Routing` still carrying one is the un-routed-verdict bug its `Drop` asserts against.
+    let _ = self.routing.take_completion_panicked();
+    // Dropping every Conn aborts its tasks WITHOUT joining them — deliberately, and unlike the QUIC
+    // driver's teardown, which JOINS its recv task. The asymmetry is by design: each stream Conn
+    // owns its OWN per-peer TCP fd, so dropping the Conn closes that fd on the spot, and the
+    // immediate-rebind contract needs only the LISTENER's fd freed (dropped below) — no Conn shares
+    // it, so there is nothing to join for. QUIC must join because its single recv task SHARES the
+    // one socket fd with the driver, so that fd frees only after the join. Queued frames are
+    // discarded (consensus retransmission re-drives them — see close_conn for why bounded teardown
+    // wins).
     self.conns.clear();
     // Drain everything already buffered, then DROP the receiver: a racing `try_send` then sees a
     // disconnected channel and the handle's own rollback runs — no command survives teardown.
@@ -764,7 +787,7 @@ where
     // Best-effort latency tuning: consensus pipelines small writes, so disable Nagle. A socket that
     // rejects it still carries traffic.
     let _ = socket.set_nodelay(true);
-    let id = self.coord.on_conn_open(record, now);
+    let id = self.coord.on_accept_open(record, now);
     let (out_tx, out_rx) = flume::unbounded();
     let queued = Arc::new(AtomicUsize::new(0));
     let (read_half, write_half) = socket.into_split();
@@ -884,7 +907,7 @@ where
       Ok(r) => r,
       Err(_) => return,
     };
-    let id = self.coord.on_conn_open(record, now);
+    let id = self.coord.on_dial_open(peer.cheap_clone(), record, now);
     let (out_tx, out_rx) = flume::unbounded();
     let queued = Arc::new(AtomicUsize::new(0));
     let dial_ready = self.dial_ready_tx.clone();
@@ -1050,7 +1073,17 @@ where
               },
             );
           }
-          Err(e) => complete(Err(map_read_err(e))),
+          // An immediate read-index refusal. The `Err` arm does not CALL the user closure — it DROPS
+          // it unused inside the completion's `catch_unwind` (`res.map(f)` on an `Err` consumes `f`
+          // without invoking it) — so a guard the closure captured runs its `Drop` there, and that
+          // `Drop` can mutate state aliased into the replicated FSM and panic. A caught panic
+          // therefore fail-stops the endpoint, exactly as a served read's panic does; the pump's
+          // poison check then fails the parked work `Poisoned` and stops the driver.
+          Err(e) => {
+            if complete(Err(map_read_err(e))) == CompletionOutcome::Panicked {
+              self.coord.fail_stop_query_panicked();
+            }
+          }
         }
       }
       Command::FailoverWindow {
@@ -1102,6 +1135,9 @@ where
           is_poisoned: ep.is_poisoned(),
           precise_releases: ep.precise_releases(),
           unprovable_floor_holds: ep.unprovable_floor_holds(),
+          unprovable_floor_campaigns: ep.unprovable_floor_campaigns(),
+          frozen: ep.is_frozen(),
+          shape_gen: ep.shape_gen(),
         };
         let _ = reply.send(status);
         drop(reservation);
@@ -1115,8 +1151,9 @@ where
   /// `now` each pass: `None` (commit-wait lifted, off-tier, inherited lease expired, poisoned) falls
   /// every query back to a normal read (`Ok(None)`); a live window whose committed prefix has applied
   /// serves the whole batch against the FSM with the limbo region; otherwise the queries stay parked for
-  /// next pass. Returns `true` on a FATAL limbo storage fault (the caller fails the parked work
-  /// `Poisoned` and stops the driver — a corrupt committed-range log is unrecoverable).
+  /// next pass. Returns `true` when the pass POISONED the endpoint — a FATAL limbo storage fault (a
+  /// corrupt committed-range log is unrecoverable) OR a caught user-closure panic in the served batch —
+  /// and the caller fails the parked work `Poisoned` and stops the driver.
   fn run_failover_serve(&mut self) -> bool {
     if self.routing.failovers.is_empty() {
       return false;
@@ -1125,11 +1162,7 @@ where
     // and the proto lease gate is strict at the boundary.
     let now = self.clock.now();
     match self.coord.endpoint().failover_read_window(now) {
-      None => {
-        for p in std::mem::take(&mut self.routing.failovers) {
-          (p.complete)(Ok(None));
-        }
-      }
+      None => self.routing.decline_failovers(),
       Some(window) if self.routing.applied >= window.index() => {
         match sailing_driver::shared::read_limbo(
           &self.log,
@@ -1141,21 +1174,24 @@ where
             let fsm = self.coord.state_machine();
             // Re-check the lease with a FRESH wall before EACH completion — the scan and each closure
             // burn wall time, so the window can expire mid-batch.
-            sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
-              self
-                .coord
-                .endpoint()
-                .failover_read_window(self.clock.now())
-                .is_some()
-            });
+            let panicked =
+              sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
+                self
+                  .coord
+                  .endpoint()
+                  .failover_read_window(self.clock.now())
+                  .is_some()
+              });
+            if panicked {
+              // A served inherited-read's user closure panicked: fail-stop the endpoint (interior
+              // mutability could have torn its FSM) and stop the driver, exactly like a fatal fault.
+              self.coord.fail_stop_query_panicked();
+              return true;
+            }
           }
           // A SAFE fallback (truncated / over-budget / incomplete / index-ceiling limbo): fall the
           // batch back to a normal read.
-          Ok(None) => {
-            for p in std::mem::take(&mut self.routing.failovers) {
-              (p.complete)(Ok(None));
-            }
-          }
+          Ok(None) => self.routing.decline_failovers(),
           // A FATAL limbo storage fault (corrupt/unreadable committed-range log): leave the reads
           // parked for the pump to fail `Poisoned` and stop the driver.
           Err(_) => return true,
@@ -1225,10 +1261,28 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
       return true;
     }
-    if run_queries {
-      for q in self.routing.take_runnable_queries() {
-        (q.complete)(Ok(self.coord.state_machine()));
-      }
+    // Read the completion-panic latch ONCE, BEFORE the serve. A `fail_all` sweep (the routed
+    // `LeaderChanged` or the leadership backstop) or a failover decline earlier THIS crank drops an
+    // unused user closure whose captured guard's `Drop` can tear the FSM and latch here; serving the
+    // parked queries against that torn FSM is the ordering window this read closes. When the latch is
+    // already set, SKIP the serve — `fail_stop_query_panicked` poisons the endpoint and the poison
+    // sweep below fails those queries `Poisoned`, never run against the torn state. A query that panics
+    // DURING the serve still reports through `query_panicked`; one read-and-clear both gates and decides.
+    let completion_panicked = self.routing.take_completion_panicked();
+    // A POISONED endpoint never serves a parked read, and this gate is what makes a fail-stop raised
+    // EARLIER in the crank actually stop the serve: an immediate read-index refusal whose dropped
+    // closure panicked fail-stops back in `handle_command`, ahead of this pump, with the confirmed
+    // queries still parked and nothing latched in `routing`. `is_poisoned` is the one surface every
+    // fail-stop funnels through, so gating on it covers every present and future poison source.
+    let query_panicked = !completion_panicked
+      && !self.coord.endpoint().is_poisoned()
+      && run_queries
+      && sailing_driver::shared::serve_query_batch(
+        self.routing.take_runnable_queries(),
+        self.coord.state_machine(),
+      );
+    if query_panicked || completion_panicked {
+      self.coord.fail_stop_query_panicked();
     }
     // The fail-stop check: a poisoned endpoint suppresses poll_event and poll_timeout by design, so
     // anything parked would otherwise wait forever holding its reservation. Fail it all with the typed
