@@ -4097,9 +4097,16 @@ fn snapshot_redundancy_term_read_failure_poisons_at_completion() {
   // A deferred compaction is pending when the install completes. The install poison must FAIL-STOP the
   // storage handler BEFORE its compaction fallback runs — a poisoned node must do no destructive
   // `log.compact`. (op 99 != the install's op, so the in-loop compaction at the completion does not match;
-  // only the post-loop fallback could fire, and with the durable snapshot covering up_to it WOULD — so the
-  // surviving entry proves the bail skipped it.)
-  ep.snapshot.pending_compact = Some((OpId::new(99), Index::new(2)));
+  // only the post-loop fallback could fire, and with the durable slot holding exactly this identity it
+  // WOULD — so the surviving entry proves the bail skipped it.)
+  ep.snapshot.pending_compact = Some((
+    OpId::new(99),
+    crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      crate::conf::ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    ),
+  ));
   let progress = ep.handle_storage(d, &mut log, &mut stable);
   assert_eq!(
     ep.poison_reason(),
@@ -4113,7 +4120,7 @@ fn snapshot_redundancy_term_read_failure_poisons_at_completion() {
   );
   assert_eq!(
     ep.pending_compact(),
-    Some((OpId::new(99), Index::new(2))),
+    Some((OpId::new(99), Index::new(5))),
     "the fail-stop skips the compaction fallback — no destructive log.compact after a poison"
   );
 }
@@ -6064,5 +6071,50 @@ fn a_mid_adoption_append_race_does_not_reclaim_the_staged_transfer() {
   assert!(
     ep.snapshot.snapshot_recv.is_some(),
     "the cross-lineage partial survives foreign coverage — the conflict stays visible, never silently freed"
+  );
+}
+
+/// The missed-completion compaction fallback fires only on the durable slot holding EXACTLY the
+/// pending capture — identity, lineage included — never on bare boundary coverage. A foreign blob at a
+/// covering boundary is another lineage's durability: compacting this node's own log on it would
+/// discard a prefix that exists nowhere in this lineage.
+///
+/// MUTATION: key the fallback on `durable.last_index() >= boundary` coverage → the foreign blob's
+/// durability compacts the own log (the intact-prefix assertion FAILS).
+#[test]
+fn the_compaction_fallback_ignores_a_foreign_blobs_durability() {
+  use crate::{Index, Instant, OpId, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+
+  // A foreign lineage's blob occupies the durable slot at a COVERING boundary (10 >= 2).
+  stable.force_snapshot(
+    SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+    .with_fork_id(fork_token(9)),
+    encode_count_snapshot(777),
+  );
+  // A pending own capture at boundary 2 whose completion was missed.
+  ep.snapshot.pending_compact = Some((
+    OpId::new(99),
+    crate::SnapshotMeta::new(
+      Index::new(2),
+      Term::new(2),
+      crate::conf::ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    ),
+  ));
+
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(
+    log.first_index(),
+    Index::new(1),
+    "the own log's prefix survives — a foreign blob's durability is not this capture's"
+  );
+  assert!(
+    ep.pending_compact().is_some(),
+    "the pending capture stays pending (its own completion never arrived)"
   );
 }

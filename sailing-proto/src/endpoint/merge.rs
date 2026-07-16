@@ -827,8 +827,11 @@ where
       meta = meta.with_fork_id(fork_id.clone());
     }
     let opid = self.mint_op_id();
+    // As in the ordinary capture: the meta rides `pending_compact` so the missed-completion
+    // fallback compacts only on THIS capture's own durability (identity, lineage included).
+    let pc_meta = meta.clone();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
-    self.snapshot.pending_compact = Some((opid, self.applied));
+    self.snapshot.pending_compact = Some((opid, pc_meta));
     true
   }
 

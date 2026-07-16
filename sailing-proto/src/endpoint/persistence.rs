@@ -521,10 +521,10 @@ where
           // Deferred compaction: fire only after the snapshot is durable.
           // This mirrors append-before-ack: the log is never compacted before the
           // snapshot backing it is safely on stable storage.
-          if let Some((pid, up_to)) = self.snapshot.pending_compact
-            && pid == opid
+          if let Some((pid, m)) = &self.snapshot.pending_compact
+            && *pid == opid
           {
-            log.compact(up_to);
+            log.compact(m.last_index());
             self.snapshot.pending_compact = None;
           }
           // a DEFERRED follower install whose blob just became durable — run the destructive
@@ -563,14 +563,18 @@ where
     //
     // This is a NO-OP on the happy path: the poll-drain loop above clears `pending_compact` when the
     // completion arrives, so the `if let` does not match. It can only fire when a completion was
-    // genuinely missed AND the durable snapshot already covers `up_to` — so it can never compact
-    // ahead of a durable snapshot (safety preserved). It runs before `maybe_snapshot` so a node that
-    // was wedged can snapshot again in this same call. (Keyed on `durable_snapshot()` — the
-    // fsync'd slot — NOT `snapshot()`, the submit-visible slot, for uniformity with the install fallback.)
-    if let Some((_pid, up_to)) = self.snapshot.pending_compact
-      && matches!(stable.durable_snapshot(), Some(m) if m.last_index() >= up_to)
+    // genuinely missed AND the durable slot holds EXACTLY this capture — identity, not boundary
+    // coverage: captures are single-flight (`maybe_snapshot` gates on `pending_compact`), so the only
+    // own-capture the slot can durably hold is this one, and identity is what a foreign blob at a
+    // covering boundary can never satisfy (compacting this node's own log on another lineage's
+    // durability would discard a prefix that exists nowhere in this lineage). It runs before
+    // `maybe_snapshot` so a node that was wedged can snapshot again in this same call. (Keyed on
+    // `durable_snapshot()` — the fsync'd slot — NOT `snapshot()`, the submit-visible slot, for
+    // uniformity with the install fallback.)
+    if let Some((_pid, m)) = &self.snapshot.pending_compact
+      && matches!(stable.durable_snapshot(), Some(d) if d.identity_eq(m))
     {
-      log.compact(up_to);
+      log.compact(m.last_index());
       self.snapshot.pending_compact = None;
     }
     // same missed/coalesced-completion fallback for a DEFERRED install — if the DURABLE snapshot

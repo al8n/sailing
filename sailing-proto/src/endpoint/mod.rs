@@ -1098,7 +1098,7 @@ where
   /// performed, and this field is cleared — so a missed completion can no longer wedge future
   /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
   /// this field to `None`.
-  pending_compact: Option<(OpId, Index)>,
+  pending_compact: Option<(OpId, crate::SnapshotMeta<I>)>,
   /// Per-peer deadline before which the full `InstallSnapshot` blob is NOT re-sent to a
   /// `Snapshot`-state peer. A deferred install legitimately takes many heartbeat intervals (blob
   /// fsync + apply), so resending on EVERY response would re-transmit a large snapshot tens of

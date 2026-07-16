@@ -46,7 +46,11 @@ where
   /// Expose `pending_compact` for testing.
   #[cfg(test)]
   pub(crate) fn pending_compact(&self) -> Option<(OpId, Index)> {
-    self.snapshot.pending_compact
+    self
+      .snapshot
+      .pending_compact
+      .as_ref()
+      .map(|(pid, m)| (*pid, m.last_index()))
   }
 
   /// Re-send the persisted snapshot to a peer that is stuck in `Snapshot` state.
@@ -341,9 +345,13 @@ where
       meta = meta.with_fork_id(fork_id.clone());
     }
     let opid = self.mint_op_id();
+    // The capture's meta rides `pending_compact`: the missed-completion fallback fires only on the
+    // durable slot holding THIS capture (identity, lineage included) — bare boundary coverage would
+    // let a foreign blob's durability compact this node's own log.
+    let pc_meta = meta.clone();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
-    self.snapshot.pending_compact = Some((opid, self.applied));
+    self.snapshot.pending_compact = Some((opid, pc_meta));
   }
 
   /// Reclaim an ABANDONED chunked receive: if the recoverable prefix (`min(commit, ack_watermark())`) has
