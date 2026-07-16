@@ -364,12 +364,19 @@ pub enum LifecycleEvent<G, I> {
   /// the coordinator's one-shot signal only after the tail accepts this event, so a full tail
   /// defers the cue to a later drain (a park that resolves before delivery drops it with the
   /// episode — the cue would be stale).
-  /// The embedder resolves it: remove the hosted child (the fork then materializes and
-  /// [`SplitApplied`](Self::SplitApplied) fires — removal tombstones the id, so pair it with
-  /// [`MultiHandle::clear_tombstone`] before the next drain, or the abandoned fork surfaces as
-  /// [`SplitRefused`](Self::SplitRefused) and the child rejoins by the ordinary lifecycle
-  /// paths), or let the hosted replica catch up from a sibling — once it carries the fork's
-  /// own lineage at-or-past the manufactured baseline, the parked fork resolves as redundant.
+  /// The embedder resolves it BY THE OCCUPANT'S STATE. A hosted replica with NO committed
+  /// content of its own (a fresh, empty joiner) catches up from a sibling: the transfer adopts
+  /// the fork's lineage, and once it carries it at-or-past the manufactured baseline the parked
+  /// fork resolves as redundant. A POPULATED occupant — an older incarnation's replica, or an
+  /// unrelated group at the id — can only be resolved by PLACEMENT: remove the hosted child
+  /// (the fork then materializes and [`SplitApplied`](Self::SplitApplied) fires — removal
+  /// tombstones the id, so pair it with [`MultiHandle::clear_tombstone`] before the next drain,
+  /// or the abandoned fork surfaces as [`SplitRefused`](Self::SplitRefused) and the child
+  /// rejoins by the ordinary lifecycle paths). A sibling's transfer can NEVER convert it: the
+  /// receive path refuses a cross-lineage snapshot into a replica holding another lineage's
+  /// committed content (silently on the wire — watch the endpoint's refusal counter), because
+  /// destructively replacing a populated replica over the wire is exactly the loss the lineage
+  /// gates exist to prevent.
   SplitConflict {
     /// The parent group whose committed split is parked.
     parent: G,

@@ -181,6 +181,11 @@ where
 /// forced onto the snapshot path — an uncompacted fork would LOG-WALK the joiner, replaying only
 /// post-fork entries onto its EMPTY state machine (silent, permanent divergence from the
 /// preloaded replicas).
+///
+/// The empty receiver is not merely the intended shape — it is ENFORCED: the receive path admits a
+/// token-bearing snapshot only onto a replica with no committed content (the fork-provenance gate),
+/// because this coordinate is the most collision-prone in any log (essentially every group's first
+/// entry lands at index 1, term 1) and coordinate proofs certify content only within one lineage.
 pub const FORK_BASE_INDEX: Index = Index::new(1);
 
 /// The term of the fork baseline entry. Term 1, not 0: a well-formed store never holds an entry

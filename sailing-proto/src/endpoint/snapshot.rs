@@ -893,11 +893,13 @@ where
     // `Pending::Campaign` self-vote (so `self_vote_durable()` would wrongly report the self-vote durable,
     // reopening a same-term double vote). A winner already holds every committed entry through the
     // boundary (the up-to-date check + Leader Completeness), so the snapshot is redundant with entries it
-    // has — drop it. The blob stays durable in the store: a genuinely-behind candidate that reverts to
-    // follower re-fetches from the leader (its ack never advanced), and a restart would
-    // `reconcile_restart_log::Restore` to the boundary. Skipping the `durable_snapshot_index` raise below
-    // is deliberate here: for a leader it would claim local durability at a boundary the real log has not
-    // yet reached.
+    // has — drop it. The blob stays durable in the store, and both exits stay coherent: a
+    // genuinely-behind candidate that reverts to follower re-fetches from the leader (its ack never
+    // advanced; a same-identity retransfer passes the provenance gate against the leftover slot), and
+    // a restart reconciles lineage-first — a same-lineage blob resolves by the ordinary log-vs-boundary
+    // arms, a cross-lineage one is an unadopted leftover restart IGNORES (never restored under a log
+    // that outvoted it). Skipping the `durable_snapshot_index` raise below is deliberate here: for a
+    // leader it would claim local durability at a boundary the real log has not yet reached.
     if !self.role.is_follower() {
       return;
     }
