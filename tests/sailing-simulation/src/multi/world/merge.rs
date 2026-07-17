@@ -665,6 +665,13 @@ impl MultiWorld {
     self.tracked_merge_wedge_set().contains(&gid)
   }
 
+  /// Per-group membership in the fork-fence coupling set (#110) — the calm-window twin of
+  /// [`tracked_underhosted_merge_wedge`](Self::tracked_underhosted_merge_wedge). See
+  /// [`fork_fence_wedge_set`](Self::fork_fence_wedge_set).
+  pub(crate) fn fork_fence_coupled_wedge(&self, gid: u64) -> bool {
+    self.fork_fence_wedge_set().contains(&gid)
+  }
+
   /// The full set of groups (live AND retired) wedged in the tracked under-hosted parked-absorb
   /// class (#106): every merge participant transitively blocked by an under-hosted merge conf. The
   /// storm-profile quiesce and calm windows certify these past instead of panicking — deliberately
@@ -686,13 +693,22 @@ impl MultiWorld {
     let participant =
       |g: u64| self.group_frozen(g) || self.group_freeze_seen(g) || self.group_merge_parked(g);
     // Base: merge participants with no live host quorum (the under-hosted husk roots).
-    let mut blocked: BTreeSet<u64> = self
+    let base: BTreeSet<u64> = self
       .groups
       .keys()
       .copied()
       .filter(|&g| participant(g) && !self.has_live_host_quorum(g))
       .collect();
-    // Fixpoint: propagate the block through the merge dependency edges.
+    self.propagate_merge_block(base)
+  }
+
+  /// Propagate a BASE set of blocked merge participants to a fixpoint over the merge dependency
+  /// edges: a PARKED target whose captured source is blocked, or a FROZEN source whose claimed
+  /// target is blocked, joins the set. Shared by both exemption classes — #106 (under-hosted) and
+  /// #110 (fork-fence) differ only in their base root; the cascade closure is identical.
+  fn propagate_merge_block(&self, mut blocked: BTreeSet<u64>) -> BTreeSet<u64> {
+    let participant =
+      |g: u64| self.group_frozen(g) || self.group_freeze_seen(g) || self.group_merge_parked(g);
     loop {
       let mut added = false;
       for g in self.groups.keys().copied() {
@@ -715,6 +731,71 @@ impl MultiWorld {
       }
     }
     blocked
+  }
+
+  /// Whether a standing fork-fence conflict is recorded on `(node, parent)` at OR BELOW `commit` —
+  /// the pure record-lookup + index-comparison leg of the fork-fence coupling (#110). At-or-below is
+  /// the narrowness: a fence ABOVE the park's commit sits past the absorb capture and does not
+  /// deadlock it.
+  pub(crate) fn has_fork_fence_below(
+    &self,
+    node: u64,
+    parent: u64,
+    commit: sailing_proto::Index,
+  ) -> bool {
+    self
+      .fork_conflicts
+      .get(&(node, parent))
+      .is_some_and(|idxs| idxs.iter().any(|&s| s <= commit))
+  }
+
+  /// Whether `gid` is a merge TARGET whose park is deadlocked behind a standing fork fence (#110):
+  /// on some node hosting a PARKED replica of `gid`, a recorded fork-conflict fence for
+  /// `(node, parent == gid)` sits at-or-below that replica's commit index. A parked fork holds the
+  /// parent's capture fence there, and a merge park on that same parent (target == parent) whose
+  /// absorb capture sits above it cannot proceed — the composition deadlock of two individually
+  /// sound designs, safety intact. The park being LIVE is a co-condition read from world state, so
+  /// an accumulated record never certifies a group whose merge is no longer parked.
+  pub(crate) fn fork_fence_coupled_park(&self, gid: u64) -> bool {
+    self.node_ids.iter().any(|&n| {
+      self.hosts[&n]
+        .group(&gid)
+        .is_some_and(|ep| ep.pending_merge().is_some())
+        && self.has_fork_fence_below(n, gid, self.commit_index_of(n, gid))
+    })
+  }
+
+  /// The full set of groups wedged in the fork-fence coupling (#110): every merge participant
+  /// transitively blocked by a fork-fence-coupled park. Base = the parked targets
+  /// [`fork_fence_coupled_park`](Self::fork_fence_coupled_park) identifies; the SAME cascade closure
+  /// as [`tracked_merge_wedge_set`](Self::tracked_merge_wedge_set) then folds in the frozen source
+  /// held behind a coupled target's stalled park. EMPTY when no coupling stands — every merge is
+  /// then obliged to converge.
+  pub(crate) fn fork_fence_wedge_set(&self) -> BTreeSet<u64> {
+    let base: BTreeSet<u64> = self
+      .groups
+      .keys()
+      .copied()
+      .filter(|&g| self.fork_fence_coupled_park(g))
+      .collect();
+    self.propagate_merge_block(base)
+  }
+
+  /// Test-only: inject a standing fork-fence record for `(node, parent)` at `split_index`, so the
+  /// narrowness red-proofs drive [`has_fork_fence_below`](Self::has_fork_fence_below) without
+  /// reconstructing a live squatter.
+  #[cfg(test)]
+  pub(crate) fn inject_fork_conflict(
+    &mut self,
+    node: u64,
+    parent: u64,
+    split_index: sailing_proto::Index,
+  ) {
+    self
+      .fork_conflicts
+      .entry((node, parent))
+      .or_default()
+      .insert(split_index);
   }
 }
 

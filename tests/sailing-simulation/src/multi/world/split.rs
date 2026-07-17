@@ -119,9 +119,12 @@ impl MultiWorld {
     let stable = self.stables.get(&(leader, parent)).expect("leader stable");
     let instruction = bytes::Bytes::copy_from_slice(&point.to_le_bytes());
     let result = host.propose_split(&parent, self.now, log, stable, &child, 0, instruction)?;
-    if result.is_ok() {
+    if let Ok(idx) = &result {
       let meta = self.groups.get_mut(&parent).expect("registered group");
       let child_keys = meta.keys.split_off(&point);
+      // Record the fence coordinate (the split entry's parent-log index) so a later parked-fork
+      // conflict on this child can be attributed to the index its standing capture fence sits at.
+      self.split_fence_index.insert(child, *idx);
       self.pending_splits.insert(
         child,
         PendingSplit {
@@ -171,14 +174,24 @@ impl MultiWorld {
         self.wire_fork_replica(node, fork);
       }
       // Conflict signals are drained and counted, never acted on: see the field docs for why
-      // the world's embedder model leaves a squatter in place.
-      while let Some(_pc) = self
+      // the world's embedder model leaves a squatter in place. Beyond the count, the standing fence
+      // is recorded per `(node, parent)` at the child's split index — a parked fork holds the
+      // parent's capture fence there, which a later merge park on the same parent can deadlock
+      // behind (issue #110, the fork-fence coupling the quiesce certifies past).
+      while let Some((parent, child)) = self
         .hosts
         .get_mut(&node)
         .expect("host exists")
         .poll_split_conflict()
       {
         self.split_conflicts += 1;
+        if let Some(&idx) = self.split_fence_index.get(&child) {
+          self
+            .fork_conflicts
+            .entry((node, parent))
+            .or_default()
+            .insert(idx);
+        }
       }
     }
     progressed

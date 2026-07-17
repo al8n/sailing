@@ -183,6 +183,18 @@ pub struct MultiWorld {
   /// by a forced teardown. Fresh child ids make the signal unreachable today; the counter keeps
   /// it visible if that ever changes.
   split_conflicts: u64,
+  /// Every proposed split's FENCE coordinate: `child -> split entry index` (the parent-log index the
+  /// split landed at, identical on every parent replica). Recorded at propose so a later drained
+  /// `(parent, child)` conflict can be attributed to the index its standing capture fence sits at.
+  /// Persistent (a split's fence index never changes); bounded by the run's split count.
+  split_fence_index: BTreeMap<u64, sailing_proto::Index>,
+  /// Standing fork-conflict fences observed per `(node, parent)`: the split indices of parked-fork
+  /// squatters the fork pump drained on that node (see [`MultiWorld::pump_forks`]). A parked fork
+  /// holds the parent's capture fence at its split index; a merge park on that same parent whose
+  /// commit sits at-or-above the fence is deadlocked behind it (issue #110, the fork-fence
+  /// coupling). Accumulated on drain — the co-condition that the merge is STILL parked is what keeps
+  /// a certification current (a resolved fence lets the park resolve, clearing the exemption).
+  fork_conflicts: BTreeMap<(u64, u64), BTreeSet<sailing_proto::Index>>,
   /// Late forks the fork pump REFUSED at materialization — the coordinator-admission model
   /// (the child id retired, or recreated past the fork's generation): no materialization, the
   /// parent's fence lifted, mirroring the product's `SplitRefused` resolution.
@@ -320,6 +332,8 @@ impl MultiWorld {
       splits_applied: 0,
       split_stale: 0,
       split_conflicts: 0,
+      split_fence_index: BTreeMap::new(),
+      fork_conflicts: BTreeMap::new(),
       split_refused: 0,
       merges: Vec::new(),
       merge_floors: BTreeSet::new(),

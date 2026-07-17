@@ -63,7 +63,10 @@ fn main() {
   let groups_removed = Arc::new(AtomicU64::new(0));
   let groups_recreated = Arc::new(AtomicU64::new(0));
   let committed = Arc::new(AtomicU64::new(0));
-  let exempted = Arc::new(AtomicU64::new(0));
+  // The two FILED merge-liveness classes, counted and seed-listed APART so neither hides the other.
+  let exempted = Arc::new(AtomicU64::new(0)); // #106 under-hosted
+  let forkfence = Arc::new(AtomicU64::new(0)); // #110 fork-fence coupling
+  let forkfence_seeds: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
 
   std::thread::scope(|scope| {
     for _ in 0..threads {
@@ -79,6 +82,8 @@ fn main() {
       let groups_recreated = Arc::clone(&groups_recreated);
       let committed = Arc::clone(&committed);
       let exempted = Arc::clone(&exempted);
+      let forkfence = Arc::clone(&forkfence);
+      let forkfence_seeds = Arc::clone(&forkfence_seeds);
       scope.spawn(move || {
         loop {
           let seed = next.fetch_add(1, Ordering::Relaxed);
@@ -102,9 +107,18 @@ fn main() {
                 exempted.fetch_add(rep.tracked_merge_wedges_exempted, Ordering::Relaxed);
                 exempt_seeds.lock().unwrap().push(seed);
                 eprintln!(
-                  "  TRACKED-EXEMPT seed {seed}: tracked_merge_wedges_exempted={} (filed #106) \
+                  "  UNDERHOSTED-EXEMPT seed {seed}: tracked_merge_wedges_exempted={} (filed #106) \
                    registered={} committed={}",
                   rep.tracked_merge_wedges_exempted, rep.merges_registered, rep.committed
+                );
+              }
+              if rep.fork_fence_couplings_exempted > 0 {
+                forkfence.fetch_add(rep.fork_fence_couplings_exempted, Ordering::Relaxed);
+                forkfence_seeds.lock().unwrap().push(seed);
+                eprintln!(
+                  "  FORK-FENCE-EXEMPT seed {seed}: fork_fence_couplings_exempted={} (filed #110) \
+                   registered={} committed={}",
+                  rep.fork_fence_couplings_exempted, rep.merges_registered, rep.committed
                 );
               }
             }
@@ -128,11 +142,14 @@ fn main() {
   f.sort();
   let mut ex = exempt_seeds.lock().unwrap();
   ex.sort();
+  let mut ff = forkfence_seeds.lock().unwrap();
+  ff.sort();
   eprintln!(
-    "reshape sweep [{name}] [{start}..{end}) ticks={ticks}: {} runs, {} FAILURES, {} tracked-exempt seeds",
+    "reshape sweep [{name}] [{start}..{end}) ticks={ticks}: {} runs, {} FAILURES, {} underhosted-exempt (#106), {} fork-fence-exempt (#110)",
     done.load(Ordering::Relaxed),
     f.len(),
     ex.len(),
+    ff.len(),
   );
   eprintln!(
     "  reshape witnesses: splits_applied={} merges_registered={} merges_prepared={} aborts={} \
@@ -146,9 +163,14 @@ fn main() {
     committed.load(Ordering::Relaxed),
   );
   eprintln!(
-    "  tracked #106: exemptions={} in seeds {:?}",
+    "  underhosted #106: exemptions={} in seeds {:?}",
     exempted.load(Ordering::Relaxed),
     ex.as_slice(),
+  );
+  eprintln!(
+    "  fork-fence #110: exemptions={} in seeds {:?}",
+    forkfence.load(Ordering::Relaxed),
+    ff.as_slice(),
   );
   for (seed, msg) in f.iter() {
     eprintln!("  FAIL seed {seed}: {msg}");

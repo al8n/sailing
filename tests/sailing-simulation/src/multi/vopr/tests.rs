@@ -381,3 +381,56 @@ fn has_live_host_quorum_tracks_the_hosting_shortfall() {
     "one of three is below a host quorum",
   );
 }
+
+/// The fork-fence coupling's INDEX narrowness (#110), red-proofed on an injected standing fence: a
+/// fence at-or-below the park's commit couples; a fence ABOVE it does not (it sits past the absorb
+/// capture); no recorded fence does not; and the record is exact per `(node, parent)`. The live-park
+/// co-condition is the sibling test below; the positive end-to-end is the lifecycle deep band.
+#[test]
+fn fork_fence_below_is_narrow_to_at_or_below_the_commit() {
+  let mut w = MultiWorld::new(17);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: std::collections::BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &voters);
+
+  // No recorded fence → never coupled, at any commit.
+  assert!(!w.has_fork_fence_below(0, 100, sailing_proto::Index::new(50)));
+
+  // A standing fence at index 5 on (node 0, parent 100):
+  w.inject_fork_conflict(0, 100, sailing_proto::Index::new(5));
+  // Park commit AT (5) or ABOVE (11) the fence → coupled.
+  assert!(w.has_fork_fence_below(0, 100, sailing_proto::Index::new(5)));
+  assert!(w.has_fork_fence_below(0, 100, sailing_proto::Index::new(11)));
+  // Park commit BELOW the fence (the fence sits ABOVE the park) → NOT coupled.
+  assert!(!w.has_fork_fence_below(0, 100, sailing_proto::Index::new(4)));
+  // A different node, or a different parent, is a different fence → NOT coupled.
+  assert!(!w.has_fork_fence_below(1, 100, sailing_proto::Index::new(11)));
+  assert!(!w.has_fork_fence_below(0, 101, sailing_proto::Index::new(11)));
+}
+
+/// The fork-fence coupling's PARK co-condition (#110): with no live merge park, an injected fence
+/// at-or-below any commit never couples and the wedge set stays empty — the exemption is gated on
+/// the merge being CURRENTLY parked, so an accumulated fence record can never certify a group whose
+/// merge already resolved (a resolved fence lets the park resolve, clearing the exemption).
+#[test]
+fn fork_fence_coupling_requires_a_live_park() {
+  let mut w = MultiWorld::new(19);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: std::collections::BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &voters);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  w.inject_fork_conflict(0, 100, sailing_proto::Index::new(1)); // a fence below any commit
+  // No replica of 100 is parked on a merge → not coupled, and the #110 set is empty.
+  assert!(
+    !w.fork_fence_coupled_park(100),
+    "a fence with no live park must not couple",
+  );
+  assert!(
+    w.fork_fence_wedge_set().is_empty(),
+    "no live park ⇒ empty fork-fence wedge set",
+  );
+}

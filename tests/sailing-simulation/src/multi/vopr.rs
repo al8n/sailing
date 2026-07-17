@@ -564,6 +564,12 @@ pub struct MultiVoprReport {
   /// storm-profile seed that reached run end still carrying the tracked shape: the count is the
   /// seed's witness that it hit the FILED class rather than a novel wedge (which panics regardless).
   pub tracked_merge_wedges_exempted: u64,
+  /// Groups the run-end quiesce EXEMPTED as the FORK-FENCE COUPLING class (#110), counted APART from
+  /// the under-hosted class above so neither hides the other: a merge park held behind a parked
+  /// fork's standing capture fence on the same parent (a composition deadlock of two individually
+  /// sound designs — safety intact, see [`MultiWorld::fork_fence_wedge_set`]). Attributed as the
+  /// groups the coupling adds beyond the under-hosted set. ALWAYS `0` under an unphased profile.
+  pub fork_fence_couplings_exempted: u64,
   /// Live groups at run end.
   pub final_groups: usize,
   /// Client commands accepted by some leader (tracked per group for the quiesce check).
@@ -893,12 +899,14 @@ fn calm_window(
       continue;
     }
     if !elected {
-      // The tracked under-hosted parked-absorb class (#106): a merge participant whose absorbing
-      // conf lacks a live host quorum cannot elect. Under a storm profile it is a FILED liveness
-      // gap, not a fresh livelock — skip it (leaving the demand fully armed for every other group,
-      // so a genuine non-merge livelock still trips here). Unphased profiles pass `false` and take
-      // the bare assert, byte-identically.
-      if exempt_tracked && w.tracked_underhosted_merge_wedge(gid) {
+      // A FILED merge-liveness class — the under-hosted parked-absorb (#106) or the fork-fence
+      // coupling (#110) — can leave a merge participant unable to elect. Under a storm profile these
+      // are certified past, not fresh livelocks; skip them (the demand stays fully armed for every
+      // other group, so a genuine non-merge livelock still trips here). Unphased profiles pass
+      // `false` and take the bare assert, byte-identically.
+      if exempt_tracked
+        && (w.tracked_underhosted_merge_wedge(gid) || w.fork_fence_coupled_wedge(gid))
+      {
         continue;
       }
       panic!(
@@ -924,13 +932,14 @@ fn calm_window(
       // fresh progress from it (the refusal is the covered behavior; the merge's own liveness
       // is the resolution/rollback path, not client load). A merely PENDING freeze settles
       // into frozen (or thaws by truncation) within the healed window's ticking below; a group
-      // absorbed mid-loop leaves the live set entirely. A storm profile additionally breaks on the
-      // tracked under-hosted parked-absorb class (#106): a parked target holds its apply at the
-      // merge boundary and cannot advance until the absorb resolves, so demanding fresh committed
-      // load from it would misread the filed liveness gap as a livelock.
+      // absorbed mid-loop leaves the live set entirely. A storm profile additionally breaks on a
+      // FILED merge-liveness class (#106 under-hosted or #110 fork-fence): a parked target holds its
+      // apply at the merge boundary and cannot advance until the absorb resolves, so demanding fresh
+      // committed load from it would misread the filed liveness gap as a livelock.
       if w.group_frozen(gid)
         || !w.live_groups().contains(&gid)
-        || (exempt_tracked && w.tracked_underhosted_merge_wedge(gid))
+        || (exempt_tracked
+          && (w.tracked_underhosted_merge_wedge(gid) || w.fork_fence_coupled_wedge(gid)))
       {
         break;
       }
@@ -1089,12 +1098,14 @@ fn quiesce(
     w.tick();
     report.ticks_run += 1;
     live = w.live_groups();
-    // A storm profile certifies convergence with the tracked under-hosted parked-absorb class
-    // (#106) exempted — the whole merge component transitively blocked by an under-hosted conf is a
-    // FILED liveness gap, not a fresh wedge. Unphased profiles pass `exempt_tracked = false`, so the
-    // set is empty (never computed) and this is the bare `all(converged_group)` — byte-identical.
+    // A storm profile certifies convergence with the two FILED merge-liveness classes exempted —
+    // the under-hosted parked-absorb (#106) and the fork-fence coupling (#110), each the whole merge
+    // component transitively blocked by its root. Unphased profiles pass `exempt_tracked = false`, so
+    // both sets are empty (never computed) and this is the bare `all(converged_group)` — byte-identical.
     let wedge = if exempt_tracked {
-      w.tracked_merge_wedge_set()
+      let mut s = w.tracked_merge_wedge_set();
+      s.extend(w.fork_fence_wedge_set());
+      s
     } else {
       BTreeSet::new()
     };
@@ -1106,16 +1117,20 @@ fn quiesce(
       break;
     }
   }
-  // `live` holds the loop's last pass (no ticks since — current). The full tracked-wedge component
-  // (live groups AND retired frozen husks), recomputed once: the convergence certification below
-  // and the freeze-wedge scan both read it, and its size is the seed's #106 witness. Empty on a
-  // fully-converged run and on every unphased profile.
-  let exempted: BTreeSet<u64> = if exempt_tracked {
-    w.tracked_merge_wedge_set()
+  // `live` holds the loop's last pass (no ticks since — current). Recompute both filed components
+  // once (live groups AND retired frozen husks): the union is what the convergence certification and
+  // the freeze-wedge scan read; the two sizes are the seed's per-class witnesses, counted APART so
+  // neither class can hide the other. Empty on a fully-converged run and on every unphased profile.
+  let (underhosted, forkfence) = if exempt_tracked {
+    (w.tracked_merge_wedge_set(), w.fork_fence_wedge_set())
   } else {
-    BTreeSet::new()
+    (BTreeSet::new(), BTreeSet::new())
   };
-  report.tracked_merge_wedges_exempted += exempted.len() as u64;
+  let exempted: BTreeSet<u64> = underhosted.union(&forkfence).copied().collect();
+  report.tracked_merge_wedges_exempted += underhosted.len() as u64;
+  // Attribute the fork-fence class to the groups it adds BEYOND the under-hosted set (a group that
+  // is both under-hosted and coupled counts once, under #106 — the hosting-shortfall root).
+  report.fork_fence_couplings_exempted += forkfence.difference(&underhosted).count() as u64;
   if !converged {
     // Only a NON-exempt group that failed to converge is a wedge worth panicking on; if every
     // straggler is the tracked class the loop already certified and we never reach here.
