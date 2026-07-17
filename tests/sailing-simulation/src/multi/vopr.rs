@@ -558,7 +558,7 @@ pub struct MultiVoprReport {
   /// Groups (live OR retired frozen husk) the run-end quiesce EXEMPTED from the convergence/
   /// freeze-wedge verdict as the tracked under-hosted parked-absorb class (#106): the merge
   /// component transitively blocked by an under-hosted merge conf
-  /// (see [`MultiWorld::tracked_merge_wedge_set`]). ALWAYS `0` under an unphased profile —
+  /// (see `MultiWorld::tracked_merge_wedge_set`). ALWAYS `0` under an unphased profile —
   /// the exemption is scoped to phased (storm) profiles, so the default/snapshot/reshape/merge
   /// families are byte-identical (quiesce panics on ANY wedge, exactly as before). Nonzero only on a
   /// storm-profile seed that reached run end still carrying the tracked shape: the count is the
@@ -567,7 +567,7 @@ pub struct MultiVoprReport {
   /// Groups the run-end quiesce EXEMPTED as the FORK-FENCE COUPLING class (#110), counted APART from
   /// the under-hosted class above so neither hides the other: a merge park held behind a parked
   /// fork's standing capture fence on the same parent (a composition deadlock of two individually
-  /// sound designs — safety intact, see [`MultiWorld::fork_fence_wedge_set`]). Attributed as the
+  /// sound designs — safety intact, see `MultiWorld::fork_fence_wedge_set`). Attributed as the
   /// groups the coupling adds beyond the under-hosted set. ALWAYS `0` under an unphased profile.
   pub fork_fence_couplings_exempted: u64,
   /// Live groups at run end.
