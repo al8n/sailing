@@ -17,7 +17,7 @@ use std::{
   net::SocketAddr,
   rc::Rc,
   sync::{
-    Arc, Mutex,
+    Arc,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
   },
   time::{Duration, Instant},
@@ -334,44 +334,6 @@ fn wait_until_at_least(counter: &AtomicU64, want: u64, what: &str) {
   }
 }
 
-/// A background thread that keeps committing `b"load"` into `gid` (redirecting to its leader)
-/// until `stop`, returning the count of commits it landed AND publishing a LIVE running count into
-/// `acked` after every commit — so a caller can sample the ack progress mid-flight (the split
-/// suite's concurrency-window witness). Best-effort: it never panics, so a transient reshape churn
-/// just costs a retry.
-fn spawn_count_loader(
-  handles: Vec<ShardedMultiHandle<u64, u64, KeyedSm>>,
-  gid: u64,
-  stop: Arc<AtomicBool>,
-  acked: Arc<AtomicU64>,
-) -> std::thread::JoinHandle<u64> {
-  std::thread::spawn(move || {
-    let groups: Vec<_> = handles.iter().map(|h| h.group(gid)).collect();
-    let mut commits = 0u64;
-    let mut at = 0usize;
-    while !stop.load(Ordering::Relaxed) {
-      match bo(groups[at].submit(Bytes::from_static(b"load"))) {
-        Ok(_) => {
-          commits += 1;
-          // FETCH-ADD (not store) so several loaders on one `acked` sum into a deep-pipeline count.
-          acked.fetch_add(1, Ordering::Release);
-        }
-        Err(DriverError::NotLeader { leader }) => {
-          at = leader
-            .map(|l| (l - 1) as usize)
-            .unwrap_or((at + 1) % groups.len());
-        }
-        Err(DriverError::Superseded) => {}
-        Err(_) => {
-          at = (at + 1) % groups.len();
-          std::thread::sleep(Duration::from_millis(10));
-        }
-      }
-    }
-    commits
-  })
-}
-
 /// A background thread that keeps submitting DISTINCT monotonically-increasing keys (1, 2, 3, …)
 /// into `gid` (redirecting to its leader) until `stop`, advancing to the next key only after the
 /// current one COMMITS — so the acked set stays the contiguous range `1..=last_acked`. Publishes
@@ -413,6 +375,19 @@ fn spawn_keyed_loader(
 /// baseline installs. `split` hands the child every ODD key and keeps the even ones (a disjoint
 /// partition), and `absorb` folds the source's keys back; so a split-then-merge-back cycle
 /// conserves the whole key set and a post-merge read of the survivor finds exactly the acked keys.
+/// A TEST-ONLY barrier inside [`KeyedSm::split`], for `split_on_plane_under_load`'s deterministic
+/// isolation proof. Scoped two ways so no other test (`reshape_cycle_under_continuous_load` also
+/// splits a KeyedSm) is affected: the split blocks only when `SPLIT_BARRIER_ARMED` is set AND the
+/// FSM carries [`SPLIT_BARRIER_KEY`] (present only in that one test's parent). On entry it bumps
+/// `SPLIT_BARRIER_ENTERED` (the apply thread is now provably held inside the fork) and spins until
+/// `SPLIT_BARRIER_RELEASE`, with a hard timeout so a missed release fails loudly instead of hanging.
+static SPLIT_BARRIER_ARMED: AtomicBool = AtomicBool::new(false);
+static SPLIT_BARRIER_ENTERED: AtomicUsize = AtomicUsize::new(0);
+static SPLIT_BARRIER_RELEASE: AtomicBool = AtomicBool::new(false);
+/// A magic EVEN key (so `split` keeps it on the parent side): its presence in the FSM is what scopes
+/// the barrier to `split_on_plane_under_load`'s parent, and it sorts far above any real key.
+const SPLIT_BARRIER_KEY: u64 = 0xB000_0000_0000_0000;
+
 #[derive(Default)]
 struct KeyedSm {
   keys: BTreeSet<u64>,
@@ -450,6 +425,19 @@ impl StateMachine for KeyedSm {
   }
 
   fn split(&mut self, _instruction: &[u8]) -> Option<Self> {
+    // TEST-ONLY barrier (see the statics above): hold this plane-0 apply thread inside the fork so the
+    // test can prove a bystander commit lands on plane 1 while plane 0 is provably frozen here.
+    if SPLIT_BARRIER_ARMED.load(Ordering::Acquire) && self.keys.contains(&SPLIT_BARRIER_KEY) {
+      SPLIT_BARRIER_ENTERED.fetch_add(1, Ordering::Release);
+      let start = Instant::now();
+      while !SPLIT_BARRIER_RELEASE.load(Ordering::Acquire) {
+        assert!(
+          start.elapsed() < Duration::from_secs(20),
+          "split barrier: release never came (deadlock guard)"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+      }
+    }
     let child: BTreeSet<u64> = self.keys.iter().copied().filter(|k| k & 1 == 1).collect();
     self.keys.retain(|k| k & 1 == 0);
     Some(Self { keys: child })
@@ -1131,11 +1119,13 @@ fn same_plane_merges_resolve_and_cross_plane_refuses() {
   bo(node.shutdown()).expect("every plane tears down");
 }
 
-/// Splitting a LOADED group on a K-plane host: an override map pins BOTH the parent and its child
-/// to plane 0, a background loop keeps the parent committing, and the split rides that live traffic
-/// — the typed `SplitApplied` fires on every node, both halves keep committing, and a plane-1
-/// bystander group advances THROUGHOUT the plane-0 reshape (the split never disturbs the sibling
-/// plane).
+/// Cross-plane ISOLATION under a large split, proven DETERMINISTICALLY (not by timing): an override
+/// map pins the split pair to plane 0 and the bystander to plane 1. A test-only barrier inside
+/// `KeyedSm::split` holds plane 0's apply thread INSIDE the fork; while it is provably frozen there, a
+/// bystander op completes a full consensus round on plane 1 — that ack IS the isolation (separate
+/// per-plane engines; a shared crank would deadlock the ack). The 200k-cell parent (installed at zero
+/// consensus cost via `create_group`'s initial FSM) is stress that makes the fork do real work. Then
+/// the barrier releases, `SplitApplied` fires on both nodes, and both halves keep committing.
 #[test]
 fn split_on_plane_under_load() {
   let base1: SocketAddr = "127.0.0.1:45400".parse().unwrap();
@@ -1161,17 +1151,17 @@ fn split_on_plane_under_load() {
   let node2: ShardedMultiHandle<u64, u64, KeyedSm> =
     spawn_host_mapped(2, base2, Some((1, base1)), plane_map());
 
-  // WIDEN THE SPLIT WINDOW BY CONSTRUCTION: `create_group` takes the INITIAL FSM value, so the parent
-  // boots with a LARGE KeyedSm (`PRELOAD` cells) at ZERO consensus cost. The fork's apply-time cost
-  // scales with the parent FSM's size (`fsm.split` moves the odd half, then the manufactured baseline
-  // is encoded and installed on the child), so the split does tens of milliseconds of real work while
-  // the bystander commits every ~1ms — dozens of in-window commits, a wide flake margin. On a
-  // near-instant window (a small parent) the split would materialize the child in the same crank as
-  // the split apply, inside the bystander's own commit cadence, and no causal in-window witness could
-  // fire. The two halves partition the preload exactly (odd -> child, even -> parent).
+  // The parent boots with a LARGE KeyedSm (`PRELOAD` cells) via `create_group`'s INITIAL FSM value at
+  // ZERO consensus cost, PLUS the magic barrier key. The preload is STRESS — the fork's apply-time cost
+  // scales with the FSM size (`fsm.split` moves the odd half, then the baseline is encoded and
+  // installed), so the split does real work — but the ISOLATION PROOF below is deterministic (the
+  // barrier), not a timing argument. The two halves partition the preload exactly (odd -> child, even
+  // -> parent; the even barrier key stays with the parent).
   const PRELOAD: u64 = 200_000;
   let preloaded = || KeyedSm {
-    keys: (1..=PRELOAD).collect(),
+    keys: (1..=PRELOAD)
+      .chain(std::iter::once(SPLIT_BARRIER_KEY))
+      .collect(),
   };
   for (h, id) in [(&node1, 1u64), (&node2, 2u64)] {
     bo(h.create_group(parent, config(id, vec![1, 2]), id, preloaded(), 0))
@@ -1184,81 +1174,22 @@ fn split_on_plane_under_load() {
   // Elect the bystander (its first committed key), so plane 1 is already serving before the split.
   assert_eq!(submit_anywhere(&gbys, b"b"), 1);
 
-  // Single background loaders on BOTH planes across the split — one per plane is enough now that the
-  // window is wide by construction. Plane 0 (parent) keeps the fork drain riding live traffic; plane 1
-  // (bystander) is the concurrency witness.
-  let stop = Arc::new(AtomicBool::new(false));
-  let parent_acks = Arc::new(AtomicU64::new(0));
-  let bys_acks = Arc::new(AtomicU64::new(0));
-  let parent_loader = spawn_count_loader(
-    vec![node1.clone(), node2.clone()],
-    parent,
-    stop.clone(),
-    parent_acks.clone(),
-  );
-  let bys_loader = spawn_count_loader(
-    vec![node1.clone(), node2.clone()],
-    bystander,
-    stop.clone(),
-    bys_acks.clone(),
-  );
-  // Let both planes start committing before the split, so a window delta is a real advance.
-  wait_until_at_least(&bys_acks, 2, "bystander warmup before the split");
-  wait_until_at_least(&parent_acks, 1, "parent warmup before the split");
-
-  // A CAUSAL split-window witness (three legs). LEG 1 — ARM first-wins pollers on BOTH lifecycle tails
-  // BEFORE proposing: each tight-loops its own tail and, on the FIRST SplitApplied dequeued across
-  // either tail, records the timestamp AND a bystander-ack SNAPSHOT taken in that same iteration. The
-  // snapshot is thus taken at the causal dequeue of the earliest SplitApplied — never a later dequeue
-  // that could fold in commits that happened after the split completed, so "can any counted commit
-  // have happened after the split completed?" is a structural NO. The by-construction wide window (the
-  // large parent FSM's fork drain runs tens of ms) is what makes both causal in-window measures fire.
-  let first_split: Arc<Mutex<Option<(Instant, u64)>>> = Arc::new(Mutex::new(None));
-  let poll_deadline = Instant::now() + Duration::from_secs(30);
-  let pollers: Vec<std::thread::JoinHandle<()>> =
-    [node1.lifecycle().clone(), node2.lifecycle().clone()]
-      .into_iter()
-      .enumerate()
-      .map(|(i, tail)| {
-        let first_split = first_split.clone();
-        let bys_acks = bys_acks.clone();
-        std::thread::spawn(move || {
-          loop {
-            assert!(
-              Instant::now() < poll_deadline,
-              "poller {i}: no SplitApplied in time"
-            );
-            match tail.recv_timeout(Duration::from_millis(50)) {
-              Ok(LifecycleEvent::SplitApplied {
-                parent: p,
-                child: c,
-              }) => {
-                assert_eq!((p, c), (parent, child), "poller {i}: the typed split event");
-                let mut fs = first_split.lock().unwrap();
-                if fs.is_none() {
-                  *fs = Some((Instant::now(), bys_acks.load(Ordering::Acquire)));
-                }
-                return;
-              }
-              Ok(_) => {}
-              Err(_) => {}
-            }
-          }
-        })
-      })
-      .collect();
-
+  // Elect the parent so the split has a leader to propose to (the bystander is elected above).
+  let _ = submit_anywhere(&gp, b"pelect00");
   let leader_idx = find_leader(&gp, "parent leader pre-split");
 
-  // LEG 2 (window-is-real) is proven BY CONSTRUCTION, not by an in-flight ack. Measured: the large
-  // parent FSM's fork drain MONOPOLIZES the parent engine for the whole window (a ~200k-cell fork runs
-  // ~600ms), so a parent request submitted before the propose does not ack until the drain finishes —
-  // its ack lands AT the split completion, never strictly inside the window (measured +634989us for a
-  // 634452us window). The parent, the reshaping plane, cannot commit mid-reshape whatever the window
-  // width. The window WIDTH itself (asserted below) is the honest proof the split did tens of ms of
-  // real work under the parent's load — a non-degenerate window across which the parent was busy.
+  // A DETERMINISTIC cross-plane ISOLATION proof via the test-only split barrier — no timing argument.
+  // Arm the barrier for this parent's fork; propose; wait until the fork drain is provably IN PROGRESS
+  // (plane 0's apply thread is held inside `KeyedSm::split`); then submit a bystander op and REQUIRE
+  // its ack WHILE plane 0 is still frozen there. A full plane-1 consensus round completing while plane
+  // 0's apply thread is blocked inside the fork IS cross-plane isolation, structurally: the planes are
+  // separate engines on separate cores by design, and a shared crank would block the bystander's ack
+  // too (its `submit_anywhere` deadline would then fail loudly). The block is brief (only until the
+  // bystander commits), well under a heartbeat, so plane 0 does not lose leadership.
+  SPLIT_BARRIER_ENTERED.store(0, Ordering::Release);
+  SPLIT_BARRIER_RELEASE.store(false, Ordering::Release);
+  SPLIT_BARRIER_ARMED.store(true, Ordering::Release);
 
-  // Propose the split to the leader (accepted fast), then record the window floor.
   {
     let deadline = Instant::now() + Duration::from_secs(15);
     let mut at = leader_idx;
@@ -1274,54 +1205,56 @@ fn split_on_plane_under_load() {
       }
     }
   }
-  let propose_return = Instant::now();
-  let bys_at_propose = bys_acks.load(Ordering::Acquire);
 
-  // Join the pollers (both tails saw SplitApplied) and read the first-wins snapshot.
-  for p in pollers {
-    p.join().expect("poller thread joins");
+  // Wait until plane 0's apply thread is provably HELD inside the fork.
+  {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while SPLIT_BARRIER_ENTERED.load(Ordering::Acquire) == 0 {
+      assert!(
+        Instant::now() < deadline,
+        "the split never entered the barrier"
+      );
+      std::thread::sleep(Duration::from_millis(1));
+    }
   }
-  let (first_split_time, bys_at_applied) = first_split
-    .lock()
-    .unwrap()
-    .expect("the first SplitApplied was observed");
-
-  let window = first_split_time.saturating_duration_since(propose_return);
   eprintln!(
-    "split window: propose->first-applied={}us  bystander in-window delta={}",
-    window.as_micros(),
-    bys_at_applied - bys_at_propose,
+    "isolation proof: plane 0 held inside the fork (entered={})",
+    SPLIT_BARRIER_ENTERED.load(Ordering::Acquire),
   );
 
-  // LEG 2 (window-is-real): the split did tens of ms of real fork work — the by-construction wide
-  // window from the large loaded parent, non-degenerate by a wide margin (measured ~600ms; a
-  // degenerate near-instant window was <10ms). This is what makes the causal in-window count below
-  // reliably non-zero.
+  // THE ISOLATION PROOF: a bystander commit lands on plane 1 while plane 0 is frozen inside the fork.
+  let bys_card = submit_anywhere(&gbys, b"isolated");
   assert!(
-    window >= Duration::from_millis(50),
-    "the split window must be widened by construction (parent fork of {PRELOAD} cells); measured {}us",
-    window.as_micros()
-  );
-  // LEG 3 — THE concurrency assertion: the bystander (plane 1) committed strictly INSIDE the causal
-  // window — plane 1 served DURING the plane-0 reshape. The snapshot was taken at the causal
-  // first-SplitApplied dequeue, so no commit after the split completed can be counted in the delta.
-  assert!(
-    bys_at_applied - bys_at_propose >= 1,
-    "the bystander must commit DURING the split window (propose {bys_at_propose} -> first applied {bys_at_applied})"
+    bys_card >= 2,
+    "the bystander committed on plane 1 while plane 0 was frozen inside the fork ({bys_card} cells)"
   );
 
-  // Stop the load; both planes committed under it throughout.
-  stop.store(true, Ordering::Release);
-  let commits = parent_loader
-    .join()
-    .expect("the parent loader thread joins")
-    + bys_loader
-      .join()
-      .expect("the bystander loader thread joins");
-  assert!(
-    commits >= 1,
-    "the loaders kept committing under load ({commits} commits)"
-  );
+  // Release the barrier; plane 0's fork completes.
+  SPLIT_BARRIER_RELEASE.store(true, Ordering::Release);
+  SPLIT_BARRIER_ARMED.store(false, Ordering::Release);
+
+  // Completion: the typed SplitApplied on BOTH nodes (the large fork takes real time to finish).
+  for (name, h) in [("node 1", &node1), ("node 2", &node2)] {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      assert!(
+        remaining > Duration::ZERO,
+        "{name}: no SplitApplied in time"
+      );
+      match h.lifecycle().recv_timeout(remaining) {
+        Ok(LifecycleEvent::SplitApplied {
+          parent: p,
+          child: c,
+        }) => {
+          assert_eq!((p, c), (parent, child), "{name}: the typed split event");
+          break;
+        }
+        Ok(_) => {}
+        Err(e) => panic!("{name}: the lifecycle tail closed: {e:?}"),
+      }
+    }
+  }
 
   // Both halves keep committing on plane 0, keyed on POST-split commits rather than absolute counts:
   // the child inherited the moved ODD half of the preload and the parent kept its EVEN half — each
