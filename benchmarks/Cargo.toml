@@ -20,6 +20,19 @@ tokio = { version = "1", default-features = false, features = [
   "sync",
   "time",
 ] }
+# The `sharded_host` bench stands up a real K-plane compio host cluster over loopback TCP; the ring
+# crypto backend matches how the compio crate itself is exercised (the bench uses plaintext
+# `Passthrough`, but the tls/quic passthroughs still need a backend to compile). `futures-executor`
+# drives the `Send` handle futures from a plain thread (no compio runtime caller-side), and
+# `futures-util::join_all` pipelines a batch of concurrent submits per group.
+sailing-compio = { workspace = true, features = [
+  "tls-rustls-ring",
+  "quic-rustls-ring",
+] }
+futures-executor = { version = "0.3", default-features = false, features = [
+  "std",
+] }
+futures-util = { workspace = true, features = ["std"] }
 
 [[bin]]
 name = "pure_core"
@@ -28,3 +41,7 @@ path = "src/bin/pure_core.rs"
 [[bin]]
 name = "parity"
 path = "src/bin/parity.rs"
+
+[[bin]]
+name = "sharded_host"
+path = "src/bin/sharded_host.rs"
