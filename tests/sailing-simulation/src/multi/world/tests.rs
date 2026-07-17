@@ -3749,3 +3749,46 @@ fn redundant_fold_clear_keys_on_the_mint_token_not_hostedness() {
     "a token-bearing fork child's fence CLEARS — the fork resolved"
   );
 }
+
+/// The FOREIGN-SUBSEQUENCE leg of cross-watermark agreement (#R3-H1) catches a replica missing an
+/// absorbed cell that the aligned own-cell leg is blind to (alignment STRIPS foreign-tagged cells). A
+/// record short one foreign-tagged absorbed cell has a foreign subsequence that is not a prefix of a
+/// fuller replica's, so the relation rejects it; agreeing records across an absorb boundary at unequal
+/// watermarks pass.
+#[test]
+fn absorbed_foreign_subsequence_prefix_catches_a_missing_absorbed_cell() {
+  let gkv = crate::multi::encode_gkv;
+  let own = gkv(10, 0, 1); // tag 10 — the group's OWN cell
+  let (f1, f2, f3) = (gkv(11, 0, 101), gkv(11, 0, 102), gkv(11, 0, 103)); // tag 11 — ABSORBED cells
+
+  // NEGATIVE: two records at unequal watermarks, identical but for a MISSING middle absorbed cell.
+  // Own-cell alignment drops every foreign cell, so both align to `[own]` and the own-cell leg passes
+  // — only the foreign subsequence ([f1,f2,f3] vs [f1,f3]) exposes the divergence.
+  let full: AppliedLog = std::vec![
+    (1, own.clone()),
+    (2, f1.clone()),
+    (3, f2.clone()),
+    (4, f3.clone())
+  ];
+  let short_one: AppliedLog = std::vec![(1, own.clone()), (2, f1.clone()), (3, f3.clone())];
+  assert!(
+    MultiWorld::aligned_prefix_holds(&[
+      MultiWorld::align_record(full.clone(), 10, &(0..1).collect()),
+      MultiWorld::align_record(short_one.clone(), 10, &(0..1).collect()),
+    ]),
+    "the own-cell aligned leg is BLIND to the missing absorbed cell (both align to [own])"
+  );
+  assert!(
+    !MultiWorld::foreign_subseq_prefix_holds(&[full, short_one], 10),
+    "the foreign subsequence must reject a replica missing an absorbed cell"
+  );
+
+  // POSITIVE: agreeing records across an absorb boundary at UNEQUAL watermarks — the shorter's foreign
+  // subsequence [f1] is an exact prefix of the longer's [f1,f2].
+  let fewer: AppliedLog = std::vec![(1, own.clone()), (2, f1.clone())];
+  let more: AppliedLog = std::vec![(1, own.clone()), (2, f1.clone()), (3, f2.clone())];
+  assert!(
+    MultiWorld::foreign_subseq_prefix_holds(&[fewer, more], 10),
+    "agreeing records across an absorb boundary at unequal watermarks pass"
+  );
+}

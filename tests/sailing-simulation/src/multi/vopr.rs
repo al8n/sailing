@@ -1304,13 +1304,19 @@ pub(crate) fn assert_group_safety(
   );
   // An ABSORBED lineage's raw records diverge by arrival path, so `agreement_holds`' absorbed branch
   // only compares EQUAL-applied replicas — leaving an exempted merge wedge (whose replicas sit at
-  // UNEQUAL watermarks) uncompared. The cross-watermark aligned-PREFIX relation judges those
-  // watermarks and still trips on a genuine divergence.
+  // UNEQUAL watermarks) uncompared. Two cross-watermark projections judge those watermarks: the
+  // aligned-PREFIX relation on OWN cells, and the FOREIGN-SUBSEQUENCE-prefix on the ABSORBED content
+  // (alignment strips foreign cells, so a replica short one absorbed cell would slip the first leg).
   if w.group_absorbed(gid) {
     assert!(
       w.absorbed_lineage_prefix_holds(gid),
-      "MULTI VOPR AGREEMENT FAILURE: group {gid} absorbed replicas diverge across watermarks (exempt \
-       or not)\n  seed={seed}",
+      "MULTI VOPR AGREEMENT FAILURE: group {gid} absorbed replicas diverge across watermarks — own \
+       cells (exempt or not)\n  seed={seed}",
+    );
+    assert!(
+      w.absorbed_foreign_prefix_holds(gid),
+      "MULTI VOPR AGREEMENT FAILURE: group {gid} absorbed replicas diverge across watermarks — \
+       absorbed content (exempt or not)\n  seed={seed}",
     );
   }
   for node in w.hosting_nodes(gid) {
