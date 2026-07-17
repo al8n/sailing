@@ -156,5 +156,10 @@ fn bench_fork_e2e(c: &mut Criterion) {
   g.finish();
 }
 
-criterion_group!(benches, bench_fork_latency, bench_absorb_cost, bench_fork_e2e);
+criterion_group!(
+  benches,
+  bench_fork_latency,
+  bench_absorb_cost,
+  bench_fork_e2e
+);
 criterion_main!(benches);
