@@ -298,6 +298,28 @@ fn wait_for_quiesced(metrics: &EngineMetrics, want: u64, what: &str) {
   }
 }
 
+/// Observe a quiesce WAKE EDGE, not merely a level: first poll until the gauge LEAVES `from` (drops
+/// below it — a group left quiescence), then until it settles back at `to`. Unlike
+/// [`wait_for_quiesced`], this refuses to accept a STALE reading already sitting at `to` before the
+/// wake ever happened — the transition must be witnessed. Bounded by a hard deadline.
+fn observe_wake_edge(metrics: &EngineMetrics, from: u64, to: u64, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  // The WAKE: the gauge must drop below `from` — a group actually left quiescence.
+  loop {
+    let g = metrics.quiesced_groups();
+    if g < from {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: quiesced gauge never left {from} (still {g}) — the wake edge was not observed"
+    );
+    std::thread::sleep(Duration::from_millis(15));
+  }
+  // The SETTLE: it returns to `to`.
+  wait_for_quiesced(metrics, to, what);
+}
+
 /// Poll an atomic progress counter until it reaches at least `want` — used to let a background
 /// keyed loader accumulate enough committed keys before the reshape.
 fn wait_until_at_least(counter: &AtomicU64, want: u64, what: &str) {
@@ -313,12 +335,15 @@ fn wait_until_at_least(counter: &AtomicU64, want: u64, what: &str) {
 }
 
 /// A background thread that keeps committing `b"load"` into `gid` (redirecting to its leader)
-/// until `stop`, returning the count of commits it landed — the "under load" companion for the
-/// split suite. Best-effort: it never panics, so a transient reshape churn just costs a retry.
+/// until `stop`, returning the count of commits it landed AND publishing a LIVE running count into
+/// `acked` after every commit — so a caller can sample the ack progress mid-flight (the split
+/// suite's concurrency-window witness). Best-effort: it never panics, so a transient reshape churn
+/// just costs a retry.
 fn spawn_count_loader(
   handles: Vec<ShardedMultiHandle<u64, u64, CountSm>>,
   gid: u64,
   stop: Arc<AtomicBool>,
+  acked: Arc<AtomicU64>,
 ) -> std::thread::JoinHandle<u64> {
   std::thread::spawn(move || {
     let groups: Vec<_> = handles.iter().map(|h| h.group(gid)).collect();
@@ -326,7 +351,10 @@ fn spawn_count_loader(
     let mut at = 0usize;
     while !stop.load(Ordering::Relaxed) {
       match bo(groups[at].submit(Bytes::from_static(b"load"))) {
-        Ok(_) => commits += 1,
+        Ok(_) => {
+          commits += 1;
+          acked.store(commits, Ordering::Release);
+        }
         Err(DriverError::NotLeader { leader }) => {
           at = leader
             .map(|l| (l - 1) as usize)
@@ -1140,20 +1168,35 @@ fn split_on_plane_under_load() {
   }
   let gp = [node1.group(parent), node2.group(parent)];
   let gbys = [node1.group(bystander), node2.group(bystander)];
-  // Preload the parent so the split has units to partition; elect the bystander.
+  // Preload the parent so the fork drain has real units to partition — the deterministic parent
+  // backlog that keeps the split window non-degenerate — and elect the bystander.
   for i in 0..7u64 {
     assert_eq!(submit_anywhere(&gp, b"load"), i + 1);
   }
   assert_eq!(submit_anywhere(&gbys, b"b"), 1);
 
-  // Load the parent (plane 0) from a background thread across the whole split.
+  // Background load on BOTH planes across the whole split: the parent loader (plane 0) keeps the fork
+  // drain busy, and the bystander loader (plane 1) is the concurrency-window WITNESS — its live ack
+  // count, sampled at propose-return and again at the FIRST SplitApplied, brackets the split window.
   let stop = Arc::new(AtomicBool::new(false));
-  let loader = spawn_count_loader(vec![node1.clone(), node2.clone()], parent, stop.clone());
+  let parent_acks = Arc::new(AtomicU64::new(0));
+  let bys_acks = Arc::new(AtomicU64::new(0));
+  let loader = spawn_count_loader(
+    vec![node1.clone(), node2.clone()],
+    parent,
+    stop.clone(),
+    parent_acks,
+  );
+  let bys_loader = spawn_count_loader(
+    vec![node1.clone(), node2.clone()],
+    bystander,
+    stop.clone(),
+    bys_acks.clone(),
+  );
+  // Let the bystander loader actually start committing before the split, so its window delta is a
+  // real in-window advance rather than a cold-start artifact.
+  wait_until_at_least(&bys_acks, 2, "bystander loader warmup before the split");
 
-  // Sample the bystander at three points straddling the reshape — before the propose, between
-  // propose and apply, and after apply — each a strict advance, so plane 1 served THROUGHOUT the
-  // plane-0 split-under-load.
-  let c0 = submit_anywhere(&gbys, b"b");
   {
     let handles = [&node1, &node2];
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -1170,13 +1213,11 @@ fn split_on_plane_under_load() {
       }
     }
   }
-  let c1 = submit_anywhere(&gbys, b"b");
-  assert!(
-    c1 > c0,
-    "the bystander advanced while the split was in flight ({c0} -> {c1})"
-  );
+  // The split window OPENS at propose-return — the bystander's ack floor.
+  let bys_at_propose = bys_acks.load(Ordering::Acquire);
 
-  // The typed SplitApplied on EVERY node.
+  // The typed SplitApplied on EVERY node; the window CLOSES at the FIRST observation anywhere.
+  let mut bys_at_applied = None;
   for (name, h) in [("node 1", &node1), ("node 2", &node2)] {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -1191,6 +1232,7 @@ fn split_on_plane_under_load() {
           child: c,
         }) => {
           assert_eq!((p, c), (parent, child), "{name}: the typed split event");
+          bys_at_applied.get_or_insert_with(|| bys_acks.load(Ordering::Acquire));
           break;
         }
         Ok(_) => {}
@@ -1198,15 +1240,21 @@ fn split_on_plane_under_load() {
       }
     }
   }
-  let c2 = submit_anywhere(&gbys, b"b");
+  let bys_at_applied = bys_at_applied.expect("at least one SplitApplied was observed");
+  // THE concurrency assertion: the bystander (plane 1) committed at least once strictly INSIDE the
+  // split window [propose-return, first SplitApplied] — plane 1 served DURING the plane-0 reshape,
+  // which a sample taken after the split already completed could not distinguish from before/after.
   assert!(
-    c2 > c1,
-    "the bystander advanced across the split-apply ({c1} -> {c2})"
+    bys_at_applied - bys_at_propose >= 1,
+    "the bystander must commit DURING the split window (propose {bys_at_propose} -> first applied {bys_at_applied})"
   );
 
   // Stop the load; the parent committed under it throughout.
   stop.store(true, Ordering::Release);
-  let commits = loader.join().expect("the loader thread joins");
+  let commits = loader.join().expect("the parent loader thread joins");
+  bys_loader
+    .join()
+    .expect("the bystander loader thread joins");
   assert!(
     commits >= 1,
     "the parent kept committing under load ({commits} commits)"
@@ -1378,7 +1426,8 @@ fn merge_on_plane_with_quiesce_cycling() {
   wait_for_quiesced(plane0, 1, "plane 0: bystander idle");
 
   // Freeze wakes the source; frozen, it is no longer quiesce-eligible, so the plane settles at just
-  // the quiesced target.
+  // the quiesced target. Observe the WAKE EDGE (2 -> 1), not the bare level: the source must be
+  // seen leaving quiescence, never a stale reading that was already 1.
   merge_verb_anywhere(
     "the freeze",
     |at| {
@@ -1387,7 +1436,7 @@ fn merge_on_plane_with_quiesce_cycling() {
     },
     2,
   );
-  wait_for_quiesced(plane1, 1, "plane 1: frozen source awake, target quiesced");
+  observe_wake_edge(plane1, 2, 1, "plane 1: the freeze woke the source (2 -> 1)");
 
   // Commit dissolves the source and the target absorbs; the union re-quiesces serving the sum.
   merge_verb_anywhere(
@@ -1409,7 +1458,14 @@ fn merge_on_plane_with_quiesce_cycling() {
     }
     std::thread::sleep(Duration::from_millis(30));
   }
-  wait_for_quiesced(plane1, 1, "plane 1: the dissolved-source union re-quiesced");
+  // The absorb WOKE the target (it was the sole quiesced group at 1), which then re-quiesced serving
+  // the union — assert the 1 -> 0 -> 1 edge, not the stale 1 the freeze phase already left standing.
+  observe_wake_edge(
+    plane1,
+    1,
+    1,
+    "plane 1: the absorb woke the target then re-quiesced (1 -> 0 -> 1)",
+  );
 
   // The merged-away source dies and floors terminally: status refuses, and re-admission refuses on
   // the floor at any generation.
