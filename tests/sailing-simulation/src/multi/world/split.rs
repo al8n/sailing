@@ -483,45 +483,6 @@ impl MultiWorld {
     Self::aligned_prefix_holds(&records)
   }
 
-  /// The FOREIGN-TAGGED subsequence of a raw applied record for `gid`: the gkv cells whose tag is NOT
-  /// `gid` — the ABSORBED content. The absorb fold is a foreign-tagged cell's only source (no
-  /// foreign-tagged cell is ever written outside a fold), and each fold applies its source's cells in
-  /// deterministic source-log order at the merge boundary, so this subsequence is arrival-path- and
-  /// watermark-independent up to length. `align_record` DROPS exactly these cells, so the aligned
-  /// relation is blind to a replica missing an absorbed cell; this projection is what sees it.
-  fn foreign_subsequence(raw: &AppliedLog, gid: u64) -> AppliedLog {
-    raw
-      .iter()
-      .filter(|(_, cmd)| super::super::decode_gkv(cmd).is_some_and(|(tag, _, _)| tag != gid))
-      .cloned()
-      .collect()
-  }
-
-  /// Whether a set of raw applied records is pairwise prefix-consistent on their FOREIGN-TAGGED
-  /// subsequences (the absorbed content) — the second leg of cross-watermark agreement for an absorbed
-  /// lineage, complementing [`aligned_prefix_holds`](Self::aligned_prefix_holds)'s own-cell leg. A
-  /// replica short one absorbed cell yields a foreign subsequence that is NOT a prefix of a fuller
-  /// replica's, so it is rejected here though the aligned own-cell views were identical.
-  pub(crate) fn foreign_subseq_prefix_holds(records: &[AppliedLog], gid: u64) -> bool {
-    let subseqs: Vec<AppliedLog> = records
-      .iter()
-      .map(|r| Self::foreign_subsequence(r, gid))
-      .collect();
-    Self::aligned_prefix_holds(&subseqs)
-  }
-
-  /// Whether every hosted replica of an absorbed `gid` holds a prefix-consistent FOREIGN-TAGGED
-  /// subsequence — the absorbed-content agreement leg the unconditional safety pass runs beside
-  /// [`absorbed_lineage_prefix_holds`](Self::absorbed_lineage_prefix_holds).
-  pub(crate) fn absorbed_foreign_prefix_holds(&self, gid: u64) -> bool {
-    let records: Vec<AppliedLog> = self
-      .hosting_nodes(gid)
-      .into_iter()
-      .map(|n| self.applied_of(n, gid))
-      .collect();
-    Self::foreign_subseq_prefix_holds(&records, gid)
-  }
-
   /// Record every replica's applied gkv cells into the conservation ledger (see the module
   /// docs for the dedupe and ordering argument). Cells are recorded under the group HOLDING
   /// them — the payload's gid tag is the cross-talk oracle's business.

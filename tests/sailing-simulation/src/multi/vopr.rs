@@ -1302,21 +1302,26 @@ pub(crate) fn assert_group_safety(
     "MULTI VOPR AGREEMENT FAILURE: group {gid} hosted replicas disagree (exempt or not)\n  \
      seed={seed}",
   );
-  // An ABSORBED lineage's raw records diverge by arrival path, so `agreement_holds`' absorbed branch
-  // only compares EQUAL-applied replicas — leaving an exempted merge wedge (whose replicas sit at
-  // UNEQUAL watermarks) uncompared. Two cross-watermark projections judge those watermarks: the
-  // aligned-PREFIX relation on OWN cells, and the FOREIGN-SUBSEQUENCE-prefix on the ABSORBED content
-  // (alignment strips foreign cells, so a replica short one absorbed cell would slip the first leg).
+  // ABSORBED-lineage coverage, SCOPED honestly. `agreement_holds`' absorbed branch compares only
+  // EQUAL-applied replicas, so an exempted merge wedge (replicas at UNEQUAL watermarks) needs a
+  // cross-watermark leg. What runs here is the aligned OWN-cell prefix. What is DELIBERATELY NOT
+  // asserted at the per-replica cross-watermark grain is ABSORBED-content completeness: a record-keyed
+  // "every replica past a merge boundary holds the complete absorbed block" form was built and
+  // rejected because it false-trips on legitimate world behavior the accumulating ledger tolerates — a
+  // target that SPLITS after absorbing sends absorbed cells to a child that RETURN via a later merge,
+  // so a lower-watermark (but past-boundary) replica legitimately lacks them until it applies the
+  // return, and a COMPACTED replica drops them from its `applied()` view. Per-replica departed/return/
+  // compaction state is not cleanly accountable at this grain. The absorbed CONTENT is instead covered
+  // by: (1) `agreement_holds`' absorbed branch — replicas at the SAME watermark must hold IDENTICAL raw
+  // records (absorbed cells included); (2) the run-end `finalize_merge_conservation_or_panic` — the
+  // union ledger judges every merge's COMPLETE absorbed content, accumulated across sweeps so
+  // per-replica departures/compaction never false-trip. NOT checked: an absorbed-suffix divergence
+  // between replicas at DIFFERENT watermarks, left to (1) at equal watermarks and (2) at run end.
   if w.group_absorbed(gid) {
     assert!(
       w.absorbed_lineage_prefix_holds(gid),
       "MULTI VOPR AGREEMENT FAILURE: group {gid} absorbed replicas diverge across watermarks — own \
        cells (exempt or not)\n  seed={seed}",
-    );
-    assert!(
-      w.absorbed_foreign_prefix_holds(gid),
-      "MULTI VOPR AGREEMENT FAILURE: group {gid} absorbed replicas diverge across watermarks — \
-       absorbed content (exempt or not)\n  seed={seed}",
     );
   }
   for node in w.hosting_nodes(gid) {
