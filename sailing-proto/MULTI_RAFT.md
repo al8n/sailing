@@ -320,10 +320,14 @@ meta, a replica adopts a foreign lineage only from content-emptiness, restart re
 hard state's lineage record against the slot before any coordinate arm, and transfer-progress acks
 are match-inert — so a recycled id's snapshot traffic cannot fuse two lineages' durable state. The
 APPEND/VOTE plane remains coordinate-trusting until the wire-level incarnation stamp lands (the
-reserved group-header field, WIRE.md §6): a term-coincident collision there is stopped by the
-committed-truncation fail-stop — loud and content-preserving, never a silent fusion — and the
-deployment mitigations are `pre_vote`/`check_quorum`. Until the stamp's enforcement lands, keeping a
-recycled id bound to its original logical group is the embedder's constraint to honor.
+reserved group-header field, WIRE.md §6), and its exposure is TWO-TIERED: entries colliding at the
+same index under DIFFERENT terms are caught by the committed-truncation fail-stop — loud and
+content-preserving — but a collision at an IDENTICAL `(index, term)` coordinate is indistinguishable
+from the entry already held (log matching never compares payloads) and fuses SILENTLY. No mitigation
+closes the second tier: `pre_vote`/`check_quorum` only narrow the window in which a foreign leader
+is heard. Re-using an id for a DIFFERENT logical group is therefore unsafe on this plane regardless
+of configuration; until the stamp's enforcement lands, keeping a recycled id bound to its original
+logical group is the embedder's constraint to honor.
 
 ## The `multi` container (as built)
 
