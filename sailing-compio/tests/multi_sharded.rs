@@ -1197,6 +1197,11 @@ fn split_on_plane_under_load() {
   // real in-window advance rather than a cold-start artifact.
   wait_until_at_least(&bys_acks, 2, "bystander loader warmup before the split");
 
+  // Synchronize one in-flight PARENT request right before proposing: its returned ack proves the
+  // parent pipeline was actively committing at propose time, so the fork drain has real concurrent
+  // work and the split window is not a degenerate instant.
+  let _ = submit_anywhere(&gp, b"presplit");
+
   {
     let handles = [&node1, &node2];
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -1216,28 +1221,44 @@ fn split_on_plane_under_load() {
   // The split window OPENS at propose-return — the bystander's ack floor.
   let bys_at_propose = bys_acks.load(Ordering::Acquire);
 
-  // The typed SplitApplied on EVERY node; the window CLOSES at the FIRST observation anywhere.
+  // Drain BOTH nodes' lifecycle tails CONCURRENTLY (interleaved non-blocking) and capture the
+  // bystander's ack count at the CAUSALLY FIRST SplitApplied delivery across either tail — the true
+  // close of the window, not whichever node a sequential blocking wait happened to poll first.
+  let tails = [&node1, &node2];
+  let mut seen = [false, false];
   let mut bys_at_applied = None;
-  for (name, h) in [("node 1", &node1), ("node 2", &node2)] {
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    loop {
-      let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-      assert!(
-        remaining > Duration::ZERO,
-        "{name}: no SplitApplied in time"
-      );
-      match h.lifecycle().recv_timeout(remaining) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while !(seen[0] && seen[1]) {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no SplitApplied in time on both tails"
+    );
+    let mut progressed = false;
+    for (i, h) in tails.iter().enumerate() {
+      if seen[i] {
+        continue;
+      }
+      match h.lifecycle().try_recv() {
         Ok(LifecycleEvent::SplitApplied {
           parent: p,
           child: c,
         }) => {
-          assert_eq!((p, c), (parent, child), "{name}: the typed split event");
+          assert_eq!(
+            (p, c),
+            (parent, child),
+            "node {}: the typed split event",
+            i + 1
+          );
           bys_at_applied.get_or_insert_with(|| bys_acks.load(Ordering::Acquire));
-          break;
+          seen[i] = true;
+          progressed = true;
         }
-        Ok(_) => {}
-        Err(e) => panic!("{name}: the lifecycle tail closed: {e:?}"),
+        Ok(_) => progressed = true,
+        Err(_) => {}
       }
+    }
+    if !progressed {
+      std::thread::sleep(Duration::from_millis(2));
     }
   }
   let bys_at_applied = bys_at_applied.expect("at least one SplitApplied was observed");
