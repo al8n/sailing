@@ -17,10 +17,10 @@ use std::{
   net::SocketAddr,
   rc::Rc,
   sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
   },
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use bytes::Bytes;
@@ -340,7 +340,7 @@ fn wait_until_at_least(counter: &AtomicU64, want: u64, what: &str) {
 /// suite's concurrency-window witness). Best-effort: it never panics, so a transient reshape churn
 /// just costs a retry.
 fn spawn_count_loader(
-  handles: Vec<ShardedMultiHandle<u64, u64, CountSm>>,
+  handles: Vec<ShardedMultiHandle<u64, u64, KeyedSm>>,
   gid: u64,
   stop: Arc<AtomicBool>,
   acked: Arc<AtomicU64>,
@@ -353,7 +353,8 @@ fn spawn_count_loader(
       match bo(groups[at].submit(Bytes::from_static(b"load"))) {
         Ok(_) => {
           commits += 1;
-          acked.store(commits, Ordering::Release);
+          // FETCH-ADD (not store) so several loaders on one `acked` sum into a deep-pipeline count.
+          acked.fetch_add(1, Ordering::Release);
         }
         Err(DriverError::NotLeader { leader }) => {
           at = leader
@@ -1155,37 +1156,45 @@ fn split_on_plane_under_load() {
     "the bystander is on plane 1"
   );
 
-  let node1: ShardedMultiHandle<u64, u64, CountSm> =
+  let node1: ShardedMultiHandle<u64, u64, KeyedSm> =
     spawn_host_mapped(1, base1, Some((2, base2)), plane_map());
-  let node2: ShardedMultiHandle<u64, u64, CountSm> =
+  let node2: ShardedMultiHandle<u64, u64, KeyedSm> =
     spawn_host_mapped(2, base2, Some((1, base1)), plane_map());
 
+  // WIDEN THE SPLIT WINDOW BY CONSTRUCTION: `create_group` takes the INITIAL FSM value, so the parent
+  // boots with a LARGE KeyedSm (`PRELOAD` cells) at ZERO consensus cost. The fork's apply-time cost
+  // scales with the parent FSM's size (`fsm.split` moves the odd half, then the manufactured baseline
+  // is encoded and installed on the child), so the split does tens of milliseconds of real work while
+  // the bystander commits every ~1ms — dozens of in-window commits, a wide flake margin. On a
+  // near-instant window (a small parent) the split would materialize the child in the same crank as
+  // the split apply, inside the bystander's own commit cadence, and no causal in-window witness could
+  // fire. The two halves partition the preload exactly (odd -> child, even -> parent).
+  const PRELOAD: u64 = 200_000;
+  let preloaded = || KeyedSm {
+    keys: (1..=PRELOAD).collect(),
+  };
   for (h, id) in [(&node1, 1u64), (&node2, 2u64)] {
-    bo(h.create_group(parent, config(id, vec![1, 2]), id, CountSm::default(), 0))
+    bo(h.create_group(parent, config(id, vec![1, 2]), id, preloaded(), 0))
       .expect("parent admission");
-    bo(h.create_group(bystander, config(id, vec![1, 2]), id, CountSm::default(), 0))
+    bo(h.create_group(bystander, config(id, vec![1, 2]), id, KeyedSm::default(), 0))
       .expect("bystander admission");
   }
   let gp = [node1.group(parent), node2.group(parent)];
   let gbys = [node1.group(bystander), node2.group(bystander)];
-  // Preload the parent so the fork drain has real units to partition — the deterministic parent
-  // backlog that keeps the split window non-degenerate — and elect the bystander.
-  for i in 0..7u64 {
-    assert_eq!(submit_anywhere(&gp, b"load"), i + 1);
-  }
+  // Elect the bystander (its first committed key), so plane 1 is already serving before the split.
   assert_eq!(submit_anywhere(&gbys, b"b"), 1);
 
-  // Background load on BOTH planes across the whole split: the parent loader (plane 0) keeps the fork
-  // drain busy, and the bystander loader (plane 1) is the concurrency-window WITNESS — its live ack
-  // count, sampled at propose-return and again at the FIRST SplitApplied, brackets the split window.
+  // Single background loaders on BOTH planes across the split — one per plane is enough now that the
+  // window is wide by construction. Plane 0 (parent) keeps the fork drain riding live traffic; plane 1
+  // (bystander) is the concurrency witness.
   let stop = Arc::new(AtomicBool::new(false));
   let parent_acks = Arc::new(AtomicU64::new(0));
   let bys_acks = Arc::new(AtomicU64::new(0));
-  let loader = spawn_count_loader(
+  let parent_loader = spawn_count_loader(
     vec![node1.clone(), node2.clone()],
     parent,
     stop.clone(),
-    parent_acks,
+    parent_acks.clone(),
   );
   let bys_loader = spawn_count_loader(
     vec![node1.clone(), node2.clone()],
@@ -1193,101 +1202,141 @@ fn split_on_plane_under_load() {
     stop.clone(),
     bys_acks.clone(),
   );
-  // Let the bystander loader actually start committing before the split, so its window delta is a
-  // real in-window advance rather than a cold-start artifact.
-  wait_until_at_least(&bys_acks, 2, "bystander loader warmup before the split");
+  // Let both planes start committing before the split, so a window delta is a real advance.
+  wait_until_at_least(&bys_acks, 2, "bystander warmup before the split");
+  wait_until_at_least(&parent_acks, 1, "parent warmup before the split");
 
-  // Synchronize one in-flight PARENT request right before proposing: its returned ack proves the
-  // parent pipeline was actively committing at propose time, so the fork drain has real concurrent
-  // work and the split window is not a degenerate instant.
-  let _ = submit_anywhere(&gp, b"presplit");
+  // A CAUSAL split-window witness (three legs). LEG 1 — ARM first-wins pollers on BOTH lifecycle tails
+  // BEFORE proposing: each tight-loops its own tail and, on the FIRST SplitApplied dequeued across
+  // either tail, records the timestamp AND a bystander-ack SNAPSHOT taken in that same iteration. The
+  // snapshot is thus taken at the causal dequeue of the earliest SplitApplied — never a later dequeue
+  // that could fold in commits that happened after the split completed, so "can any counted commit
+  // have happened after the split completed?" is a structural NO. The by-construction wide window (the
+  // large parent FSM's fork drain runs tens of ms) is what makes both causal in-window measures fire.
+  let first_split: Arc<Mutex<Option<(Instant, u64)>>> = Arc::new(Mutex::new(None));
+  let poll_deadline = Instant::now() + Duration::from_secs(30);
+  let pollers: Vec<std::thread::JoinHandle<()>> =
+    [node1.lifecycle().clone(), node2.lifecycle().clone()]
+      .into_iter()
+      .enumerate()
+      .map(|(i, tail)| {
+        let first_split = first_split.clone();
+        let bys_acks = bys_acks.clone();
+        std::thread::spawn(move || {
+          loop {
+            assert!(
+              Instant::now() < poll_deadline,
+              "poller {i}: no SplitApplied in time"
+            );
+            match tail.recv_timeout(Duration::from_millis(50)) {
+              Ok(LifecycleEvent::SplitApplied {
+                parent: p,
+                child: c,
+              }) => {
+                assert_eq!((p, c), (parent, child), "poller {i}: the typed split event");
+                let mut fs = first_split.lock().unwrap();
+                if fs.is_none() {
+                  *fs = Some((Instant::now(), bys_acks.load(Ordering::Acquire)));
+                }
+                return;
+              }
+              Ok(_) => {}
+              Err(_) => {}
+            }
+          }
+        })
+      })
+      .collect();
 
+  let leader_idx = find_leader(&gp, "parent leader pre-split");
+
+  // LEG 2 (window-is-real) is proven BY CONSTRUCTION, not by an in-flight ack. Measured: the large
+  // parent FSM's fork drain MONOPOLIZES the parent engine for the whole window (a ~200k-cell fork runs
+  // ~600ms), so a parent request submitted before the propose does not ack until the drain finishes —
+  // its ack lands AT the split completion, never strictly inside the window (measured +634989us for a
+  // 634452us window). The parent, the reshaping plane, cannot commit mid-reshape whatever the window
+  // width. The window WIDTH itself (asserted below) is the honest proof the split did tens of ms of
+  // real work under the parent's load — a non-degenerate window across which the parent was busy.
+
+  // Propose the split to the leader (accepted fast), then record the window floor.
   {
-    let handles = [&node1, &node2];
-    let deadline = std::time::Instant::now() + Duration::from_secs(15);
-    let mut at = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut at = leader_idx;
     loop {
-      assert!(std::time::Instant::now() < deadline, "no split accepted");
-      match bo(handles[at].propose_split(parent, child, 0, Bytes::from_static(b"\x05"))) {
+      assert!(Instant::now() < deadline, "no split accepted");
+      match bo([&node1, &node2][at].propose_split(parent, child, 0, Bytes::from_static(b"\x00"))) {
         Ok(_) => break,
         Err(DriverError::NotLeader { .. }) | Err(DriverError::Rejected { .. }) => {
-          at = (at + 1) % handles.len();
+          at = (at + 1) % 2;
           std::thread::sleep(Duration::from_millis(40));
         }
         Err(e) => panic!("unexpected split error: {e:?}"),
       }
     }
   }
-  // The split window OPENS at propose-return — the bystander's ack floor.
+  let propose_return = Instant::now();
   let bys_at_propose = bys_acks.load(Ordering::Acquire);
 
-  // Drain BOTH nodes' lifecycle tails CONCURRENTLY (interleaved non-blocking) and capture the
-  // bystander's ack count at the CAUSALLY FIRST SplitApplied delivery across either tail — the true
-  // close of the window, not whichever node a sequential blocking wait happened to poll first.
-  let tails = [&node1, &node2];
-  let mut seen = [false, false];
-  let mut bys_at_applied = None;
-  let deadline = std::time::Instant::now() + Duration::from_secs(15);
-  while !(seen[0] && seen[1]) {
-    assert!(
-      std::time::Instant::now() < deadline,
-      "no SplitApplied in time on both tails"
-    );
-    let mut progressed = false;
-    for (i, h) in tails.iter().enumerate() {
-      if seen[i] {
-        continue;
-      }
-      match h.lifecycle().try_recv() {
-        Ok(LifecycleEvent::SplitApplied {
-          parent: p,
-          child: c,
-        }) => {
-          assert_eq!(
-            (p, c),
-            (parent, child),
-            "node {}: the typed split event",
-            i + 1
-          );
-          bys_at_applied.get_or_insert_with(|| bys_acks.load(Ordering::Acquire));
-          seen[i] = true;
-          progressed = true;
-        }
-        Ok(_) => progressed = true,
-        Err(_) => {}
-      }
-    }
-    if !progressed {
-      std::thread::sleep(Duration::from_millis(2));
-    }
+  // Join the pollers (both tails saw SplitApplied) and read the first-wins snapshot.
+  for p in pollers {
+    p.join().expect("poller thread joins");
   }
-  let bys_at_applied = bys_at_applied.expect("at least one SplitApplied was observed");
-  // THE concurrency assertion: the bystander (plane 1) committed at least once strictly INSIDE the
-  // split window [propose-return, first SplitApplied] — plane 1 served DURING the plane-0 reshape,
-  // which a sample taken after the split already completed could not distinguish from before/after.
+  let (first_split_time, bys_at_applied) = first_split
+    .lock()
+    .unwrap()
+    .expect("the first SplitApplied was observed");
+
+  let window = first_split_time.saturating_duration_since(propose_return);
+  eprintln!(
+    "split window: propose->first-applied={}us  bystander in-window delta={}",
+    window.as_micros(),
+    bys_at_applied - bys_at_propose,
+  );
+
+  // LEG 2 (window-is-real): the split did tens of ms of real fork work — the by-construction wide
+  // window from the large loaded parent, non-degenerate by a wide margin (measured ~600ms; a
+  // degenerate near-instant window was <10ms). This is what makes the causal in-window count below
+  // reliably non-zero.
+  assert!(
+    window >= Duration::from_millis(50),
+    "the split window must be widened by construction (parent fork of {PRELOAD} cells); measured {}us",
+    window.as_micros()
+  );
+  // LEG 3 — THE concurrency assertion: the bystander (plane 1) committed strictly INSIDE the causal
+  // window — plane 1 served DURING the plane-0 reshape. The snapshot was taken at the causal
+  // first-SplitApplied dequeue, so no commit after the split completed can be counted in the delta.
   assert!(
     bys_at_applied - bys_at_propose >= 1,
     "the bystander must commit DURING the split window (propose {bys_at_propose} -> first applied {bys_at_applied})"
   );
 
-  // Stop the load; the parent committed under it throughout.
+  // Stop the load; both planes committed under it throughout.
   stop.store(true, Ordering::Release);
-  let commits = loader.join().expect("the parent loader thread joins");
-  bys_loader
+  let commits = parent_loader
     .join()
-    .expect("the bystander loader thread joins");
+    .expect("the parent loader thread joins")
+    + bys_loader
+      .join()
+      .expect("the bystander loader thread joins");
   assert!(
     commits >= 1,
-    "the parent kept committing under load ({commits} commits)"
+    "the loaders kept committing under load ({commits} commits)"
   );
 
-  // Both halves keep committing on plane 0 — the child preloaded exactly its 5 units — and the
-  // bystander still lives on plane 1.
+  // Both halves keep committing on plane 0, keyed on POST-split commits rather than absolute counts:
+  // the child inherited the moved ODD half of the preload and the parent kept its EVEN half — each
+  // partition holds ~PRELOAD/2 cells and each still accepts a fresh commit (the returned cardinality
+  // reflects the inherited partition plus the new key). The bystander still lives on plane 1.
   let gc = [node1.group(child), node2.group(child)];
-  assert_eq!(submit_anywhere(&gc, b"c"), 6, "the child preloaded 5");
+  let child_card = submit_anywhere(&gc, b"childkey");
   assert!(
-    submit_anywhere(&gp, b"p") >= 3,
-    "the parent still commits post-split"
+    child_card >= PRELOAD / 2,
+    "the child inherited the moved half and committed post-split ({child_card} cells)"
+  );
+  let parent_card = submit_anywhere(&gp, b"parntkey");
+  assert!(
+    parent_card >= PRELOAD / 2,
+    "the parent kept its half and committed post-split ({parent_card} cells)"
   );
   assert!(
     bo(node1.shard_handle(0).unwrap().group(child).status()).is_ok(),
