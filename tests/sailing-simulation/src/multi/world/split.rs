@@ -175,10 +175,12 @@ impl MultiWorld {
             .lift_fork_barrier(&fork.parent, fork.split_index);
           continue;
         }
-        // The MATERIALIZE arm wires the child; its fence is cleared uniformly with the redundant fold
-        // by the hosted-child reconciliation at the end of this pump (a wired child is a hosted child).
+        // The MATERIALIZE arm wires the child HERE — exact knowledge that the fork resolved, no
+        // inference: clear its fence right at the wire (#110).
+        let (materialized_parent, materialized_child) = (fork.parent, fork.child);
         self.register_split_child(&fork);
         self.wire_fork_replica(node, fork);
+        self.clear_fork_fence(node, materialized_parent, materialized_child);
       }
       // Conflict signals are drained and counted, never acted on: see the field docs for why
       // the world's embedder model leaves a squatter in place. Beyond the count, the standing fence
@@ -202,14 +204,24 @@ impl MultiWorld {
       }
     }
     // The REDUNDANT-fold arm (the container resolves a fork whose child is already provenance-matched
-    // on the node, WITHOUT yielding it) is invisible to the loops above. Reconcile it — and the
-    // ordinary materialize — here: a fence whose child is now HOSTED on that node has resolved (the
-    // fresh-id world never hosts a NON-matching squatter at a fork child, so a hosted child IS the
-    // resolved fork). Clear it so no record outlives the resolved conflict (#110).
+    // on the node, WITHOUT yielding it) is invisible to the loops above. Reconcile it here, keyed on
+    // the MINT TOKEN — NOT bare hostedness: `Endpoint::fork_id()` is the exact discriminator. A
+    // token-BEARING hosted child is a resolved fork (a materialized fork is created with the token; the
+    // redundant-fold twin fires precisely because it ALREADY carries the matching token — the catch-up
+    // adoption), so its fence has resolved and clears. A token-LESS hosted child is a STANDING SQUATTER
+    // — a plain CreateGroup/RecreateGroup incarnation at the fork-child id (token-less by construction),
+    // the very #110 mechanism the lifecycle-churn profile builds — whose fence MUST survive. (A
+    // different-token child is unconstructible at a recorded conflict: two forks onto one id refuse at
+    // propose, and a removed token-bearing child's late fork hits the refuse arm.) The materialize arm
+    // already cleared its own fence at the wire, so this leg carries only the redundant fold.
     let mut resolved: Vec<((u64, u64), sailing_proto::Index)> = Vec::new();
     for (&key, idxs) in &self.fork_conflicts {
       for (&idx, &child) in idxs {
-        if self.hosts_group(key.0, child) {
+        if self.hosts_group(key.0, child)
+          && self.hosts[&key.0]
+            .group(&child)
+            .is_some_and(|ep| ep.fork_id().is_some())
+        {
           resolved.push((key, idx));
         }
       }

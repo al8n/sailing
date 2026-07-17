@@ -3702,3 +3702,50 @@ fn exempted_absorbed_wedge_at_unequal_watermarks_passes_safety() {
   let expected: BTreeSet<Vec<u8>> = [b"t0".to_vec(), b"s0".to_vec()].into_iter().collect();
   crate::multi::vopr::assert_group_safety(&w, 10, &expected, 53);
 }
+
+/// The redundant-fold reconciliation keys on the MINT TOKEN, not bare hostedness (#110): a TOKEN-LESS
+/// hosted child at a fork-child id is a STANDING squatter (a plain create/recreate incarnation — the
+/// lifecycle-churn #110 mechanism), so its recorded fence MUST survive the pump; only a TOKEN-BEARING
+/// child (a materialized fork or a redundant-fold twin that adopted the token) clears it. The
+/// hostedness-only form cleared the squatter's fence in the very pump that recorded it, un-exempting a
+/// real standing wedge.
+#[test]
+fn redundant_fold_clear_keys_on_the_mint_token_not_hostedness() {
+  // TOKEN-LESS squatter: its fence SURVIVES the pump/reconciliation.
+  let mut w = MultiWorld::new(71);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all); // the parent
+  w.create_group(200, &all); // a PLAIN create at a fork-child id — token-less by construction
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()
+    && w.leader_of(200).is_some()));
+  assert!(
+    w.hosts[&0]
+      .group(&200)
+      .is_some_and(|ep| ep.fork_id().is_none()),
+    "the plain-created squatter is token-less"
+  );
+  w.inject_fork_conflict_for_child(0, 10, sailing_proto::Index::new(3), 200);
+  w.pump_forks();
+  assert!(
+    w.has_fork_fence_below(0, 10, sailing_proto::Index::new(u64::MAX)),
+    "a token-less standing squatter's fence must SURVIVE the pump — the wedge is real"
+  );
+
+  // TOKEN-BEARING fork child: its fence CLEARS via the reconciliation (the redundant-fold arm).
+  let mut w2 = world_after_split(73, 200); // 100 split into 200 — a real materialized fork
+  assert!(
+    w2.hosts[&0]
+      .group(&200)
+      .is_some_and(|ep| ep.fork_id().is_some()),
+    "the materialized fork carries the mint token"
+  );
+  w2.inject_fork_conflict_for_child(0, 100, w2.split_fence_index[&200], 200);
+  w2.pump_forks();
+  assert!(
+    !w2.has_fork_fence_below(0, 100, sailing_proto::Index::new(u64::MAX)),
+    "a token-bearing fork child's fence CLEARS — the fork resolved"
+  );
+}
