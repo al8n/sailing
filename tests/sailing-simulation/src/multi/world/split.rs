@@ -170,8 +170,21 @@ impl MultiWorld {
             .lift_fork_barrier(&fork.parent, fork.split_index);
           continue;
         }
+        let (materialized_parent, materialized_child) = (fork.parent, fork.child);
         self.register_split_child(&fork);
         self.wire_fork_replica(node, fork);
+        // The fork MATERIALIZED on this node: its standing capture fence has lifted, so the
+        // `(node, parent)` fence record this child contributed is now stale and must not outlive the
+        // resolved conflict (#110). Drop the child's own split-index entry — the fence records are
+        // ACTIVE state, never append-only history — and clear the slot when it empties.
+        if let Some(&idx) = self.split_fence_index.get(&materialized_child)
+          && let Some(idxs) = self.fork_conflicts.get_mut(&(node, materialized_parent))
+        {
+          idxs.remove(&idx);
+          if idxs.is_empty() {
+            self.fork_conflicts.remove(&(node, materialized_parent));
+          }
+        }
       }
       // Conflict signals are drained and counted, never acted on: see the field docs for why
       // the world's embedder model leaves a squatter in place. Beyond the count, the standing fence

@@ -733,35 +733,43 @@ impl MultiWorld {
     blocked
   }
 
-  /// Whether a standing fork-fence conflict is recorded on `(node, parent)` at OR BELOW `commit` —
-  /// the pure record-lookup + index-comparison leg of the fork-fence coupling (#110). At-or-below is
-  /// the narrowness: a fence ABOVE the park's commit sits past the absorb capture and does not
-  /// deadlock it.
+  /// Whether a standing fork-fence conflict is recorded on `(node, parent)` at OR BELOW `coord` — the
+  /// pure record-lookup + index-comparison leg of the fork-fence coupling (#110). `coord` is the
+  /// PARK's own coordinate (see [`fork_fence_coupled_park`](Self::fork_fence_coupled_park)); a fence
+  /// ABOVE it sits past the absorb capture and does not deadlock the park — the narrowness.
   pub(crate) fn has_fork_fence_below(
     &self,
     node: u64,
     parent: u64,
-    commit: sailing_proto::Index,
+    coord: sailing_proto::Index,
   ) -> bool {
     self
       .fork_conflicts
       .get(&(node, parent))
-      .is_some_and(|idxs| idxs.iter().any(|&s| s <= commit))
+      .is_some_and(|idxs| idxs.iter().any(|&s| s <= coord))
   }
 
   /// Whether `gid` is a merge TARGET whose park is deadlocked behind a standing fork fence (#110):
   /// on some node hosting a PARKED replica of `gid`, a recorded fork-conflict fence for
-  /// `(node, parent == gid)` sits at-or-below that replica's commit index. A parked fork holds the
-  /// parent's capture fence there, and a merge park on that same parent (target == parent) whose
-  /// absorb capture sits above it cannot proceed — the composition deadlock of two individually
-  /// sound designs, safety intact. The park being LIVE is a co-condition read from world state, so
-  /// an accumulated record never certifies a group whose merge is no longer parked.
+  /// `(node, parent == gid)` sits at-or-below that replica's PARK COORDINATE. A drained merge park
+  /// pins its applied index at `k-1` (one below the `CommitMerge` entry it waits on), so the park's
+  /// own entry index is `applied_index() + 1` — the capture coordinate a standing fence must sit at
+  /// or below to deadlock it. The comparison is against the PARK's coordinate, NOT the moving commit:
+  /// a parked target's commit races ahead of its pinned apply, and comparing against it would
+  /// over-couple a fence sitting between the two. A parked fork holds the parent's capture fence
+  /// there, and this absorb cannot proceed above it — the composition deadlock of two individually
+  /// sound designs, safety intact. The park being LIVE is a co-condition read from world state, so an
+  /// accumulated record never certifies a group whose merge is no longer parked.
   pub(crate) fn fork_fence_coupled_park(&self, gid: u64) -> bool {
     self.node_ids.iter().any(|&n| {
       self.hosts[&n]
         .group(&gid)
         .is_some_and(|ep| ep.pending_merge().is_some())
-        && self.has_fork_fence_below(n, gid, self.commit_index_of(n, gid))
+        && self.has_fork_fence_below(
+          n,
+          gid,
+          sailing_proto::Index::new(self.applied_index_of(n, gid).get() + 1),
+        )
     })
   }
 

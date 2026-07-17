@@ -564,12 +564,18 @@ pub struct MultiVoprReport {
   /// storm-profile seed that reached run end still carrying the tracked shape: the count is the
   /// seed's witness that it hit the FILED class rather than a novel wedge (which panics regardless).
   pub tracked_merge_wedges_exempted: u64,
-  /// Groups the run-end quiesce EXEMPTED as the FORK-FENCE COUPLING class (#110), counted APART from
-  /// the under-hosted class above so neither hides the other: a merge park held behind a parked
-  /// fork's standing capture fence on the same parent (a composition deadlock of two individually
-  /// sound designs — safety intact, see `MultiWorld::fork_fence_wedge_set`). Attributed as the
-  /// groups the coupling adds beyond the under-hosted set. ALWAYS `0` under an unphased profile.
+  /// Groups the run-end quiesce EXEMPTED as the FORK-FENCE COUPLING class (#110), the RAW predicate
+  /// count: a group satisfying BOTH this and the under-hosted predicate contributes to both counters
+  /// (and both seed lists in the sweep), so neither class can hide the other. A merge park held
+  /// behind a parked fork's standing capture fence on the same parent (a composition deadlock of two
+  /// individually sound designs — safety intact, see `MultiWorld::fork_fence_wedge_set`). ALWAYS `0`
+  /// under an unphased profile. The overlap with #106 is reported separately in
+  /// [`exemption_overlap`](Self::exemption_overlap).
   pub fork_fence_couplings_exempted: u64,
+  /// Groups counted in BOTH exemption classes above (#106 under-hosted AND #110 fork-fence) — the
+  /// explicit overlap, so the two RAW counters are never misread as disjoint. ALWAYS `0` under an
+  /// unphased profile.
+  pub exemption_overlap: u64,
   /// Live groups at run end.
   pub final_groups: usize,
   /// Client commands accepted by some leader (tracked per group for the quiesce check).
@@ -901,12 +907,19 @@ fn calm_window(
     if !elected {
       // A FILED merge-liveness class — the under-hosted parked-absorb (#106) or the fork-fence
       // coupling (#110) — can leave a merge participant unable to elect. Under a storm profile these
-      // are certified past, not fresh livelocks; skip them (the demand stays fully armed for every
-      // other group, so a genuine non-merge livelock still trips here). Unphased profiles pass
-      // `false` and take the bare assert, byte-identically.
+      // are certified past, not fresh livelocks; skip the ELECTION demand (it stays fully armed for
+      // every other group, so a genuine non-merge livelock still trips here). Unphased profiles pass
+      // `false` and take the bare panic, byte-identically. SAFETY still runs unconditionally: even a
+      // leaderless exempted wedge's hosted replicas must agree as prefixes — a liveness exemption
+      // never gates safety.
       if exempt_tracked
         && (w.tracked_underhosted_merge_wedge(gid) || w.fork_fence_coupled_wedge(gid))
       {
+        assert!(
+          w.agreement_holds(gid),
+          "MULTI VOPR AGREEMENT FAILURE: exempted group {gid} hosted replicas disagree in the calm \
+           window\n  seed={seed}",
+        );
         continue;
       }
       panic!(
@@ -1127,10 +1140,13 @@ fn quiesce(
     (BTreeSet::new(), BTreeSet::new())
   };
   let exempted: BTreeSet<u64> = underhosted.union(&forkfence).copied().collect();
+  // Count BOTH raw predicate sets INDEPENDENTLY: a group satisfying both predicates contributes to
+  // both counters (and both seed lists in the sweep), so neither class can hide the other. The
+  // `exempted` union is what the liveness gate certifies past; the raw counters are the per-class
+  // witnesses; the overlap is reported explicitly so the two are never read as disjoint.
   report.tracked_merge_wedges_exempted += underhosted.len() as u64;
-  // Attribute the fork-fence class to the groups it adds BEYOND the under-hosted set (a group that
-  // is both under-hosted and coupled counts once, under #106 — the hosting-shortfall root).
-  report.fork_fence_couplings_exempted += forkfence.difference(&underhosted).count() as u64;
+  report.fork_fence_couplings_exempted += forkfence.len() as u64;
+  report.exemption_overlap += underhosted.intersection(&forkfence).count() as u64;
   if !converged {
     // Only a NON-exempt group that failed to converge is a wedge worth panicking on; if every
     // straggler is the tracked class the loop already certified and we never reach here.
@@ -1191,31 +1207,29 @@ fn quiesce(
   }
 
   for &gid in &live {
-    // A tracked-class group (#106) never converged — its members are not caught up and it may be
-    // leaderless — so the applied-history integrity checks below cannot apply to it. It is already
-    // counted in `tracked_merge_wedges_exempted`; skip it here (empty set on unphased profiles).
-    if exempted.contains(&gid) {
-      continue;
-    }
-    let leader = w.leader_of(gid).expect("quiesce converged to a leader");
-    let leader_applied = w.applied_of(leader, gid);
     let expected: BTreeSet<Vec<u8>> = st
       .expected
       .get(&gid)
       .map(|v| v.iter().cloned().collect())
       .unwrap_or_default();
-    let mut committed = 0u64;
-    for (_, cmd) in &leader_applied {
-      if cmd.is_empty() {
-        continue; // empty / conf entries carry no client payload
-      }
-      assert!(
-        expected.contains(cmd),
-        "MULTI VOPR INTEGRITY FAILURE: group {gid} applied a command {cmd:?} the fuzzer never \
-         proposed for it\n  seed={seed}",
-      );
-      committed += 1;
+    // SAFETY runs UNCONDITIONALLY over every hosted replica of every group — a liveness exemption
+    // (a tracked #106/#110 wedge) gates only the CONVERGENCE demands below, NEVER safety (agreement +
+    // applied-history integrity; see [`assert_group_safety`]). On an unphased profile `exempted` is
+    // empty and every group additionally takes the convergence pass below — byte-identical to before.
+    assert_group_safety(w, gid, &expected, seed);
+    // CONVERGENCE-dependent checks: an exempted wedge never converged (leaderless / members not
+    // caught up by design), so the leader-anchored caught-up equality below does not apply — it is
+    // already counted in the exemption witnesses. Skip ONLY this part (empty set ⇒ never skipped on
+    // an unphased profile, where the pass stays byte-identical).
+    if exempted.contains(&gid) {
+      continue;
     }
+    let leader = w.leader_of(gid).expect("quiesce converged to a leader");
+    let leader_applied = w.applied_of(leader, gid);
+    let committed = leader_applied
+      .iter()
+      .filter(|(_, cmd)| !cmd.is_empty())
+      .count() as u64;
     report.committed += committed;
     let leader_cmds: Vec<&Vec<u8>> = leader_applied
       .iter()
@@ -1245,6 +1259,42 @@ fn quiesce(
         cmds, expected_cmds,
         "MULTI VOPR APPLY FAILURE: group {gid} member {member} applied a different committed \
          client history than leader {leader}\n  seed={seed}",
+      );
+    }
+  }
+}
+
+/// The UNCONDITIONAL per-group safety pass the quiesce runs on EVERY hosted replica of a group,
+/// exempt or not — a liveness exemption (a #106 under-hosted or #110 fork-fence wedge) gates the
+/// CONVERGENCE demands, NEVER this. Two legs, neither needing a leader (an exempted wedge may be
+/// leaderless), so both read the hosting replicas directly:
+///   1. AGREEMENT — the hosting replicas' applied records agree as prefixes (State Machine Safety,
+///      aligned across splits/absorbs), and
+///   2. INTEGRITY — no hosted replica applied a client command absent from `expected` (the set the
+///      fuzzer proposed for the group).
+///
+/// Panics with `seed` on a violation. Extracted so the exemption-does-not-gate-safety contract is
+/// unit-testable directly on a constructed exempted wedge.
+pub(crate) fn assert_group_safety(
+  w: &MultiWorld,
+  gid: u64,
+  expected: &BTreeSet<Vec<u8>>,
+  seed: u64,
+) {
+  assert!(
+    w.agreement_holds(gid),
+    "MULTI VOPR AGREEMENT FAILURE: group {gid} hosted replicas disagree (exempt or not)\n  \
+     seed={seed}",
+  );
+  for node in w.hosting_nodes(gid) {
+    for (_, cmd) in w.applied_of(node, gid) {
+      if cmd.is_empty() {
+        continue; // empty / conf entries carry no client payload
+      }
+      assert!(
+        expected.contains(&cmd),
+        "MULTI VOPR INTEGRITY FAILURE: group {gid} node {node} applied a command {cmd:?} the \
+         fuzzer never proposed for it\n  seed={seed}",
       );
     }
   }

@@ -110,17 +110,6 @@ impl MultiWorld {
       .unwrap_or(sailing_proto::Index::ZERO)
   }
 
-  /// Replica `(node, gid)`'s commit watermark (`Index::ZERO` if not hosted) — the merge park's
-  /// commit coordinate the fork-fence coupling compares its standing fence against.
-  pub(crate) fn commit_index_of(&self, node: u64, gid: u64) -> sailing_proto::Index {
-    self
-      .hosts
-      .get(&node)
-      .and_then(|h| h.group(&gid))
-      .map(sailing_proto::Endpoint::commit_index)
-      .unwrap_or(sailing_proto::Index::ZERO)
-  }
-
   /// The maximum commit index any replica of `gid` currently believes — the group's
   /// completed-write watermark (an entry committed anywhere is durably on a quorum).
   pub(crate) fn max_commit_of(&self, gid: u64) -> sailing_proto::Index {

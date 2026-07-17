@@ -3324,3 +3324,261 @@ fn recorded_floors_reach_the_service_as_the_terminal_sentinel() {
     "the REMOVAL floor is cluster-wide: the catalog is one fact, read at every node"
   );
 }
+
+/// Drive an already-live `target` (absorbing an already-live `source`, both on nodes {0,1,2}) to a
+/// HELD merge PARK on a non-leader follower — the async-capture crash-replay shape
+/// [`replayed_park_holds_while_the_capture_barrier_is_open`] pins: the follower's absorb capture dies
+/// in the crash, its durable log replays the commit, and it re-parks with the barrier open (no
+/// snapshot route arrives to supersede it here). Returns the parked follower node.
+fn drive_park_on_existing(w: &mut MultiWorld, source: u64, target: u64) -> u64 {
+  colocate_source_onto_target(w, source, target);
+  let follower = (0..3u64)
+    .find(|n| Some(*n) != w.leader_of(source) && Some(*n) != w.leader_of(target))
+    .expect("three nodes, at most two leaders");
+  w.stables
+    .get_mut(&(follower, target))
+    .expect("target stable")
+    .set_mode(crate::StoreMode::Async);
+  merge_verb_until_accepted(w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(source, target)
+  });
+  merge_verb_until_accepted(w, 4_000, "the commit", |w| {
+    w.propose_commit_merge(target, source)
+  });
+  assert!(
+    w.run_until(8_000, |w| w.merges_resolved() >= 3),
+    "every host resolves the absorb"
+  );
+  w.crash(follower);
+  assert!(
+    w.run_until(4_000, |w| {
+      w.hosts[&follower]
+        .group(&target)
+        .is_some_and(|ep| ep.pending_merge().is_some())
+    }),
+    "the restored follower replays the commit and re-parks"
+  );
+  follower
+}
+
+/// Create `source` and `target` on {0,1,2} with a little committed client load (so the target has an
+/// applied history to judge), then drive `target` to a HELD merge park via [`drive_park_on_existing`].
+fn held_park_target(seed: u64, source: u64, target: u64) -> (MultiWorld, u64) {
+  let mut w = MultiWorld::new(seed);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(source, &all);
+  w.create_group(target, &all);
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(source).is_some() && w.leader_of(target).is_some()
+  }));
+  propose_until_accepted(&mut w, source, b"s0");
+  propose_until_accepted(&mut w, target, b"t0");
+  w.run_until(200, |_| false);
+  let follower = drive_park_on_existing(&mut w, source, target);
+  (w, follower)
+}
+
+/// The fork-fence coupling compares against the PARK's coordinate (`applied_index + 1`), NOT the
+/// moving commit (#110). A parked target pins its apply at `k-1` while its commit races ahead, so a
+/// fence strictly ABOVE the park coordinate but at-or-below the racing commit must NOT couple — the
+/// boundary the earlier commit-based compare over-coupled.
+#[test]
+fn fork_fence_coupled_park_uses_the_park_coordinate_not_commit() {
+  let (mut w, follower) = held_park_target(23, 11, 10);
+  // Race the target's COMMIT past the park's pinned apply: the leader commits fresh load, which the
+  // parked follower appends and acks (its commit advances) while its apply stays pinned at k-1.
+  for _ in 0..4 {
+    propose_until_accepted(&mut w, 10, b"more");
+  }
+  assert!(
+    w.run_until(4_000, |w| {
+      w.hosts[&follower].group(&10).is_some_and(|ep| {
+        ep.pending_merge().is_some() && ep.commit_index().get() >= ep.applied_index().get() + 2
+      })
+    }),
+    "the parked follower's commit must race >= 2 past its pinned apply"
+  );
+  let applied = w.hosts[&follower]
+    .group(&10)
+    .expect("parked")
+    .applied_index()
+    .get();
+  // A fence AT the park coordinate (applied + 1) couples — the deadlock boundary is inclusive.
+  w.fork_conflicts.clear();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 1));
+  assert!(
+    w.fork_fence_coupled_park(10),
+    "a fence at the park coordinate (applied + 1) couples"
+  );
+  // A fence ABOVE the park coordinate but at-or-below the RACING COMMIT must NOT couple: the fix
+  // compares against applied + 1, not the moving commit. Under the old commit-based compare this
+  // fence (<= commit) would have falsely certified the group as coupled.
+  w.fork_conflicts.clear();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 2));
+  assert!(
+    !w.fork_fence_coupled_park(10),
+    "a fence above the park coordinate must not couple, even at-or-below the racing commit"
+  );
+  assert!(
+    w.fork_fence_wedge_set().is_empty(),
+    "no coupling => empty #110 set"
+  );
+}
+
+/// A fork conflict that RESOLVES (its fork materializes) must clear the standing fence, so a LATER
+/// merge park on the same parent is NOT exempted (#110). Real machinery for the resolution: a real
+/// split materializes the child through `pump_forks`, which drops the recorded fence; a real merge
+/// then parks the same parent, and the coupling must read FALSE because the fence is gone.
+#[test]
+fn fork_fence_clears_on_materialization_so_a_later_park_is_not_exempted() {
+  let mut w = MultiWorld::new(29);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all); // the parent (later the merge target)
+  w.create_group(11, &all); // the merge source
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(10).is_some() && w.leader_of(11).is_some()
+  }));
+  // Load the parent so the split has an interior point with keys on both sides.
+  for key in 0u16..4 {
+    propose_until_accepted(
+      &mut w,
+      10,
+      &crate::multi::encode_gkv(10, key, u64::from(key)),
+    );
+  }
+  // Propose a real split, then RECORD a standing fence at the child's real split index on every
+  // hosting node — the squatter conflict the world cannot itself mint, injected at exactly the
+  // coordinate the real materialization will clear.
+  propose_split_until_accepted(&mut w, 10, 200, 2);
+  let fence = w.split_fence_index[&200];
+  for n in 0..3u64 {
+    w.inject_fork_conflict(n, 10, fence);
+  }
+  // Materialize the fork through the real drain: each node's `pump_forks` wires its child replica
+  // and, on doing so, drops the fence its child contributed.
+  assert!(
+    w.run_until(3_000, |w| w.splits_applied() == 1),
+    "the split materializes on the quorum"
+  );
+  for n in 0..3u64 {
+    assert!(
+      !w.has_fork_fence_below(n, 10, sailing_proto::Index::new(u64::MAX)),
+      "node {n}: the materialized fork cleared its standing fence"
+    );
+  }
+  // A LATER merge park on the same parent must NOT be exempted — the resolved conflict left no fence.
+  let follower = drive_park_on_existing(&mut w, 11, 10);
+  assert!(
+    w.hosts[&follower]
+      .group(&10)
+      .is_some_and(|ep| ep.pending_merge().is_some()),
+    "the parent is parked mid-absorb"
+  );
+  assert!(
+    !w.fork_fence_coupled_park(10),
+    "a park after the fork resolved must not be certified as fork-fence coupled"
+  );
+  assert!(
+    w.fork_fence_wedge_set().is_empty(),
+    "no standing fence => empty #110 set"
+  );
+}
+
+/// The fork-fence record is cleared when the parent replica is torn down — active state, not
+/// append-only history (#110). The shared `purge_group_stores` chokepoint fires for both
+/// `drop_group_replica` and `remove_group`.
+#[test]
+fn fork_fence_clears_when_the_parent_replica_is_torn_down() {
+  let mut w = MultiWorld::new(31);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(2_000, |w| w.leader_of(100).is_some()));
+  w.inject_fork_conflict(1, 100, sailing_proto::Index::new(3));
+  assert!(
+    w.has_fork_fence_below(1, 100, sailing_proto::Index::new(3)),
+    "the fence is recorded"
+  );
+  // Tear the parent replica down on that node — the record must go with it.
+  w.drop_group_replica(100, 1);
+  assert!(
+    !w.has_fork_fence_below(1, 100, sailing_proto::Index::new(u64::MAX)),
+    "tearing down the parent replica cleared its fork-fence record"
+  );
+}
+
+/// The two exemption classes are counted and overlapped INDEPENDENTLY (#106 under-hosted AND #110
+/// fork-fence): a group satisfying BOTH predicates lands in both wedge sets, so both raw counters and
+/// the overlap are positive. The earlier `difference`-based #110 count dropped exactly this group,
+/// zeroing its counter and its seed-list entry.
+#[test]
+fn both_wedge_classes_count_and_overlap_independently() {
+  let (mut w, follower) = held_park_target(37, 11, 10);
+  // Strip the target's host quorum: drop every OTHER hosting replica (each resolved the absorb, so
+  // none is a merge participant), leaving only the parked follower — a merge participant with no live
+  // host quorum (the #106 under-hosted root).
+  for n in 0..3u64 {
+    if n != follower && w.hosts_group(n, 10) {
+      w.drop_group_replica(10, n);
+    }
+  }
+  assert!(
+    !w.has_live_host_quorum(10),
+    "only the parked follower hosts the target"
+  );
+  // Record a standing fence at-or-below the follower's park coordinate (the #110 fork-fence root).
+  let applied = w.applied_index_of(follower, 10).get();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 1));
+
+  let underhosted = w.tracked_merge_wedge_set();
+  let forkfence = w.fork_fence_wedge_set();
+  assert!(
+    underhosted.contains(&10),
+    "the parked under-hosted target is the #106 class"
+  );
+  assert!(
+    forkfence.contains(&10),
+    "the same target is the #110 fork-fence class"
+  );
+  assert!(!underhosted.is_empty() && !forkfence.is_empty());
+  let overlap: BTreeSet<u64> = underhosted.intersection(&forkfence).copied().collect();
+  assert!(
+    overlap.contains(&10),
+    "a group in both predicates is the explicit overlap"
+  );
+  // The earlier `difference`-based #110 attribution dropped exactly this group, zeroing its counter.
+  assert!(
+    forkfence.difference(&underhosted).count() < forkfence.len(),
+    "the old difference-based #110 count would miss the overlapping group"
+  );
+}
+
+/// A liveness exemption must NEVER gate safety (#106/#110): the quiesce's per-group safety pass runs
+/// on EVERY hosted replica of every group, exempt or not. Here a group is driven into the exempted
+/// fork-fence wedge, then the integrity leg is shown to STILL trip on a hosted replica whose applied
+/// record carries a command outside the proposed set — before the fix the group was skipped whole.
+#[test]
+#[should_panic(expected = "INTEGRITY FAILURE")]
+fn exemption_does_not_gate_safety_on_a_wedged_group() {
+  let (mut w, follower) = held_park_target(41, 11, 10);
+  let applied = w.applied_index_of(follower, 10).get();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 1));
+  // The target is now the exempted fork-fence wedge (#110).
+  assert!(
+    w.fork_fence_wedge_set().contains(&10),
+    "the parked target is exempted"
+  );
+  // Its hosted replicas DID apply the target's real client load. Present an `expected` set that omits
+  // it (a divergent applied record); the unconditional safety pass must still panic on the exempted
+  // group — the exemption gates only convergence, never this.
+  let expected: BTreeSet<Vec<u8>> = BTreeSet::new();
+  crate::multi::vopr::assert_group_safety(&w, 10, &expected, 41);
+}
