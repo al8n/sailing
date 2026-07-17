@@ -6,7 +6,7 @@ fn pick_action_is_deterministic_and_covers_the_menu() {
   let profile = MultiProfile::default_multi();
   let draw = |seed: u64| -> Vec<MultiAction> {
     let mut p = FaultPrng::new(seed);
-    (0..512).map(|_| pick_action(&mut p, profile)).collect()
+    (0..512).map(|t| pick_action(&mut p, profile, t)).collect()
   };
   assert_eq!(draw(7), draw(7), "same seed ⇒ same action stream");
   let stream = draw(7);
@@ -236,7 +236,7 @@ fn reshape_pick_covers_the_menu() {
   let profile = MultiProfile::reshape();
   let draw = |seed: u64| -> Vec<MultiAction> {
     let mut p = FaultPrng::new(seed);
-    (0..512).map(|_| pick_action(&mut p, profile)).collect()
+    (0..512).map(|t| pick_action(&mut p, profile, t)).collect()
   };
   assert_eq!(draw(7), draw(7), "same seed ⇒ same action stream");
   let stream = draw(7);
@@ -246,4 +246,138 @@ fn reshape_pick_covers_the_menu() {
       "512 draws never hit {action:?} — the reshape weights are broken"
     );
   }
+}
+
+/// The phase draw swaps the WHOLE menu by cyclic iteration and wraps at `cycle`; a tick outside
+/// every phase range falls back to the base weights. Asserted on a real storm profile (by value —
+/// `const` data is not address-stable, so identity is the menu CONTENTS) so it is the actual wiring
+/// under test. The three menus are content-distinct, so equality pins the exact selection.
+#[test]
+fn weights_at_selects_the_phase_menu_cyclically() {
+  let p = MultiProfile::split_storm();
+  // Base outside the phases — at 0 and, wrapping, at exactly one cycle on.
+  assert_eq!(p.weights_at(0), SPLIT_STORM_BASE);
+  assert_eq!(p.weights_at(300), SPLIT_STORM_BASE); // 300 % 300 == 0
+  // Storm slice 100..180, and its wrap one cycle later.
+  assert_eq!(p.weights_at(120), SPLIT_STORM_STORM);
+  assert_eq!(p.weights_at(420), SPLIT_STORM_STORM); // 420 % 300 == 120
+  // Drain slice 180..300.
+  assert_eq!(p.weights_at(200), SPLIT_STORM_DRAIN);
+  assert_eq!(p.weights_at(299), SPLIT_STORM_DRAIN);
+}
+
+/// The phase seam is INERT on an unphased profile: `weights_at` returns the base `weights` at every
+/// tick, including past any cycle length. This is the behavior-identity proof — the per-tick draw
+/// is byte-identical to a world predating phases, which every default/reshape/merge band and pinned
+/// seed depends on.
+#[test]
+fn weights_at_is_inert_without_phases() {
+  for p in [
+    MultiProfile::default_multi(),
+    MultiProfile::reshape(),
+    MultiProfile::merge_reshape(),
+    MultiProfile::snapshot_heavy(7),
+  ] {
+    for t in [0usize, 1, 99, 100, 179, 300, 601, 10_000] {
+      assert_eq!(
+        p.weights_at(t),
+        p.weights,
+        "an unphased profile must draw from its base weights at every tick (t={t})",
+      );
+    }
+  }
+}
+
+/// The tracked-wedge exemption is NARROW: a plain group with no merge freeze and no park is NEVER
+/// exempted, even when deliberately stripped below a host quorum. This is the red-proof that a
+/// fresh (non-merge) livelock still trips the storm-profile liveness gates rather than being
+/// silently certified — the exemption only ever covers the filed under-hosted merge shape.
+#[test]
+fn tracked_wedge_never_exempts_a_bare_underhosted_group() {
+  let mut w = MultiWorld::new(5);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: std::collections::BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &voters);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  w.reconcile_membership(100);
+
+  // Fully hosted, no merge: a live host quorum, and not a wedge.
+  assert!(w.has_live_host_quorum(100));
+  assert!(!w.tracked_underhosted_merge_wedge(100));
+
+  // Tear down two of three replicas WITHOUT reconciling: now under-hosted — yet STILL not exempt,
+  // because there is no merge freeze or park. A bare under-hosted group is a fresh wedge the gates
+  // must keep catching.
+  w.drop_group_replica(100, 1);
+  w.drop_group_replica(100, 2);
+  assert!(!w.has_live_host_quorum(100));
+  assert!(
+    !w.tracked_underhosted_merge_wedge(100),
+    "an under-hosted group with no merge state must NOT be exempted",
+  );
+}
+
+/// A genuinely FROZEN source whose absorbing target is fully hosted is NOT the tracked class — the
+/// merge keeps its host quorum, so it must still converge and is not certified past. The other
+/// safety direction: the exemption fires on the HOSTING shortfall, never on the mere presence of a
+/// freeze.
+#[test]
+fn tracked_wedge_not_exempt_for_a_fully_hosted_freeze() {
+  let mut w = MultiWorld::new(11);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: std::collections::BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &voters); // target
+  w.create_group(101, &voters); // source — 101 > 100 by byte order, the merge orientation
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()
+    && w.leader_of(101).is_some()));
+  w.reconcile_membership(100);
+  w.reconcile_membership(101);
+  assert!(
+    matches!(w.propose_prepare_merge(101, 100), Some(Ok(_))),
+    "prepare_merge must be accepted for equal-voter colocated groups",
+  );
+  for _ in 0..300 {
+    w.tick();
+  }
+  assert!(w.group_freeze_seen(101), "the source must carry the freeze");
+  assert!(w.has_live_host_quorum(100), "the target stays fully hosted");
+  assert!(
+    !w.tracked_underhosted_merge_wedge(101),
+    "a fully-hosted freeze must NOT be exempted — it keeps its quorum and must converge",
+  );
+}
+
+/// `has_live_host_quorum` tracks the hosting shortfall the exemption's second leg turns on: full at
+/// three-of-three, lost once a majority of the committed voters stop hosting. This is the leg the
+/// two `tracked_underhosted_merge_wedge` tests hold constant while varying merge participation —
+/// together they pin the exemption to the CONJUNCTION (a merge participant AND under-hosted), the
+/// exact tracked shape. The runtime state where both hold at once is NOT synthetically
+/// constructible (the world guards merge participants against teardown and refuses freezing into an
+/// under-hosted target — the very guards that make the class a real-choreography-only liveness
+/// gap); the deep sweep's `tracked_merge_wedges_exempted` witness is where the live `true` surfaces.
+#[test]
+fn has_live_host_quorum_tracks_the_hosting_shortfall() {
+  let mut w = MultiWorld::new(13);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: std::collections::BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &voters);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  w.reconcile_membership(100);
+  assert!(
+    w.has_live_host_quorum(100),
+    "three of three host — a quorum"
+  );
+  w.drop_group_replica(100, 2);
+  assert!(w.has_live_host_quorum(100), "two of three still a majority");
+  w.drop_group_replica(100, 1);
+  assert!(
+    !w.has_live_host_quorum(100),
+    "one of three is below a host quorum",
+  );
 }

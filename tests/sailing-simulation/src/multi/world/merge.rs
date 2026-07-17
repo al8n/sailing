@@ -587,6 +587,135 @@ impl MultiWorld {
       .filter_map(|&n| self.hosts[&n].group(&gid))
       .any(|ep| ep.pending_merge().is_some())
   }
+
+  /// The source id a PARKED replica of `gid` (a merge target mid-absorb) names in its
+  /// `pending_merge` — the group whose captured state the park is waiting on. `None` when no replica
+  /// of `gid` is parked. First-found across replicas (a target parks on one absorb at a time).
+  pub(crate) fn parked_source_of(&self, gid: u64) -> Option<u64> {
+    for node in &self.node_ids {
+      if let Some(ep) = self.hosts[node].group(&gid)
+        && let Some(p) = ep.pending_merge()
+        && let Ok(source) = <u64 as sailing_proto::Data>::decode_exact(p.source_bytes())
+      {
+        return Some(source);
+      }
+    }
+    None
+  }
+
+  /// Whether `gid`'s committed voter conf keeps a LIVE HOST QUORUM: a strict majority of its
+  /// committed voters currently host a replica of `gid`. Read at a fully-healed point (quiesce /
+  /// calm window), a voter that does NOT host means reconcile could not resurrect its replica — the
+  /// "under-hosted" condition the tracked merge wedge turns on. A conf with no voters is treated as
+  /// lacking a quorum (an empty absorbing conf cannot make the absorb durable).
+  pub(crate) fn has_live_host_quorum(&self, gid: u64) -> bool {
+    let voters = self.group_voters(gid);
+    if voters.is_empty() {
+      return false;
+    }
+    let hosting = voters.iter().filter(|&&n| self.hosts_group(n, gid)).count();
+    hosting * 2 > voters.len()
+  }
+
+  /// A one-line diagnostic of `gid`'s merge-blocking state for the quiesce / wedge panics: whether
+  /// it is frozen or parked, the merge counterpart its completion depends on (a parked target's
+  /// captured SOURCE, a frozen source's claimed TARGET), and that counterpart's live/hosting status
+  /// — the exact facts needed to adjudicate a stuck merge participant against the tracked
+  /// under-hosted class.
+  pub(crate) fn merge_block_dbg(&self, gid: u64) -> String {
+    let mut parts = std::vec![std::format!(
+      "g{gid}[frozen={} freeze_seen={} parked={} host_quorum={}]",
+      self.group_frozen(gid),
+      self.group_freeze_seen(gid),
+      self.group_merge_parked(gid),
+      self.has_live_host_quorum(gid),
+    )];
+    if let Some(source) = self.parked_source_of(gid) {
+      parts.push(std::format!(
+        "parked_on_source g{source}[live={} host_quorum={} voters={:?} hosting={:?}]",
+        self.live_groups().contains(&source),
+        self.has_live_host_quorum(source),
+        self.group_voters(source),
+        self.hosting_nodes(source),
+      ));
+    }
+    if let Some(target) = self.claimed_target_of(gid) {
+      parts.push(std::format!(
+        "claims_target g{target}[live={} host_quorum={}]",
+        self.live_groups().contains(&target),
+        self.has_live_host_quorum(target),
+      ));
+    }
+    parts.join(" ")
+  }
+
+  /// Whether `gid` is wedged in the TRACKED under-hosted parked-absorb completion class (#106): an
+  /// unresolved merge participant whose completion is blocked because the absorbing conf lacks a
+  /// live host quorum. This is the DOCUMENTED exemption predicate the storm-profile quiesce and calm
+  /// windows certify past instead of panicking (see the `exempt_tracked` paths in the multi VOPR
+  /// runner) — deliberately NARROW so a NON-merge livelock or a merge wedged for any OTHER reason
+  /// still trips the liveness gates as a fresh find.
+  ///
+  /// It is a per-group membership test against [`tracked_merge_wedge_set`](Self::tracked_merge_wedge_set),
+  /// which computes the whole blocked component at once (the tracked class cascades — an under-hosted
+  /// source strands the target parked on it, which strands the next source frozen against that
+  /// target). Convenient for the calm window and the unit tests; the quiesce loop computes the set
+  /// once per pass instead.
+  pub(crate) fn tracked_underhosted_merge_wedge(&self, gid: u64) -> bool {
+    self.tracked_merge_wedge_set().contains(&gid)
+  }
+
+  /// The full set of groups (live AND retired) wedged in the tracked under-hosted parked-absorb
+  /// class (#106): every merge participant transitively blocked by an under-hosted merge conf. The
+  /// storm-profile quiesce and calm windows certify these past instead of panicking — deliberately
+  /// NARROW (rooted only at a genuine hosting shortfall) so a NON-merge livelock, or a merge wedged
+  /// with every relevant conf still hosted, stays a fresh find that trips the liveness gates.
+  ///
+  /// Computed as a fixpoint over the merge dependency graph:
+  /// - **Base (the #106 root).** A merge participant — frozen (`group_frozen`/`group_freeze_seen`) or
+  ///   parked (`group_merge_parked`) — whose OWN committed conf lacks a live host quorum. This is the
+  ///   observed shape: a source dismantled host-by-host to a husk cannot be captured, so the park on
+  ///   it never resolves.
+  /// - **Propagate.** A PARKED target whose captured SOURCE (`parked_source_of`) is already blocked;
+  ///   or a FROZEN source whose claimed TARGET (`claimed_target_of`) is already blocked (a target
+  ///   pinned at another park cannot absorb it). Iterated to a fixpoint over the (bounded) group set.
+  ///
+  /// A world with no under-hosted merge participant yields the EMPTY set — every merge is then
+  /// obliged to converge, and any that does not still trips the gate.
+  pub(crate) fn tracked_merge_wedge_set(&self) -> BTreeSet<u64> {
+    let participant =
+      |g: u64| self.group_frozen(g) || self.group_freeze_seen(g) || self.group_merge_parked(g);
+    // Base: merge participants with no live host quorum (the under-hosted husk roots).
+    let mut blocked: BTreeSet<u64> = self
+      .groups
+      .keys()
+      .copied()
+      .filter(|&g| participant(g) && !self.has_live_host_quorum(g))
+      .collect();
+    // Fixpoint: propagate the block through the merge dependency edges.
+    loop {
+      let mut added = false;
+      for g in self.groups.keys().copied() {
+        if blocked.contains(&g) || !participant(g) {
+          continue;
+        }
+        let waits_on_blocked = self
+          .parked_source_of(g)
+          .is_some_and(|s| blocked.contains(&s))
+          || self
+            .claimed_target_of(g)
+            .is_some_and(|t| blocked.contains(&t));
+        if waits_on_blocked {
+          blocked.insert(g);
+          added = true;
+        }
+      }
+      if !added {
+        break;
+      }
+    }
+    blocked
+  }
 }
 
 /// Prints replay context if a union assert unwinds (the ledger's panics carry ids and histories
