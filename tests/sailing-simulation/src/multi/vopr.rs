@@ -576,6 +576,11 @@ pub struct MultiVoprReport {
   /// explicit overlap, so the two RAW counters are never misread as disjoint. ALWAYS `0` under an
   /// unphased profile.
   pub exemption_overlap: u64,
+  /// HOSTED RETIRED HUSKS the run-end quiesce safety pass visited — gids with a lingering replica
+  /// (a merged-away source frozen on a lagging host) that are NOT in `live_groups`. The witness that
+  /// the unconditional safety worklist reaches beyond the live set; nonzero only when a husk survived
+  /// to run end (the merge families), `0` otherwise.
+  pub retired_husks_safety_checked: u64,
   /// Live groups at run end.
   pub final_groups: usize,
   /// Client commands accepted by some leader (tracked per group for the quiesce check).
@@ -1206,21 +1211,29 @@ fn quiesce(
     );
   }
 
-  for &gid in &live {
+  // SAFETY runs UNCONDITIONALLY over every HOSTED gid — a liveness exemption (a tracked #106/#110
+  // wedge) gates only the CONVERGENCE demands below, NEVER safety (agreement + absorbed cross-watermark
+  // + applied-history integrity; see [`assert_group_safety`]). The worklist is the union over hosts,
+  // RETIRED HUSKS INCLUDED: `live_groups` omits a merged-away source's frozen replica lingering after
+  // other hosts resolved, but the wedge sets contain it and its hosted replicas must still be judged.
+  let live_set: BTreeSet<u64> = live.iter().copied().collect();
+  for gid in w.all_hosted_groups() {
+    if !live_set.contains(&gid) {
+      report.retired_husks_safety_checked += 1;
+    }
     let expected: BTreeSet<Vec<u8>> = st
       .expected
       .get(&gid)
       .map(|v| v.iter().cloned().collect())
       .unwrap_or_default();
-    // SAFETY runs UNCONDITIONALLY over every hosted replica of every group — a liveness exemption
-    // (a tracked #106/#110 wedge) gates only the CONVERGENCE demands below, NEVER safety (agreement +
-    // applied-history integrity; see [`assert_group_safety`]). On an unphased profile `exempted` is
-    // empty and every group additionally takes the convergence pass below — byte-identical to before.
     assert_group_safety(w, gid, &expected, seed);
-    // CONVERGENCE-dependent checks: an exempted wedge never converged (leaderless / members not
-    // caught up by design), so the leader-anchored caught-up equality below does not apply — it is
-    // already counted in the exemption witnesses. Skip ONLY this part (empty set ⇒ never skipped on
-    // an unphased profile, where the pass stays byte-identical).
+  }
+
+  // CONVERGENCE-dependent checks: leader-anchored caught-up equality, over LIVE groups only. An
+  // exempted wedge never converged (leaderless / members not caught up by design), so this does not
+  // apply to it — it is already counted in the exemption witnesses. On an unphased profile `exempted`
+  // is empty and every live group takes this pass, byte-identical to before.
+  for &gid in &live {
     if exempted.contains(&gid) {
       continue;
     }
@@ -1266,11 +1279,14 @@ fn quiesce(
 
 /// The UNCONDITIONAL per-group safety pass the quiesce runs on EVERY hosted replica of a group,
 /// exempt or not — a liveness exemption (a #106 under-hosted or #110 fork-fence wedge) gates the
-/// CONVERGENCE demands, NEVER this. Two legs, neither needing a leader (an exempted wedge may be
-/// leaderless), so both read the hosting replicas directly:
+/// CONVERGENCE demands, NEVER this. Three legs, none needing a leader (an exempted wedge may be
+/// leaderless), so all read the hosting replicas directly:
 ///   1. AGREEMENT — the hosting replicas' applied records agree as prefixes (State Machine Safety,
-///      aligned across splits/absorbs), and
-///   2. INTEGRITY — no hosted replica applied a client command absent from `expected` (the set the
+///      aligned across splits/absorbs),
+///   2. ABSORBED CROSS-WATERMARK — an absorbed lineage's replicas at UNEQUAL watermarks (where
+///      `agreement_holds`' equal-applied absorbed branch compares nothing) must hold prefix-consistent
+///      ALIGNED records, and
+///   3. INTEGRITY — no hosted replica applied a client command absent from `expected` (the set the
 ///      fuzzer proposed for the group).
 ///
 /// Panics with `seed` on a violation. Extracted so the exemption-does-not-gate-safety contract is
@@ -1286,6 +1302,17 @@ pub(crate) fn assert_group_safety(
     "MULTI VOPR AGREEMENT FAILURE: group {gid} hosted replicas disagree (exempt or not)\n  \
      seed={seed}",
   );
+  // An ABSORBED lineage's raw records diverge by arrival path, so `agreement_holds`' absorbed branch
+  // only compares EQUAL-applied replicas — leaving an exempted merge wedge (whose replicas sit at
+  // UNEQUAL watermarks) uncompared. The cross-watermark aligned-PREFIX relation judges those
+  // watermarks and still trips on a genuine divergence.
+  if w.group_absorbed(gid) {
+    assert!(
+      w.absorbed_lineage_prefix_holds(gid),
+      "MULTI VOPR AGREEMENT FAILURE: group {gid} absorbed replicas diverge across watermarks (exempt \
+       or not)\n  seed={seed}",
+    );
+  }
   for node in w.hosting_nodes(gid) {
     for (_, cmd) in w.applied_of(node, gid) {
       if cmd.is_empty() {

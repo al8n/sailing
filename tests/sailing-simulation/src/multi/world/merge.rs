@@ -746,7 +746,7 @@ impl MultiWorld {
     self
       .fork_conflicts
       .get(&(node, parent))
-      .is_some_and(|idxs| idxs.iter().any(|&s| s <= coord))
+      .is_some_and(|idxs| idxs.keys().any(|&s| s <= coord))
   }
 
   /// Whether `gid` is a merge TARGET whose park is deadlocked behind a standing fork fence (#110):
@@ -789,9 +789,12 @@ impl MultiWorld {
     self.propagate_merge_block(base)
   }
 
-  /// Test-only: inject a standing fork-fence record for `(node, parent)` at `split_index`, so the
-  /// narrowness red-proofs drive [`has_fork_fence_below`](Self::has_fork_fence_below) without
-  /// reconstructing a live squatter.
+  /// Test-only: inject a standing fork-fence record for `(node, parent)` at `split_index` for pure
+  /// BOUNDARY-ARITHMETIC red-proofs. The child is a sentinel (`u64::MAX`) no node ever hosts, so the
+  /// pump's redundant-fold reconciliation never clears it — the fence stands until the boundary
+  /// assertion reads it. A resolution-arm regression uses
+  /// [`inject_fork_conflict_for_child`](Self::inject_fork_conflict_for_child) and drives the arm for
+  /// real.
   #[cfg(test)]
   pub(crate) fn inject_fork_conflict(
     &mut self,
@@ -799,11 +802,28 @@ impl MultiWorld {
     parent: u64,
     split_index: sailing_proto::Index,
   ) {
+    self.inject_fork_conflict_for_child(node, parent, split_index, u64::MAX);
+  }
+
+  /// Test-only: inject a standing fork-fence record for `(node, parent)` at `split_index` naming the
+  /// real `child` — so a subsequent REAL barrier-resolution arm clears it exactly as an
+  /// organically-recorded conflict would: the refuse arm by its split index, or the container's
+  /// internal redundant fold via the pump's reconciliation once `child` is hosted on the node. The
+  /// world draws only fresh child ids and so cannot itself mint a split conflict; a regression records
+  /// the conflict this way and drives the resolution arm through real machinery.
+  #[cfg(test)]
+  pub(crate) fn inject_fork_conflict_for_child(
+    &mut self,
+    node: u64,
+    parent: u64,
+    split_index: sailing_proto::Index,
+    child: u64,
+  ) {
     self
       .fork_conflicts
       .entry((node, parent))
       .or_default()
-      .insert(split_index);
+      .insert(split_index, child);
   }
 }
 

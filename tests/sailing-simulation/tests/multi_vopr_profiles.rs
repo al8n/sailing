@@ -299,3 +299,21 @@ fn soak_lifecycle_churn_reshape() {
     "the lifecycle-churn soak slice did not churn and reshape (removed={removed} reshaped={reshaped})"
   );
 }
+
+/// The run-end safety pass reaches HOSTED RETIRED HUSKS, not just live groups (#H3): this merge-storm
+/// seed ends with a merged-away source's frozen replica still hosted on a lagging node — a gid
+/// `live_groups` omits but the wedge sets contain. The pass's own accounting (`retired_husks_safety_
+/// checked`) proves it visited that husk and ran the safety oracles over its replicas, exempt or not.
+#[test]
+fn merge_storm_safety_pass_visits_a_hosted_retired_husk() {
+  let r = run_multi_vopr(17, 450, MultiProfile::merge_storm());
+  assert!(
+    r.merges_registered > 0,
+    "a merge registered — the husk is a merged-away source: {r:?}"
+  );
+  assert!(
+    r.retired_husks_safety_checked > 0,
+    "the unconditional safety pass must VISIT the hosted retired husk this seed leaves (live_groups \
+     omits it): {r:?}"
+  );
+}

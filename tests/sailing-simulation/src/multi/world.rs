@@ -188,13 +188,16 @@ pub struct MultiWorld {
   /// `(parent, child)` conflict can be attributed to the index its standing capture fence sits at.
   /// Persistent (a split's fence index never changes); bounded by the run's split count.
   split_fence_index: BTreeMap<u64, sailing_proto::Index>,
-  /// Standing fork-conflict fences observed per `(node, parent)`: the split indices of parked-fork
-  /// squatters the fork pump drained on that node (see [`MultiWorld::pump_forks`]). A parked fork
-  /// holds the parent's capture fence at its split index; a merge park on that same parent whose
-  /// commit sits at-or-above the fence is deadlocked behind it (issue #110, the fork-fence
-  /// coupling). Accumulated on drain — the co-condition that the merge is STILL parked is what keeps
-  /// a certification current (a resolved fence lets the park resolve, clearing the exemption).
-  fork_conflicts: BTreeMap<(u64, u64), BTreeSet<sailing_proto::Index>>,
+  /// Standing fork-conflict fences observed per `(node, parent)`: `split index -> conflicting CHILD`
+  /// for each parked-fork squatter the fork pump drained on that node (see
+  /// [`MultiWorld::pump_forks`]). A parked fork holds the parent's capture fence at its split index; a
+  /// merge park on that same parent whose coordinate sits at-or-above the fence is deadlocked behind
+  /// it (issue #110, the fork-fence coupling). The child is retained so the pump can clear a fence on
+  /// every barrier-resolution arm — materialize, refuse, or the container's internal REDUNDANT fold
+  /// (a provenance-matched twin, invisible to the pump): a fence whose child is now hosted on the node
+  /// has resolved (the fresh-id world never hosts a NON-matching squatter at a fork child, so a hosted
+  /// child IS the resolved fork). Records are ACTIVE state, never append-only history.
+  fork_conflicts: BTreeMap<(u64, u64), BTreeMap<sailing_proto::Index, u64>>,
   /// Late forks the fork pump REFUSED at materialization — the coordinator-admission model
   /// (the child id retired, or recreated past the fork's generation): no materialization, the
   /// parent's fence lifted, mirroring the product's `SplitRefused` resolution.

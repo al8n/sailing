@@ -3428,50 +3428,60 @@ fn fork_fence_coupled_park_uses_the_park_coordinate_not_commit() {
   );
 }
 
-/// A fork conflict that RESOLVES (its fork materializes) must clear the standing fence, so a LATER
-/// merge park on the same parent is NOT exempted (#110). Real machinery for the resolution: a real
-/// split materializes the child through `pump_forks`, which drops the recorded fence; a real merge
-/// then parks the same parent, and the coupling must read FALSE because the fence is gone.
+/// The REFUSE arm clears the fence: a real parked conflict whose child is then REMOVED resolves
+/// through the refusal arm (the late fork hits the tombstone), and a LATER merge park on the same
+/// parent must NOT be exempted (#110). The conflict is recorded on the lagging node (the world cannot
+/// mint one organically) and the refusal is driven end-to-end — not an injected record beside a
+/// conflict-free fork.
 #[test]
-fn fork_fence_clears_on_materialization_so_a_later_park_is_not_exempted() {
-  let mut w = MultiWorld::new(29);
+fn fork_fence_clears_on_the_refuse_arm_so_a_later_park_is_not_exempted() {
+  let mut w = MultiWorld::new(43);
   for n in 0..3 {
     w.add_node(n);
   }
   let all: BTreeSet<u64> = (0..3).collect();
   w.create_group(10, &all); // the parent (later the merge target)
   w.create_group(11, &all); // the merge source
-  assert!(w.run_until(2_000, |w| {
+  assert!(w.run_until(3_000, |w| {
     w.leader_of(10).is_some() && w.leader_of(11).is_some()
   }));
-  // Load the parent so the split has an interior point with keys on both sides.
-  for key in 0u16..4 {
+  for key in 0u16..8 {
     propose_until_accepted(
       &mut w,
       10,
       &crate::multi::encode_gkv(10, key, u64::from(key)),
     );
   }
-  // Propose a real split, then RECORD a standing fence at the child's real split index on every
-  // hosting node — the squatter conflict the world cannot itself mint, injected at exactly the
-  // coordinate the real materialization will clear.
-  propose_split_until_accepted(&mut w, 10, 200, 2);
+  assert!(w.run_until(2_000, |w| (0..3).all(|n| w.applied_of(n, 10).len() >= 8)));
+
+  // Node 2 lags the whole split: isolate it, commit the split on {0,1}, materialize child 200 there.
+  w.isolate(2);
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some_and(|l| l != 2)));
+  propose_split_until_accepted(&mut w, 10, 200, 4);
+  assert!(w.run_until(3_000, |w| w.splits_applied() == 1));
+  // A REAL standing conflict on the lagging node 2 for child 200 — recorded naming the child, so the
+  // refuse arm clears it exactly as an organic conflict would.
   let fence = w.split_fence_index[&200];
-  for n in 0..3u64 {
-    w.inject_fork_conflict(n, 10, fence);
-  }
-  // Materialize the fork through the real drain: each node's `pump_forks` wires its child replica
-  // and, on doing so, drops the fence its child contributed.
+  w.inject_fork_conflict_for_child(2, 10, fence, 200);
+  assert!(w.has_fork_fence_below(2, 10, sailing_proto::Index::new(u64::MAX)));
+
+  // Retire the child while node 2 still has the split entry ahead of it, then heal: node 2 applies the
+  // split and its late fork REFUSES against the tombstone — the fence's resolution arm.
+  w.remove_group(200);
+  w.heal(2);
   assert!(
-    w.run_until(3_000, |w| w.splits_applied() == 1),
-    "the split materializes on the quorum"
+    w.run_until(4_000, |w| w.split_refused_observed() == 1),
+    "the late fork never resolved refused"
   );
-  for n in 0..3u64 {
-    assert!(
-      !w.has_fork_fence_below(n, 10, sailing_proto::Index::new(u64::MAX)),
-      "node {n}: the materialized fork cleared its standing fence"
-    );
-  }
+  assert!(
+    !w.hosts_group(2, 200),
+    "a refused fork must not materialize"
+  );
+  assert!(
+    !w.has_fork_fence_below(2, 10, sailing_proto::Index::new(u64::MAX)),
+    "the refuse arm cleared the standing fence"
+  );
+
   // A LATER merge park on the same parent must NOT be exempted — the resolved conflict left no fence.
   let follower = drive_park_on_existing(&mut w, 11, 10);
   assert!(
@@ -3482,7 +3492,65 @@ fn fork_fence_clears_on_materialization_so_a_later_park_is_not_exempted() {
   );
   assert!(
     !w.fork_fence_coupled_park(10),
-    "a park after the fork resolved must not be certified as fork-fence coupled"
+    "a park after the refuse resolved must not be certified as fork-fence coupled"
+  );
+  assert!(
+    w.fork_fence_wedge_set().is_empty(),
+    "no standing fence => empty #110 set"
+  );
+}
+
+/// The REDUNDANT fold clears the fence: a real parked conflict whose child is already
+/// provenance-matched on the node resolves through the container's internal redundant arm (a crashed
+/// parent replays its split and folds the fork against its own restored child, yielding NO fork), and
+/// a LATER merge park on the same parent must NOT be exempted (#110). The pump can't see that internal
+/// fold, so it reconciles it off the hosted-child fact — driven end-to-end through the crash-replay.
+#[test]
+fn fork_fence_clears_on_the_redundant_fold_so_a_later_park_is_not_exempted() {
+  let mut w = world_after_split(47, 200); // 100 split into 200, materialized on all nodes
+  assert_eq!(w.splits_applied(), 1);
+  // A merge source that encodes ABOVE the parent (the direction rule), for the later park.
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(101, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(101).is_some()));
+
+  // A REAL standing conflict on node 0 for child 200, recorded naming the child.
+  let fence = w.split_fence_index[&200];
+  w.inject_fork_conflict_for_child(0, 100, fence, 200);
+  assert!(w.has_fork_fence_below(0, 100, sailing_proto::Index::new(u64::MAX)));
+
+  // Crash node 0: it restores its 200 replica (carrying the fork token) and the parent replays the
+  // split — the replayed fork resolves REDUNDANT against the provenance-matched twin, yielding no
+  // fork. The pump reconciles the fence off node 0 hosting the resolved child.
+  w.crash(0);
+  assert!(
+    w.run_until(2_000, |w| w.hosts_group(0, 200)),
+    "the crashed node restores its child replica"
+  );
+  for _ in 0..80 {
+    w.tick();
+  }
+  assert_eq!(
+    w.splits_applied(),
+    1,
+    "the replayed fork folds redundant, not re-registered"
+  );
+  assert!(
+    !w.has_fork_fence_below(0, 100, sailing_proto::Index::new(u64::MAX)),
+    "the redundant fold cleared the standing fence"
+  );
+
+  // A LATER merge park on the same parent must NOT be exempted.
+  let follower = drive_park_on_existing(&mut w, 101, 100);
+  assert!(
+    w.hosts[&follower]
+      .group(&100)
+      .is_some_and(|ep| ep.pending_merge().is_some()),
+    "the parent is parked mid-absorb"
+  );
+  assert!(
+    !w.fork_fence_coupled_park(100),
+    "a park after the redundant fold must not be certified as fork-fence coupled"
   );
   assert!(
     w.fork_fence_wedge_set().is_empty(),
@@ -3581,4 +3649,56 @@ fn exemption_does_not_gate_safety_on_a_wedged_group() {
   // group — the exemption gates only convergence, never this.
   let expected: BTreeSet<Vec<u8>> = BTreeSet::new();
   crate::multi::vopr::assert_group_safety(&w, 10, &expected, 41);
+}
+
+/// The cross-watermark aligned-PREFIX relation (#H2), unit red-proofed on synthetic aligned records:
+/// at UNEQUAL watermarks the shorter must be an exact prefix of the longer (agree), and a divergent
+/// shared cell breaks it (panic-worthy). The world can't synthetically diverge two real replicas
+/// (the codebase's standing note), so the relation is red-proofed directly here.
+#[test]
+fn absorbed_cross_watermark_prefix_relation_holds_and_catches_divergence() {
+  let cell = |i: u64, v: &str| (i, v.as_bytes().to_vec());
+  // Unequal watermarks, prefix-consistent → holds.
+  let short: AppliedLog = std::vec![cell(1, "a"), cell(2, "b")];
+  let long: AppliedLog = std::vec![cell(1, "a"), cell(2, "b"), cell(3, "c")];
+  assert!(
+    MultiWorld::aligned_prefix_holds(&[short.clone(), long.clone()]),
+    "a shorter record that is an exact prefix of the longer agrees across watermarks"
+  );
+  // A genuine divergence at a shared position (still unequal watermarks) → breaks.
+  let divergent: AppliedLog = std::vec![cell(1, "a"), cell(2, "DIFFERENT")];
+  assert!(
+    !MultiWorld::aligned_prefix_holds(&[divergent, long]),
+    "a divergent shared cell must break the prefix relation even at unequal watermarks"
+  );
+}
+
+/// The absorbed cross-watermark relation passes on a real EXEMPTED wedge sitting at unequal watermarks
+/// with AGREEING records (#H2 integration): the parked follower's aligned record is an exact prefix of
+/// the resolved hosts', so the safety pass certifies it without a leader and without equal watermarks.
+#[test]
+fn exempted_absorbed_wedge_at_unequal_watermarks_passes_safety() {
+  let (mut w, follower) = held_park_target(53, 11, 10);
+  assert!(w.group_absorbed(10), "the target absorbed the source");
+  // The parked follower sits at k-1; the resolved hosts are past k — unequal watermarks.
+  let lens: Vec<usize> = (0..3u64).map(|n| w.applied_of(n, 10).len()).collect();
+  assert!(
+    lens.iter().min() != lens.iter().max(),
+    "the wedge must straddle unequal watermarks: {lens:?}"
+  );
+  // Make it the exempted fork-fence wedge (#110) so the safety pass runs on it EXEMPT.
+  let applied = w.applied_index_of(follower, 10).get();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 1));
+  assert!(
+    w.fork_fence_wedge_set().contains(&10),
+    "the parked target is exempted"
+  );
+  // The aligned records AGREE across the unequal watermarks → the relation holds and the safety pass
+  // passes (the target's own load, source's load folded on the resolved hosts, are the expected set).
+  assert!(
+    w.absorbed_lineage_prefix_holds(10),
+    "agreeing absorbed replicas at unequal watermarks must pass the cross-watermark relation"
+  );
+  let expected: BTreeSet<Vec<u8>> = [b"t0".to_vec(), b"s0".to_vec()].into_iter().collect();
+  crate::multi::vopr::assert_group_safety(&w, 10, &expected, 53);
 }

@@ -163,6 +163,11 @@ impl MultiWorld {
           .is_some_and(|m| m.retired || fork.child_gen < m.generation)
         {
           self.split_refused += 1;
+          // The REFUSE arm resolves the barrier without materializing — clear the fence this child's
+          // split index pinned on `(node, parent)`, so a stale record cannot outlive the resolved
+          // conflict (#110). The child is retired here, so the redundant-fold reconciliation below
+          // (keyed on the child being HOSTED) can never catch it; this arm must clear it explicitly.
+          self.clear_fork_fence(node, fork.parent, fork.child);
           self
             .hosts
             .get_mut(&node)
@@ -170,21 +175,10 @@ impl MultiWorld {
             .lift_fork_barrier(&fork.parent, fork.split_index);
           continue;
         }
-        let (materialized_parent, materialized_child) = (fork.parent, fork.child);
+        // The MATERIALIZE arm wires the child; its fence is cleared uniformly with the redundant fold
+        // by the hosted-child reconciliation at the end of this pump (a wired child is a hosted child).
         self.register_split_child(&fork);
         self.wire_fork_replica(node, fork);
-        // The fork MATERIALIZED on this node: its standing capture fence has lifted, so the
-        // `(node, parent)` fence record this child contributed is now stale and must not outlive the
-        // resolved conflict (#110). Drop the child's own split-index entry — the fence records are
-        // ACTIVE state, never append-only history — and clear the slot when it empties.
-        if let Some(&idx) = self.split_fence_index.get(&materialized_child)
-          && let Some(idxs) = self.fork_conflicts.get_mut(&(node, materialized_parent))
-        {
-          idxs.remove(&idx);
-          if idxs.is_empty() {
-            self.fork_conflicts.remove(&(node, materialized_parent));
-          }
-        }
       }
       // Conflict signals are drained and counted, never acted on: see the field docs for why
       // the world's embedder model leaves a squatter in place. Beyond the count, the standing fence
@@ -203,11 +197,46 @@ impl MultiWorld {
             .fork_conflicts
             .entry((node, parent))
             .or_default()
-            .insert(idx);
+            .insert(idx, child);
+        }
+      }
+    }
+    // The REDUNDANT-fold arm (the container resolves a fork whose child is already provenance-matched
+    // on the node, WITHOUT yielding it) is invisible to the loops above. Reconcile it — and the
+    // ordinary materialize — here: a fence whose child is now HOSTED on that node has resolved (the
+    // fresh-id world never hosts a NON-matching squatter at a fork child, so a hosted child IS the
+    // resolved fork). Clear it so no record outlives the resolved conflict (#110).
+    let mut resolved: Vec<((u64, u64), sailing_proto::Index)> = Vec::new();
+    for (&key, idxs) in &self.fork_conflicts {
+      for (&idx, &child) in idxs {
+        if self.hosts_group(key.0, child) {
+          resolved.push((key, idx));
+        }
+      }
+    }
+    for (key, idx) in resolved {
+      if let Some(idxs) = self.fork_conflicts.get_mut(&key) {
+        idxs.remove(&idx);
+        if idxs.is_empty() {
+          self.fork_conflicts.remove(&key);
         }
       }
     }
     progressed
+  }
+
+  /// Drop the fork-fence record `child`'s split index pinned on `(node, parent)` — the shared per-arm
+  /// clear the materialize/refuse arms and the teardown seams all funnel through (#110). A no-op when
+  /// the child never had a recorded fence.
+  fn clear_fork_fence(&mut self, node: u64, parent: u64, child: u64) {
+    if let Some(&idx) = self.split_fence_index.get(&child)
+      && let Some(idxs) = self.fork_conflicts.get_mut(&(node, parent))
+    {
+      idxs.remove(&idx);
+      if idxs.is_empty() {
+        self.fork_conflicts.remove(&(node, parent));
+      }
+    }
   }
 
   /// Register a fork's child in the harness catalog on its FIRST materialization anywhere:
@@ -403,6 +432,43 @@ impl MultiWorld {
         None => true,
       })
       .collect()
+  }
+
+  /// Whether a set of ALIGNED applied records is pairwise PREFIX-consistent: in every pair the
+  /// shorter record is an exact prefix of the longer. This is the cross-watermark form of State
+  /// Machine Safety for an absorbed lineage. [`align_record`](Self::align_record) collapses every
+  /// replica's view to `filter(own(k))`, differing across replicas only by `k` — so a faithful absorb
+  /// yields an exact prefix relation WHATEVER the arrival path (live fold vs capture restore) or
+  /// watermark, while a genuine divergence inside a shared position survives alignment and breaks it.
+  /// Unlike the equal-applied raw form in [`agreement_holds`](Self::agreement_holds) it carries NO
+  /// equal-watermark requirement, so it judges the unequal watermarks an exempted merge wedge sits at.
+  pub(crate) fn aligned_prefix_holds(records: &[AppliedLog]) -> bool {
+    for i in 0..records.len() {
+      for j in (i + 1)..records.len() {
+        let (short, long) = if records[i].len() <= records[j].len() {
+          (&records[i], &records[j])
+        } else {
+          (&records[j], &records[i])
+        };
+        if long[..short.len()] != short[..] {
+          return false;
+        }
+      }
+    }
+    true
+  }
+
+  /// Whether every hosted replica of an absorbed `gid` holds a prefix-consistent aligned record — the
+  /// cross-watermark agreement leg the unconditional safety pass runs for absorbed groups. It catches
+  /// a divergence between replicas at UNEQUAL watermarks that `agreement_holds`' absorbed branch, which
+  /// compares only EQUAL-applied replicas, never puts side by side.
+  pub(crate) fn absorbed_lineage_prefix_holds(&self, gid: u64) -> bool {
+    let records: Vec<AppliedLog> = self
+      .hosting_nodes(gid)
+      .into_iter()
+      .map(|n| self.aligned_applied(n, gid))
+      .collect();
+    Self::aligned_prefix_holds(&records)
   }
 
   /// Record every replica's applied gkv cells into the conservation ledger (see the module

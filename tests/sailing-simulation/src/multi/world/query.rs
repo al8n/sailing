@@ -49,6 +49,20 @@ impl MultiWorld {
       .collect()
   }
 
+  /// Every gid with a replica hosted on ANY node — the union over hosts' registries, RETIRED HUSKS
+  /// INCLUDED (a merged-away source's frozen replica lingering after other hosts resolved). The
+  /// unconditional safety worklist: [`live_groups`](Self::live_groups) omits these husks, but the
+  /// wedge sets contain them and their hosted replicas must still face the safety oracles.
+  pub(crate) fn all_hosted_groups(&self) -> BTreeSet<u64> {
+    let mut gids = BTreeSet::new();
+    for node in &self.node_ids {
+      for gid in self.hosts[node].group_ids() {
+        gids.insert(*gid);
+      }
+    }
+    gids
+  }
+
   /// The AUTHORITATIVE hosting replicas of `gid`: non-parked AND caught up to the applied frontier
   /// (tied for the furthest applied index among the non-parked). This is the admission set for the
   /// per-key value floor. It carries [`leader_of`](Self::leader_of)'s parked exclusion — a reaped
