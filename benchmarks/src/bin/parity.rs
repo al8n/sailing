@@ -338,6 +338,16 @@ async fn run(args: Args) {
   let mut observed = 0u64;
   let mut per_group: Vec<(u64, u64)> = Vec::with_capacity(groups as usize);
   let mut remaining = loads.len();
+  // The NEIGHBOUR stopwatch closes when the LAST N-member load task finishes. In `--reshape` mode the
+  // group-0 reshape task is a single-voter container — a different topology whose churn runs longer —
+  // and it must NOT stretch the neighbours' throughput divisor; the all-task window is reported apart,
+  // on the reshape_local line. In non-reshape mode every task is a neighbour, so the two coincide.
+  let mut neighbour_remaining = if args.reshape {
+    (groups - 1) as usize
+  } else {
+    groups as usize
+  };
+  let mut neighbour_elapsed = None;
   while remaining > 0 {
     tokio::select! {
       biased;
@@ -348,6 +358,12 @@ async fn run(args: Args) {
           observed += committed;
           per_group.push((grp, committed));
           remaining -= 1;
+          if !args.reshape || grp != 0 {
+            neighbour_remaining -= 1;
+            if neighbour_remaining == 0 {
+              neighbour_elapsed = Some(start.elapsed());
+            }
+          }
         }
         None => break,
       },
@@ -359,6 +375,9 @@ async fn run(args: Args) {
     }
   }
   let elapsed = start.elapsed();
+  // The all-task window closes with the last task (the reshape group in `--reshape` mode); the
+  // neighbour window closed when the last N-member load finished (== `elapsed` without `--reshape`).
+  let neighbour_elapsed = neighbour_elapsed.unwrap_or(elapsed);
 
   // Close the boundary race: a node may have died or leadership moved between the last load completing
   // and the window closing, so sweep every group's guards once more before the number is reported.
@@ -397,8 +416,11 @@ async fn run(args: Args) {
   };
   let headline_ops = observed - group0_committed;
   let headline_groups = groups - u64::from(args.reshape);
-  let put_s = headline_ops as f64 / elapsed.as_secs_f64();
-  let millis = elapsed.as_millis().max(1);
+  // The headline divides neighbour work by the NEIGHBOUR window (closed when the last N-member load
+  // finished), never the all-task window (which in `--reshape` mode closes on the longer-running
+  // reshape task). Without `--reshape` the two are identical, so this is byte-identical to before.
+  let put_s = headline_ops as f64 / neighbour_elapsed.as_secs_f64();
+  let millis = neighbour_elapsed.as_millis().max(1);
   let per_group_avg = put_s / headline_groups as f64;
   println!(
     "parity  groups={} members={} clients={} batch={} ops={} elapsed={:.3}s  put/s={:.0}  \
@@ -408,29 +430,33 @@ async fn run(args: Args) {
     args.clients,
     args.batch,
     headline_ops,
-    elapsed.as_secs_f64(),
+    neighbour_elapsed.as_secs_f64(),
     put_s,
     (headline_ops as u128) / millis,
     per_group_avg,
   );
 
-  // Machine-comparable per-group lines: one per NEIGHBOUR group, its own committed count over the
-  // shared elapsed — directly comparable against a plain `-g` run (identical neighbour substrate),
+  // Machine-comparable per-group lines: one per NEIGHBOUR group, its committed count over the
+  // NEIGHBOUR window — directly comparable against a plain `-g` run (identical neighbour substrate),
   // the neighbour-isolation read. In `--reshape` mode group 0 is the single-voter churner and is
-  // excluded here, reported on the separate `reshape_local` line below instead.
+  // excluded here, reported on the separate `reshape_local` line below over the all-task window.
   per_group.sort_by_key(|(g, _)| *g);
   for (g, committed) in &per_group {
     if args.reshape && *g == 0 {
       continue;
     }
-    let g_put_s = *committed as f64 / elapsed.as_secs_f64();
+    let g_put_s = *committed as f64 / neighbour_elapsed.as_secs_f64();
     println!("group={g} role=load committed={committed} put_s={g_put_s:.0}");
   }
   if args.reshape {
-    // The local-reshape line: group 0's own committed count (kept OUT of the neighbour aggregate)
-    // plus its per-cycle freeze windows.
+    // The local-reshape line: group 0's own committed count over the ALL-TASK window (its own churn
+    // window, distinct from the neighbour window above), plus its per-cycle freeze windows.
     let g0_put_s = group0_committed as f64 / elapsed.as_secs_f64();
-    println!("reshape_local group=0 committed={group0_committed} put_s={g0_put_s:.0}");
+    println!(
+      "reshape_local group=0 committed={group0_committed} put_s={g0_put_s:.0} \
+       all_task_elapsed={:.3}s",
+      elapsed.as_secs_f64(),
+    );
     let fws = freeze_windows.lock().expect("freeze-window mutex poisoned");
     for (i, w) in fws.iter().enumerate() {
       println!("reshape_cycle={i} freeze_window_ms={w:.3}");
