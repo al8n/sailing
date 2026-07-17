@@ -288,10 +288,24 @@ transport:
 
 `HardState` persistence goes through the `StableStore` trait as a typed value — the codec above is
 not (yet) used for disk. A store that serializes `HardState` itself must version its own format;
-see the decoder obligations documented on `src/hard_state.rs`. Note that `ConfChange` entries IN
-THE LOG carry the §1 envelope encoding (`sailing.v1.ConfChangeV2`): a log written before the
-envelope migration does not replay against this version (pre-release; no migration path is
+see the decoder obligations documented on `src/hard_state.rs` — including `lineage`, the fork
+token the restart reconciliation compares against the durable snapshot slot (absent decodes to
+`None`: exact, since no pre-`lineage` writer could have forked or adopted). Note that `ConfChange`
+entries IN THE LOG carry the §1 envelope encoding (`sailing.v1.ConfChangeV2`): a log written before
+the envelope migration does not replay against this version (pre-release; no migration path is
 provided).
+
+Snapshot metadata is durable state too: the meta-fidelity contract on `StableStore::submit_snapshot`
+requires every meta the store hands back — the visible slot, the durable slot, and chunk staging —
+to be the submitted value VERBATIM, `shape_gen` and `fork_id` included. A store that persists only
+the coordinate triple breaks adoption completion and chunked-transfer resume silently.
+
+The multi engine's PER-GROUP LINEAGE RECORDS — the incarnation generation and the admission floor —
+are durable state that OUTLIVES group removal, written under the same flush barrier as the stores:
+the floor is raised at REMOVAL (the removal ceiling), at MERGE resolution (the terminal
+`MERGED_FLOOR` that refuses any successor incarnation), and consulted at every ADMISSION
+(create/restore/fork walk the floor-first gate). A disk engine mirrors `multi::engine`'s reference
+semantics; losing a floor record re-admits a retired incarnation below its fence.
 
 ## 6. Reserved: the group-header incarnation stamp (the generation fence)
 
