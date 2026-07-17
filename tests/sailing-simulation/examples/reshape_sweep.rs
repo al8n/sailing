@@ -48,6 +48,18 @@ fn main() {
     std::process::exit(2);
   };
 
+  // Reject the degenerate configurations that would otherwise exit GREEN having run nothing: an empty
+  // band (`end <= start`), a zero tick budget (vacuous runs), or a zero-thread pool (no worker ever
+  // draws a seed). A silent no-op sweep must never read as a clean pass.
+  if end <= start || ticks == 0 || threads == 0 {
+    eprintln!(
+      "invalid sweep bounds: start={start} end={end} ticks={ticks} threads={threads}\n  \
+       require end > start, ticks > 0, threads > 0\nusage: reshape_sweep <profile> <start> <end> \
+       <ticks> <threads>"
+    );
+    std::process::exit(2);
+  }
+
   panic::set_hook(Box::new(|_| {})); // quiet — only our summary prints
 
   let failures: Arc<Mutex<Vec<(u64, String)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -178,4 +190,15 @@ fn main() {
   if !f.is_empty() {
     std::process::exit(1);
   }
+  // Never report success without having actually swept the whole band: every seed in `[start, end)`
+  // must have completed. Restore the default panic hook first so this safety net is visible if it
+  // ever fires (the validated bounds above make it a `should-never-happen`, not a routine path).
+  let _ = panic::take_hook();
+  let completed = done.load(Ordering::Relaxed);
+  assert_eq!(
+    completed,
+    end - start,
+    "sweep incomplete: {completed} of {} seeds ran — refusing the green exit",
+    end - start,
+  );
 }

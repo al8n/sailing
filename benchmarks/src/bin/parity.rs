@@ -383,39 +383,54 @@ async fn run(args: Args) {
     args.operations,
   );
 
-  // Aggregate throughput: every group's committed ops over the single shared wall clock.
-  let put_s = observed as f64 / elapsed.as_secs_f64();
+  // Aggregate throughput over the N-MEMBER neighbour substrate only. In `--reshape` mode group 0 is
+  // a single-voter `MultiRaft` container — a DIFFERENT topology whose throughput is not comparable to
+  // the N-member neighbours — so it is excluded from the headline aggregate/average here and reported
+  // on its own local-reshape line below; the `observed == -n` invariant above still spans every group.
+  let group0_committed: u64 = if args.reshape {
+    per_group
+      .iter()
+      .find(|(g, _)| *g == 0)
+      .map_or(0, |(_, c)| *c)
+  } else {
+    0
+  };
+  let headline_ops = observed - group0_committed;
+  let headline_groups = groups - u64::from(args.reshape);
+  let put_s = headline_ops as f64 / elapsed.as_secs_f64();
   let millis = elapsed.as_millis().max(1);
-  let per_group_avg = put_s / groups as f64;
+  let per_group_avg = put_s / headline_groups as f64;
   println!(
     "parity  groups={} members={} clients={} batch={} ops={} elapsed={:.3}s  put/s={:.0}  \
      op/ms={}  per-group put/s={:.0}",
-    groups,
+    headline_groups,
     args.members,
     args.clients,
     args.batch,
-    observed,
+    headline_ops,
     elapsed.as_secs_f64(),
     put_s,
-    (observed as u128) / millis,
+    (headline_ops as u128) / millis,
     per_group_avg,
   );
 
-  // Machine-comparable per-group lines: one per group, its own committed count over the shared
-  // elapsed. In `--reshape` mode the neighbour lines (group 1..K) are directly comparable against a
-  // plain `-g K` run (identical neighbour substrate) — the neighbour-isolation read — and group 0
-  // (`role=reshape`) is the churner.
+  // Machine-comparable per-group lines: one per NEIGHBOUR group, its own committed count over the
+  // shared elapsed — directly comparable against a plain `-g` run (identical neighbour substrate),
+  // the neighbour-isolation read. In `--reshape` mode group 0 is the single-voter churner and is
+  // excluded here, reported on the separate `reshape_local` line below instead.
   per_group.sort_by_key(|(g, _)| *g);
   for (g, committed) in &per_group {
+    if args.reshape && *g == 0 {
+      continue;
+    }
     let g_put_s = *committed as f64 / elapsed.as_secs_f64();
-    let role = if args.reshape && *g == 0 {
-      "reshape"
-    } else {
-      "load"
-    };
-    println!("group={g} role={role} committed={committed} put_s={g_put_s:.0}");
+    println!("group={g} role=load committed={committed} put_s={g_put_s:.0}");
   }
   if args.reshape {
+    // The local-reshape line: group 0's own committed count (kept OUT of the neighbour aggregate)
+    // plus its per-cycle freeze windows.
+    let g0_put_s = group0_committed as f64 / elapsed.as_secs_f64();
+    println!("reshape_local group=0 committed={group0_committed} put_s={g0_put_s:.0}");
     let fws = freeze_windows.lock().expect("freeze-window mutex poisoned");
     for (i, w) in fws.iter().enumerate() {
       println!("reshape_cycle={i} freeze_window_ms={w:.3}");

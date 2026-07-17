@@ -92,6 +92,10 @@ fn merge_storm_band_merges_and_aborts() {
 fn mixed_reshape_band_exercises_both_families() {
   let mut splits = 0u64;
   let mut registered = 0u64;
+  // The JOINT witness: some SINGLE run must exercise both families at once. The aggregate sums below
+  // can both be nonzero while no run ever saw a split AND a merge together (one seed splits, another
+  // merges) — which is not the both-families-in-one-run interaction this band is here to cover.
+  let mut joint = false;
   for seed in 0..6u64 {
     let r = run_multi_vopr(seed, 550, MultiProfile::mixed_reshape());
     assert!(
@@ -100,10 +104,17 @@ fn mixed_reshape_band_exercises_both_families() {
     );
     splits += r.splits_applied;
     registered += r.merges_registered;
+    joint |= r.splits_applied > 0 && r.merges_registered > 0;
   }
-  std::eprintln!("mixed_reshape band: splits_applied={splits} merges_registered={registered}");
+  std::eprintln!(
+    "mixed_reshape band: splits_applied={splits} merges_registered={registered} joint={joint}"
+  );
   assert!(splits > 0, "the mixed band never split");
   assert!(registered > 0, "the mixed band never merged");
+  assert!(
+    joint,
+    "no single run exercised BOTH a split and a merge — the aggregate masks the interaction"
+  );
 }
 
 /// The lifecycle-churn band crosses the floor/tombstone/incarnation boundaries WHILE reshaping:
@@ -115,6 +126,11 @@ fn lifecycle_churn_band_churns_and_reshapes() {
   let mut removed = 0u64;
   let mut recreated = 0u64;
   let mut reshaped = 0u64;
+  // The JOINT witness: some SINGLE run must retire a group AND recreate a retired gid AND reshape,
+  // all in the same episode — the floor/tombstone/incarnation boundary CROSSED WHILE reshaping, the
+  // interaction the per-seed aggregate sums below cannot certify (each could come from a different
+  // seed).
+  let mut joint = false;
   for seed in 0..6u64 {
     let r = run_multi_vopr(seed, 450, MultiProfile::lifecycle_churn_reshape());
     assert!(
@@ -124,9 +140,12 @@ fn lifecycle_churn_band_churns_and_reshapes() {
     removed += r.groups_removed;
     recreated += r.groups_recreated;
     reshaped += r.splits_applied + r.merges_registered;
+    joint |= r.groups_removed > 0
+      && r.groups_recreated > 0
+      && (r.splits_applied + r.merges_registered) > 0;
   }
   std::eprintln!(
-    "lifecycle_churn band: groups_removed={removed} groups_recreated={recreated} reshaped={reshaped}"
+    "lifecycle_churn band: groups_removed={removed} groups_recreated={recreated} reshaped={reshaped} joint={joint}"
   );
   assert!(removed > 0, "the lifecycle storm never retired a group");
   assert!(
@@ -136,6 +155,10 @@ fn lifecycle_churn_band_churns_and_reshapes() {
   assert!(
     reshaped > 0,
     "the lifecycle storm never reshaped amid the churn"
+  );
+  assert!(
+    joint,
+    "no single run retired, recreated, AND reshaped together — the aggregate masks the interaction"
   );
 }
 
