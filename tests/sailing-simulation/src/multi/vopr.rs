@@ -1320,7 +1320,10 @@ pub(crate) fn assert_group_safety(
   // cross-watermark leg. What runs here is per-index agreement over the group's OWN CLIENT (gkv) cells
   // at shared indices — and a RETIRED source's husk replicas align against their TERMINAL pre-merge
   // population (see `aligned_applied`), so their client cells are judged here rather than blanked by the
-  // emptied live set. What is DELIBERATELY NOT
+  // emptied live set. Standard choreography converges tracked husks to the freeze coordinate (the
+  // every-peer freeze barrier), so husk pairs sit at EQUAL watermarks there. A storage-fault-regressed
+  // husk below the freeze is the randomized-only unequal shape, where for an absorbed source this leg
+  // is its only client-content judge. What is DELIBERATELY NOT
   // asserted at the per-replica cross-watermark grain is ABSORBED-content completeness: a record-keyed
   // "every replica past a merge boundary holds the complete absorbed block" form was built and
   // rejected because it false-trips on legitimate world behavior the accumulating ledger tolerates — a

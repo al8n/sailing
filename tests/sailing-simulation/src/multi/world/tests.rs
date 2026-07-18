@@ -3109,21 +3109,23 @@ fn merge_teardown_records_floors_and_drops_source_stores() {
   w.finalize_merge_conservation_or_panic(17);
 }
 
-/// NON-VACUITY of the cross-watermark leg on a RETIRED-SOURCE HUSK — the terminal-population fix.
-/// A merge empties the source's LIVE key population at resolution, but a lagging husk replica stays
-/// hosted and inside the safety sweep; without the terminal-population fallback in `aligned_applied`
-/// every husk's aligned record would align gkv-EMPTY and the cross-watermark leg would certify
-/// vacuously. On an ABSORBED source (12 merged into 11 first) leg 1's absorbed branch skips
-/// unequal-watermark pairs and integrity is membership-only, so leg 2 is the ONLY client-content
-/// cover at exactly this last-chance checkpoint — hence the chained shape. Doctrine (the world cannot
-/// diverge two real replicas) means this red-proofs VACUITY, not divergence; divergence-catching stays
-/// covered by the synthetic relation red cases in
-/// `absorbed_cross_watermark_client_cell_agreement_holds_and_catches_divergence`. Red-proof: revert
-/// `aligned_applied` to the live-only population and the `>= 2 gkv-non-empty` assert fails.
+/// The terminal-population fallback keeps a RETIRED-SOURCE HUSK's aligned record NON-VACUOUS — the
+/// MECHANISM the aligned consumers (the cross-watermark leg and the non-absorbed positional branch)
+/// read. A merge empties the source's LIVE key population at resolution, but a lagging husk replica
+/// stays hosted inside the safety sweep; without the fallback in `aligned_applied` every husk's aligned
+/// record would align gkv-EMPTY and those consumers would judge nothing. The every-peer freeze barrier
+/// (`peers_matched_through`) converges the tracked source replicas to the freeze coordinate, so these
+/// husks sit at the SAME watermark — where an ABSORBED husk's client content is independently judged by
+/// the absorbed agreement branch on RAW records. The cross-watermark leg is the absorbed husk's ONLY
+/// judge in the randomized-only shape where a storage fault regresses a husk BELOW the freeze (no leader
+/// re-replicates a retired group's log); this deterministic test pins the aligned non-vacuity that leg
+/// consumes, NOT an unequal pair. Doctrine (the world cannot diverge two real replicas) means this
+/// red-proofs VACUITY, not divergence. Red-proof: revert `aligned_applied` to live-only and the
+/// `>= 2 gkv-non-empty` assert fails.
 #[test]
 fn retired_husk_aligns_against_its_terminal_population() {
-  // The gkv (client) cells an aligned record retains — exactly what the cross-watermark leg judges
-  // (non-gkv conf cells survive alignment regardless, so they cannot stand in for client coverage).
+  // The gkv (client) cells an aligned record retains — what the aligned consumers judge (non-gkv conf
+  // cells survive alignment regardless, so they cannot stand in for client coverage).
   let gkv_cells = |w: &MultiWorld, n: u64, gid: u64| -> usize {
     w.aligned_applied(n, gid)
       .iter()
@@ -3184,9 +3186,9 @@ fn retired_husk_aligns_against_its_terminal_population() {
     w.propose_commit_merge(10, 11)
   });
   // Isolate {3,4} BEFORE the CommitMerge reaches them: the {0,1,2} quorum applies and resolves (retiring
-  // 11, emptying its live keys) while {3,4} stay at the pre-resolution watermark — hosted husks at an
-  // UNEQUAL watermark. (The resolved hosts' `Merged` teardown drains fast; the two isolated husks are
-  // what keep the leg non-vacuous by construction.)
+  // 11, emptying its live keys) while {3,4} stay hosted as husks. The every-peer freeze barrier put all
+  // tracked voters at the freeze coordinate, so these husks sit at the SAME watermark (the deferred
+  // `Merged` teardown drains fast; the two isolated husks are what keep the aligned records non-vacuous).
   w.isolate(3);
   w.isolate(4);
   assert!(
@@ -3203,7 +3205,7 @@ fn retired_husk_aligns_against_its_terminal_population() {
     w.groups[&11].terminal_keys.is_some(),
     "its terminal population was stashed at resolution"
   );
-  // THE FIX: hosted husks keep their gkv content, so the cross-watermark leg is NON-VACUOUS.
+  // THE FIX: hosted husks keep their gkv content, so the aligned consumers are NON-VACUOUS.
   let hosts = w.hosting_nodes(11);
   let with_gkv: Vec<u64> = hosts
     .iter()
@@ -3212,7 +3214,7 @@ fn retired_husk_aligns_against_its_terminal_population() {
     .collect();
   assert!(
     with_gkv.len() >= 2,
-    "the cross-watermark leg must be non-vacuous: >=2 hosted husks keep gkv content, got \
+    "the husks' aligned records must be non-vacuous: >=2 hosted husks keep gkv content, got \
      {with_gkv:?} of hosts {hosts:?}"
   );
   assert!(
@@ -3222,6 +3224,112 @@ fn retired_husk_aligns_against_its_terminal_population() {
   assert!(
     w.absorbed_lineage_client_cells_agree_at_shared_indices(11),
     "the retired absorbed lineage's husks agree per index"
+  );
+  // The full safety helper passes over the husks with the HONEST expected set (11's own load plus the
+  // 12 cell it absorbed) — the wrapper wiring end-to-end, not just the relation in isolation.
+  let expected: BTreeSet<Vec<u8>> = [
+    crate::multi::encode_gkv(11, 0, 100),
+    crate::multi::encode_gkv(11, 1, 101),
+    crate::multi::encode_gkv(11, 2, 102),
+    crate::multi::encode_gkv(11, 3, 103),
+    crate::multi::encode_gkv(12, 0, 120),
+  ]
+  .into_iter()
+  .collect();
+  crate::multi::vopr::assert_group_safety(&w, 11, &expected, 29);
+}
+
+/// The plain-source variant — the fix's DETERMINISTICALLY-reachable value. A NEVER-absorbed source
+/// merged away routes agreement to the NON-absorbed positional branch (`group_absorbed` is false), which
+/// reads `aligned_applied`; without the terminal-population fallback its retained husks align gkv-EMPTY
+/// and that branch judges empty records (vacuous). The every-peer freeze barrier pins the husks at the
+/// SAME watermark, as in the chained test. Red-proof: revert `aligned_applied` to live-only and the
+/// gkv-non-empty assert fails — `agreement_holds` passes either way (empty == empty is a vacuous pass),
+/// so the non-vacuity is the load-bearing assert here.
+#[test]
+fn plain_source_husk_aligns_via_the_non_absorbed_branch() {
+  let gkv_cells = |w: &MultiWorld, n: u64, gid: u64| -> usize {
+    w.aligned_applied(n, gid)
+      .iter()
+      .filter(|(_, c)| crate::multi::decode_gkv(c).is_some())
+      .count()
+  };
+
+  let mut w = MultiWorld::new(31);
+  for n in 0..5 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..5).collect();
+  w.create_group(10, &all); // the target
+  w.create_group(11, &all); // a PLAIN (never-absorbed) source
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()
+    && w.leader_of(11).is_some()));
+  for (key, val) in [(0u16, 200u64), (1, 201), (2, 202)] {
+    propose_until_accepted(&mut w, 11, &crate::multi::encode_gkv(11, key, val));
+  }
+  assert!(
+    w.run_until(2_000, |w| (0..5)
+      .all(|n| w.hosts_group(n, 11) && gkv_cells(w, n, 11) > 0)),
+    "every 11 replica holds gkv content before the merge"
+  );
+  assert!(
+    !w.group_absorbed(11),
+    "11 never absorbed anything — agreement routes to the non-absorbed positional branch"
+  );
+
+  // Leadership off {3,4}; freeze+commit with all five voters reachable; then isolate {3,4} before the
+  // CommitMerge reaches them so they stay hosted as husks at the freeze coordinate.
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()));
+  if w.leader_of(10).is_some_and(|l| l >= 3) {
+    w.transfer_group_leader(10, 0);
+    assert!(w.run_until(3_000, |w| w.leader_of(10).is_some_and(|l| l < 3)));
+  }
+  colocate_source_onto_target(&mut w, 11, 10);
+  merge_verb_until_accepted(&mut w, 2_000, "freeze 11", |w| {
+    w.propose_prepare_merge(11, 10)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "commit 11", |w| {
+    w.propose_commit_merge(10, 11)
+  });
+  w.isolate(3);
+  w.isolate(4);
+  assert!(
+    w.run_until(8_000, |w| w.is_merged(11)),
+    "11 retires — its live population is emptied"
+  );
+
+  assert!(
+    w.groups[&11].keys.is_empty(),
+    "the retired source's live population is emptied"
+  );
+  assert!(
+    w.groups[&11].terminal_keys.is_some(),
+    "the terminal population was stashed at resolution"
+  );
+  assert!(
+    !w.group_absorbed(11),
+    "still non-absorbed — agreement routes to the positional branch that reads aligned_applied"
+  );
+  // THE FIX: the husks align NON-VACUOUS via the terminal population; without it the non-absorbed
+  // positional branch would compare empty records.
+  let hosts = w.hosting_nodes(11);
+  let with_gkv: Vec<u64> = hosts
+    .iter()
+    .copied()
+    .filter(|&n| gkv_cells(&w, n, 11) > 0)
+    .collect();
+  assert!(
+    with_gkv.len() >= 2,
+    "the non-absorbed positional branch must be non-vacuous: >=2 husks keep gkv content, got \
+     {with_gkv:?} of hosts {hosts:?}"
+  );
+  assert!(
+    gkv_cells(&w, 3, 11) > 0 && gkv_cells(&w, 4, 11) > 0,
+    "both husks retain gkv content via the terminal population"
+  );
+  assert!(
+    w.agreement_holds(11),
+    "the non-absorbed positional branch passes over the husks"
   );
 }
 
