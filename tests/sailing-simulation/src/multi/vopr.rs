@@ -1318,7 +1318,9 @@ pub(crate) fn assert_group_safety(
   // ABSORBED-lineage coverage, SCOPED honestly. `agreement_holds`' absorbed branch compares only
   // EQUAL-applied replicas, so an exempted merge wedge (replicas at UNEQUAL watermarks) needs a
   // cross-watermark leg. What runs here is per-index agreement over the group's OWN CLIENT (gkv) cells
-  // at shared indices. What is DELIBERATELY NOT
+  // at shared indices — and a RETIRED source's husk replicas align against their TERMINAL pre-merge
+  // population (see `aligned_applied`), so their client cells are judged here rather than blanked by the
+  // emptied live set. What is DELIBERATELY NOT
   // asserted at the per-replica cross-watermark grain is ABSORBED-content completeness: a record-keyed
   // "every replica past a merge boundary holds the complete absorbed block" form was built and
   // rejected because it false-trips on legitimate world behavior the accumulating ledger tolerates — a

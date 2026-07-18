@@ -3109,6 +3109,122 @@ fn merge_teardown_records_floors_and_drops_source_stores() {
   w.finalize_merge_conservation_or_panic(17);
 }
 
+/// NON-VACUITY of the cross-watermark leg on a RETIRED-SOURCE HUSK — the terminal-population fix.
+/// A merge empties the source's LIVE key population at resolution, but a lagging husk replica stays
+/// hosted and inside the safety sweep; without the terminal-population fallback in `aligned_applied`
+/// every husk's aligned record would align gkv-EMPTY and the cross-watermark leg would certify
+/// vacuously. On an ABSORBED source (12 merged into 11 first) leg 1's absorbed branch skips
+/// unequal-watermark pairs and integrity is membership-only, so leg 2 is the ONLY client-content
+/// cover at exactly this last-chance checkpoint — hence the chained shape. Doctrine (the world cannot
+/// diverge two real replicas) means this red-proofs VACUITY, not divergence; divergence-catching stays
+/// covered by the synthetic relation red cases in
+/// `absorbed_cross_watermark_client_cell_agreement_holds_and_catches_divergence`. Red-proof: revert
+/// `aligned_applied` to the live-only population and the `>= 2 gkv-non-empty` assert fails.
+#[test]
+fn retired_husk_aligns_against_its_terminal_population() {
+  // The gkv (client) cells an aligned record retains — exactly what the cross-watermark leg judges
+  // (non-gkv conf cells survive alignment regardless, so they cannot stand in for client coverage).
+  let gkv_cells = |w: &MultiWorld, n: u64, gid: u64| -> usize {
+    w.aligned_applied(n, gid)
+      .iter()
+      .filter(|(_, c)| crate::multi::decode_gkv(c).is_some())
+      .count()
+  };
+
+  let mut w = MultiWorld::new(29);
+  for n in 0..5 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..5).collect();
+  w.create_group(10, &all); // the final target
+  w.create_group(11, &all); // absorbs 12, then merges into 10
+  w.create_group(12, &all); // the first source
+  assert!(w.run_until(3_000, |w| {
+    w.leader_of(10).is_some() && w.leader_of(11).is_some() && w.leader_of(12).is_some()
+  }));
+  // Client (gkv) load so 11 carries own gkv cells the husk records must retain.
+  for (key, val) in [(0u16, 100u64), (1, 101)] {
+    propose_until_accepted(&mut w, 11, &crate::multi::encode_gkv(11, key, val));
+  }
+  propose_until_accepted(&mut w, 12, &crate::multi::encode_gkv(12, 0, 120));
+
+  // Merge 12 into 11 and resolve fully — 11 is now an ABSORBED lineage.
+  colocate_source_onto_target(&mut w, 12, 11);
+  merge_verb_until_accepted(&mut w, 2_000, "freeze 12", |w| {
+    w.propose_prepare_merge(12, 11)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "commit 12", |w| {
+    w.propose_commit_merge(11, 12)
+  });
+  assert!(w.run_until(8_000, |w| w.is_merged(12)), "12 merges away");
+  assert!(w.group_absorbed(11), "11 absorbed 12");
+  // More 11-own client load after the absorb, then confirm every replica carries gkv content.
+  for (key, val) in [(2u16, 102u64), (3, 103)] {
+    propose_until_accepted(&mut w, 11, &crate::multi::encode_gkv(11, key, val));
+  }
+  assert!(
+    w.run_until(2_000, |w| (0..5)
+      .all(|n| w.hosts_group(n, 11) && gkv_cells(w, n, 11) > 0)),
+    "every 11 replica holds gkv content before the second merge"
+  );
+
+  // Put 10's (and colocated 11's) leadership on {0,1,2} so isolating {3,4} later cannot remove it.
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()));
+  if w.leader_of(10).is_some_and(|l| l >= 3) {
+    w.transfer_group_leader(10, 0);
+    assert!(w.run_until(3_000, |w| w.leader_of(10).is_some_and(|l| l < 3)));
+  }
+  // Freeze then commit 11 into 10 with all FIVE source voters reachable — the commit barrier waits for
+  // EVERY source voter to match the freeze, so {3,4} cannot be isolated before this.
+  colocate_source_onto_target(&mut w, 11, 10);
+  merge_verb_until_accepted(&mut w, 2_000, "freeze 11", |w| {
+    w.propose_prepare_merge(11, 10)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "commit 11", |w| {
+    w.propose_commit_merge(10, 11)
+  });
+  // Isolate {3,4} BEFORE the CommitMerge reaches them: the {0,1,2} quorum applies and resolves (retiring
+  // 11, emptying its live keys) while {3,4} stay at the pre-resolution watermark — hosted husks at an
+  // UNEQUAL watermark. (The resolved hosts' `Merged` teardown drains fast; the two isolated husks are
+  // what keep the leg non-vacuous by construction.)
+  w.isolate(3);
+  w.isolate(4);
+  assert!(
+    w.run_until(8_000, |w| w.is_merged(11)),
+    "11 retires — its live population is emptied"
+  );
+
+  // The retired source's LIVE population is empty, but the terminal set was stashed at resolution.
+  assert!(
+    w.groups[&11].keys.is_empty(),
+    "the retired source's live population is emptied"
+  );
+  assert!(
+    w.groups[&11].terminal_keys.is_some(),
+    "its terminal population was stashed at resolution"
+  );
+  // THE FIX: hosted husks keep their gkv content, so the cross-watermark leg is NON-VACUOUS.
+  let hosts = w.hosting_nodes(11);
+  let with_gkv: Vec<u64> = hosts
+    .iter()
+    .copied()
+    .filter(|&n| gkv_cells(&w, n, 11) > 0)
+    .collect();
+  assert!(
+    with_gkv.len() >= 2,
+    "the cross-watermark leg must be non-vacuous: >=2 hosted husks keep gkv content, got \
+     {with_gkv:?} of hosts {hosts:?}"
+  );
+  assert!(
+    gkv_cells(&w, 3, 11) > 0 && gkv_cells(&w, 4, 11) > 0,
+    "both lagging husks (nodes 3,4) retain gkv content via the terminal population"
+  );
+  assert!(
+    w.absorbed_lineage_client_cells_agree_at_shared_indices(11),
+    "the retired absorbed lineage's husks agree per index"
+  );
+}
+
 /// A crash AFTER the absorb's barrier landed must not bring the source back in any form: the
 /// floor and store drop are terminal, so the restored host rebuilds the target alone and no
 /// frozen source replica reappears anywhere. Under the dead hosting-check sweep the source's

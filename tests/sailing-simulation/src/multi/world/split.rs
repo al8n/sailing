@@ -406,10 +406,26 @@ impl MultiWorld {
   /// cells exact-cell across the handover, and quiesce equality reads the raw records once
   /// every replica converged. For a group that never split this is the raw record verbatim
   /// (own-tagged cells, full domain); an unregistered gid aligns as itself.
+  ///
+  /// A RETIRED source's live population is emptied at merge resolution, but a lagging husk replica
+  /// still hosts its record and stays inside the safety sweep — so align against the TERMINAL
+  /// pre-merge population when the live set is empty and one was stashed, else every husk record would
+  /// align gkv-empty and the cross-watermark leg would certify vacuously. The terminal set is the
+  /// source's final owned population (post-every-split, pre-merge), so the split-erasure argument is
+  /// unchanged: split-away keys stay filtered from every replica's view, pre-split husk replicas
+  /// included, and every husk replica of the lineage aligns against the SAME set — views still differ
+  /// only by watermark. This heals every aligned consumer (the cross-watermark wrapper and
+  /// `agreement_holds`' non-absorbed positional branch for plain-source husks) at one seam.
   pub(super) fn aligned_applied(&self, node: u64, gid: u64) -> AppliedLog {
     let raw = self.applied_of(node, gid);
     match self.groups.get(&gid) {
-      Some(meta) => Self::align_record(raw, gid, &meta.keys),
+      Some(meta) => {
+        let population = match &meta.terminal_keys {
+          Some(terminal) if meta.keys.is_empty() => terminal,
+          _ => &meta.keys,
+        };
+        Self::align_record(raw, gid, population)
+      }
       None => raw,
     }
   }
