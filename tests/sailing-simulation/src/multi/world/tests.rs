@@ -3115,13 +3115,14 @@ fn merge_teardown_records_floors_and_drops_source_stores() {
 /// stays hosted inside the safety sweep; without the fallback in `aligned_applied` every husk's aligned
 /// record would align gkv-EMPTY and those consumers would judge nothing. The every-peer freeze barrier
 /// (`peers_matched_through`) converges the tracked source replicas to the freeze coordinate, so these
-/// husks sit at the SAME watermark — where an ABSORBED husk's client content is independently judged by
-/// the absorbed agreement branch on RAW records. The cross-watermark leg is the absorbed husk's ONLY
-/// judge in the randomized-only shape where a storage fault regresses a husk BELOW the freeze (no leader
-/// re-replicates a retired group's log); this deterministic test pins the aligned non-vacuity that leg
-/// consumes, NOT an unequal pair. Doctrine (the world cannot diverge two real replicas) means this
-/// red-proofs VACUITY, not divergence. Red-proof: revert `aligned_applied` to live-only and the
-/// `>= 2 gkv-non-empty` assert fails.
+/// husks sit at the SAME watermark (asserted below) — where an ABSORBED husk's client content is
+/// independently judged by the absorbed agreement branch on RAW records. A BELOW-freeze
+/// matched-but-not-applied husk is protocol-reachable but simulator-unmodeled (the barrier acks durable
+/// state and the settle loop coalesces commit+apply), so the cross-watermark leg's coverage of that
+/// shape is red-proofed at the relation level; this deterministic test proves only equal-applied
+/// aligned-record NON-VACUITY — the mechanism those consumers read — NOT an unequal pair. Doctrine (the
+/// world cannot diverge two real replicas) means this red-proofs VACUITY, not divergence. Red-proof:
+/// revert `aligned_applied` to live-only and the `>= 2 gkv-non-empty` assert fails.
 #[test]
 fn retired_husk_aligns_against_its_terminal_population() {
   // The gkv (client) cells an aligned record retains — what the aligned consumers judge (non-gkv conf
