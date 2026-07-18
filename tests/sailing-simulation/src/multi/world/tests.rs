@@ -3363,7 +3363,7 @@ fn drive_park_on_existing(w: &mut MultiWorld, source: u64, target: u64) -> u64 {
 
 /// Create `source` and `target` on {0,1,2} with a little committed client load (so the target has an
 /// applied history to judge), then drive `target` to a HELD merge park via [`drive_park_on_existing`].
-fn held_park_target(seed: u64, source: u64, target: u64) -> (MultiWorld, u64) {
+pub(crate) fn held_park_target(seed: u64, source: u64, target: u64) -> (MultiWorld, u64) {
   let mut w = MultiWorld::new(seed);
   for n in 0..3 {
     w.add_node(n);

@@ -1501,7 +1501,7 @@ impl MultiWorld {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 mod faults;
 mod lifecycle;

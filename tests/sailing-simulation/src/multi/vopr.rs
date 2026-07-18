@@ -914,17 +914,22 @@ fn calm_window(
       // coupling (#110) — can leave a merge participant unable to elect. Under a storm profile these
       // are certified past, not fresh livelocks; skip the ELECTION demand (it stays fully armed for
       // every other group, so a genuine non-merge livelock still trips here). Unphased profiles pass
-      // `false` and take the bare panic, byte-identically. SAFETY still runs unconditionally: even a
-      // leaderless exempted wedge's hosted replicas must agree as prefixes — a liveness exemption
-      // never gates safety.
+      // `false` and take the bare panic, byte-identically. SAFETY still runs unconditionally via the
+      // full group-safety helper: even a leaderless exempted wedge's hosted replicas must pass
+      // agreement, the absorbed cross-watermark per-index own-client-cell agreement, and applied-history
+      // integrity — a liveness exemption never gates safety.
       if exempt_tracked
         && (w.tracked_underhosted_merge_wedge(gid) || w.fork_fence_coupled_wedge(gid))
       {
-        assert!(
-          w.agreement_holds(gid),
-          "MULTI VOPR AGREEMENT FAILURE: exempted group {gid} hosted replicas disagree in the calm \
-           window\n  seed={seed}",
-        );
+        // The expected set is built exactly as the quiesce sweep builds it, so this checkpoint's
+        // integrity verdict is identical to run-end's — the point of catching a divergent replica
+        // that is dismantled between here and quiesce and never reaches the run-end sweep.
+        let expected: BTreeSet<Vec<u8>> = st
+          .expected
+          .get(&gid)
+          .map(|v| v.iter().cloned().collect())
+          .unwrap_or_default();
+        assert_group_safety(w, gid, &expected, seed);
         continue;
       }
       panic!(
@@ -992,10 +997,16 @@ fn calm_window(
       budget -= 1;
     }
     if w.live_groups().contains(&gid) {
-      assert!(
-        w.agreement_holds(gid),
-        "MULTI VOPR: group {gid} agreement must hold at the calm-window progress point (seed={seed})"
-      );
+      // The full safety helper (agreement, absorbed cross-watermark per-index own-client-cell
+      // agreement, applied-history integrity) at the progress point, expected built exactly as the
+      // quiesce sweep builds it: a replica dismantled between this checkpoint and quiesce escapes the
+      // run-end sweep, so this is its last judge — agreement alone would let a divergent such replica slip.
+      let expected: BTreeSet<Vec<u8>> = st
+        .expected
+        .get(&gid)
+        .map(|v| v.iter().cloned().collect())
+        .unwrap_or_default();
+      assert_group_safety(w, gid, &expected, seed);
     }
   }
 }

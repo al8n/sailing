@@ -435,3 +435,87 @@ fn fork_fence_coupling_requires_a_live_park() {
     "no live park ⇒ empty fork-fence wedge set",
   );
 }
+
+/// Build the leaderless EXEMPTED merge wedge both calm-window regressions drive through
+/// `calm_window`. `held_park_target` leaves a parked follower on target 10 (which absorbed source
+/// 11, so 10 holds `t0` and the folded `s0` as applied client load); dropping every OTHER resolved
+/// host leaves only the parked follower — a merge participant with no live host quorum, the #106
+/// under-hosted root — and a fork fence recorded at the follower's park coordinate is the #110
+/// fork-fence root (reusing the `both_wedge_classes_count_and_overlap_independently` construction).
+/// The group is BOTH exempt classes AND cannot elect a leader, so `calm_window` spends its election
+/// budget and reaches the leaderless exempted arm rather than the elected progress tail.
+fn exempted_wedge_world(seed: u64) -> MultiWorld {
+  let (mut w, follower) = crate::multi::world::tests::held_park_target(seed, 11, 10);
+  for n in 0..3u64 {
+    if n != follower && w.hosts_group(n, 10) {
+      w.drop_group_replica(10, n);
+    }
+  }
+  assert!(
+    !w.has_live_host_quorum(10),
+    "only the parked follower hosts the target — the #106 under-hosted root",
+  );
+  let applied = w.applied_index_of(follower, 10).get();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 1));
+  assert!(
+    w.tracked_underhosted_merge_wedge(10) && w.fork_fence_wedge_set().contains(&10),
+    "the parked target must be the exempted wedge (#106 under-hosted and #110 fork-fence)",
+  );
+  w
+}
+
+/// The leaderless exempted arm of a calm-window checkpoint runs the FULL group-safety helper — not
+/// merely agreement — so a divergent replica dismantled between a mid-run calm window and the final
+/// quiesce is still judged: such a replica never reaches the run-end quiesce sweep, and the calm
+/// window is its last chance. The wedge's hosted replicas DID apply real client load; driving it
+/// THROUGH `calm_window` with an expected set that OMITS that load trips the integrity leg on the
+/// exempted arm. Since `assert_group_safety` carries all three legs inseparably, the same observable
+/// proves the aligned-prefix leg runs on this path too (its own predicate red-proof is at the
+/// relation level in `world::tests`). Agreement is trivially true on this wedge, so with the wiring
+/// reverted to `agreement_holds` the exempted arm passes silently and this should_panic test FAILS
+/// — the red-proof of the wiring.
+#[test]
+#[should_panic(expected = "INTEGRITY FAILURE")]
+fn calm_window_exempted_arm_runs_the_full_safety_helper() {
+  let mut w = exempted_wedge_world(41);
+  // No entry for the wedged group ⇒ `unwrap_or_default()` empties the expected set, exactly as the
+  // direct-call regression presents an empty one — the replicas' real `t0`/`s0` load is then a
+  // command the fuzzer never proposed, and the integrity leg trips.
+  let mut st = MState {
+    next_gid: 100,
+    pending_merges: std::collections::BTreeMap::new(),
+    expected: std::collections::BTreeMap::new(),
+    cmd_counter: 0,
+  };
+  let mut report = MultiVoprReport {
+    seed: 41,
+    ..MultiVoprReport::default()
+  };
+  let mut prng = FaultPrng::new(41);
+  calm_window(&mut w, &mut st, &mut prng, &mut report, 41, true);
+}
+
+/// The green twin: the SAME exempted wedge, but the expected set holds the group's real applied
+/// client load (its own `t0` plus the absorbed source's `s0` — the set the direct-call green
+/// regression uses). Driven through `calm_window` with the exemption armed, the exempted arm takes
+/// the full helper and CONTINUES — no false trip. This pins the non-vacuity of the exempt path:
+/// honest expected passes. (It passes with the wiring reverted too, since agreement alone also holds
+/// here — only the should_panic twin above red-proofs the wiring.)
+#[test]
+fn calm_window_exempted_arm_passes_when_expected_is_honest() {
+  let mut w = exempted_wedge_world(53);
+  let mut st = MState {
+    next_gid: 100,
+    pending_merges: std::collections::BTreeMap::new(),
+    expected: std::collections::BTreeMap::new(),
+    cmd_counter: 0,
+  };
+  st.expected
+    .insert(10, std::vec![b"t0".to_vec(), b"s0".to_vec()]);
+  let mut report = MultiVoprReport {
+    seed: 53,
+    ..MultiVoprReport::default()
+  };
+  let mut prng = FaultPrng::new(53);
+  calm_window(&mut w, &mut st, &mut prng, &mut report, 53, true);
+}
