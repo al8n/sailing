@@ -432,10 +432,17 @@ impl MultiWorld {
   /// `remove_S(baseline) ++ remove_S(own(k))`. The tag test erases `remove_S(baseline)` for
   /// any S, and the population test collapses `remove_S(own(k))` to `filter(own(k))` for any S
   /// (every split in any replica's S flipped the population before that replica could apply
-  /// it), so every replica's aligned view is `filter(own(k))` — views differ across replicas
-  /// only by k, an exact prefix relation, whatever the arrival path, replication lag, or
-  /// number of onward splits on either side. A genuine divergence inside `own(k)` survives
-  /// untouched (live key, own tag) and still trips the oracle.
+  /// it), so every replica's aligned view is `filter(own(k))` — the views agree at every LOG
+  /// INDEX they share, whatever the replication lag or number of onward splits. Under split-lag
+  /// the application is index-ordered, so the shorter view is additionally an exact PREFIX of the
+  /// longer — the positional relation the non-absorbed [`agreement_holds`](Self::agreement_holds)
+  /// branch reads. An ABSORBED lineage's arrival path (merge-fold vs capture restore) can apply
+  /// those cells OUT of index order, so its cross-watermark leg keys on the log index over the OWN-GKV
+  /// (client) cells instead (see
+  /// [`own_client_cells_agree_at_shared_indices`](Self::own_client_cells_agree_at_shared_indices); kept
+  /// non-gkv cells the fold leaves at source indices are judged only at equal watermarks). A genuine
+  /// divergence inside a gkv `own(k)` cell — a differing payload at a shared index — survives untouched
+  /// (live key, own tag) and still trips the oracle.
   pub(super) fn align_record(raw: AppliedLog, gid: u64, population: &BTreeSet<u16>) -> AppliedLog {
     raw
       .into_iter()
@@ -446,41 +453,66 @@ impl MultiWorld {
       .collect()
   }
 
-  /// Whether a set of ALIGNED applied records is pairwise PREFIX-consistent: in every pair the
-  /// shorter record is an exact prefix of the longer. This is the cross-watermark form of State
-  /// Machine Safety for an absorbed lineage. [`align_record`](Self::align_record) collapses every
-  /// replica's view to `filter(own(k))`, differing across replicas only by `k` — so a faithful absorb
-  /// yields an exact prefix relation WHATEVER the arrival path (live fold vs capture restore) or
-  /// watermark, while a genuine divergence inside a shared position survives alignment and breaks it.
-  /// Unlike the equal-applied raw form in [`agreement_holds`](Self::agreement_holds) it carries NO
+  /// Whether a set of ALIGNED records AGREE at every LOG INDEX they share, over the group's OWN
+  /// CLIENT (gkv) cells ONLY. Each entry is `(log_index, payload)`; NON-GKV cells are SKIPPED — a
+  /// fold keeps a non-gkv source cell at its SOURCE log index (whereas folded gkv cells carry the
+  /// source's gid tag and are dropped by [`align_record`](Self::align_record)), so the two logs'
+  /// index spaces merge for kept non-gkv cells and any per-index claim about them is false by
+  /// construction; they are covered instead by the equal-watermark sorted form in
+  /// [`agreement_holds`](Self::agreement_holds) and by the integrity leg. For OWN-GKV cells the
+  /// aligned record draws from exactly ONE log — the group's own — so "one index, one payload" is a
+  /// true invariant: a single record carrying two DIFFERENT gkv payloads at one index is real
+  /// corruption (self-conflict), and across every pair an index present in BOTH records must carry the
+  /// same payload. Indices present on only ONE side are NOT judged — a replica that compacted low
+  /// indices out of its `applied()` view legitimately lacks them, and a subset demand would false-trip
+  /// (loss is the run-end conservation ledger's business). The ARRIVAL PATH (merge-fold / capture
+  /// restore) can apply cells OUT of index order, so agreement is keyed on the log index — NOT position
+  /// (the equal-applied raw form in `agreement_holds` sorts for the same reason). It carries NO
   /// equal-watermark requirement, so it judges the unequal watermarks an exempted merge wedge sits at.
-  pub(crate) fn aligned_prefix_holds(records: &[AppliedLog]) -> bool {
-    for i in 0..records.len() {
-      for j in (i + 1)..records.len() {
-        let (short, long) = if records[i].len() <= records[j].len() {
-          (&records[i], &records[j])
-        } else {
-          (&records[j], &records[i])
-        };
-        if long[..short.len()] != short[..] {
-          return false;
+  pub(crate) fn own_client_cells_agree_at_shared_indices(records: &[AppliedLog]) -> bool {
+    let mut maps: Vec<BTreeMap<u64, &[u8]>> = Vec::with_capacity(records.len());
+    for record in records {
+      let mut map: BTreeMap<u64, &[u8]> = BTreeMap::new();
+      for (index, payload) in record {
+        // Only own-gkv (client) cells are index-canonical; a non-gkv cell the fold kept at its source
+        // index is excluded (the equal-watermark sorted form and the integrity leg cover it).
+        if super::super::decode_gkv(payload).is_none() {
+          continue;
+        }
+        if let Some(prev) = map.insert(*index, payload.as_slice())
+          && prev != payload.as_slice()
+        {
+          return false; // one replica applied two different client payloads at a single committed index
+        }
+      }
+      maps.push(map);
+    }
+    for i in 0..maps.len() {
+      for j in (i + 1)..maps.len() {
+        for (index, payload) in &maps[i] {
+          if let Some(other) = maps[j].get(index)
+            && other != payload
+          {
+            return false; // two replicas disagree at a shared committed client index
+          }
         }
       }
     }
     true
   }
 
-  /// Whether every hosted replica of an absorbed `gid` holds a prefix-consistent aligned record — the
-  /// cross-watermark agreement leg the unconditional safety pass runs for absorbed groups. It catches
-  /// a divergence between replicas at UNEQUAL watermarks that `agreement_holds`' absorbed branch, which
-  /// compares only EQUAL-applied replicas, never puts side by side.
-  pub(crate) fn absorbed_lineage_prefix_holds(&self, gid: u64) -> bool {
+  /// Whether every hosted replica of an absorbed `gid` agrees at the log indices it shares with the
+  /// others over their OWN CLIENT (gkv) cells — the cross-watermark agreement leg the unconditional
+  /// safety pass runs for absorbed groups. It catches a divergence between replicas at UNEQUAL
+  /// watermarks that `agreement_holds`' absorbed branch, which compares only EQUAL-applied replicas,
+  /// never puts side by side.
+  pub(crate) fn absorbed_lineage_client_cells_agree_at_shared_indices(&self, gid: u64) -> bool {
     let records: Vec<AppliedLog> = self
       .hosting_nodes(gid)
       .into_iter()
       .map(|n| self.aligned_applied(n, gid))
       .collect();
-    Self::aligned_prefix_holds(&records)
+    Self::own_client_cells_agree_at_shared_indices(&records)
   }
 
   /// Record every replica's applied gkv cells into the conservation ledger (see the module

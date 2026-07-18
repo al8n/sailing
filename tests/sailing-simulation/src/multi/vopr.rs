@@ -1284,8 +1284,9 @@ fn quiesce(
 ///   1. AGREEMENT — the hosting replicas' applied records agree as prefixes (State Machine Safety,
 ///      aligned across splits/absorbs),
 ///   2. ABSORBED CROSS-WATERMARK — an absorbed lineage's replicas at UNEQUAL watermarks (where
-///      `agreement_holds`' equal-applied absorbed branch compares nothing) must hold prefix-consistent
-///      ALIGNED records, and
+///      `agreement_holds`' equal-applied absorbed branch compares nothing) must AGREE at every log
+///      index they share over their OWN CLIENT (gkv) cells (keyed on index, not position — the arrival
+///      path can reorder; cross-watermark non-gkv content is not judged here), and
 ///   3. INTEGRITY — no hosted replica applied a client command absent from `expected` (the set the
 ///      fuzzer proposed for the group).
 ///
@@ -1304,7 +1305,8 @@ pub(crate) fn assert_group_safety(
   );
   // ABSORBED-lineage coverage, SCOPED honestly. `agreement_holds`' absorbed branch compares only
   // EQUAL-applied replicas, so an exempted merge wedge (replicas at UNEQUAL watermarks) needs a
-  // cross-watermark leg. What runs here is the aligned OWN-cell prefix. What is DELIBERATELY NOT
+  // cross-watermark leg. What runs here is per-index agreement over the group's OWN CLIENT (gkv) cells
+  // at shared indices. What is DELIBERATELY NOT
   // asserted at the per-replica cross-watermark grain is ABSORBED-content completeness: a record-keyed
   // "every replica past a merge boundary holds the complete absorbed block" form was built and
   // rejected because it false-trips on legitimate world behavior the accumulating ledger tolerates — a
@@ -1322,15 +1324,19 @@ pub(crate) fn assert_group_safety(
   // originated or inherited after the split — and is deliberately not narrowed (the dedup-by-value
   // ledger cannot tell a genuine return to the FSM from record inheritance; narrowing would re-demand
   // legitimately departed cells — see the ledger's own note). NOT checked, then: an absorbed-suffix
-  // divergence between replicas at DIFFERENT watermarks; the ORDER of absorbed content anywhere
-  // post-absorb (both (1) and (2) compare order-insensitively; only the OWN-cell prefix above is
-  // positional); and all-replica loss of ANY value sitting in both the source's and a matching
+  // divergence between replicas at DIFFERENT watermarks; cross-watermark NON-GKV content (a fold keeps
+  // non-gkv source cells at their SOURCE index, so index collisions there are representational, not
+  // divergence — covered at equal watermarks by (1) and by the integrity leg); the ORDER of absorbed
+  // content anywhere post-absorb (EVERY leg is order-insensitive — (1) and (2) compare unordered and
+  // this cross-watermark leg keys on log index over own-gkv cells; cells at an index present on only
+  // ONE side are not judged here — the run-end conservation ledger owns loss); and all-replica loss of
+  // ANY value sitting in both the source's and a matching
   // child's history when it rides a later merge — the departed → returned-via-merge-back → re-merged
   // chain, and equally a child-born or child-inherited cell that entered the source via a merge-back
   // (exempt from (2)'s demand, invisible to (1) when every replica drops it alike).
   if w.group_absorbed(gid) {
     assert!(
-      w.absorbed_lineage_prefix_holds(gid),
+      w.absorbed_lineage_client_cells_agree_at_shared_indices(gid),
       "MULTI VOPR AGREEMENT FAILURE: group {gid} absorbed replicas diverge across watermarks — own \
        cells (exempt or not)\n  seed={seed}",
     );

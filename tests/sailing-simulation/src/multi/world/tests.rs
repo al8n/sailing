@@ -3651,31 +3651,60 @@ fn exemption_does_not_gate_safety_on_a_wedged_group() {
   crate::multi::vopr::assert_group_safety(&w, 10, &expected, 41);
 }
 
-/// The cross-watermark aligned-PREFIX relation (#H2), unit red-proofed on synthetic aligned records:
-/// at UNEQUAL watermarks the shorter must be an exact prefix of the longer (agree), and a divergent
-/// shared cell breaks it (panic-worthy). The world can't synthetically diverge two real replicas
-/// (the codebase's standing note), so the relation is red-proofed directly here.
+/// The cross-watermark per-index AGREEMENT relation over OWN CLIENT (gkv) cells (#H2), unit red-proofed
+/// on synthetic aligned records: gkv cells at every SHARED log index must carry the same payload
+/// (agree); a legitimate arrival-path REORDER (same index→payload, scrambled order) still agrees; a
+/// differing gkv payload at a shared index breaks it; one record holding two different gkv payloads at a
+/// single index is a self-conflict; and NON-GKV cells are EXCLUDED — a fold keeps them at source
+/// indices, so an index collision there is representational, not divergence. The world can't
+/// synthetically diverge two real replicas (the codebase's standing note), so this is red-proofed here.
 #[test]
-fn absorbed_cross_watermark_prefix_relation_holds_and_catches_divergence() {
-  let cell = |i: u64, v: &str| (i, v.as_bytes().to_vec());
-  // Unequal watermarks, prefix-consistent → holds.
-  let short: AppliedLog = std::vec![cell(1, "a"), cell(2, "b")];
-  let long: AppliedLog = std::vec![cell(1, "a"), cell(2, "b"), cell(3, "c")];
+fn absorbed_cross_watermark_client_cell_agreement_holds_and_catches_divergence() {
+  let g = 105u64;
+  let gc = |i: u64, key: u16, val: u64| (i, crate::multi::encode_gkv(g, key, val));
+  // Unequal watermarks, agreeing on every shared client index → holds.
+  let short: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 11)];
+  let long: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 11), gc(3, 2, 12)];
   assert!(
-    MultiWorld::aligned_prefix_holds(&[short.clone(), long.clone()]),
-    "a shorter record that is an exact prefix of the longer agrees across watermarks"
+    MultiWorld::own_client_cells_agree_at_shared_indices(&[short.clone(), long.clone()]),
+    "client cells agreeing at every shared log index agree across watermarks"
   );
-  // A genuine divergence at a shared position (still unequal watermarks) → breaks.
-  let divergent: AppliedLog = std::vec![cell(1, "a"), cell(2, "DIFFERENT")];
+  // A legitimate arrival-path reorder (the merge-fold / capture restore applies cells out of index
+  // order — the seed-0 shape minimized): same index→payload, scrambled order → still agrees. Keying on
+  // the index, not position, is the whole point.
+  let reordered: AppliedLog = std::vec![gc(1, 0, 10), gc(3, 2, 12), gc(2, 1, 11)];
   assert!(
-    !MultiWorld::aligned_prefix_holds(&[divergent, long]),
-    "a divergent shared cell must break the prefix relation even at unequal watermarks"
+    MultiWorld::own_client_cells_agree_at_shared_indices(&[short.clone(), reordered]),
+    "an out-of-order client record agreeing per index must NOT be judged a divergence"
+  );
+  // A genuine divergence at a shared index — same group, different value → breaks.
+  let divergent: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 999)];
+  assert!(
+    !MultiWorld::own_client_cells_agree_at_shared_indices(&[divergent, long]),
+    "a differing client payload at a shared index must break agreement even at unequal watermarks"
+  );
+  // One record carrying two DIFFERENT gkv payloads at a single index is a self-conflict → breaks (a
+  // folded gkv cell carries a foreign tag and is dropped by alignment, so this is real corruption).
+  let self_conflict: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 11), gc(2, 1, 22)];
+  assert!(
+    !MultiWorld::own_client_cells_agree_at_shared_indices(&[self_conflict]),
+    "one replica applying two client payloads at a single index must fail"
+  );
+  // NON-GKV cells are EXCLUDED (the seed-53 fold-collision minimized): a parked follower holds the
+  // target's own raw `t0`; the resolved host additionally holds the folded raw `s0` at the SAME index
+  // (the fold keeps the source's index). Neither decodes as gkv, so the leg does not judge them → holds.
+  let parked: AppliedLog = std::vec![(2, b"t0".to_vec())];
+  let resolved: AppliedLog = std::vec![(2, b"t0".to_vec()), (2, b"s0".to_vec())];
+  assert!(
+    MultiWorld::own_client_cells_agree_at_shared_indices(&[parked, resolved]),
+    "non-gkv cells kept at colliding fold indices are excluded from this leg"
   );
 }
 
 /// The absorbed cross-watermark relation passes on a real EXEMPTED wedge sitting at unequal watermarks
-/// with AGREEING records (#H2 integration): the parked follower's aligned record is an exact prefix of
-/// the resolved hosts', so the safety pass certifies it without a leader and without equal watermarks.
+/// with AGREEING records (#H2 integration): the parked follower's aligned record agrees at every shared
+/// index with the resolved hosts', so the safety pass certifies it without a leader and without equal
+/// watermarks.
 #[test]
 fn exempted_absorbed_wedge_at_unequal_watermarks_passes_safety() {
   let (mut w, follower) = held_park_target(53, 11, 10);
@@ -3696,7 +3725,7 @@ fn exempted_absorbed_wedge_at_unequal_watermarks_passes_safety() {
   // The aligned records AGREE across the unequal watermarks → the relation holds and the safety pass
   // passes (the target's own load, source's load folded on the resolved hosts, are the expected set).
   assert!(
-    w.absorbed_lineage_prefix_holds(10),
+    w.absorbed_lineage_client_cells_agree_at_shared_indices(10),
     "agreeing absorbed replicas at unequal watermarks must pass the cross-watermark relation"
   );
   let expected: BTreeSet<Vec<u8>> = [b"t0".to_vec(), b"s0".to_vec()].into_iter().collect();
