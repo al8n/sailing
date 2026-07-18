@@ -358,25 +358,29 @@ impl MultiWorld {
     });
   }
 
-  /// Judge every registered merge's union conservation: the target's recorded history for each
-  /// source key must CONTAIN the source's full recorded history in order (the absorbed run).
+  /// Judge every registered merge's union conservation: every value of the source's recorded
+  /// history for each absorbed key — minus the split-child exemption below — must appear in the
+  /// target's; unordered value containment (`assert_union` checks membership, never position).
   /// Sound at any quiescent point; the multi VOPR runs it at run end beside the split verdict.
   pub fn finalize_merge_conservation_or_panic(&self, seed: u64) {
     for rec in &self.merges {
       // A key this source SPLIT AWAY before the merge left its pre-split cells with the split child,
       // record-wide (the one non-append-only FSM mutation), so a later merge target is not demanded
-      // to hold them. Collect them per absorbed key — every value in a registered split child's record
-      // for a key this source parented — and exempt them from the union demand: values are globally
-      // unique, so membership in the child's record is an EXACT departure witness.
+      // to hold them. Collect, per absorbed key, every value in a registered split child's record for
+      // a key this source parented, and exempt the lot from the union demand. Globally-unique values
+      // make child-record membership an exact witness that a cell rode the CHILD LINEAGE — not that
+      // it departed this source: the child's accumulated record also holds cells the child originated
+      // or inherited after the split, so the exemption is a SUPERSET of true departures.
       //
-      // Deliberately NOT netted against "returns" (a departed cell whose child lineage later merged
-      // BACK into this source): the only ledger signal is the value's presence in an absorbed union
-      // source's record, and the append-only, dedup-by-value ledger cannot separate a genuine return
-      // to the FSM from a value merely INHERITED into that union source's record and never in the
-      // source's FSM at the merge — subtracting it over-demands, re-tripping legitimately departed
-      // cells. A genuinely returned cell that survives to the merge is in the target anyway, so a
-      // faithful absorb needs no exemption for it; the split partition verdict still guards the
-      // handover.
+      // Deliberately NOT narrowed by netting returns: the only ledger signal for a return is the
+      // value's presence in an absorbed union source's record, and the append-only, dedup-by-value
+      // ledger cannot separate a genuine return to the FSM from a value merely INHERITED into that
+      // union source's record and never in this source's FSM at the merge — netting over-demands,
+      // re-tripping legitimately departed cells. Consequently any cell sitting in both this source's
+      // and a matching child's history — returned after departing, or child-born/child-inherited and
+      // merged back — stays exempt while riding this merge, and its all-replica loss escapes this
+      // demand (disclosed at the VOPR absorbed-coverage note); the split partition verdict still
+      // guards the handover.
       let mut departed: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
       for sp in self.splits.values() {
         if sp.parent_led != rec.source_led {

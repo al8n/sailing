@@ -1312,11 +1312,22 @@ pub(crate) fn assert_group_safety(
   // so a lower-watermark (but past-boundary) replica legitimately lacks them until it applies the
   // return, and a COMPACTED replica drops them from its `applied()` view. Per-replica departed/return/
   // compaction state is not cleanly accountable at this grain. The absorbed CONTENT is instead covered
-  // by: (1) `agreement_holds`' absorbed branch — replicas at the SAME watermark must hold IDENTICAL raw
-  // records (absorbed cells included); (2) the run-end `finalize_merge_conservation_or_panic` — the
-  // union ledger judges every merge's COMPLETE absorbed content, accumulated across sweeps so
-  // per-replica departures/compaction never false-trip. NOT checked: an absorbed-suffix divergence
-  // between replicas at DIFFERENT watermarks, left to (1) at equal watermarks and (2) at run end.
+  // by: (1) `agreement_holds`' absorbed branch — replicas at the SAME watermark must hold the same
+  // MULTISET of raw cells, compared order-insensitively (the branch sorts each record first; absorbed
+  // cells included); (2) the run-end `finalize_merge_conservation_or_panic` — per merge and per
+  // absorbed key, every value of the source's run-end history, MINUS those also appearing in the
+  // run-end history of any split child of that source that took the key, must appear in the target's
+  // (unordered value containment — `assert_union` checks membership, never position). That exemption
+  // is a SUPERSET of true departures — the child's accumulated history also holds cells the child
+  // originated or inherited after the split — and is deliberately not narrowed (the dedup-by-value
+  // ledger cannot tell a genuine return to the FSM from record inheritance; narrowing would re-demand
+  // legitimately departed cells — see the ledger's own note). NOT checked, then: an absorbed-suffix
+  // divergence between replicas at DIFFERENT watermarks; the ORDER of absorbed content anywhere
+  // post-absorb (both (1) and (2) compare order-insensitively; only the OWN-cell prefix above is
+  // positional); and all-replica loss of ANY value sitting in both the source's and a matching
+  // child's history when it rides a later merge — the departed → returned-via-merge-back → re-merged
+  // chain, and equally a child-born or child-inherited cell that entered the source via a merge-back
+  // (exempt from (2)'s demand, invisible to (1) when every replica drops it alike).
   if w.group_absorbed(gid) {
     assert!(
       w.absorbed_lineage_prefix_holds(gid),
