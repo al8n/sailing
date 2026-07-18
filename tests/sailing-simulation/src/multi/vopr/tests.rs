@@ -470,8 +470,8 @@ fn exempted_wedge_world(seed: u64) -> MultiWorld {
 /// window is its last chance. The wedge's hosted replicas DID apply real client load; driving it
 /// THROUGH `calm_window` with an expected set that OMITS that load trips the integrity leg on the
 /// exempted arm. Since `assert_group_safety` carries all three legs inseparably, the same observable
-/// proves the aligned-prefix leg runs on this path too (its own predicate red-proof is at the
-/// relation level in `world::tests`). Agreement is trivially true on this wedge, so with the wiring
+/// proves the absorbed cross-watermark leg runs on this path too (its own predicate red-proof is at
+/// the relation level in `world::tests`). Agreement is trivially true on this wedge, so with the wiring
 /// reverted to `agreement_holds` the exempted arm passes silently and this should_panic test FAILS
 /// — the red-proof of the wiring.
 #[test]

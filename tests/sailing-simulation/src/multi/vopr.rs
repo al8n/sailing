@@ -1292,8 +1292,9 @@ fn quiesce(
 /// exempt or not — a liveness exemption (a #106 under-hosted or #110 fork-fence wedge) gates the
 /// CONVERGENCE demands, NEVER this. Three legs, none needing a leader (an exempted wedge may be
 /// leaderless), so all read the hosting replicas directly:
-///   1. AGREEMENT — the hosting replicas' applied records agree as prefixes (State Machine Safety,
-///      aligned across splits/absorbs),
+///   1. AGREEMENT — the hosting replicas' applied records agree (State Machine Safety, aligned
+///      across splits/absorbs): positionally over the shared prefix for a live lineage, as sorted
+///      multisets at equal watermarks for an absorbed one,
 ///   2. ABSORBED CROSS-WATERMARK — an absorbed lineage's replicas at UNEQUAL watermarks (where
 ///      `agreement_holds`' equal-applied absorbed branch compares nothing) must AGREE at every log
 ///      index they share over their OWN CLIENT (gkv) cells (keyed on index, not position — the arrival
