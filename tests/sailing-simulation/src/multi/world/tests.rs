@@ -3221,6 +3221,17 @@ fn retired_husk_aligns_against_its_terminal_population() {
     gkv_cells(&w, 3, 11) > 0 && gkv_cells(&w, 4, 11) > 0,
     "both lagging husks (nodes 3,4) retain gkv content via the terminal population"
   );
+  // Equal-applied by construction (see the coverage note): the durable-ack every-peer barrier makes
+  // the freeze durable on every voter and the settle loop coalesces commit+apply, so the sim cannot
+  // host a below-freeze husk — every surviving husk sits at the same applied index.
+  let applied3 = w.applied_index_of(3, 11).get();
+  for &n in &hosts {
+    assert_eq!(
+      w.applied_index_of(n, 11).get(),
+      applied3,
+      "surviving husk {n} must be applied-equal (== node 3's {applied3})"
+    );
+  }
   assert!(
     w.absorbed_lineage_client_cells_agree_at_shared_indices(11),
     "the retired absorbed lineage's husks agree per index"
@@ -3327,6 +3338,17 @@ fn plain_source_husk_aligns_via_the_non_absorbed_branch() {
     gkv_cells(&w, 3, 11) > 0 && gkv_cells(&w, 4, 11) > 0,
     "both husks retain gkv content via the terminal population"
   );
+  // Equal-applied by construction (see the coverage note): the durable-ack every-peer barrier makes
+  // the freeze durable on every voter and the settle loop coalesces commit+apply, so the sim cannot
+  // host a below-freeze husk — every surviving husk sits at the same applied index.
+  let applied3 = w.applied_index_of(3, 11).get();
+  for &n in &hosts {
+    assert_eq!(
+      w.applied_index_of(n, 11).get(),
+      applied3,
+      "surviving husk {n} must be applied-equal (== node 3's {applied3})"
+    );
+  }
   assert!(
     w.agreement_holds(11),
     "the non-absorbed positional branch passes over the husks"
@@ -3928,7 +3950,10 @@ fn absorbed_cross_watermark_client_cell_agreement_holds_and_catches_divergence()
 /// The absorbed cross-watermark relation passes on a real EXEMPTED wedge sitting at unequal watermarks
 /// with AGREEING records (#H2 integration): the parked follower's aligned record agrees at every shared
 /// index with the resolved hosts', so the safety pass certifies it without a leader and without equal
-/// watermarks.
+/// watermarks. Its load is non-gkv (`t0`/`s0`), so the CLIENT-cell leg is vacuous here BY CONSTRUCTION —
+/// integrity carries its client content; and its UNEQUAL watermarks come from the PARK COORDINATE (the
+/// follower pinned at k-1 while the resolved hosts moved past k), NOT the merge barrier's match/apply
+/// gap, so the two unequal shapes are not conflated.
 #[test]
 fn exempted_absorbed_wedge_at_unequal_watermarks_passes_safety() {
   let (mut w, follower) = held_park_target(53, 11, 10);
