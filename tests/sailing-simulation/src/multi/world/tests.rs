@@ -3109,6 +3109,253 @@ fn merge_teardown_records_floors_and_drops_source_stores() {
   w.finalize_merge_conservation_or_panic(17);
 }
 
+/// The terminal-population fallback keeps a RETIRED-SOURCE HUSK's aligned record NON-VACUOUS — the
+/// MECHANISM the aligned consumers (the cross-watermark leg and the non-absorbed positional branch)
+/// read. A merge empties the source's LIVE key population at resolution, but a lagging husk replica
+/// stays hosted inside the safety sweep; without the fallback in `aligned_applied` every husk's aligned
+/// record would align gkv-EMPTY and those consumers would judge nothing. The every-peer freeze barrier
+/// (`peers_matched_through`) converges the tracked source replicas to the freeze coordinate, so these
+/// husks sit at the SAME watermark (asserted below) — where an ABSORBED husk's client content is
+/// independently judged by the absorbed agreement branch on RAW records. A BELOW-freeze
+/// matched-but-not-applied husk is protocol-reachable but simulator-unmodeled (the barrier acks durable
+/// state and the settle loop coalesces commit+apply), so the cross-watermark leg's coverage of that
+/// shape is red-proofed at the relation level; this deterministic test proves only equal-applied
+/// aligned-record NON-VACUITY — the mechanism those consumers read — NOT an unequal pair. Doctrine (the
+/// world cannot diverge two real replicas) means this red-proofs VACUITY, not divergence. Red-proof:
+/// revert `aligned_applied` to live-only and the `>= 2 gkv-non-empty` assert fails.
+#[test]
+fn retired_husk_aligns_against_its_terminal_population() {
+  // The gkv (client) cells an aligned record retains — what the aligned consumers judge (non-gkv conf
+  // cells survive alignment regardless, so they cannot stand in for client coverage).
+  let gkv_cells = |w: &MultiWorld, n: u64, gid: u64| -> usize {
+    w.aligned_applied(n, gid)
+      .iter()
+      .filter(|(_, c)| crate::multi::decode_gkv(c).is_some())
+      .count()
+  };
+
+  let mut w = MultiWorld::new(29);
+  for n in 0..5 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..5).collect();
+  w.create_group(10, &all); // the final target
+  w.create_group(11, &all); // absorbs 12, then merges into 10
+  w.create_group(12, &all); // the first source
+  assert!(w.run_until(3_000, |w| {
+    w.leader_of(10).is_some() && w.leader_of(11).is_some() && w.leader_of(12).is_some()
+  }));
+  // Client (gkv) load so 11 carries own gkv cells the husk records must retain.
+  for (key, val) in [(0u16, 100u64), (1, 101)] {
+    propose_until_accepted(&mut w, 11, &crate::multi::encode_gkv(11, key, val));
+  }
+  propose_until_accepted(&mut w, 12, &crate::multi::encode_gkv(12, 0, 120));
+
+  // Merge 12 into 11 and resolve fully — 11 is now an ABSORBED lineage.
+  colocate_source_onto_target(&mut w, 12, 11);
+  merge_verb_until_accepted(&mut w, 2_000, "freeze 12", |w| {
+    w.propose_prepare_merge(12, 11)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "commit 12", |w| {
+    w.propose_commit_merge(11, 12)
+  });
+  assert!(w.run_until(8_000, |w| w.is_merged(12)), "12 merges away");
+  assert!(w.group_absorbed(11), "11 absorbed 12");
+  // More 11-own client load after the absorb, then confirm every replica carries gkv content.
+  for (key, val) in [(2u16, 102u64), (3, 103)] {
+    propose_until_accepted(&mut w, 11, &crate::multi::encode_gkv(11, key, val));
+  }
+  assert!(
+    w.run_until(2_000, |w| (0..5)
+      .all(|n| w.hosts_group(n, 11) && gkv_cells(w, n, 11) > 0)),
+    "every 11 replica holds gkv content before the second merge"
+  );
+
+  // Put 10's (and colocated 11's) leadership on {0,1,2} so isolating {3,4} later cannot remove it.
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()));
+  if w.leader_of(10).is_some_and(|l| l >= 3) {
+    w.transfer_group_leader(10, 0);
+    assert!(w.run_until(3_000, |w| w.leader_of(10).is_some_and(|l| l < 3)));
+  }
+  // Freeze then commit 11 into 10 with all FIVE source voters reachable — the commit barrier waits for
+  // EVERY source voter to match the freeze, so {3,4} cannot be isolated before this.
+  colocate_source_onto_target(&mut w, 11, 10);
+  merge_verb_until_accepted(&mut w, 2_000, "freeze 11", |w| {
+    w.propose_prepare_merge(11, 10)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "commit 11", |w| {
+    w.propose_commit_merge(10, 11)
+  });
+  // Isolate {3,4} BEFORE the CommitMerge reaches them: the {0,1,2} quorum applies and resolves (retiring
+  // 11, emptying its live keys) while {3,4} stay hosted as husks. The every-peer freeze barrier put all
+  // tracked voters at the freeze coordinate, so these husks sit at the SAME watermark (the deferred
+  // `Merged` teardown drains fast; the two isolated husks are what keep the aligned records non-vacuous).
+  w.isolate(3);
+  w.isolate(4);
+  assert!(
+    w.run_until(8_000, |w| w.is_merged(11)),
+    "11 retires — its live population is emptied"
+  );
+
+  // The retired source's LIVE population is empty, but the terminal set was stashed at resolution.
+  assert!(
+    w.groups[&11].keys.is_empty(),
+    "the retired source's live population is emptied"
+  );
+  assert!(
+    w.groups[&11].terminal_keys.is_some(),
+    "its terminal population was stashed at resolution"
+  );
+  // THE FIX: hosted husks keep their gkv content, so the aligned consumers are NON-VACUOUS.
+  let hosts = w.hosting_nodes(11);
+  let with_gkv: Vec<u64> = hosts
+    .iter()
+    .copied()
+    .filter(|&n| gkv_cells(&w, n, 11) > 0)
+    .collect();
+  assert!(
+    with_gkv.len() >= 2,
+    "the husks' aligned records must be non-vacuous: >=2 hosted husks keep gkv content, got \
+     {with_gkv:?} of hosts {hosts:?}"
+  );
+  assert!(
+    gkv_cells(&w, 3, 11) > 0 && gkv_cells(&w, 4, 11) > 0,
+    "both lagging husks (nodes 3,4) retain gkv content via the terminal population"
+  );
+  // Equal-applied by construction (see the coverage note): the durable-ack every-peer barrier makes
+  // the freeze durable on every voter and the settle loop coalesces commit+apply, so the sim cannot
+  // host a below-freeze husk — every surviving husk sits at the same applied index.
+  let applied3 = w.applied_index_of(3, 11).get();
+  for &n in &hosts {
+    assert_eq!(
+      w.applied_index_of(n, 11).get(),
+      applied3,
+      "surviving husk {n} must be applied-equal (== node 3's {applied3})"
+    );
+  }
+  assert!(
+    w.absorbed_lineage_client_cells_agree_at_shared_indices(11),
+    "the retired absorbed lineage's husks agree per index"
+  );
+  // The full safety helper passes over the husks with the HONEST expected set (11's own load plus the
+  // 12 cell it absorbed) — the wrapper wiring end-to-end, not just the relation in isolation.
+  let expected: BTreeSet<Vec<u8>> = [
+    crate::multi::encode_gkv(11, 0, 100),
+    crate::multi::encode_gkv(11, 1, 101),
+    crate::multi::encode_gkv(11, 2, 102),
+    crate::multi::encode_gkv(11, 3, 103),
+    crate::multi::encode_gkv(12, 0, 120),
+  ]
+  .into_iter()
+  .collect();
+  crate::multi::vopr::assert_group_safety(&w, 11, &expected, 29);
+}
+
+/// The plain-source variant — the fix's DETERMINISTICALLY-reachable value. A NEVER-absorbed source
+/// merged away routes agreement to the NON-absorbed positional branch (`group_absorbed` is false), which
+/// reads `aligned_applied`; without the terminal-population fallback its retained husks align gkv-EMPTY
+/// and that branch judges empty records (vacuous). The every-peer freeze barrier pins the husks at the
+/// SAME watermark, as in the chained test. Red-proof: revert `aligned_applied` to live-only and the
+/// gkv-non-empty assert fails — `agreement_holds` passes either way (empty == empty is a vacuous pass),
+/// so the non-vacuity is the load-bearing assert here.
+#[test]
+fn plain_source_husk_aligns_via_the_non_absorbed_branch() {
+  let gkv_cells = |w: &MultiWorld, n: u64, gid: u64| -> usize {
+    w.aligned_applied(n, gid)
+      .iter()
+      .filter(|(_, c)| crate::multi::decode_gkv(c).is_some())
+      .count()
+  };
+
+  let mut w = MultiWorld::new(31);
+  for n in 0..5 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..5).collect();
+  w.create_group(10, &all); // the target
+  w.create_group(11, &all); // a PLAIN (never-absorbed) source
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()
+    && w.leader_of(11).is_some()));
+  for (key, val) in [(0u16, 200u64), (1, 201), (2, 202)] {
+    propose_until_accepted(&mut w, 11, &crate::multi::encode_gkv(11, key, val));
+  }
+  assert!(
+    w.run_until(2_000, |w| (0..5)
+      .all(|n| w.hosts_group(n, 11) && gkv_cells(w, n, 11) > 0)),
+    "every 11 replica holds gkv content before the merge"
+  );
+  assert!(
+    !w.group_absorbed(11),
+    "11 never absorbed anything — agreement routes to the non-absorbed positional branch"
+  );
+
+  // Leadership off {3,4}; freeze+commit with all five voters reachable; then isolate {3,4} before the
+  // CommitMerge reaches them so they stay hosted as husks at the freeze coordinate.
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()));
+  if w.leader_of(10).is_some_and(|l| l >= 3) {
+    w.transfer_group_leader(10, 0);
+    assert!(w.run_until(3_000, |w| w.leader_of(10).is_some_and(|l| l < 3)));
+  }
+  colocate_source_onto_target(&mut w, 11, 10);
+  merge_verb_until_accepted(&mut w, 2_000, "freeze 11", |w| {
+    w.propose_prepare_merge(11, 10)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "commit 11", |w| {
+    w.propose_commit_merge(10, 11)
+  });
+  w.isolate(3);
+  w.isolate(4);
+  assert!(
+    w.run_until(8_000, |w| w.is_merged(11)),
+    "11 retires — its live population is emptied"
+  );
+
+  assert!(
+    w.groups[&11].keys.is_empty(),
+    "the retired source's live population is emptied"
+  );
+  assert!(
+    w.groups[&11].terminal_keys.is_some(),
+    "the terminal population was stashed at resolution"
+  );
+  assert!(
+    !w.group_absorbed(11),
+    "still non-absorbed — agreement routes to the positional branch that reads aligned_applied"
+  );
+  // THE FIX: the husks align NON-VACUOUS via the terminal population; without it the non-absorbed
+  // positional branch would compare empty records.
+  let hosts = w.hosting_nodes(11);
+  let with_gkv: Vec<u64> = hosts
+    .iter()
+    .copied()
+    .filter(|&n| gkv_cells(&w, n, 11) > 0)
+    .collect();
+  assert!(
+    with_gkv.len() >= 2,
+    "the non-absorbed positional branch must be non-vacuous: >=2 husks keep gkv content, got \
+     {with_gkv:?} of hosts {hosts:?}"
+  );
+  assert!(
+    gkv_cells(&w, 3, 11) > 0 && gkv_cells(&w, 4, 11) > 0,
+    "both husks retain gkv content via the terminal population"
+  );
+  // Equal-applied by construction (see the coverage note): the durable-ack every-peer barrier makes
+  // the freeze durable on every voter and the settle loop coalesces commit+apply, so the sim cannot
+  // host a below-freeze husk — every surviving husk sits at the same applied index.
+  let applied3 = w.applied_index_of(3, 11).get();
+  for &n in &hosts {
+    assert_eq!(
+      w.applied_index_of(n, 11).get(),
+      applied3,
+      "surviving husk {n} must be applied-equal (== node 3's {applied3})"
+    );
+  }
+  assert!(
+    w.agreement_holds(11),
+    "the non-absorbed positional branch passes over the husks"
+  );
+}
+
 /// A crash AFTER the absorb's barrier landed must not bring the source back in any form: the
 /// floor and store drop are terminal, so the restored host rebuilds the target alone and no
 /// frozen source replica reappears anywhere. Under the dead hosting-check sweep the source's
@@ -3322,5 +3569,462 @@ fn recorded_floors_reach_the_service_as_the_terminal_sentinel() {
     other.floor(&12),
     3,
     "the REMOVAL floor is cluster-wide: the catalog is one fact, read at every node"
+  );
+}
+
+/// Drive an already-live `target` (absorbing an already-live `source`, both on nodes {0,1,2}) to a
+/// HELD merge PARK on a non-leader follower — the async-capture crash-replay shape
+/// [`replayed_park_holds_while_the_capture_barrier_is_open`] pins: the follower's absorb capture dies
+/// in the crash, its durable log replays the commit, and it re-parks with the barrier open (no
+/// snapshot route arrives to supersede it here). Returns the parked follower node.
+fn drive_park_on_existing(w: &mut MultiWorld, source: u64, target: u64) -> u64 {
+  colocate_source_onto_target(w, source, target);
+  let follower = (0..3u64)
+    .find(|n| Some(*n) != w.leader_of(source) && Some(*n) != w.leader_of(target))
+    .expect("three nodes, at most two leaders");
+  w.stables
+    .get_mut(&(follower, target))
+    .expect("target stable")
+    .set_mode(crate::StoreMode::Async);
+  merge_verb_until_accepted(w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(source, target)
+  });
+  merge_verb_until_accepted(w, 4_000, "the commit", |w| {
+    w.propose_commit_merge(target, source)
+  });
+  assert!(
+    w.run_until(8_000, |w| w.merges_resolved() >= 3),
+    "every host resolves the absorb"
+  );
+  w.crash(follower);
+  assert!(
+    w.run_until(4_000, |w| {
+      w.hosts[&follower]
+        .group(&target)
+        .is_some_and(|ep| ep.pending_merge().is_some())
+    }),
+    "the restored follower replays the commit and re-parks"
+  );
+  follower
+}
+
+/// Create `source` and `target` on {0,1,2} with a little committed client load (so the target has an
+/// applied history to judge), then drive `target` to a HELD merge park via [`drive_park_on_existing`].
+pub(crate) fn held_park_target(seed: u64, source: u64, target: u64) -> (MultiWorld, u64) {
+  let mut w = MultiWorld::new(seed);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(source, &all);
+  w.create_group(target, &all);
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(source).is_some() && w.leader_of(target).is_some()
+  }));
+  propose_until_accepted(&mut w, source, b"s0");
+  propose_until_accepted(&mut w, target, b"t0");
+  w.run_until(200, |_| false);
+  let follower = drive_park_on_existing(&mut w, source, target);
+  (w, follower)
+}
+
+/// The fork-fence coupling compares against the PARK's coordinate (`applied_index + 1`), NOT the
+/// moving commit (#110). A parked target pins its apply at `k-1` while its commit races ahead, so a
+/// fence strictly ABOVE the park coordinate but at-or-below the racing commit must NOT couple — the
+/// boundary the earlier commit-based compare over-coupled.
+#[test]
+fn fork_fence_coupled_park_uses_the_park_coordinate_not_commit() {
+  let (mut w, follower) = held_park_target(23, 11, 10);
+  // Race the target's COMMIT past the park's pinned apply: the leader commits fresh load, which the
+  // parked follower appends and acks (its commit advances) while its apply stays pinned at k-1.
+  for _ in 0..4 {
+    propose_until_accepted(&mut w, 10, b"more");
+  }
+  assert!(
+    w.run_until(4_000, |w| {
+      w.hosts[&follower].group(&10).is_some_and(|ep| {
+        ep.pending_merge().is_some() && ep.commit_index().get() >= ep.applied_index().get() + 2
+      })
+    }),
+    "the parked follower's commit must race >= 2 past its pinned apply"
+  );
+  let applied = w.hosts[&follower]
+    .group(&10)
+    .expect("parked")
+    .applied_index()
+    .get();
+  // A fence AT the park coordinate (applied + 1) couples — the deadlock boundary is inclusive.
+  w.fork_conflicts.clear();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 1));
+  assert!(
+    w.fork_fence_coupled_park(10),
+    "a fence at the park coordinate (applied + 1) couples"
+  );
+  // A fence ABOVE the park coordinate but at-or-below the RACING COMMIT must NOT couple: the fix
+  // compares against applied + 1, not the moving commit. Under the old commit-based compare this
+  // fence (<= commit) would have falsely certified the group as coupled.
+  w.fork_conflicts.clear();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 2));
+  assert!(
+    !w.fork_fence_coupled_park(10),
+    "a fence above the park coordinate must not couple, even at-or-below the racing commit"
+  );
+  assert!(
+    w.fork_fence_wedge_set().is_empty(),
+    "no coupling => empty #110 set"
+  );
+}
+
+/// The REFUSE arm clears the fence: a real parked conflict whose child is then REMOVED resolves
+/// through the refusal arm (the late fork hits the tombstone), and a LATER merge park on the same
+/// parent must NOT be exempted (#110). The conflict is recorded on the lagging node (the world cannot
+/// mint one organically) and the refusal is driven end-to-end — not an injected record beside a
+/// conflict-free fork.
+#[test]
+fn fork_fence_clears_on_the_refuse_arm_so_a_later_park_is_not_exempted() {
+  let mut w = MultiWorld::new(43);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all); // the parent (later the merge target)
+  w.create_group(11, &all); // the merge source
+  assert!(w.run_until(3_000, |w| {
+    w.leader_of(10).is_some() && w.leader_of(11).is_some()
+  }));
+  for key in 0u16..8 {
+    propose_until_accepted(
+      &mut w,
+      10,
+      &crate::multi::encode_gkv(10, key, u64::from(key)),
+    );
+  }
+  assert!(w.run_until(2_000, |w| (0..3).all(|n| w.applied_of(n, 10).len() >= 8)));
+
+  // Node 2 lags the whole split: isolate it, commit the split on {0,1}, materialize child 200 there.
+  w.isolate(2);
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some_and(|l| l != 2)));
+  propose_split_until_accepted(&mut w, 10, 200, 4);
+  assert!(w.run_until(3_000, |w| w.splits_applied() == 1));
+  // A REAL standing conflict on the lagging node 2 for child 200 — recorded naming the child, so the
+  // refuse arm clears it exactly as an organic conflict would.
+  let fence = w.split_fence_index[&200];
+  w.inject_fork_conflict_for_child(2, 10, fence, 200);
+  assert!(w.has_fork_fence_below(2, 10, sailing_proto::Index::new(u64::MAX)));
+
+  // Retire the child while node 2 still has the split entry ahead of it, then heal: node 2 applies the
+  // split and its late fork REFUSES against the tombstone — the fence's resolution arm.
+  w.remove_group(200);
+  w.heal(2);
+  assert!(
+    w.run_until(4_000, |w| w.split_refused_observed() == 1),
+    "the late fork never resolved refused"
+  );
+  assert!(
+    !w.hosts_group(2, 200),
+    "a refused fork must not materialize"
+  );
+  assert!(
+    !w.has_fork_fence_below(2, 10, sailing_proto::Index::new(u64::MAX)),
+    "the refuse arm cleared the standing fence"
+  );
+
+  // A LATER merge park on the same parent must NOT be exempted — the resolved conflict left no fence.
+  let follower = drive_park_on_existing(&mut w, 11, 10);
+  assert!(
+    w.hosts[&follower]
+      .group(&10)
+      .is_some_and(|ep| ep.pending_merge().is_some()),
+    "the parent is parked mid-absorb"
+  );
+  assert!(
+    !w.fork_fence_coupled_park(10),
+    "a park after the refuse resolved must not be certified as fork-fence coupled"
+  );
+  assert!(
+    w.fork_fence_wedge_set().is_empty(),
+    "no standing fence => empty #110 set"
+  );
+}
+
+/// The REDUNDANT fold clears the fence: a real parked conflict whose child is already
+/// provenance-matched on the node resolves through the container's internal redundant arm (a crashed
+/// parent replays its split and folds the fork against its own restored child, yielding NO fork), and
+/// a LATER merge park on the same parent must NOT be exempted (#110). The pump can't see that internal
+/// fold, so it reconciles it off the hosted-child fact — driven end-to-end through the crash-replay.
+#[test]
+fn fork_fence_clears_on_the_redundant_fold_so_a_later_park_is_not_exempted() {
+  let mut w = world_after_split(47, 200); // 100 split into 200, materialized on all nodes
+  assert_eq!(w.splits_applied(), 1);
+  // A merge source that encodes ABOVE the parent (the direction rule), for the later park.
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(101, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(101).is_some()));
+
+  // A REAL standing conflict on node 0 for child 200, recorded naming the child.
+  let fence = w.split_fence_index[&200];
+  w.inject_fork_conflict_for_child(0, 100, fence, 200);
+  assert!(w.has_fork_fence_below(0, 100, sailing_proto::Index::new(u64::MAX)));
+
+  // Crash node 0: it restores its 200 replica (carrying the fork token) and the parent replays the
+  // split — the replayed fork resolves REDUNDANT against the provenance-matched twin, yielding no
+  // fork. The pump reconciles the fence off node 0 hosting the resolved child.
+  w.crash(0);
+  assert!(
+    w.run_until(2_000, |w| w.hosts_group(0, 200)),
+    "the crashed node restores its child replica"
+  );
+  for _ in 0..80 {
+    w.tick();
+  }
+  assert_eq!(
+    w.splits_applied(),
+    1,
+    "the replayed fork folds redundant, not re-registered"
+  );
+  assert!(
+    !w.has_fork_fence_below(0, 100, sailing_proto::Index::new(u64::MAX)),
+    "the redundant fold cleared the standing fence"
+  );
+
+  // A LATER merge park on the same parent must NOT be exempted.
+  let follower = drive_park_on_existing(&mut w, 101, 100);
+  assert!(
+    w.hosts[&follower]
+      .group(&100)
+      .is_some_and(|ep| ep.pending_merge().is_some()),
+    "the parent is parked mid-absorb"
+  );
+  assert!(
+    !w.fork_fence_coupled_park(100),
+    "a park after the redundant fold must not be certified as fork-fence coupled"
+  );
+  assert!(
+    w.fork_fence_wedge_set().is_empty(),
+    "no standing fence => empty #110 set"
+  );
+}
+
+/// The fork-fence record is cleared when the parent replica is torn down — active state, not
+/// append-only history (#110). The shared `purge_group_stores` chokepoint fires for both
+/// `drop_group_replica` and `remove_group`.
+#[test]
+fn fork_fence_clears_when_the_parent_replica_is_torn_down() {
+  let mut w = MultiWorld::new(31);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(2_000, |w| w.leader_of(100).is_some()));
+  w.inject_fork_conflict(1, 100, sailing_proto::Index::new(3));
+  assert!(
+    w.has_fork_fence_below(1, 100, sailing_proto::Index::new(3)),
+    "the fence is recorded"
+  );
+  // Tear the parent replica down on that node — the record must go with it.
+  w.drop_group_replica(100, 1);
+  assert!(
+    !w.has_fork_fence_below(1, 100, sailing_proto::Index::new(u64::MAX)),
+    "tearing down the parent replica cleared its fork-fence record"
+  );
+}
+
+/// The two exemption classes are counted and overlapped INDEPENDENTLY (#106 under-hosted AND #110
+/// fork-fence): a group satisfying BOTH predicates lands in both wedge sets, so both raw counters and
+/// the overlap are positive. The earlier `difference`-based #110 count dropped exactly this group,
+/// zeroing its counter and its seed-list entry.
+#[test]
+fn both_wedge_classes_count_and_overlap_independently() {
+  let (mut w, follower) = held_park_target(37, 11, 10);
+  // Strip the target's host quorum: drop every OTHER hosting replica (each resolved the absorb, so
+  // none is a merge participant), leaving only the parked follower — a merge participant with no live
+  // host quorum (the #106 under-hosted root).
+  for n in 0..3u64 {
+    if n != follower && w.hosts_group(n, 10) {
+      w.drop_group_replica(10, n);
+    }
+  }
+  assert!(
+    !w.has_live_host_quorum(10),
+    "only the parked follower hosts the target"
+  );
+  // Record a standing fence at-or-below the follower's park coordinate (the #110 fork-fence root).
+  let applied = w.applied_index_of(follower, 10).get();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 1));
+
+  let underhosted = w.tracked_merge_wedge_set();
+  let forkfence = w.fork_fence_wedge_set();
+  assert!(
+    underhosted.contains(&10),
+    "the parked under-hosted target is the #106 class"
+  );
+  assert!(
+    forkfence.contains(&10),
+    "the same target is the #110 fork-fence class"
+  );
+  assert!(!underhosted.is_empty() && !forkfence.is_empty());
+  let overlap: BTreeSet<u64> = underhosted.intersection(&forkfence).copied().collect();
+  assert!(
+    overlap.contains(&10),
+    "a group in both predicates is the explicit overlap"
+  );
+  // The earlier `difference`-based #110 attribution dropped exactly this group, zeroing its counter.
+  assert!(
+    forkfence.difference(&underhosted).count() < forkfence.len(),
+    "the old difference-based #110 count would miss the overlapping group"
+  );
+}
+
+/// A liveness exemption must NEVER gate safety (#106/#110): the quiesce's per-group safety pass runs
+/// on EVERY hosted replica of every group, exempt or not. Here a group is driven into the exempted
+/// fork-fence wedge, then the integrity leg is shown to STILL trip on a hosted replica whose applied
+/// record carries a command outside the proposed set — before the fix the group was skipped whole.
+#[test]
+#[should_panic(expected = "INTEGRITY FAILURE")]
+fn exemption_does_not_gate_safety_on_a_wedged_group() {
+  let (mut w, follower) = held_park_target(41, 11, 10);
+  let applied = w.applied_index_of(follower, 10).get();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 1));
+  // The target is now the exempted fork-fence wedge (#110).
+  assert!(
+    w.fork_fence_wedge_set().contains(&10),
+    "the parked target is exempted"
+  );
+  // Its hosted replicas DID apply the target's real client load. Present an `expected` set that omits
+  // it (a divergent applied record); the unconditional safety pass must still panic on the exempted
+  // group — the exemption gates only convergence, never this.
+  let expected: BTreeSet<Vec<u8>> = BTreeSet::new();
+  crate::multi::vopr::assert_group_safety(&w, 10, &expected, 41);
+}
+
+/// The cross-watermark per-index AGREEMENT relation over OWN CLIENT (gkv) cells (#H2), unit red-proofed
+/// on synthetic aligned records: gkv cells at every SHARED log index must carry the same payload
+/// (agree); a legitimate arrival-path REORDER (same index→payload, scrambled order) still agrees; a
+/// differing gkv payload at a shared index breaks it; one record holding two different gkv payloads at a
+/// single index is a self-conflict; and NON-GKV cells are EXCLUDED — a fold keeps them at source
+/// indices, so an index collision there is representational, not divergence. The world can't
+/// synthetically diverge two real replicas (the codebase's standing note), so this is red-proofed here.
+#[test]
+fn absorbed_cross_watermark_client_cell_agreement_holds_and_catches_divergence() {
+  let g = 105u64;
+  let gc = |i: u64, key: u16, val: u64| (i, crate::multi::encode_gkv(g, key, val));
+  // Unequal watermarks, agreeing on every shared client index → holds.
+  let short: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 11)];
+  let long: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 11), gc(3, 2, 12)];
+  assert!(
+    MultiWorld::own_client_cells_agree_at_shared_indices(&[short.clone(), long.clone()]),
+    "client cells agreeing at every shared log index agree across watermarks"
+  );
+  // A legitimate arrival-path reorder (the merge-fold / capture restore applies cells out of index
+  // order — the seed-0 shape minimized): same index→payload, scrambled order → still agrees. Keying on
+  // the index, not position, is the whole point.
+  let reordered: AppliedLog = std::vec![gc(1, 0, 10), gc(3, 2, 12), gc(2, 1, 11)];
+  assert!(
+    MultiWorld::own_client_cells_agree_at_shared_indices(&[short.clone(), reordered]),
+    "an out-of-order client record agreeing per index must NOT be judged a divergence"
+  );
+  // A genuine divergence at a shared index — same group, different value → breaks.
+  let divergent: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 999)];
+  assert!(
+    !MultiWorld::own_client_cells_agree_at_shared_indices(&[divergent, long]),
+    "a differing client payload at a shared index must break agreement even at unequal watermarks"
+  );
+  // One record carrying two DIFFERENT gkv payloads at a single index is a self-conflict → breaks (a
+  // folded gkv cell carries a foreign tag and is dropped by alignment, so this is real corruption).
+  let self_conflict: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 11), gc(2, 1, 22)];
+  assert!(
+    !MultiWorld::own_client_cells_agree_at_shared_indices(&[self_conflict]),
+    "one replica applying two client payloads at a single index must fail"
+  );
+  // NON-GKV cells are EXCLUDED (the seed-53 fold-collision minimized): a parked follower holds the
+  // target's own raw `t0`; the resolved host additionally holds the folded raw `s0` at the SAME index
+  // (the fold keeps the source's index). Neither decodes as gkv, so the leg does not judge them → holds.
+  let parked: AppliedLog = std::vec![(2, b"t0".to_vec())];
+  let resolved: AppliedLog = std::vec![(2, b"t0".to_vec()), (2, b"s0".to_vec())];
+  assert!(
+    MultiWorld::own_client_cells_agree_at_shared_indices(&[parked, resolved]),
+    "non-gkv cells kept at colliding fold indices are excluded from this leg"
+  );
+}
+
+/// The absorbed cross-watermark relation passes on a real EXEMPTED wedge sitting at unequal watermarks
+/// with AGREEING records (#H2 integration): the parked follower's aligned record agrees at every shared
+/// index with the resolved hosts', so the safety pass certifies it without a leader and without equal
+/// watermarks. Its load is non-gkv (`t0`/`s0`), so the CLIENT-cell leg is vacuous here BY CONSTRUCTION —
+/// integrity carries its client content; and its UNEQUAL watermarks come from the PARK COORDINATE (the
+/// follower pinned at k-1 while the resolved hosts moved past k), NOT the merge barrier's match/apply
+/// gap, so the two unequal shapes are not conflated.
+#[test]
+fn exempted_absorbed_wedge_at_unequal_watermarks_passes_safety() {
+  let (mut w, follower) = held_park_target(53, 11, 10);
+  assert!(w.group_absorbed(10), "the target absorbed the source");
+  // The parked follower sits at k-1; the resolved hosts are past k — unequal watermarks.
+  let lens: Vec<usize> = (0..3u64).map(|n| w.applied_of(n, 10).len()).collect();
+  assert!(
+    lens.iter().min() != lens.iter().max(),
+    "the wedge must straddle unequal watermarks: {lens:?}"
+  );
+  // Make it the exempted fork-fence wedge (#110) so the safety pass runs on it EXEMPT.
+  let applied = w.applied_index_of(follower, 10).get();
+  w.inject_fork_conflict(follower, 10, sailing_proto::Index::new(applied + 1));
+  assert!(
+    w.fork_fence_wedge_set().contains(&10),
+    "the parked target is exempted"
+  );
+  // The aligned records AGREE across the unequal watermarks → the relation holds and the safety pass
+  // passes (the target's own load, source's load folded on the resolved hosts, are the expected set).
+  assert!(
+    w.absorbed_lineage_client_cells_agree_at_shared_indices(10),
+    "agreeing absorbed replicas at unequal watermarks must pass the cross-watermark relation"
+  );
+  let expected: BTreeSet<Vec<u8>> = [b"t0".to_vec(), b"s0".to_vec()].into_iter().collect();
+  crate::multi::vopr::assert_group_safety(&w, 10, &expected, 53);
+}
+
+/// The redundant-fold reconciliation keys on the MINT TOKEN, not bare hostedness (#110): a TOKEN-LESS
+/// hosted child at a fork-child id is a STANDING squatter (a plain create/recreate incarnation — the
+/// lifecycle-churn #110 mechanism), so its recorded fence MUST survive the pump; only a TOKEN-BEARING
+/// child (a materialized fork or a redundant-fold twin that adopted the token) clears it. The
+/// hostedness-only form cleared the squatter's fence in the very pump that recorded it, un-exempting a
+/// real standing wedge.
+#[test]
+fn redundant_fold_clear_keys_on_the_mint_token_not_hostedness() {
+  // TOKEN-LESS squatter: its fence SURVIVES the pump/reconciliation.
+  let mut w = MultiWorld::new(71);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all); // the parent
+  w.create_group(200, &all); // a PLAIN create at a fork-child id — token-less by construction
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()
+    && w.leader_of(200).is_some()));
+  assert!(
+    w.hosts[&0]
+      .group(&200)
+      .is_some_and(|ep| ep.fork_id().is_none()),
+    "the plain-created squatter is token-less"
+  );
+  w.inject_fork_conflict_for_child(0, 10, sailing_proto::Index::new(3), 200);
+  w.pump_forks();
+  assert!(
+    w.has_fork_fence_below(0, 10, sailing_proto::Index::new(u64::MAX)),
+    "a token-less standing squatter's fence must SURVIVE the pump — the wedge is real"
+  );
+
+  // TOKEN-BEARING fork child: its fence CLEARS via the reconciliation (the redundant-fold arm).
+  let mut w2 = world_after_split(73, 200); // 100 split into 200 — a real materialized fork
+  assert!(
+    w2.hosts[&0]
+      .group(&200)
+      .is_some_and(|ep| ep.fork_id().is_some()),
+    "the materialized fork carries the mint token"
+  );
+  w2.inject_fork_conflict_for_child(0, 100, w2.split_fence_index[&200], 200);
+  w2.pump_forks();
+  assert!(
+    !w2.has_fork_fence_below(0, 100, sailing_proto::Index::new(u64::MAX)),
+    "a token-bearing fork child's fence CLEARS — the fork resolved"
   );
 }

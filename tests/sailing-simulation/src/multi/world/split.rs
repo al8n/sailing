@@ -119,9 +119,12 @@ impl MultiWorld {
     let stable = self.stables.get(&(leader, parent)).expect("leader stable");
     let instruction = bytes::Bytes::copy_from_slice(&point.to_le_bytes());
     let result = host.propose_split(&parent, self.now, log, stable, &child, 0, instruction)?;
-    if result.is_ok() {
+    if let Ok(idx) = &result {
       let meta = self.groups.get_mut(&parent).expect("registered group");
       let child_keys = meta.keys.split_off(&point);
+      // Record the fence coordinate (the split entry's parent-log index) so a later parked-fork
+      // conflict on this child can be attributed to the index its standing capture fence sits at.
+      self.split_fence_index.insert(child, *idx);
       self.pending_splits.insert(
         child,
         PendingSplit {
@@ -160,6 +163,11 @@ impl MultiWorld {
           .is_some_and(|m| m.retired || fork.child_gen < m.generation)
         {
           self.split_refused += 1;
+          // The REFUSE arm resolves the barrier without materializing — clear the fence this child's
+          // split index pinned on `(node, parent)`, so a stale record cannot outlive the resolved
+          // conflict (#110). The child is retired here, so the redundant-fold reconciliation below
+          // (keyed on the child being HOSTED) can never catch it; this arm must clear it explicitly.
+          self.clear_fork_fence(node, fork.parent, fork.child);
           self
             .hosts
             .get_mut(&node)
@@ -167,21 +175,80 @@ impl MultiWorld {
             .lift_fork_barrier(&fork.parent, fork.split_index);
           continue;
         }
+        // The MATERIALIZE arm wires the child HERE — exact knowledge that the fork resolved, no
+        // inference: clear its fence right at the wire (#110).
+        let (materialized_parent, materialized_child) = (fork.parent, fork.child);
         self.register_split_child(&fork);
         self.wire_fork_replica(node, fork);
+        self.clear_fork_fence(node, materialized_parent, materialized_child);
       }
       // Conflict signals are drained and counted, never acted on: see the field docs for why
-      // the world's embedder model leaves a squatter in place.
-      while let Some(_pc) = self
+      // the world's embedder model leaves a squatter in place. Beyond the count, the standing fence
+      // is recorded per `(node, parent)` at the child's split index — a parked fork holds the
+      // parent's capture fence there, which a later merge park on the same parent can deadlock
+      // behind (issue #110, the fork-fence coupling the quiesce certifies past).
+      while let Some((parent, child)) = self
         .hosts
         .get_mut(&node)
         .expect("host exists")
         .poll_split_conflict()
       {
         self.split_conflicts += 1;
+        if let Some(&idx) = self.split_fence_index.get(&child) {
+          self
+            .fork_conflicts
+            .entry((node, parent))
+            .or_default()
+            .insert(idx, child);
+        }
+      }
+    }
+    // The REDUNDANT-fold arm (the container resolves a fork whose child is already provenance-matched
+    // on the node, WITHOUT yielding it) is invisible to the loops above. Reconcile it here, keyed on
+    // the MINT TOKEN — NOT bare hostedness: `Endpoint::fork_id()` is the exact discriminator. A
+    // token-BEARING hosted child is a resolved fork (a materialized fork is created with the token; the
+    // redundant-fold twin fires precisely because it ALREADY carries the matching token — the catch-up
+    // adoption), so its fence has resolved and clears. A token-LESS hosted child is a STANDING SQUATTER
+    // — a plain CreateGroup/RecreateGroup incarnation at the fork-child id (token-less by construction),
+    // the very #110 mechanism the lifecycle-churn profile builds — whose fence MUST survive. (A
+    // different-token child is unconstructible at a recorded conflict: two forks onto one id refuse at
+    // propose, and a removed token-bearing child's late fork hits the refuse arm.) The materialize arm
+    // already cleared its own fence at the wire, so this leg carries only the redundant fold.
+    let mut resolved: Vec<((u64, u64), sailing_proto::Index)> = Vec::new();
+    for (&key, idxs) in &self.fork_conflicts {
+      for (&idx, &child) in idxs {
+        if self.hosts_group(key.0, child)
+          && self.hosts[&key.0]
+            .group(&child)
+            .is_some_and(|ep| ep.fork_id().is_some())
+        {
+          resolved.push((key, idx));
+        }
+      }
+    }
+    for (key, idx) in resolved {
+      if let Some(idxs) = self.fork_conflicts.get_mut(&key) {
+        idxs.remove(&idx);
+        if idxs.is_empty() {
+          self.fork_conflicts.remove(&key);
+        }
       }
     }
     progressed
+  }
+
+  /// Drop the fork-fence record `child`'s split index pinned on `(node, parent)` — the shared per-arm
+  /// clear the materialize/refuse arms and the teardown seams all funnel through (#110). A no-op when
+  /// the child never had a recorded fence.
+  fn clear_fork_fence(&mut self, node: u64, parent: u64, child: u64) {
+    if let Some(&idx) = self.split_fence_index.get(&child)
+      && let Some(idxs) = self.fork_conflicts.get_mut(&(node, parent))
+    {
+      idxs.remove(&idx);
+      if idxs.is_empty() {
+        self.fork_conflicts.remove(&(node, parent));
+      }
+    }
   }
 
   /// Register a fork's child in the harness catalog on its FIRST materialization anywhere:
@@ -339,10 +406,26 @@ impl MultiWorld {
   /// cells exact-cell across the handover, and quiesce equality reads the raw records once
   /// every replica converged. For a group that never split this is the raw record verbatim
   /// (own-tagged cells, full domain); an unregistered gid aligns as itself.
+  ///
+  /// A RETIRED source's live population is emptied at merge resolution, but a lagging husk replica
+  /// still hosts its record and stays inside the safety sweep — so align against the TERMINAL
+  /// pre-merge population when the live set is empty and one was stashed, else every husk record would
+  /// align gkv-empty and the cross-watermark leg would certify vacuously. The terminal set is the
+  /// source's final owned population (post-every-split, pre-merge), so the split-erasure argument is
+  /// unchanged: split-away keys stay filtered from every replica's view, pre-split husk replicas
+  /// included, and every husk replica of the lineage aligns against the SAME set — views still differ
+  /// only by watermark. This heals every aligned consumer (the cross-watermark wrapper and
+  /// `agreement_holds`' non-absorbed positional branch for plain-source husks) at one seam.
   pub(super) fn aligned_applied(&self, node: u64, gid: u64) -> AppliedLog {
     let raw = self.applied_of(node, gid);
     match self.groups.get(&gid) {
-      Some(meta) => Self::align_record(raw, gid, &meta.keys),
+      Some(meta) => {
+        let population = match &meta.terminal_keys {
+          Some(terminal) if meta.keys.is_empty() => terminal,
+          _ => &meta.keys,
+        };
+        Self::align_record(raw, gid, population)
+      }
       None => raw,
     }
   }
@@ -365,10 +448,17 @@ impl MultiWorld {
   /// `remove_S(baseline) ++ remove_S(own(k))`. The tag test erases `remove_S(baseline)` for
   /// any S, and the population test collapses `remove_S(own(k))` to `filter(own(k))` for any S
   /// (every split in any replica's S flipped the population before that replica could apply
-  /// it), so every replica's aligned view is `filter(own(k))` — views differ across replicas
-  /// only by k, an exact prefix relation, whatever the arrival path, replication lag, or
-  /// number of onward splits on either side. A genuine divergence inside `own(k)` survives
-  /// untouched (live key, own tag) and still trips the oracle.
+  /// it), so every replica's aligned view is `filter(own(k))` — the views agree at every LOG
+  /// INDEX they share, whatever the replication lag or number of onward splits. Under split-lag
+  /// the application is index-ordered, so the shorter view is additionally an exact PREFIX of the
+  /// longer — the positional relation the non-absorbed [`agreement_holds`](Self::agreement_holds)
+  /// branch reads. An ABSORBED lineage's arrival path (merge-fold vs capture restore) can apply
+  /// those cells OUT of index order, so its cross-watermark leg keys on the log index over the OWN-GKV
+  /// (client) cells instead (see
+  /// [`own_client_cells_agree_at_shared_indices`](Self::own_client_cells_agree_at_shared_indices); kept
+  /// non-gkv cells the fold leaves at source indices are judged only at equal watermarks). A genuine
+  /// divergence inside a gkv `own(k)` cell — a differing payload at a shared index — survives untouched
+  /// (live key, own tag) and still trips the oracle.
   pub(super) fn align_record(raw: AppliedLog, gid: u64, population: &BTreeSet<u16>) -> AppliedLog {
     raw
       .into_iter()
@@ -377,6 +467,68 @@ impl MultiWorld {
         None => true,
       })
       .collect()
+  }
+
+  /// Whether a set of ALIGNED records AGREE at every LOG INDEX they share, over the group's OWN
+  /// CLIENT (gkv) cells ONLY. Each entry is `(log_index, payload)`; NON-GKV cells are SKIPPED — a
+  /// fold keeps a non-gkv source cell at its SOURCE log index (whereas folded gkv cells carry the
+  /// source's gid tag and are dropped by [`align_record`](Self::align_record)), so the two logs'
+  /// index spaces merge for kept non-gkv cells and any per-index claim about them is false by
+  /// construction; they are covered instead by the equal-watermark sorted form in
+  /// [`agreement_holds`](Self::agreement_holds) and by the integrity leg. For OWN-GKV cells the
+  /// aligned record draws from exactly ONE log — the group's own — so "one index, one payload" is a
+  /// true invariant: a single record carrying two DIFFERENT gkv payloads at one index is real
+  /// corruption (self-conflict), and across every pair an index present in BOTH records must carry the
+  /// same payload. Indices present on only ONE side are NOT judged — a replica that compacted low
+  /// indices out of its `applied()` view legitimately lacks them, and a subset demand would false-trip
+  /// (loss is the run-end conservation ledger's business). The ARRIVAL PATH (merge-fold / capture
+  /// restore) can apply cells OUT of index order, so agreement is keyed on the log index — NOT position
+  /// (the equal-applied raw form in `agreement_holds` sorts for the same reason). It carries NO
+  /// equal-watermark requirement, so it judges the unequal watermarks an exempted merge wedge sits at.
+  pub(crate) fn own_client_cells_agree_at_shared_indices(records: &[AppliedLog]) -> bool {
+    let mut maps: Vec<BTreeMap<u64, &[u8]>> = Vec::with_capacity(records.len());
+    for record in records {
+      let mut map: BTreeMap<u64, &[u8]> = BTreeMap::new();
+      for (index, payload) in record {
+        // Only own-gkv (client) cells are index-canonical; a non-gkv cell the fold kept at its source
+        // index is excluded (the equal-watermark sorted form and the integrity leg cover it).
+        if super::super::decode_gkv(payload).is_none() {
+          continue;
+        }
+        if let Some(prev) = map.insert(*index, payload.as_slice())
+          && prev != payload.as_slice()
+        {
+          return false; // one replica applied two different client payloads at a single committed index
+        }
+      }
+      maps.push(map);
+    }
+    for i in 0..maps.len() {
+      for j in (i + 1)..maps.len() {
+        for (index, payload) in &maps[i] {
+          if let Some(other) = maps[j].get(index)
+            && other != payload
+          {
+            return false; // two replicas disagree at a shared committed client index
+          }
+        }
+      }
+    }
+    true
+  }
+
+  /// Whether every hosted replica of an absorbed `gid` agrees at the log indices it shares with the
+  /// others over their OWN CLIENT (gkv) cells — the cross-watermark agreement leg the unconditional
+  /// safety pass runs for absorbed groups. It catches a divergence between replicas at UNEQUAL
+  /// watermarks that `agreement_holds`' absorbed branch, which compares only EQUAL-applied replicas,
+  /// never puts side by side.
+  pub(crate) fn absorbed_lineage_client_cells_agree_at_shared_indices(&self, gid: u64) -> bool {
+    let records: Vec<AppliedLog> = self
+      .hosting_nodes(gid)
+      .into_iter()
+      .map(|n| self.aligned_applied(n, gid))
+      .collect();
+    Self::own_client_cells_agree_at_shared_indices(&records)
   }
 
   /// Record every replica's applied gkv cells into the conservation ledger (see the module

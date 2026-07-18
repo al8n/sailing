@@ -323,6 +323,12 @@ impl MultiWorld {
       meta.conf_in_flight = false;
       meta.wired.clear();
       meta.departed_streak.clear();
+      // Stash the terminal population before emptying the live set: a lagging husk replica of this
+      // retired source stays hosted and inside the safety sweep, but alignment keeps a gkv cell only
+      // if the LIVE population owns its key — an emptied live set would blank every husk record. This
+      // is the source's final owned population (post-every-split, pre-merge); `aligned_applied` falls
+      // back to it so the cross-watermark leg still judges the husk's client content.
+      meta.terminal_keys = Some(meta.keys.clone());
       (
         core::mem::take(&mut meta.keys),
         core::mem::take(&mut meta.carried_tags),
@@ -358,25 +364,29 @@ impl MultiWorld {
     });
   }
 
-  /// Judge every registered merge's union conservation: the target's recorded history for each
-  /// source key must CONTAIN the source's full recorded history in order (the absorbed run).
+  /// Judge every registered merge's union conservation: every value of the source's recorded
+  /// history for each absorbed key — minus the split-child exemption below — must appear in the
+  /// target's; unordered value containment (`assert_union` checks membership, never position).
   /// Sound at any quiescent point; the multi VOPR runs it at run end beside the split verdict.
   pub fn finalize_merge_conservation_or_panic(&self, seed: u64) {
     for rec in &self.merges {
       // A key this source SPLIT AWAY before the merge left its pre-split cells with the split child,
       // record-wide (the one non-append-only FSM mutation), so a later merge target is not demanded
-      // to hold them. Collect them per absorbed key — every value in a registered split child's record
-      // for a key this source parented — and exempt them from the union demand: values are globally
-      // unique, so membership in the child's record is an EXACT departure witness.
+      // to hold them. Collect, per absorbed key, every value in a registered split child's record for
+      // a key this source parented, and exempt the lot from the union demand. Globally-unique values
+      // make child-record membership an exact witness that a cell rode the CHILD LINEAGE — not that
+      // it departed this source: the child's accumulated record also holds cells the child originated
+      // or inherited after the split, so the exemption is a SUPERSET of true departures.
       //
-      // Deliberately NOT netted against "returns" (a departed cell whose child lineage later merged
-      // BACK into this source): the only ledger signal is the value's presence in an absorbed union
-      // source's record, and the append-only, dedup-by-value ledger cannot separate a genuine return
-      // to the FSM from a value merely INHERITED into that union source's record and never in the
-      // source's FSM at the merge — subtracting it over-demands, re-tripping legitimately departed
-      // cells. A genuinely returned cell that survives to the merge is in the target anyway, so a
-      // faithful absorb needs no exemption for it; the split partition verdict still guards the
-      // handover.
+      // Deliberately NOT narrowed by netting returns: the only ledger signal for a return is the
+      // value's presence in an absorbed union source's record, and the append-only, dedup-by-value
+      // ledger cannot separate a genuine return to the FSM from a value merely INHERITED into that
+      // union source's record and never in this source's FSM at the merge — netting over-demands,
+      // re-tripping legitimately departed cells. Consequently any cell sitting in both this source's
+      // and a matching child's history — returned after departing, or child-born/child-inherited and
+      // merged back — stays exempt while riding this merge, and its all-replica loss escapes this
+      // demand (disclosed at the VOPR absorbed-coverage note); the split partition verdict still
+      // guards the handover.
       let mut departed: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
       for sp in self.splits.values() {
         if sp.parent_led != rec.source_led {
@@ -586,6 +596,244 @@ impl MultiWorld {
       .iter()
       .filter_map(|&n| self.hosts[&n].group(&gid))
       .any(|ep| ep.pending_merge().is_some())
+  }
+
+  /// The source id a PARKED replica of `gid` (a merge target mid-absorb) names in its
+  /// `pending_merge` — the group whose captured state the park is waiting on. `None` when no replica
+  /// of `gid` is parked. First-found across replicas (a target parks on one absorb at a time).
+  pub(crate) fn parked_source_of(&self, gid: u64) -> Option<u64> {
+    for node in &self.node_ids {
+      if let Some(ep) = self.hosts[node].group(&gid)
+        && let Some(p) = ep.pending_merge()
+        && let Ok(source) = <u64 as sailing_proto::Data>::decode_exact(p.source_bytes())
+      {
+        return Some(source);
+      }
+    }
+    None
+  }
+
+  /// Whether `gid`'s committed voter conf keeps a LIVE HOST QUORUM: a strict majority of its
+  /// committed voters currently host a replica of `gid`. Read at a fully-healed point (quiesce /
+  /// calm window), a voter that does NOT host means reconcile could not resurrect its replica — the
+  /// "under-hosted" condition the tracked merge wedge turns on. A conf with no voters is treated as
+  /// lacking a quorum (an empty absorbing conf cannot make the absorb durable).
+  pub(crate) fn has_live_host_quorum(&self, gid: u64) -> bool {
+    let voters = self.group_voters(gid);
+    if voters.is_empty() {
+      return false;
+    }
+    let hosting = voters.iter().filter(|&&n| self.hosts_group(n, gid)).count();
+    hosting * 2 > voters.len()
+  }
+
+  /// A one-line diagnostic of `gid`'s merge-blocking state for the quiesce / wedge panics: whether
+  /// it is frozen or parked, the merge counterpart its completion depends on (a parked target's
+  /// captured SOURCE, a frozen source's claimed TARGET), and that counterpart's live/hosting status
+  /// — the exact facts needed to adjudicate a stuck merge participant against the tracked
+  /// under-hosted class.
+  pub(crate) fn merge_block_dbg(&self, gid: u64) -> String {
+    let mut parts = std::vec![std::format!(
+      "g{gid}[frozen={} freeze_seen={} parked={} host_quorum={}]",
+      self.group_frozen(gid),
+      self.group_freeze_seen(gid),
+      self.group_merge_parked(gid),
+      self.has_live_host_quorum(gid),
+    )];
+    if let Some(source) = self.parked_source_of(gid) {
+      parts.push(std::format!(
+        "parked_on_source g{source}[live={} host_quorum={} voters={:?} hosting={:?}]",
+        self.live_groups().contains(&source),
+        self.has_live_host_quorum(source),
+        self.group_voters(source),
+        self.hosting_nodes(source),
+      ));
+    }
+    if let Some(target) = self.claimed_target_of(gid) {
+      parts.push(std::format!(
+        "claims_target g{target}[live={} host_quorum={}]",
+        self.live_groups().contains(&target),
+        self.has_live_host_quorum(target),
+      ));
+    }
+    parts.join(" ")
+  }
+
+  /// Whether `gid` is wedged in the TRACKED under-hosted parked-absorb completion class (#106): an
+  /// unresolved merge participant whose completion is blocked because the absorbing conf lacks a
+  /// live host quorum. This is the DOCUMENTED exemption predicate the storm-profile quiesce and calm
+  /// windows certify past instead of panicking (see the `exempt_tracked` paths in the multi VOPR
+  /// runner) — deliberately NARROW so a NON-merge livelock or a merge wedged for any OTHER reason
+  /// still trips the liveness gates as a fresh find.
+  ///
+  /// It is a per-group membership test against [`tracked_merge_wedge_set`](Self::tracked_merge_wedge_set),
+  /// which computes the whole blocked component at once (the tracked class cascades — an under-hosted
+  /// source strands the target parked on it, which strands the next source frozen against that
+  /// target). Convenient for the calm window and the unit tests; the quiesce loop computes the set
+  /// once per pass instead.
+  pub(crate) fn tracked_underhosted_merge_wedge(&self, gid: u64) -> bool {
+    self.tracked_merge_wedge_set().contains(&gid)
+  }
+
+  /// Per-group membership in the fork-fence coupling set (#110) — the calm-window twin of
+  /// [`tracked_underhosted_merge_wedge`](Self::tracked_underhosted_merge_wedge). See
+  /// [`fork_fence_wedge_set`](Self::fork_fence_wedge_set).
+  pub(crate) fn fork_fence_coupled_wedge(&self, gid: u64) -> bool {
+    self.fork_fence_wedge_set().contains(&gid)
+  }
+
+  /// The full set of groups (live AND retired) wedged in the tracked under-hosted parked-absorb
+  /// class (#106): every merge participant transitively blocked by an under-hosted merge conf. The
+  /// storm-profile quiesce and calm windows certify these past instead of panicking — deliberately
+  /// NARROW (rooted only at a genuine hosting shortfall) so a NON-merge livelock, or a merge wedged
+  /// with every relevant conf still hosted, stays a fresh find that trips the liveness gates.
+  ///
+  /// Computed as a fixpoint over the merge dependency graph:
+  /// - **Base (the #106 root).** A merge participant — frozen (`group_frozen`/`group_freeze_seen`) or
+  ///   parked (`group_merge_parked`) — whose OWN committed conf lacks a live host quorum. This is the
+  ///   observed shape: a source dismantled host-by-host to a husk cannot be captured, so the park on
+  ///   it never resolves.
+  /// - **Propagate.** A PARKED target whose captured SOURCE (`parked_source_of`) is already blocked;
+  ///   or a FROZEN source whose claimed TARGET (`claimed_target_of`) is already blocked (a target
+  ///   pinned at another park cannot absorb it). Iterated to a fixpoint over the (bounded) group set.
+  ///
+  /// A world with no under-hosted merge participant yields the EMPTY set — every merge is then
+  /// obliged to converge, and any that does not still trips the gate.
+  pub(crate) fn tracked_merge_wedge_set(&self) -> BTreeSet<u64> {
+    let participant =
+      |g: u64| self.group_frozen(g) || self.group_freeze_seen(g) || self.group_merge_parked(g);
+    // Base: merge participants with no live host quorum (the under-hosted husk roots).
+    let base: BTreeSet<u64> = self
+      .groups
+      .keys()
+      .copied()
+      .filter(|&g| participant(g) && !self.has_live_host_quorum(g))
+      .collect();
+    self.propagate_merge_block(base)
+  }
+
+  /// Propagate a BASE set of blocked merge participants to a fixpoint over the merge dependency
+  /// edges: a PARKED target whose captured source is blocked, or a FROZEN source whose claimed
+  /// target is blocked, joins the set. Shared by both exemption classes — #106 (under-hosted) and
+  /// #110 (fork-fence) differ only in their base root; the cascade closure is identical.
+  fn propagate_merge_block(&self, mut blocked: BTreeSet<u64>) -> BTreeSet<u64> {
+    let participant =
+      |g: u64| self.group_frozen(g) || self.group_freeze_seen(g) || self.group_merge_parked(g);
+    loop {
+      let mut added = false;
+      for g in self.groups.keys().copied() {
+        if blocked.contains(&g) || !participant(g) {
+          continue;
+        }
+        let waits_on_blocked = self
+          .parked_source_of(g)
+          .is_some_and(|s| blocked.contains(&s))
+          || self
+            .claimed_target_of(g)
+            .is_some_and(|t| blocked.contains(&t));
+        if waits_on_blocked {
+          blocked.insert(g);
+          added = true;
+        }
+      }
+      if !added {
+        break;
+      }
+    }
+    blocked
+  }
+
+  /// Whether a standing fork-fence conflict is recorded on `(node, parent)` at OR BELOW `coord` — the
+  /// pure record-lookup + index-comparison leg of the fork-fence coupling (#110). `coord` is the
+  /// PARK's own coordinate (see [`fork_fence_coupled_park`](Self::fork_fence_coupled_park)); a fence
+  /// ABOVE it sits past the absorb capture and does not deadlock the park — the narrowness.
+  pub(crate) fn has_fork_fence_below(
+    &self,
+    node: u64,
+    parent: u64,
+    coord: sailing_proto::Index,
+  ) -> bool {
+    self
+      .fork_conflicts
+      .get(&(node, parent))
+      .is_some_and(|idxs| idxs.keys().any(|&s| s <= coord))
+  }
+
+  /// Whether `gid` is a merge TARGET whose park is deadlocked behind a standing fork fence (#110):
+  /// on some node hosting a PARKED replica of `gid`, a recorded fork-conflict fence for
+  /// `(node, parent == gid)` sits at-or-below that replica's PARK COORDINATE. A drained merge park
+  /// pins its applied index at `k-1` (one below the `CommitMerge` entry it waits on), so the park's
+  /// own entry index is `applied_index() + 1` — the capture coordinate a standing fence must sit at
+  /// or below to deadlock it. The comparison is against the PARK's coordinate, NOT the moving commit:
+  /// a parked target's commit races ahead of its pinned apply, and comparing against it would
+  /// over-couple a fence sitting between the two. A parked fork holds the parent's capture fence
+  /// there, and this absorb cannot proceed above it — the composition deadlock of two individually
+  /// sound designs, safety intact. The park being LIVE is a co-condition read from world state, so an
+  /// accumulated record never certifies a group whose merge is no longer parked.
+  pub(crate) fn fork_fence_coupled_park(&self, gid: u64) -> bool {
+    self.node_ids.iter().any(|&n| {
+      self.hosts[&n]
+        .group(&gid)
+        .is_some_and(|ep| ep.pending_merge().is_some())
+        && self.has_fork_fence_below(
+          n,
+          gid,
+          sailing_proto::Index::new(self.applied_index_of(n, gid).get() + 1),
+        )
+    })
+  }
+
+  /// The full set of groups wedged in the fork-fence coupling (#110): every merge participant
+  /// transitively blocked by a fork-fence-coupled park. Base = the parked targets
+  /// [`fork_fence_coupled_park`](Self::fork_fence_coupled_park) identifies; the SAME cascade closure
+  /// as [`tracked_merge_wedge_set`](Self::tracked_merge_wedge_set) then folds in the frozen source
+  /// held behind a coupled target's stalled park. EMPTY when no coupling stands — every merge is
+  /// then obliged to converge.
+  pub(crate) fn fork_fence_wedge_set(&self) -> BTreeSet<u64> {
+    let base: BTreeSet<u64> = self
+      .groups
+      .keys()
+      .copied()
+      .filter(|&g| self.fork_fence_coupled_park(g))
+      .collect();
+    self.propagate_merge_block(base)
+  }
+
+  /// Test-only: inject a standing fork-fence record for `(node, parent)` at `split_index` for pure
+  /// BOUNDARY-ARITHMETIC red-proofs. The child is a sentinel (`u64::MAX`) no node ever hosts, so the
+  /// pump's redundant-fold reconciliation never clears it — the fence stands until the boundary
+  /// assertion reads it. A resolution-arm regression uses
+  /// [`inject_fork_conflict_for_child`](Self::inject_fork_conflict_for_child) and drives the arm for
+  /// real.
+  #[cfg(test)]
+  pub(crate) fn inject_fork_conflict(
+    &mut self,
+    node: u64,
+    parent: u64,
+    split_index: sailing_proto::Index,
+  ) {
+    self.inject_fork_conflict_for_child(node, parent, split_index, u64::MAX);
+  }
+
+  /// Test-only: inject a standing fork-fence record for `(node, parent)` at `split_index` naming the
+  /// real `child` — so a subsequent REAL barrier-resolution arm clears it exactly as an
+  /// organically-recorded conflict would: the refuse arm by its split index, or the container's
+  /// internal redundant fold via the pump's reconciliation once `child` is hosted on the node. The
+  /// world draws only fresh child ids and so cannot itself mint a split conflict; a regression records
+  /// the conflict this way and drives the resolution arm through real machinery.
+  #[cfg(test)]
+  pub(crate) fn inject_fork_conflict_for_child(
+    &mut self,
+    node: u64,
+    parent: u64,
+    split_index: sailing_proto::Index,
+    child: u64,
+  ) {
+    self
+      .fork_conflicts
+      .entry((node, parent))
+      .or_default()
+      .insert(split_index, child);
   }
 }
 

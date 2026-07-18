@@ -3,11 +3,15 @@
 
 use super::*;
 
-/// Draw a weighted action from `profile` (deterministic from the master PRNG).
-pub(super) fn pick_action(prng: &mut FaultPrng, profile: MultiProfile) -> MultiAction {
-  let total: u32 = profile.weights.iter().map(|(_, w)| w).sum();
+/// Draw a weighted action from `profile`'s menu AT loop iteration `tick` (deterministic from the
+/// master PRNG). `tick` selects the phase-local menu via [`MultiProfile::weights_at`]; an unphased
+/// profile reads the same `weights` at every tick, so its draw is byte-identical to the pre-phase
+/// seam and consumes exactly one PRNG word either way.
+pub(super) fn pick_action(prng: &mut FaultPrng, profile: MultiProfile, tick: usize) -> MultiAction {
+  let menu = profile.weights_at(tick);
+  let total: u32 = menu.iter().map(|(_, w)| w).sum();
   let mut pick = (prng.next_u64() % u64::from(total)) as u32;
-  for (action, weight) in profile.weights {
+  for (action, weight) in menu {
     if pick < *weight {
       return *action;
     }

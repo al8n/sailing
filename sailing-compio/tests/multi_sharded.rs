@@ -12,23 +12,26 @@
 mod common;
 
 use std::{
+  collections::BTreeSet,
   future::Future,
   net::SocketAddr,
   rc::Rc,
   sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
   },
-  time::Duration,
+  time::{Duration, Instant},
 };
 
 use bytes::Bytes;
 use common::{CountSm, TrapSm};
 use sailing_compio::{
-  BoxedGroupFactory, DriverConfig, DriverError, GroupBlueprint, GroupHandle, LifecycleEvent, Node,
-  ShardMap, ShardedCompioHost, ShardedMultiHandle, SpawnError, factory_fn,
+  BoxedGroupFactory, DriverConfig, DriverError, EngineMetrics, GroupBlueprint, GroupHandle,
+  LifecycleEvent, Node, ShardMap, ShardedCompioHost, ShardedMultiHandle, SpawnError, factory_fn,
 };
-use sailing_proto::{ClusterId, Config, Data, LabelOptions, Labeled, Passthrough, StateMachine};
+use sailing_proto::{
+  ClusterId, Config, Data, Index, LabelOptions, Labeled, Passthrough, Role, StateMachine,
+};
 
 const ELECTION: Duration = Duration::from_millis(300);
 const HEARTBEAT: Duration = Duration::from_millis(60);
@@ -155,11 +158,31 @@ fn query_anywhere(groups: &[GroupHandle<u64, u64, CountSm>]) -> u64 {
 }
 
 /// Spawn one node's sharded host: K=2 planes at `base` (ports base, base+1), dialing `peer`'s
-/// planes by the same convention.
+/// planes by the same convention, under the DEFAULT uniform shard map.
 fn spawn_host<F>(
   id: u64,
   base: SocketAddr,
   peer: Option<(u64, SocketAddr)>,
+) -> ShardedMultiHandle<u64, u64, F>
+where
+  F: StateMachine<Command = Bytes, Response = u64> + Send + Default + 'static,
+  F::Command: Data + Send,
+  F::Snapshot: Data,
+  F::Response: Clone + Send,
+  F::Error: core::error::Error,
+{
+  spawn_host_mapped(id, base, peer, ShardMap::uniform(2))
+}
+
+/// The [`spawn_host`] variant taking an EXPLICIT shard map, for the reshaping suites that pin a
+/// split/merge pair (and a bystander) to named planes. The map is cluster-wide, so every node's
+/// host must be spawned with the same one — the shard-consistency contract the skew suite proves
+/// is fatal to violate.
+fn spawn_host_mapped<F>(
+  id: u64,
+  base: SocketAddr,
+  peer: Option<(u64, SocketAddr)>,
+  map: ShardMap<u64>,
 ) -> ShardedMultiHandle<u64, u64, F>
 where
   F: StateMachine<Command = Bytes, Response = u64> + Send + Default + 'static,
@@ -173,7 +196,7 @@ where
     .into_iter()
     .collect();
   ShardedCompioHost::<u64, u64, F, Labeled<Passthrough>>::new(
-    ShardMap::uniform(2),
+    map,
     base,
     peers,
     plain_records(id),
@@ -181,6 +204,257 @@ where
   )
   .spawn()
   .expect("the sharded host spawns")
+}
+
+/// The index of the node currently LEADING `groups`, waited for — the sync twin of the reactor
+/// suite's helper (needed to colocate a merge pair's leadership before the freeze).
+fn find_leader<F>(groups: &[GroupHandle<u64, u64, F>], what: &str) -> usize
+where
+  F: StateMachine<Command = Bytes, Response = u64> + Send,
+  F::Command: Data + Send,
+{
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: no leader in time"
+    );
+    for (i, g) in groups.iter().enumerate() {
+      if let Ok(status) = bo(g.status())
+        && status.role == Role::Leader
+      {
+        return i;
+      }
+    }
+    std::thread::sleep(Duration::from_millis(30));
+  }
+}
+
+/// Move `groups`' leadership onto node `to_node` (1-based) and wait until it settles. The merge's
+/// all-source-voters freeze barrier is observable only on the source LEADER, so `commit_merge`
+/// certifies it only when the absorbing target's leader also leads the source — the CRDB
+/// colocate-then-merge discipline. Move the SOURCE (a frozen source refuses a transfer, so this
+/// must precede the freeze).
+fn colocate_onto<F>(groups: &[GroupHandle<u64, u64, F>], to_node: u64, what: &str)
+where
+  F: StateMachine<Command = Bytes, Response = u64> + Send,
+  F::Command: Data + Send,
+{
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: colocation never settled onto node {to_node}"
+    );
+    let at = find_leader(groups, what);
+    if at as u64 + 1 == to_node {
+      return;
+    }
+    let _ = bo(groups[at].transfer_leader(to_node));
+    std::thread::sleep(Duration::from_millis(40));
+  }
+}
+
+/// Retry a merge verb across every node until one accepts, failing FAST on the permanent
+/// `DirectionInverted` refusal (a property of the id pair, never cleared by retrying) so a
+/// re-introduced direction bug is a pointed panic, not a 15s timeout.
+fn merge_verb_anywhere<Fut>(what: &str, mut verb: impl FnMut(usize) -> Fut, n: usize)
+where
+  Fut: Future<Output = Result<Index, DriverError<u64>>>,
+{
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what} never accepted"
+    );
+    for at in 0..n {
+      match bo(verb(at)) {
+        Ok(_) => return,
+        Err(DriverError::Rejected { reason }) if reason == inverted => {
+          panic!(
+            "{what}: the merge claim is permanently inverted — source must encode above target"
+          )
+        }
+        Err(_) => {}
+      }
+    }
+    std::thread::sleep(Duration::from_millis(40));
+  }
+}
+
+/// Poll `metrics`' quiesced-group gauge until it reaches `want` (the driver publishes it after
+/// every quiesce sweep) — the sync twin of the reactor suite's helper.
+fn wait_for_quiesced(metrics: &EngineMetrics, want: u64, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while metrics.quiesced_groups() != want {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: quiesced gauge stuck at {} (want {want})",
+      metrics.quiesced_groups()
+    );
+    std::thread::sleep(Duration::from_millis(30));
+  }
+}
+
+/// Observe a quiesce WAKE EDGE, not merely a level: first poll until the gauge LEAVES `from` (drops
+/// below it — a group left quiescence), then until it settles back at `to`. Unlike
+/// [`wait_for_quiesced`], this refuses to accept a STALE reading already sitting at `to` before the
+/// wake ever happened — the transition must be witnessed. Bounded by a hard deadline.
+fn observe_wake_edge(metrics: &EngineMetrics, from: u64, to: u64, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  // The WAKE: the gauge must drop below `from` — a group actually left quiescence.
+  loop {
+    let g = metrics.quiesced_groups();
+    if g < from {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: quiesced gauge never left {from} (still {g}) — the wake edge was not observed"
+    );
+    std::thread::sleep(Duration::from_millis(15));
+  }
+  // The SETTLE: it returns to `to`.
+  wait_for_quiesced(metrics, to, what);
+}
+
+/// Poll an atomic progress counter until it reaches at least `want` — used to let a background
+/// keyed loader accumulate enough committed keys before the reshape.
+fn wait_until_at_least(counter: &AtomicU64, want: u64, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while counter.load(Ordering::Acquire) < want {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: stuck at {} (want >= {want})",
+      counter.load(Ordering::Acquire)
+    );
+    std::thread::sleep(Duration::from_millis(30));
+  }
+}
+
+/// A background thread that keeps submitting DISTINCT monotonically-increasing keys (1, 2, 3, …)
+/// into `gid` (redirecting to its leader) until `stop`, advancing to the next key only after the
+/// current one COMMITS — so the acked set stays the contiguous range `1..=last_acked`. Publishes
+/// the last acked key into `last_acked`, the conservation suite's ground truth.
+fn spawn_keyed_loader(
+  handles: Vec<ShardedMultiHandle<u64, u64, KeyedSm>>,
+  gid: u64,
+  stop: Arc<AtomicBool>,
+  last_acked: Arc<AtomicU64>,
+) -> std::thread::JoinHandle<()> {
+  std::thread::spawn(move || {
+    let groups: Vec<_> = handles.iter().map(|h| h.group(gid)).collect();
+    let mut key = 1u64;
+    let mut at = 0usize;
+    while !stop.load(Ordering::Relaxed) {
+      match bo(groups[at].submit(Bytes::from(key.to_le_bytes().to_vec()))) {
+        Ok(_) => {
+          last_acked.store(key, Ordering::Release);
+          key += 1;
+        }
+        Err(DriverError::NotLeader { leader }) => {
+          at = leader
+            .map(|l| (l - 1) as usize)
+            .unwrap_or((at + 1) % groups.len());
+        }
+        Err(DriverError::Superseded) => {}
+        Err(_) => {
+          at = (at + 1) % groups.len();
+          std::thread::sleep(Duration::from_millis(10));
+        }
+      }
+    }
+  })
+}
+
+/// A keyed-set state machine local to the reshaping suite: each command is an 8-byte little-endian
+/// key, `apply` inserts it (returning the running cardinality), and the snapshot is the key set
+/// itself — which round-trips through `Data` (`BTreeSet<u64>`), the shape a manufactured fork
+/// baseline installs. `split` hands the child every ODD key and keeps the even ones (a disjoint
+/// partition), and `absorb` folds the source's keys back; so a split-then-merge-back cycle
+/// conserves the whole key set and a post-merge read of the survivor finds exactly the acked keys.
+/// A TEST-ONLY barrier inside [`KeyedSm::split`], for `split_on_plane_under_load`'s deterministic
+/// isolation proof. Scoped two ways so no other test (`reshape_cycle_under_continuous_load` also
+/// splits a KeyedSm) is affected: the split blocks only when `SPLIT_BARRIER_ARMED` is set AND the
+/// FSM carries [`SPLIT_BARRIER_KEY`] (present only in that one test's parent). On entry it bumps
+/// `SPLIT_BARRIER_ENTERED` (the apply thread is now provably held inside the fork) and spins until
+/// `SPLIT_BARRIER_RELEASE`, with a hard timeout so a missed release fails loudly instead of hanging.
+static SPLIT_BARRIER_ARMED: AtomicBool = AtomicBool::new(false);
+static SPLIT_BARRIER_ENTERED: AtomicUsize = AtomicUsize::new(0);
+static SPLIT_BARRIER_RELEASE: AtomicBool = AtomicBool::new(false);
+/// A magic EVEN key (so `split` keeps it on the parent side): its presence in the FSM is what scopes
+/// the barrier to `split_on_plane_under_load`'s parent, and it sorts far above any real key.
+const SPLIT_BARRIER_KEY: u64 = 0xB000_0000_0000_0000;
+
+#[derive(Default)]
+struct KeyedSm {
+  keys: BTreeSet<u64>,
+}
+
+impl KeyedSm {
+  fn keys(&self) -> &BTreeSet<u64> {
+    &self.keys
+  }
+}
+
+impl StateMachine for KeyedSm {
+  type Command = Bytes;
+  type Response = u64;
+  type Snapshot = BTreeSet<u64>;
+  type Error = std::convert::Infallible;
+
+  fn apply(&mut self, _index: Index, cmd: Bytes) -> Result<u64, Self::Error> {
+    // The command is an 8-byte LE key; a short frame zero-pads (defensive — the suite always
+    // submits a full key).
+    let mut raw = [0u8; 8];
+    let n = cmd.len().min(8);
+    raw[..n].copy_from_slice(&cmd[..n]);
+    self.keys.insert(u64::from_le_bytes(raw));
+    Ok(self.keys.len() as u64)
+  }
+
+  fn snapshot(&self) -> Result<Self::Snapshot, Self::Error> {
+    Ok(self.keys.clone())
+  }
+
+  fn restore(&mut self, snapshot: Self::Snapshot) -> Result<(), Self::Error> {
+    self.keys = snapshot;
+    Ok(())
+  }
+
+  fn split(&mut self, _instruction: &[u8]) -> Option<Self> {
+    // TEST-ONLY barrier (see the statics above): hold this plane-0 apply thread inside the fork so the
+    // test can prove a bystander commit lands on plane 1 while plane 0 is provably frozen here.
+    if SPLIT_BARRIER_ARMED.load(Ordering::Acquire) && self.keys.contains(&SPLIT_BARRIER_KEY) {
+      SPLIT_BARRIER_ENTERED.fetch_add(1, Ordering::Release);
+      let start = Instant::now();
+      while !SPLIT_BARRIER_RELEASE.load(Ordering::Acquire) {
+        assert!(
+          start.elapsed() < Duration::from_secs(20),
+          "split barrier: release never came (deadlock guard)"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+      }
+    }
+    let child: BTreeSet<u64> = self.keys.iter().copied().filter(|k| k & 1 == 1).collect();
+    self.keys.retain(|k| k & 1 == 0);
+    Some(Self { keys: child })
+  }
+
+  fn absorb(&mut self, source: Self) -> bool {
+    self.keys.extend(source.keys);
+    true
+  }
+
+  fn supports_split(&self) -> bool {
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
+    true
+  }
 }
 
 /// The sharded gate: two groups on DIFFERENT planes both elect and commit through the routing
@@ -843,4 +1117,564 @@ fn same_plane_merges_resolve_and_cross_plane_refuses() {
   }
 
   bo(node.shutdown()).expect("every plane tears down");
+}
+
+/// Cross-plane ISOLATION under a large split, proven DETERMINISTICALLY (not by timing): an override
+/// map pins the split pair to plane 0 and the bystander to plane 1. A test-only barrier inside
+/// `KeyedSm::split` holds plane 0's apply thread INSIDE the fork; while it is provably frozen there, a
+/// bystander op completes a full consensus round on plane 1 — that ack IS the isolation (separate
+/// per-plane engines; a shared crank would deadlock the ack). The 200k-cell parent (installed at zero
+/// consensus cost via `create_group`'s initial FSM) is stress that makes the fork do real work. Then
+/// the barrier releases, `SplitApplied` fires on both nodes, and both halves keep committing.
+#[test]
+fn split_on_plane_under_load() {
+  let base1: SocketAddr = "127.0.0.1:45400".parse().unwrap();
+  let base2: SocketAddr = "127.0.0.1:45410".parse().unwrap();
+  let parent = 10u64;
+  let child = 11u64;
+  let bystander = 20u64;
+  // The override map pins the split pair to plane 0 and the bystander to plane 1, cluster-wide.
+  let plane_map = || ShardMap::<u64>::with_mapping(2, move |g: &u64| usize::from(*g == bystander));
+  assert_eq!(
+    (plane_map().shard(&parent), plane_map().shard(&child)),
+    (0, 0),
+    "the split pair shares plane 0"
+  );
+  assert_eq!(
+    plane_map().shard(&bystander),
+    1,
+    "the bystander is on plane 1"
+  );
+
+  let node1: ShardedMultiHandle<u64, u64, KeyedSm> =
+    spawn_host_mapped(1, base1, Some((2, base2)), plane_map());
+  let node2: ShardedMultiHandle<u64, u64, KeyedSm> =
+    spawn_host_mapped(2, base2, Some((1, base1)), plane_map());
+
+  // The parent boots with a LARGE KeyedSm (`PRELOAD` cells) via `create_group`'s INITIAL FSM value at
+  // ZERO consensus cost, PLUS the magic barrier key. The preload is STRESS — the fork's apply-time cost
+  // scales with the FSM size (`fsm.split` moves the odd half, then the baseline is encoded and
+  // installed), so the split does real work — but the ISOLATION PROOF below is deterministic (the
+  // barrier), not a timing argument. The two halves partition the preload exactly (odd -> child, even
+  // -> parent; the even barrier key stays with the parent).
+  const PRELOAD: u64 = 200_000;
+  let preloaded = || KeyedSm {
+    keys: (1..=PRELOAD)
+      .chain(std::iter::once(SPLIT_BARRIER_KEY))
+      .collect(),
+  };
+  for (h, id) in [(&node1, 1u64), (&node2, 2u64)] {
+    bo(h.create_group(parent, config(id, vec![1, 2]), id, preloaded(), 0))
+      .expect("parent admission");
+    bo(h.create_group(bystander, config(id, vec![1, 2]), id, KeyedSm::default(), 0))
+      .expect("bystander admission");
+  }
+  let gp = [node1.group(parent), node2.group(parent)];
+  let gbys = [node1.group(bystander), node2.group(bystander)];
+  // Elect the bystander (its first committed key), so plane 1 is already serving before the split.
+  assert_eq!(submit_anywhere(&gbys, b"b"), 1);
+
+  // Elect the parent so the split has a leader to propose to (the bystander is elected above).
+  let _ = submit_anywhere(&gp, b"pelect00");
+  let leader_idx = find_leader(&gp, "parent leader pre-split");
+
+  // A DETERMINISTIC cross-plane ISOLATION proof via the test-only split barrier — no timing argument.
+  // Arm the barrier for this parent's fork; propose; wait until the fork drain is provably IN PROGRESS
+  // (plane 0's apply thread is held inside `KeyedSm::split`); then submit a bystander op and REQUIRE
+  // its ack WHILE plane 0 is still frozen there. A full plane-1 consensus round completing while plane
+  // 0's apply thread is blocked inside the fork IS cross-plane isolation, structurally: the planes are
+  // separate engines on separate cores by design, and a shared crank would block the bystander's ack
+  // too (its `submit_anywhere` deadline would then fail loudly). The block is brief (only until the
+  // bystander commits), well under a heartbeat, so plane 0 does not lose leadership.
+  SPLIT_BARRIER_ENTERED.store(0, Ordering::Release);
+  SPLIT_BARRIER_RELEASE.store(false, Ordering::Release);
+  SPLIT_BARRIER_ARMED.store(true, Ordering::Release);
+
+  {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut at = leader_idx;
+    loop {
+      assert!(Instant::now() < deadline, "no split accepted");
+      match bo([&node1, &node2][at].propose_split(parent, child, 0, Bytes::from_static(b"\x00"))) {
+        Ok(_) => break,
+        Err(DriverError::NotLeader { .. }) | Err(DriverError::Rejected { .. }) => {
+          at = (at + 1) % 2;
+          std::thread::sleep(Duration::from_millis(40));
+        }
+        Err(e) => panic!("unexpected split error: {e:?}"),
+      }
+    }
+  }
+
+  // Wait until plane 0's apply thread is provably HELD inside the fork.
+  {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while SPLIT_BARRIER_ENTERED.load(Ordering::Acquire) == 0 {
+      assert!(
+        Instant::now() < deadline,
+        "the split never entered the barrier"
+      );
+      std::thread::sleep(Duration::from_millis(1));
+    }
+  }
+  eprintln!(
+    "isolation proof: plane 0 held inside the fork (entered={})",
+    SPLIT_BARRIER_ENTERED.load(Ordering::Acquire),
+  );
+
+  // THE ISOLATION PROOF: a bystander commit lands on plane 1 while plane 0 is frozen inside the fork.
+  let bys_card = submit_anywhere(&gbys, b"isolated");
+  assert!(
+    bys_card >= 2,
+    "the bystander committed on plane 1 while plane 0 was frozen inside the fork ({bys_card} cells)"
+  );
+
+  // Release the barrier; plane 0's fork completes.
+  SPLIT_BARRIER_RELEASE.store(true, Ordering::Release);
+  SPLIT_BARRIER_ARMED.store(false, Ordering::Release);
+
+  // Completion: the typed SplitApplied on BOTH nodes (the large fork takes real time to finish).
+  for (name, h) in [("node 1", &node1), ("node 2", &node2)] {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+      let remaining = deadline.saturating_duration_since(Instant::now());
+      assert!(
+        remaining > Duration::ZERO,
+        "{name}: no SplitApplied in time"
+      );
+      match h.lifecycle().recv_timeout(remaining) {
+        Ok(LifecycleEvent::SplitApplied {
+          parent: p,
+          child: c,
+        }) => {
+          assert_eq!((p, c), (parent, child), "{name}: the typed split event");
+          break;
+        }
+        Ok(_) => {}
+        Err(e) => panic!("{name}: the lifecycle tail closed: {e:?}"),
+      }
+    }
+  }
+
+  // Both halves keep committing on plane 0, keyed on POST-split commits rather than absolute counts:
+  // the child inherited the moved ODD half of the preload and the parent kept its EVEN half — each
+  // partition holds ~PRELOAD/2 cells and each still accepts a fresh commit (the returned cardinality
+  // reflects the inherited partition plus the new key). The bystander still lives on plane 1.
+  let gc = [node1.group(child), node2.group(child)];
+  let child_card = submit_anywhere(&gc, b"childkey");
+  assert!(
+    child_card >= PRELOAD / 2,
+    "the child inherited the moved half and committed post-split ({child_card} cells)"
+  );
+  let parent_card = submit_anywhere(&gp, b"parntkey");
+  assert!(
+    parent_card >= PRELOAD / 2,
+    "the parent kept its half and committed post-split ({parent_card} cells)"
+  );
+  assert!(
+    bo(node1.shard_handle(0).unwrap().group(child).status()).is_ok(),
+    "the child lives on the parent's plane 0"
+  );
+  assert!(
+    bo(node1.shard_handle(1).unwrap().group(bystander).status()).is_ok(),
+    "the bystander lives on plane 1"
+  );
+
+  for h in [&node1, &node2] {
+    bo(h.shutdown()).expect("the sharded host tears down");
+  }
+}
+
+/// The cross-plane split refusal, in isolation: with the child id mapped to plane 1 and the parent
+/// on plane 0, `propose_split` refuses TYPED at the handle before any command is sent — no fork on
+/// any plane, the parent never freezes, both planes keep serving, and nothing for the child id
+/// ever reaches the lifecycle tail (the refusal appended nothing).
+#[test]
+fn cross_plane_split_refused_typed() {
+  let base: SocketAddr = "127.0.0.1:45450".parse().unwrap();
+  let parent = 10u64; // plane 0
+  let cross_child = 11u64; // plane 1 — the cross-plane child id
+  let server = 20u64; // plane 1 — proves plane 1 keeps serving
+  let map = ShardMap::<u64>::with_mapping(2, move |g: &u64| usize::from(*g != parent));
+  assert_eq!(
+    (
+      map.shard(&parent),
+      map.shard(&cross_child),
+      map.shard(&server)
+    ),
+    (0, 1, 1),
+    "the parent is on plane 0, the child and server on plane 1"
+  );
+
+  let node: ShardedMultiHandle<u64, u64, CountSm> = spawn_host_mapped(1, base, None, map);
+  bo(node.create_group(parent, config(1, vec![1]), parent, CountSm::default(), 0))
+    .expect("parent admission");
+  bo(node.create_group(server, config(1, vec![1]), server, CountSm::default(), 0))
+    .expect("server admission");
+  let gp = [node.group(parent)];
+  let gsrv = [node.group(server)];
+  assert_eq!(submit_anywhere(&gp, b"p1"), 1);
+  assert_eq!(submit_anywhere(&gsrv, b"s1"), 1);
+
+  // The cross-plane child refuses at the handle, typed, before any propose.
+  match bo(node.propose_split(parent, cross_child, 0, Bytes::from_static(b"\x01"))) {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(
+        reason.contains("plane"),
+        "the typed CrossPlane refusal: {reason}"
+      );
+    }
+    other => panic!("expected the cross-plane rejection, got {other:?}"),
+  }
+
+  // No fork: the child id exists on NEITHER plane.
+  for plane in 0..2usize {
+    match bo(
+      node
+        .shard_handle(plane)
+        .unwrap()
+        .group(cross_child)
+        .status(),
+    ) {
+      Err(DriverError::Rejected { .. }) => {}
+      other => panic!("the refused child must not exist on plane {plane}, got {other:?}"),
+    }
+  }
+
+  // No freeze, both planes serve: the parent (plane 0) and the server (plane 1) keep committing.
+  assert_eq!(
+    submit_anywhere(&gp, b"p2"),
+    2,
+    "plane 0 still serves — the parent never froze"
+  );
+  assert_eq!(submit_anywhere(&gsrv, b"s2"), 2, "plane 1 still serves");
+
+  // Nothing for the child id ever reached the shared lifecycle tail.
+  while let Ok(ev) = node.lifecycle().try_recv() {
+    let touches_child = matches!(&ev, LifecycleEvent::UnknownGroup { group, .. } if *group == cross_child)
+      || matches!(&ev, LifecycleEvent::RemovedSelf { group } if *group == cross_child)
+      || matches!(&ev, LifecycleEvent::Poisoned { group } if *group == cross_child)
+      || matches!(&ev, LifecycleEvent::SplitApplied { child, .. } if *child == cross_child)
+      || matches!(&ev, LifecycleEvent::SplitRefused { child, .. } if *child == cross_child)
+      || matches!(&ev, LifecycleEvent::SplitConflict { child, .. } if *child == cross_child)
+      || matches!(&ev, LifecycleEvent::MergeCaptureFailed { source, target } if *source == cross_child || *target == cross_child);
+    assert!(
+      !touches_child,
+      "no lifecycle event may name the refused child: {ev:?}"
+    );
+  }
+
+  bo(node.shutdown()).expect("the sharded host tears down");
+}
+
+/// The same-plane merge with QUIESCE CYCLING: a colocated source+target on plane 1 (Safe read
+/// mode, the default; quiescence needs a tracked voter, so the pair is 2-node with leadership
+/// pinned to node 1) commit, then idle past the eligibility window until BOTH quiesce. The merge
+/// cycles them — `prepare_merge` wakes and freezes the source, which, freeze-pending, can no longer
+/// quiesce, so the plane settles at just the target; `commit_merge` dissolves the source and the
+/// union re-quiesces serving the summed count — while the merged-away id refuses TERMINALLY on its
+/// floor and a plane-0 bystander's quiesced gauge is never touched.
+#[test]
+fn merge_on_plane_with_quiesce_cycling() {
+  let base1: SocketAddr = "127.0.0.1:45500".parse().unwrap();
+  let base2: SocketAddr = "127.0.0.1:45510".parse().unwrap();
+  let target = 30u64; // plane 1
+  let source = 31u64; // plane 1 — encodes strictly ABOVE the target, so it is the dissolving source
+  let bystander = 40u64; // plane 0
+  assert!(
+    source.to_le_bytes() > target.to_le_bytes(),
+    "the source must encode above the target for the merge direction"
+  );
+  let plane_map = || ShardMap::<u64>::with_mapping(2, move |g: &u64| usize::from(*g != bystander));
+  assert_eq!(
+    (
+      plane_map().shard(&source),
+      plane_map().shard(&target),
+      plane_map().shard(&bystander)
+    ),
+    (1, 1, 0),
+    "the merge pair is on plane 1, the bystander on plane 0"
+  );
+
+  let node1: ShardedMultiHandle<u64, u64, CountSm> =
+    spawn_host_mapped(1, base1, Some((2, base2)), plane_map());
+  let node2: ShardedMultiHandle<u64, u64, CountSm> =
+    spawn_host_mapped(2, base2, Some((1, base1)), plane_map());
+  for (h, id) in [(&node1, 1u64), (&node2, 2u64)] {
+    for gid in [source, target, bystander] {
+      bo(h.create_group(gid, config(id, vec![1, 2]), id, CountSm::default(), 0))
+        .expect("group admission");
+    }
+  }
+  let gsrc = [node1.group(source), node2.group(source)];
+  let gtgt = [node1.group(target), node2.group(target)];
+  let gbys = [node1.group(bystander), node2.group(bystander)];
+  // Source = 2 units, target = 1; the union serves their sum, 3. The bystander commits once.
+  assert_eq!(submit_anywhere(&gsrc, b"s1"), 1);
+  assert_eq!(submit_anywhere(&gsrc, b"s2"), 2);
+  assert_eq!(submit_anywhere(&gtgt, b"t1"), 1);
+  assert_eq!(submit_anywhere(&gbys, b"z"), 1);
+
+  // Pin every group's leadership onto node 1: the merge runs there (so the source's freeze barrier
+  // certifies on the target leader), and the gauges we watch are that one driver's leader-side.
+  colocate_onto(&gsrc, 1, "source onto node 1");
+  colocate_onto(&gtgt, 1, "target onto node 1");
+  colocate_onto(&gbys, 1, "bystander onto node 1");
+
+  let plane1 = node1.engine_metrics(1).expect("plane 1 metrics");
+  let plane0 = node1.engine_metrics(0).expect("plane 0 metrics");
+
+  // Idle past the eligibility window: both plane-1 groups quiesce, and the plane-0 bystander too.
+  wait_for_quiesced(plane1, 2, "plane 1: source + target idle");
+  wait_for_quiesced(plane0, 1, "plane 0: bystander idle");
+
+  // Freeze wakes the source; frozen, it is no longer quiesce-eligible, so the plane settles at just
+  // the quiesced target. Observe the WAKE EDGE (2 -> 1), not the bare level: the source must be
+  // seen leaving quiescence, never a stale reading that was already 1.
+  merge_verb_anywhere(
+    "the freeze",
+    |at| {
+      let h = [&node1, &node2][at].clone();
+      async move { h.prepare_merge(source, target).await }
+    },
+    2,
+  );
+  observe_wake_edge(plane1, 2, 1, "plane 1: the freeze woke the source (2 -> 1)");
+
+  // Commit dissolves the source and the target absorbs; the union re-quiesces serving the sum.
+  merge_verb_anywhere(
+    "the commit",
+    |at| {
+      let h = [&node1, &node2][at].clone();
+      async move { h.commit_merge(target, source).await }
+    },
+    2,
+  );
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the union never served"
+    );
+    if bo(gtgt[0].query(|sm: &CountSm| sm.count())) == Ok(3) {
+      break;
+    }
+    std::thread::sleep(Duration::from_millis(30));
+  }
+  // The absorb WOKE the target (it was the sole quiesced group at 1), which then re-quiesced serving
+  // the union — assert the 1 -> 0 -> 1 edge, not the stale 1 the freeze phase already left standing.
+  observe_wake_edge(
+    plane1,
+    1,
+    1,
+    "plane 1: the absorb woke the target then re-quiesced (1 -> 0 -> 1)",
+  );
+
+  // The merged-away source dies and floors terminally: status refuses, and re-admission refuses on
+  // the floor at any generation.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the source never died"
+    );
+    if matches!(bo(gsrc[0].status()), Err(DriverError::Rejected { .. })) {
+      break;
+    }
+    std::thread::sleep(Duration::from_millis(30));
+  }
+  match bo(node1.create_group(source, config(1, vec![1, 2]), 9, CountSm::default(), 42)) {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(
+        reason.contains("floor"),
+        "the terminal floor refusal: {reason}"
+      );
+    }
+    other => panic!("a merged-away id must never re-admit, got {other:?}"),
+  }
+
+  // Plane 0's gauge was never touched by the plane-1 merge: the bystander is still the one quiesced
+  // group.
+  assert_eq!(
+    plane0.quiesced_groups(),
+    1,
+    "the plane-1 merge never perturbed plane 0's quiesced gauge"
+  );
+
+  for h in [&node1, &node2] {
+    bo(h.shutdown()).expect("every plane tears down");
+  }
+}
+
+/// A whole reshape CYCLE under continuous keyed load: a parent is split into a same-plane child,
+/// then the child is merged BACK in, all while a background loop keeps submitting distinct keys to
+/// the surviving parent. The fork is materialized EVERYWHERE (SplitApplied on both nodes, the child
+/// live) BEFORE the merge is proposed — the realistic sequence, and the one that never wedges a
+/// parked fork's fence against the absorb. The e2e invariant is conservation: after the merge-back
+/// the survivor holds EXACTLY the acked key set, `1..=last_acked`, every acked key readable.
+#[test]
+fn reshape_cycle_under_continuous_load() {
+  let base1: SocketAddr = "127.0.0.1:45550".parse().unwrap();
+  let base2: SocketAddr = "127.0.0.1:45560".parse().unwrap();
+  let parent = 10u64; // the merge-back SURVIVOR (target)
+  let child = 11u64; // forked out, then dissolves (encodes above the parent, so it is the source)
+  assert!(
+    child.to_le_bytes() > parent.to_le_bytes(),
+    "the child must encode above the parent to be the merge-back source"
+  );
+  // Both halves share plane 0 (a split is same-plane; the merge-back absorb is in-plane too).
+  let plane_map = || ShardMap::<u64>::with_mapping(2, |_g: &u64| 0usize);
+
+  let node1: ShardedMultiHandle<u64, u64, KeyedSm> =
+    spawn_host_mapped(1, base1, Some((2, base2)), plane_map());
+  let node2: ShardedMultiHandle<u64, u64, KeyedSm> =
+    spawn_host_mapped(2, base2, Some((1, base1)), plane_map());
+
+  for (h, id) in [(&node1, 1u64), (&node2, 2u64)] {
+    bo(h.create_group(parent, config(id, vec![1, 2]), id, KeyedSm::default(), 0))
+      .expect("parent admission");
+  }
+  let gp = [node1.group(parent), node2.group(parent)];
+
+  // The continuous keyed load on the survivor across the whole cycle: the loader's first submits
+  // also elect the parent's leader (it redirects until one emerges).
+  let stop = Arc::new(AtomicBool::new(false));
+  let last_acked = Arc::new(AtomicU64::new(0));
+  let loader = spawn_keyed_loader(
+    vec![node1.clone(), node2.clone()],
+    parent,
+    stop.clone(),
+    last_acked.clone(),
+  );
+  // Let the parent accumulate enough keys that the ODD-key partition hands the child real state.
+  wait_until_at_least(&last_acked, 8, "loader warmup before the split");
+
+  // Split the parent into the same-plane child (instruction ignored by the keyed FSM).
+  {
+    let handles = [&node1, &node2];
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let mut at = 0usize;
+    loop {
+      assert!(std::time::Instant::now() < deadline, "no split accepted");
+      match bo(handles[at].propose_split(parent, child, 0, Bytes::from_static(b"\x01"))) {
+        Ok(_) => break,
+        Err(DriverError::NotLeader { .. }) | Err(DriverError::Rejected { .. }) => {
+          at = (at + 1) % handles.len();
+          std::thread::sleep(Duration::from_millis(40));
+        }
+        Err(e) => panic!("unexpected split error: {e:?}"),
+      }
+    }
+  }
+
+  // Materialize the fork EVERYWHERE before merging: SplitApplied on both nodes, then the child
+  // serves (a live group, not a parked fork) — the sequence that keeps a later absorb from wedging
+  // behind a parked fork's still-standing capture fence.
+  for (name, h) in [("node 1", &node1), ("node 2", &node2)] {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+      let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+      assert!(
+        remaining > Duration::ZERO,
+        "{name}: no SplitApplied in time"
+      );
+      match h.lifecycle().recv_timeout(remaining) {
+        Ok(LifecycleEvent::SplitApplied {
+          parent: p,
+          child: c,
+        }) => {
+          assert_eq!((p, c), (parent, child), "{name}: the typed split event");
+          break;
+        }
+        Ok(_) => {}
+        Err(e) => panic!("{name}: the lifecycle tail closed: {e:?}"),
+      }
+    }
+  }
+  let gc = [node1.group(child), node2.group(child)];
+  {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the child never served its partition"
+      );
+      let child_live = matches!(bo(gc[0].query(|sm: &KeyedSm| sm.keys().len())), Ok(n) if n >= 1)
+        || matches!(bo(gc[1].query(|sm: &KeyedSm| sm.keys().len())), Ok(n) if n >= 1);
+      if child_live {
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(30));
+    }
+  }
+
+  // Merge the child BACK into the parent: colocate the child's leadership onto the parent's leader
+  // (the freeze-barrier discipline), then freeze and commit through whichever node leads each verb.
+  let t_leader = find_leader(&gp, "parent leader pre-merge");
+  colocate_onto(&gc, t_leader as u64 + 1, "child onto parent leader");
+  merge_verb_anywhere(
+    "the freeze",
+    |at| {
+      let h = [&node1, &node2][at].clone();
+      async move { h.prepare_merge(child, parent).await }
+    },
+    2,
+  );
+  merge_verb_anywhere(
+    "the commit",
+    |at| {
+      let h = [&node1, &node2][at].clone();
+      async move { h.commit_merge(parent, child).await }
+    },
+    2,
+  );
+
+  // The child dissolves everywhere.
+  {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "the child never tore down everywhere"
+      );
+      let gone = [&node1, &node2]
+        .iter()
+        .filter(|h| {
+          matches!(
+            bo(h.group(child).status()),
+            Err(DriverError::Rejected { .. })
+          )
+        })
+        .count();
+      if gone == 2 {
+        break;
+      }
+      std::thread::sleep(Duration::from_millis(30));
+    }
+  }
+
+  // Stop the load and take the ground truth: the acked keys are exactly `1..=last_acked`.
+  stop.store(true, Ordering::Release);
+  loader.join().expect("the loader thread joins");
+  let acked: BTreeSet<u64> = (1..=last_acked.load(Ordering::Acquire)).collect();
+  assert!(acked.len() >= 8, "the load ran ({} keys)", acked.len());
+
+  // CONSERVATION at e2e grain: the survivor holds EXACTLY the acked key set — the child's odd-key
+  // partition folded back, nothing lost, nothing invented — every acked key readable.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the survivor never converged on the acked key set"
+    );
+    if let Ok(keys) = bo(gp[t_leader].query(|sm: &KeyedSm| sm.keys().clone()))
+      && keys == acked
+    {
+      break;
+    }
+    std::thread::sleep(Duration::from_millis(30));
+  }
+
+  for h in [&node1, &node2] {
+    bo(h.shutdown()).expect("the sharded host tears down");
+  }
 }

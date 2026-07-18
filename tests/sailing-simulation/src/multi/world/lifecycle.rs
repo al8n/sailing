@@ -55,6 +55,14 @@ pub(crate) struct GroupMeta {
   /// floor is `u64::MAX` in the product, so recreation is refused forever (the harness catalog
   /// mirrors that refusal at [`MultiWorld::recreate_group`]). Implies `retired`.
   pub(crate) merged: bool,
+  /// The source's TERMINAL owned key population, stashed at merge resolution the instant before the
+  /// live `keys` set is emptied (the same set `mem::take`n there, which the ledger snapshots as
+  /// `absorbed_keys`). `Some` only for a MERGED-away source. Alignment falls back to it for a lagging
+  /// husk replica so the emptied live population does not blank the husk's client cells and leave the
+  /// cross-watermark leg vacuous on exactly the retired husks the safety sweep judges (see
+  /// [`MultiWorld::aligned_applied`]). Never set for a recreatable group, so no incarnation ever reads
+  /// another's terminal set — a merged id is refused recreation, so its meta is never replaced.
+  pub(crate) terminal_keys: Option<BTreeSet<u16>>,
   /// The transitive set of FOREIGN group tags whose cells legitimately ride this group's
   /// record — its tag lineage: a fork child inherits its parent's tag (the baseline cells carry
   /// it) plus the parent's own carried set, and a merge target inherits the source's tag plus
@@ -257,6 +265,10 @@ impl MultiWorld {
     meta.retired = false;
     meta.generation += 1;
     meta.learners.clear();
+    // Cross the incarnation boundary: drop every fork-fence record naming this id as a PARENT. The
+    // retirement teardown already cleared the hosting nodes' records; this is the belt on the
+    // boundary itself, so the new incarnation can never inherit the old one's coupling (#110).
+    self.fork_conflicts.retain(|&(_, parent), _| parent != gid);
     meta.keys = (0..super::super::NUM_KEYS).collect();
     meta.fork_baseline = 0;
     meta.carried_tags.clear();
@@ -597,6 +609,11 @@ impl MultiWorld {
     self.snapshot_lineage.remove(&(node, gid));
     self.member_view.remove(&(node, gid));
     self.parked.remove(&(node, gid));
+    // A fork-fence record on `(node, gid)` — `gid` in the PARENT role — is a live coupling fact, not
+    // history: tearing this node's `gid` replica down lifts any standing capture fence it held, so the
+    // record must go with it (#110). This is the shared teardown chokepoint for both
+    // `drop_group_replica` and `remove_group`.
+    self.fork_conflicts.remove(&(node, gid));
     // The durable relay lineage is per-incarnation (a real driver's engine drops the group's
     // `group_gen` on teardown): a fresh incarnation of this id must not inherit the retired one's
     // relayed forks, or a later restart's guard would fold its legitimate new forks.

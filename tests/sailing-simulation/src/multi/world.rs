@@ -183,6 +183,21 @@ pub struct MultiWorld {
   /// by a forced teardown. Fresh child ids make the signal unreachable today; the counter keeps
   /// it visible if that ever changes.
   split_conflicts: u64,
+  /// Every proposed split's FENCE coordinate: `child -> split entry index` (the parent-log index the
+  /// split landed at, identical on every parent replica). Recorded at propose so a later drained
+  /// `(parent, child)` conflict can be attributed to the index its standing capture fence sits at.
+  /// Persistent (a split's fence index never changes); bounded by the run's split count.
+  split_fence_index: BTreeMap<u64, sailing_proto::Index>,
+  /// Standing fork-conflict fences observed per `(node, parent)`: `split index -> conflicting CHILD`
+  /// for each parked-fork squatter the fork pump drained on that node (see
+  /// [`MultiWorld::pump_forks`]). A parked fork holds the parent's capture fence at its split index; a
+  /// merge park on that same parent whose coordinate sits at-or-above the fence is deadlocked behind
+  /// it (issue #110, the fork-fence coupling). The child is retained so the pump can clear a fence on
+  /// every barrier-resolution arm — materialize, refuse, or the container's internal REDUNDANT fold
+  /// (a provenance-matched twin, invisible to the pump): a fence whose child is now hosted on the node
+  /// has resolved (the fresh-id world never hosts a NON-matching squatter at a fork child, so a hosted
+  /// child IS the resolved fork). Records are ACTIVE state, never append-only history.
+  fork_conflicts: BTreeMap<(u64, u64), BTreeMap<sailing_proto::Index, u64>>,
   /// Late forks the fork pump REFUSED at materialization — the coordinator-admission model
   /// (the child id retired, or recreated past the fork's generation): no materialization, the
   /// parent's fence lifted, mirroring the product's `SplitRefused` resolution.
@@ -320,6 +335,8 @@ impl MultiWorld {
       splits_applied: 0,
       split_stale: 0,
       split_conflicts: 0,
+      split_fence_index: BTreeMap::new(),
+      fork_conflicts: BTreeMap::new(),
       split_refused: 0,
       merges: Vec::new(),
       merge_floors: BTreeSet::new(),
@@ -1484,7 +1501,7 @@ impl MultiWorld {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 mod faults;
 mod lifecycle;

@@ -37,9 +37,9 @@
 //! you raise `-g`. `-g 1` (the default) is exactly the single-group benchmark above.
 
 use std::{
-  collections::HashMap,
+  collections::{BTreeMap, BTreeSet, HashMap},
   sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
   },
   time::{Duration, Instant as WallInstant},
@@ -47,8 +47,11 @@ use std::{
 
 use bytes::Bytes;
 use clap::Parser;
-use sailing_benchmark::CountSm;
-use sailing_proto::{Config, Endpoint, Event, Index, Instant, Message, Outgoing};
+use sailing_benchmark::{CountSm, ReshapeSm};
+use sailing_proto::{
+  Config, Endpoint, Event, FloorStore, GroupStores, Index, Instant, MERGED_FLOOR, MergeResolution,
+  Message, MultiRaft, Outgoing,
+};
 use sailing_simulation::{MemLog, MemStable};
 use tokio::{
   sync::{mpsc, oneshot},
@@ -118,6 +121,17 @@ struct Args {
   /// harness uses ~16 worker threads — sweep `-w` to compare. Default 4.
   #[arg(short = 'w', long, default_value_t = 4)]
   workers: usize,
+  /// Drive a periodic split→merge-back RESHAPE cycle on group 0 while every group carries load, to
+  /// measure reshaping cost and neighbour isolation. Requires `-g >= 2` (there must be at least one
+  /// neighbour group to observe). In this mode group 0 is a single-voter `MultiRaft` container
+  /// hosting a split/absorb-capable counter: it commits its op share while performing 8
+  /// evenly-spaced split→merge-back cycles on a fresh child each time, printing one
+  /// `reshape_cycle=<i> freeze_window_ms=<w>` line per cycle (PrepareMerge-propose →
+  /// CommitMerge-applied, wall time). The neighbour groups (1..K) keep the ordinary Endpoint
+  /// substrate UNCHANGED, so their `group=<i> ... put_s=<x>` lines are directly comparable against
+  /// a plain `-g K` run (same neighbour substrate) — that diff is the neighbour-isolation read.
+  #[arg(long)]
+  reshape: bool,
 }
 
 /// Parse a `u64` with optional `_` separators and a decimal unit suffix (`k`/`m`/`g`), matching
@@ -158,9 +172,19 @@ enum Wake {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
   let args = Args::parse();
   assert!(args.workers >= 1, "--workers must be >= 1");
+  assert!(
+    !args.reshape || args.groups >= 2,
+    "--reshape requires -g >= 2 (group 0 reshapes while >= 1 neighbour group is observed)"
+  );
   eprintln!(
-    "parity config: groups={} clients={} operations={} members={} batch={} workers={}",
-    args.groups, args.clients, args.operations, args.members, args.batch, args.workers
+    "parity config: groups={} clients={} operations={} members={} batch={} workers={} reshape={}",
+    args.groups,
+    args.clients,
+    args.operations,
+    args.members,
+    args.batch,
+    args.workers,
+    args.reshape
   );
   // Pin the runtime to a fixed worker count rather than `#[tokio::main]`'s default (one worker per
   // CPU). At `-g 1` this workload's per-node loop is serial, so the extra default workers add
@@ -193,14 +217,19 @@ async fn run(args: Args) {
   let base = args.operations / groups;
   let rem = args.operations % groups;
 
-  // Phase 1 — build and elect every group concurrently, OUTSIDE the timed window. Each group is a
-  // fully independent cluster (its own monotonic origin, node set, channels, published-leader cell,
-  // and timing flag — nothing is shared across groups); its `setup` task returns once that group
-  // holds a single stable leader. Awaiting all of them is the barrier: the timed window below starts
-  // only after every group is quiesced on a stable leader, so election churn is startup cost, never
-  // throughput. A panic in any setup (e.g. a group that never elects) is FATAL to the whole run.
+  // Group 0 is the RESHAPE group when `--reshape` is set: a single-voter `MultiRaft` container
+  // driven on its own OS thread (built below), NOT an Endpoint cluster. The Endpoint setup then
+  // covers only the neighbours 1..K; in the normal mode it covers every group 0..K.
+  let neighbour_start = if args.reshape { 1 } else { 0 };
+
+  // Phase 1 — build and elect every NEIGHBOUR group concurrently, OUTSIDE the timed window. Each is
+  // a fully independent cluster (its own monotonic origin, node set, channels, published-leader
+  // cell, and timing flag — nothing shared); its `setup` task returns once it holds a single stable
+  // leader. Awaiting all of them is the barrier: the timed window below starts only after every
+  // neighbour is quiesced on a stable leader, so election churn is startup cost, never throughput. A
+  // panic in any setup (e.g. a group that never elects) is FATAL to the whole run.
   let mut setups: JoinSet<GroupReady> = JoinSet::new();
-  for group in 0..groups {
+  for group in neighbour_start..groups {
     let ops_for_group = base + if group < rem { 1 } else { 0 };
     setups.spawn(setup_group(
       group,
@@ -210,13 +239,18 @@ async fn run(args: Args) {
       ops_for_group,
     ));
   }
-  let mut ready: Vec<GroupReady> = Vec::with_capacity(groups as usize);
+  let mut ready: Vec<GroupReady> = Vec::with_capacity((groups - neighbour_start) as usize);
   while let Some(res) = setups.join_next().await {
     ready.push(res.expect("a group's setup task panicked — run invalid"));
   }
+  // Group 0's exact op share (reshape mode): the neighbour shares plus it sum to `-n`.
+  let group0_ops = base + u64::from(rem > 0);
   // The per-group exact shares sum to `-n` by construction; assert it as a guard against a
   // distribution bug before the timed window relies on it.
-  let aggregate_total: u64 = ready.iter().map(|g| g.group_total).sum();
+  let mut aggregate_total: u64 = ready.iter().map(|g| g.group_total).sum();
+  if args.reshape {
+    aggregate_total += group0_ops;
+  }
   assert_eq!(
     aggregate_total, args.operations,
     "internal: per-group shares sum to {aggregate_total}, expected -n = {} — distribution bug",
@@ -235,13 +269,17 @@ async fn run(args: Args) {
   for g in &ready {
     g.timing_active.store(true, Ordering::Release);
   }
+  // Group 0's per-cycle freeze windows (PrepareMerge-propose → CommitMerge-applied, wall ms),
+  // published by the reshape thread and printed after the window.
+  let freeze_windows: Arc<Mutex<Vec<f64>>> = Arc::new(Mutex::new(Vec::new()));
   let start = WallInstant::now();
 
-  // Split each ready group into its client-load task (which records the group's committed count) and
-  // its live guard (node tasks + leader cell + timing flag), kept here so the central window loop can
-  // police it for the entire shared window — including after its own clients have finished.
-  let mut loads: JoinSet<u64> = JoinSet::new();
-  let mut guards: Vec<Guard> = Vec::with_capacity(groups as usize);
+  // Split each ready neighbour into its client-load task (recording its committed count as
+  // `(group, committed)`) and its live guard (node tasks + leader cell + timing flag), kept here so
+  // the central window loop can police it for the entire shared window — including after its own
+  // clients have finished.
+  let mut loads: JoinSet<(u64, u64)> = JoinSet::new();
+  let mut guards: Vec<Guard> = Vec::with_capacity(ready.len());
   for g in ready {
     let GroupReady {
       group,
@@ -270,6 +308,25 @@ async fn run(args: Args) {
       timing_active,
     });
   }
+  // The reshape group: drive it on a dedicated OS thread (the container is built INSIDE the closure,
+  // so nothing non-`Send` crosses the boundary), and fold its committed count into the window via a
+  // load task that awaits the thread's report. Its churn competes with the neighbour tasks for CPU —
+  // the isolation this run measures. Single-voter, so it never changes leader and cannot silently
+  // die; it needs no guard, and a panic there surfaces through this load task.
+  if args.reshape {
+    let fw = freeze_windows.clone();
+    let (tx, rx) = oneshot::channel::<u64>();
+    std::thread::spawn(move || {
+      let committed = drive_reshape_group(group0_ops, fw);
+      let _ = tx.send(committed);
+    });
+    loads.spawn(async move {
+      let committed = rx
+        .await
+        .expect("the reshape thread panicked before reporting — run invalid");
+      (0u64, committed)
+    });
+  }
 
   // Drive the window: drain the per-group load tasks as they finish, and on every idle tick sweep
   // EVERY group's guards. The per-group load tasks stay pending until a whole group's clients finish,
@@ -279,14 +336,34 @@ async fn run(args: Args) {
   let mut sweep = tokio::time::interval(Duration::from_millis(2));
   sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
   let mut observed = 0u64;
-  let mut remaining = guards.len();
+  let mut per_group: Vec<(u64, u64)> = Vec::with_capacity(groups as usize);
+  let mut remaining = loads.len();
+  // The NEIGHBOUR stopwatch closes when the LAST N-member load task finishes. In `--reshape` mode the
+  // group-0 reshape task is a single-voter container — a different topology whose churn runs longer —
+  // and it must NOT stretch the neighbours' throughput divisor; the all-task window is reported apart,
+  // on the reshape_local line. In non-reshape mode every task is a neighbour, so the two coincide.
+  let mut neighbour_remaining = if args.reshape {
+    (groups - 1) as usize
+  } else {
+    groups as usize
+  };
+  let mut neighbour_elapsed = None;
   while remaining > 0 {
     tokio::select! {
       biased;
       load = loads.join_next() => match load {
         Some(res) => {
-          observed += res.expect("a group's client load task panicked or was cancelled — run invalid");
+          let (grp, committed) =
+            res.expect("a group's client load task panicked or was cancelled — run invalid");
+          observed += committed;
+          per_group.push((grp, committed));
           remaining -= 1;
+          if !args.reshape || grp != 0 {
+            neighbour_remaining -= 1;
+            if neighbour_remaining == 0 {
+              neighbour_elapsed = Some(start.elapsed());
+            }
+          }
         }
         None => break,
       },
@@ -298,6 +375,9 @@ async fn run(args: Args) {
     }
   }
   let elapsed = start.elapsed();
+  // The all-task window closes with the last task (the reshape group in `--reshape` mode); the
+  // neighbour window closed when the last N-member load finished (== `elapsed` without `--reshape`).
+  let neighbour_elapsed = neighbour_elapsed.unwrap_or(elapsed);
 
   // Close the boundary race: a node may have died or leadership moved between the last load completing
   // and the window closing, so sweep every group's guards once more before the number is reported.
@@ -322,23 +402,66 @@ async fn run(args: Args) {
     args.operations,
   );
 
-  // Aggregate throughput: every group's committed ops over the single shared wall clock.
-  let put_s = observed as f64 / elapsed.as_secs_f64();
-  let millis = elapsed.as_millis().max(1);
-  let per_group = put_s / groups as f64;
+  // Aggregate throughput over the N-MEMBER neighbour substrate only. In `--reshape` mode group 0 is
+  // a single-voter `MultiRaft` container — a DIFFERENT topology whose throughput is not comparable to
+  // the N-member neighbours — so it is excluded from the headline aggregate/average here and reported
+  // on its own local-reshape line below; the `observed == -n` invariant above still spans every group.
+  let group0_committed: u64 = if args.reshape {
+    per_group
+      .iter()
+      .find(|(g, _)| *g == 0)
+      .map_or(0, |(_, c)| *c)
+  } else {
+    0
+  };
+  let headline_ops = observed - group0_committed;
+  let headline_groups = groups - u64::from(args.reshape);
+  // The headline divides neighbour work by the NEIGHBOUR window (closed when the last N-member load
+  // finished), never the all-task window (which in `--reshape` mode closes on the longer-running
+  // reshape task). Without `--reshape` the two are identical, so this is byte-identical to before.
+  let put_s = headline_ops as f64 / neighbour_elapsed.as_secs_f64();
+  let millis = neighbour_elapsed.as_millis().max(1);
+  let per_group_avg = put_s / headline_groups as f64;
   println!(
     "parity  groups={} members={} clients={} batch={} ops={} elapsed={:.3}s  put/s={:.0}  \
      op/ms={}  per-group put/s={:.0}",
-    groups,
+    headline_groups,
     args.members,
     args.clients,
     args.batch,
-    observed,
-    elapsed.as_secs_f64(),
+    headline_ops,
+    neighbour_elapsed.as_secs_f64(),
     put_s,
-    (observed as u128) / millis,
-    per_group,
+    (headline_ops as u128) / millis,
+    per_group_avg,
   );
+
+  // Machine-comparable per-group lines: one per NEIGHBOUR group, its committed count over the
+  // NEIGHBOUR window — directly comparable against a plain `-g` run (identical neighbour substrate),
+  // the neighbour-isolation read. In `--reshape` mode group 0 is the single-voter churner and is
+  // excluded here, reported on the separate `reshape_local` line below over the all-task window.
+  per_group.sort_by_key(|(g, _)| *g);
+  for (g, committed) in &per_group {
+    if args.reshape && *g == 0 {
+      continue;
+    }
+    let g_put_s = *committed as f64 / neighbour_elapsed.as_secs_f64();
+    println!("group={g} role=load committed={committed} put_s={g_put_s:.0}");
+  }
+  if args.reshape {
+    // The local-reshape line: group 0's own committed count over the ALL-TASK window (its own churn
+    // window, distinct from the neighbour window above), plus its per-cycle freeze windows.
+    let g0_put_s = group0_committed as f64 / elapsed.as_secs_f64();
+    println!(
+      "reshape_local group=0 committed={group0_committed} put_s={g0_put_s:.0} \
+       all_task_elapsed={:.3}s",
+      elapsed.as_secs_f64(),
+    );
+    let fws = freeze_windows.lock().expect("freeze-window mutex poisoned");
+    for (i, w) in fws.iter().enumerate() {
+      println!("reshape_cycle={i} freeze_window_ms={w:.3}");
+    }
+  }
 }
 
 /// A group built and quiesced on a single stable leader, ready to join the timed window. Carries the
@@ -502,7 +625,7 @@ async fn run_group_load(
   batch: u64,
   client_ops: Vec<u64>,
   group_total: u64,
-) -> u64 {
+) -> (u64, u64) {
   let mut client_handles = Vec::with_capacity(client_ops.len());
   for ops_for_client in client_ops {
     let senders = senders.clone();
@@ -549,7 +672,7 @@ async fn run_group_load(
     observed, group_total,
     "group {group}: clients committed {observed} ops, expected {group_total} — run invalid"
   );
-  observed
+  (group, observed)
 }
 
 /// Police one group for the two anomalies that invalidate a throughput number — leadership leaving the
@@ -750,4 +873,354 @@ fn pump(
       break;
     }
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The reshape group (`--reshape`): group 0 as a single-voter `MultiRaft` container, driven
+// synchronously on its own OS thread, splitting a fresh child then merging it back each cycle.
+// ---------------------------------------------------------------------------------------------
+
+/// The container gid of group 0's reshaping PARENT. Every child id (`RESHAPE_FIRST_CHILD + cycle`)
+/// encodes strictly above it, satisfying the merge direction rule (source encodes above target) for
+/// the merge-back leg.
+const RESHAPE_PARENT: u64 = 1;
+/// The first fork child id; each cycle uses a fresh one (a merged-away id floors terminally, so it
+/// can never be reused).
+const RESHAPE_FIRST_CHILD: u64 = 100;
+/// Evenly-spaced split→merge-back cycles across group 0's op share.
+const RESHAPE_CYCLES: u64 = 8;
+/// A fixed seed for group 0's container (single voter — cross-group decorrelation is moot).
+const RESHAPE_SEED: u64 = 0x5EED_0000;
+
+/// The [`GroupStores`] + [`FloorStore`] seam over group 0's per-gid stores — what the container's
+/// merge verbs (`prepare_merge`, `service_merge_applies`) resolve their logs through. The floor leg
+/// reports the terminal [`MERGED_FLOOR`] for ids this host has already merged away, `0` otherwise;
+/// the lineage leg is unused here.
+struct ContainerStores<'a> {
+  stores: &'a mut BTreeMap<u64, (MemLog, MemStable<u64>)>,
+  floored: &'a BTreeSet<u64>,
+}
+
+impl GroupStores<u64, MemLog, MemStable<u64>> for ContainerStores<'_> {
+  fn stores(&mut self, group: &u64) -> Option<(&mut MemLog, &mut MemStable<u64>)> {
+    let (log, stable) = self.stores.get_mut(group)?;
+    Some((log, stable))
+  }
+}
+
+impl FloorStore<u64> for ContainerStores<'_> {
+  fn floor(&self, gid: &u64) -> u64 {
+    if self.floored.contains(gid) {
+      MERGED_FLOOR
+    } else {
+      0
+    }
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
+/// A single-host, single-voter `MultiRaft` container hosting the reshape group's parent (and, mid
+/// cycle, its child). A VIRTUAL logical clock (`vnow`, advanced manually to due deadlines) drives
+/// elections/heartbeats — decoupled from wall time so elections are instant — while wall time is
+/// measured separately by the caller for throughput and by [`Self::reshape_cycle`] for the freeze
+/// window. No peers, so there is no network to route; every crank is local storage + FSM work.
+struct ReshapeHost {
+  host: MultiRaft<u64, u64, ReshapeSm>,
+  stores: BTreeMap<u64, (MemLog, MemStable<u64>)>,
+  /// Ids this host has merged away — the [`FloorStore`] terminal-floor set.
+  floored: BTreeSet<u64>,
+  /// The virtual logical clock (monotone; advanced to due deadlines for timers).
+  vnow: Instant,
+  /// Monotone per-fork boot epoch (`create_group_from_fork` requires `>= 1`).
+  boot_epoch: u64,
+}
+
+impl ReshapeHost {
+  /// Build the container and admit the parent group (single voter on node 0). Does NOT elect.
+  fn new() -> Self {
+    let mut host: MultiRaft<u64, u64, ReshapeSm> = MultiRaft::default();
+    let cfg = Config::try_new(
+      0,
+      std::vec![0],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .expect("valid single-voter config");
+    host
+      .create_group(
+        RESHAPE_PARENT,
+        0,
+        cfg,
+        Instant::ORIGIN,
+        RESHAPE_SEED,
+        ReshapeSm::new(),
+      )
+      .expect("parent admission");
+    let mut stores = BTreeMap::new();
+    stores.insert(RESHAPE_PARENT, (MemLog::new(), MemStable::new()));
+    Self {
+      host,
+      stores,
+      floored: BTreeSet::new(),
+      vnow: Instant::ORIGIN,
+      boot_epoch: 0,
+    }
+  }
+
+  /// Whether `gid` is currently hosted.
+  fn hosts(&self, gid: u64) -> bool {
+    self.host.contains_group(&gid)
+  }
+
+  /// Whether `gid`'s local replica leads.
+  fn leads(&self, gid: u64) -> bool {
+    self
+      .host
+      .group(&gid)
+      .is_some_and(|ep| ep.role().is_leader())
+  }
+
+  /// Drive local quiescence: storage completions for every hosted group, drain outgoing (none — no
+  /// peers) and events, materialize any committed fork (`poll_pending_fork` →
+  /// `create_group_from_fork` → `lift_fork_barrier`), and drop split-conflict signals. Merges are
+  /// resolved separately in [`Self::drive_until_merged`].
+  fn drain(&mut self) {
+    let now = self.vnow;
+    for _ in 0..1_000_000 {
+      let mut progressed = false;
+      let gids: Vec<u64> = self.host.group_ids().copied().collect();
+      for g in &gids {
+        if let Some((log, stable)) = self.stores.get_mut(g) {
+          while self
+            .host
+            .handle_storage(g, now, log, stable)
+            .is_some_and(|p| p.is_more_pending())
+          {
+            progressed = true;
+          }
+        }
+      }
+      while self.host.poll_message().is_some() {
+        progressed = true;
+      }
+      while self.host.poll_event().is_some() {
+        progressed = true;
+      }
+      while let Some(fork) = self.host.poll_pending_fork() {
+        progressed = true;
+        self.boot_epoch += 1;
+        let epoch = self.boot_epoch;
+        let (parent, child, split_index) = (fork.parent, fork.child, fork.split_index);
+        self.stores.insert(child, (MemLog::new(), MemStable::new()));
+        let (log, stable) = self.stores.get_mut(&child).expect("child stores");
+        self
+          .host
+          .create_group_from_fork(
+            child,
+            fork.child_gen,
+            fork.config,
+            now,
+            RESHAPE_SEED,
+            fork.fsm,
+            fork.blob,
+            fork.read_only,
+            Some(fork.fork_id),
+            epoch,
+            log,
+            stable,
+          )
+          .expect("fork materialization");
+        self.host.lift_fork_barrier(&parent, split_index);
+      }
+      while self.host.poll_split_conflict().is_some() {
+        progressed = true;
+      }
+      if !progressed {
+        break;
+      }
+    }
+  }
+
+  /// Fire `gid`'s timer at its own (virtual) deadline until it leads. A single voter self-elects on
+  /// the first campaign; the budget guards a wiring bug.
+  fn elect(&mut self, gid: u64) {
+    for _ in 0..64 {
+      if self.leads(gid) {
+        return;
+      }
+      if let Some((_, dl)) = self.host.deadlines().find(|(g, _)| *g == gid)
+        && dl > self.vnow
+      {
+        self.vnow = dl;
+      }
+      let now = self.vnow;
+      let (log, stable) = self.stores.get_mut(&gid).expect("gid stores");
+      self
+        .host
+        .handle_timeout(&gid, now, log, stable)
+        .expect("hosted");
+      self.drain();
+    }
+    panic!("reshape group {gid} never elected a leader");
+  }
+
+  /// Propose one client op on `gid` (the parent leader), flush, drain, and return `1` once it has
+  /// applied. A single-voter leader always accepts and commits locally, so this returns `1`.
+  fn propose_one(&mut self, gid: u64, payload: &Bytes) -> u64 {
+    let now = self.vnow;
+    let idx = {
+      let (log, stable) = self.stores.get_mut(&gid).expect("gid stores");
+      match self.host.propose(&gid, now, log, stable, payload) {
+        Some(Ok(idx)) => idx,
+        other => panic!("reshape parent {gid} rejected a client propose: {other:?}"),
+      }
+    };
+    {
+      let (log, stable) = self.stores.get_mut(&gid).expect("gid stores");
+      let _ = self.host.flush_appends(&gid, now, log, stable);
+    }
+    self.drain();
+    assert!(
+      self
+        .host
+        .group(&gid)
+        .is_some_and(|ep| ep.applied_index() >= idx),
+      "reshape parent {gid} failed to commit a single-voter propose"
+    );
+    1
+  }
+
+  /// One split→merge-back cycle: split `parent` into a fresh `child`, elect the child, then merge it
+  /// back into the parent. Returns the freeze window in wall milliseconds (PrepareMerge-propose →
+  /// CommitMerge-applied — the source's freeze acceptance through the target's Merged resolution).
+  fn reshape_cycle(&mut self, parent: u64, child: u64, instr: &Bytes) -> f64 {
+    self.split(parent, child, instr);
+    assert!(self.hosts(child), "the child materialized after the split");
+    self.elect(child);
+
+    let freeze_start = WallInstant::now();
+    assert!(
+      self.prepare_merge(child, parent),
+      "the freeze (PrepareMerge) was accepted"
+    );
+    self.drain();
+    assert!(
+      self.commit_merge(parent, child),
+      "the absorb (CommitMerge) was accepted"
+    );
+    self.drain();
+    self.drive_until_merged(child, parent);
+    (WallInstant::now() - freeze_start).as_secs_f64() * 1000.0
+  }
+
+  /// Propose (and settle) a split of `parent` at a fresh `child`.
+  fn split(&mut self, parent: u64, child: u64, instr: &Bytes) {
+    let now = self.vnow;
+    {
+      let (log, stable) = self.stores.get_mut(&parent).expect("parent stores");
+      self
+        .host
+        .propose_split(&parent, now, log, stable, &child, 0, instr.clone())
+        .expect("parent hosted")
+        .expect("split accepted");
+      let _ = self.host.flush_appends(&parent, now, log, stable);
+    }
+    self.drain();
+  }
+
+  /// Propose the merge FREEZE of `source` into `target`; `true` iff accepted.
+  fn prepare_merge(&mut self, source: u64, target: u64) -> bool {
+    let now = self.vnow;
+    let mut cs = ContainerStores {
+      stores: &mut self.stores,
+      floored: &self.floored,
+    };
+    matches!(
+      self.host.prepare_merge(&source, now, &mut cs, &target),
+      Some(Ok(_))
+    )
+  }
+
+  /// Propose the merge ABSORB of `source` into `target`; `true` iff accepted.
+  fn commit_merge(&mut self, target: u64, source: u64) -> bool {
+    let now = self.vnow;
+    let (log, stable) = self.stores.get_mut(&target).expect("target stores");
+    matches!(
+      self.host.commit_merge(&target, now, log, stable, &source),
+      Some(Ok(_))
+    )
+  }
+
+  /// Run the per-crank merge service until the `source`→`target` absorb resolves `Merged`, dropping
+  /// the dissolved source's stores and flooring its id. Panics if it does not resolve in budget.
+  fn drive_until_merged(&mut self, source: u64, target: u64) {
+    for _ in 0..100_000 {
+      self.drain();
+      let now = self.vnow;
+      let resolutions = {
+        let mut cs = ContainerStores {
+          stores: &mut self.stores,
+          floored: &self.floored,
+        };
+        self.host.service_merge_applies(now, &mut cs)
+      };
+      for r in resolutions {
+        match r {
+          MergeResolution::Merged { source: s, .. } | MergeResolution::Retired { source: s } => {
+            self.stores.remove(&s);
+            self.floored.insert(s);
+          }
+          MergeResolution::Aborted { .. } | MergeResolution::CaptureFailed { .. } => {
+            panic!("reshape merge {source}->{target} resolved unexpectedly: {r:?}");
+          }
+        }
+      }
+      if !self.hosts(source) {
+        return;
+      }
+    }
+    panic!("reshape merge {source}->{target} never resolved");
+  }
+}
+
+/// Drive group 0's reshape workload synchronously (on its own OS thread): elect the parent, then
+/// commit `ops_for_group` client ops interleaved with up to [`RESHAPE_CYCLES`] evenly-spaced
+/// split→merge-back cycles, pushing each cycle's freeze window (wall ms) into `freeze_windows`.
+/// Returns the committed client-op count (`== ops_for_group`).
+fn drive_reshape_group(ops_for_group: u64, freeze_windows: Arc<Mutex<Vec<f64>>>) -> u64 {
+  let payload = Bytes::from_static(&[0u8; 8]);
+  let instr = Bytes::from_static(&[1u8]);
+  let mut rh = ReshapeHost::new();
+  rh.elect(RESHAPE_PARENT);
+
+  let cycles = ops_for_group.clamp(1, RESHAPE_CYCLES);
+  let mut committed = 0u64;
+  let mut cycle = 0u64;
+  while committed < ops_for_group {
+    committed += rh.propose_one(RESHAPE_PARENT, &payload);
+    if cycle < cycles && committed >= (cycle + 1) * ops_for_group / cycles {
+      let child = RESHAPE_FIRST_CHILD + cycle;
+      let w = rh.reshape_cycle(RESHAPE_PARENT, child, &instr);
+      freeze_windows
+        .lock()
+        .expect("freeze-window mutex poisoned")
+        .push(w);
+      cycle += 1;
+    }
+  }
+  // A tiny op budget can exhaust before every checkpoint fired; run the rest so the cycle count is
+  // deterministic (`RESHAPE_CYCLES`, or `ops_for_group` if smaller).
+  while cycle < cycles {
+    let child = RESHAPE_FIRST_CHILD + cycle;
+    let w = rh.reshape_cycle(RESHAPE_PARENT, child, &instr);
+    freeze_windows
+      .lock()
+      .expect("freeze-window mutex poisoned")
+      .push(w);
+    cycle += 1;
+  }
+  committed
 }

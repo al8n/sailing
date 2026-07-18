@@ -74,3 +74,84 @@ impl StateMachine for CountSm {
     Ok(())
   }
 }
+
+/// A split/absorb-capable counting state machine for the reshaping benches.
+///
+/// Like [`CountSm`] it keeps only a running applied count, so its snapshot is O(1) and a group
+/// hosting it commits at the same bounded steady-state cost. It ADDITIONALLY overrides the
+/// reshaping seams: [`split`](StateMachine::split) hands the child HALF the count (the parent
+/// keeps the rest) and [`absorb`](StateMachine::absorb) folds an absorbed source's count back in,
+/// so a split-then-merge-back cycle conserves the total. It exists so the reshaping-cost benches
+/// (`parity --reshape`, `sharded_host --reshape`) can drive the REAL `propose_split` / merge verbs
+/// against an FSM whose per-op cost stays O(1) — keeping the throughput a read on consensus +
+/// reshape work rather than on the O(n) snapshot artifact the simulation `LogSm` carries.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ReshapeSm {
+  applied: u64,
+}
+
+impl ReshapeSm {
+  /// A fresh state machine with a zero count.
+  pub fn new() -> Self {
+    Self::default()
+  }
+
+  /// The number of commands applied so far.
+  pub fn applied(&self) -> u64 {
+    self.applied
+  }
+}
+
+impl StateMachine for ReshapeSm {
+  type Command = Bytes;
+  type Response = u64;
+  /// The applied count, encoded as a single little-endian `u64` (O(1), as [`CountSm`]).
+  type Snapshot = Bytes;
+  type Error = CountSmError;
+
+  fn apply(&mut self, _index: Index, _cmd: Bytes) -> Result<u64, Self::Error> {
+    self.applied += 1;
+    Ok(self.applied)
+  }
+
+  fn snapshot(&self) -> Result<Bytes, Self::Error> {
+    let mut buf = std::vec::Vec::with_capacity(8);
+    self.applied.encode(&mut buf);
+    Ok(Bytes::from(buf))
+  }
+
+  fn restore(&mut self, snapshot: Bytes) -> Result<(), Self::Error> {
+    let mut cur = sailing_proto::ByteCursor::new(snapshot);
+    let applied = u64::decode(&mut cur).map_err(|_| CountSmError)?;
+    if !cur.is_empty() {
+      return Err(CountSmError); // trailing bytes: a malformed snapshot
+    }
+    self.applied = applied;
+    Ok(())
+  }
+
+  /// Hand the child HALF the applied count (rounding down); the parent keeps the remainder. The
+  /// opaque `instruction` is ignored — a counter has no keys to partition, only a magnitude to
+  /// halve, and half is a deterministic function of the pre-split count, so every replica applying
+  /// the same committed `Split` partitions identically (the seam's `apply`-grade determinism).
+  fn split(&mut self, _instruction: &[u8]) -> Option<Self> {
+    let give = self.applied / 2;
+    self.applied -= give;
+    Some(Self { applied: give })
+  }
+
+  /// Fold an absorbed source's count back into this one — the inverse of an earlier
+  /// [`split`](Self::split), so a split-then-merge-back cycle restores the pre-split total.
+  fn absorb(&mut self, source: Self) -> bool {
+    self.applied += source.applied;
+    true
+  }
+
+  fn supports_split(&self) -> bool {
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
+    true
+  }
+}
