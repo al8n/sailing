@@ -70,6 +70,11 @@ where
     // Abort any in-progress leader transfer — leadership is changing, the transfer is moot.
     self.transfer.lead_transferee = None;
     self.transfer.transfer_deadline = None;
+    // Pending farewell retries PARK across this step-down (NOT cleared): a re-election re-arms and
+    // re-drives their surviving shots, curing the self-recovery cycle where a removed disruptor
+    // deposes this leader and then loses (it cannot hold a quorum). Inert while a follower — the
+    // leader-gated `has_pending_farewells` reads false, and `drive_pending_farewells` runs only on a
+    // leader tick.
     // The partitioned former leader arms the election timer; once it heals and
     // pre-vote/real vote succeeds it can campaign again without disrupting the cluster.
     self.arm_election_timer(now);
@@ -631,6 +636,22 @@ where
     // Fresh leadership starts fresh snapshot-resend pacing (the per-peer deadlines belong to the
     // previous leadership's transfer windows).
     self.snapshot.snapshot_resend_after.clear();
+    // Farewell retries that PARKED on this node (as a follower across a term change) are NOT cleared,
+    // but they are RECONCILED against the current tracker before re-arming — the load-bearing staleness
+    // edge. An entry whose peer was RE-ADMITTED while parked (by a snapshot install, or any other path
+    // that rebuilt the tracker) names an obsolete removal; re-arming it would deliver a stale directive
+    // to a CURRENT voter, and a rejoiner on the old prefix could commit it and self-remove. So KEEP and
+    // re-arm (`next_at = None`, front-loaded at the first tick) ONLY entries whose peer is still ABSENT
+    // — the same `tracker.progress(peer).is_none()` predicate the log-applied prune uses — and DROP the
+    // rest. The budget is not refreshed — the shots that remain are all that remain.
+    let tracker = &self.tracker;
+    self.pending_farewells.retain(|peer, retry| {
+      let still_removed = tracker.progress(peer).is_none();
+      if still_removed {
+        retry.next_at = None;
+      }
+      still_removed
+    });
     // Clear any in-progress leader transfer — becoming the leader means the transfer
     // target (us) has won; the previous leader's transfer state is irrelevant.
     self.transfer.lead_transferee = None;

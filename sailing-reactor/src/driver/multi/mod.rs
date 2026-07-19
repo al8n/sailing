@@ -84,6 +84,42 @@ pub(crate) fn blueprint_names<I: PartialEq>(
   blueprint.config_ref().voters().contains(from)
 }
 
+/// Force pre-vote + check-quorum on for a RESHAPE-BORN group's config. A reshaping id's steady-state
+/// membership churn is exactly where an ignorant removed voter would otherwise depose a live leader.
+/// Applied UNCONDITIONALLY at the split-child birth path (a split child is reshape-born by
+/// construction) and, via [`reshape_born_factory_config`], to the reshape/rejoin subset of factory
+/// materializations. Independent of the seed config's flags; embedder `with_group` groups and fresh
+/// day-0 factory births keep their configured (etcd-parity) defaults, so single-group deployments and
+/// the VOPR corpus are untouched.
+pub(crate) fn reshape_born_prevention<I>(
+  config: sailing_proto::Config<I>,
+) -> sailing_proto::Config<I> {
+  config.with_pre_vote(true).with_check_quorum(true)
+}
+
+/// The factory-materialization gate for [`reshape_born_prevention`]: force prevention only on the
+/// RESHAPE/rejoin subset, so a fresh day-0 materialization keeps the caller's config byte-for-byte.
+/// Two legs: `generation > 0` (a recreated/reshaped incarnation) OR an OBSERVER-shaped blueprint (the
+/// host's own id absent from the seed voters). Observer-shape ⇔ fork-born is enforced in-repo — a
+/// full-voter blueprint for a fork-born id fuses committed histories (the loopback regression
+/// `full_voter_blueprint_for_a_fork_born_id_fuses_histories`) — so a legitimate fork-born blueprint is
+/// always the observer shape, and generation alone would miss it: fork children are born at
+/// generation 0, which conflates incarnation with reshape-born-ness. The flags persist across the
+/// observer-to-voter promotion (a conf change swaps membership, not the config knobs), so forcing at
+/// materialization is sufficient. Accepted over-reach, the conservative direction: an observer-shaped
+/// blueprint is always treated as reshape-born, so a hypothetical day-0 learner materialization
+/// inherits prevention.
+pub(crate) fn reshape_born_factory_config<I: sailing_proto::NodeId>(
+  generation: u64,
+  config: sailing_proto::Config<I>,
+) -> sailing_proto::Config<I> {
+  if generation > 0 || !config.is_voter(config.id()) {
+    reshape_born_prevention(config)
+  } else {
+    config
+  }
+}
+
 /// Map the proto's split-propose error, preserving the redirect hint and the poison verdict
 /// exactly as [`map_propose_err`](crate::driver::map_propose_err) does for plain proposals.
 pub(crate) fn map_split_err<I: core::fmt::Debug>(
@@ -235,6 +271,12 @@ where
     // caught-up check below already refuses) — kept explicit so quiesce eligibility never
     // silently inherits that coupling.
     || ep.pending_merge().is_some()
+    // A committed removal's farewell is re-driven on a bounded blind budget; the removed peer's ack is
+    // unobservable (its Progress is pruned), so a quiesced group would strand the remaining shots until
+    // unrelated traffic woke it. Ineligible until the budget drains — leader-gated, but the budget PARKS
+    // across a demotion and re-arms on re-election, so the shots can span MULTIPLE leaderships before it
+    // drains (still bounded — at most the original budget per removal across all terms).
+    || ep.has_pending_farewells()
   {
     return false;
   }

@@ -619,6 +619,9 @@ where
       peers_scratch: Vec::new(),
       // A restarted node comes up Follower; the propose paths set this once it (re-)wins an election.
       replication_pending: false,
+      // A restarted node is a Follower with no leadership history to re-drive; farewell retries are
+      // leader-scoped and re-populated only after it (re-)wins an election and prunes a removed peer.
+      pending_farewells: BTreeMap::new(),
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).

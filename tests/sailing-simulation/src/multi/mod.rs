@@ -38,7 +38,10 @@ pub(crate) use oracles::{decode_gkv, encode_gkv};
 pub(crate) const NUM_KEYS: u16 = 8;
 
 mod vopr;
-pub use vopr::{MultiAction, MultiProfile, MultiVoprReport, run_multi_vopr};
+pub use vopr::{
+  MultiAction, MultiProfile, MultiVoprReport, run_multi_vopr,
+  run_multi_vopr_certifying_tracked_wedges,
+};
 
 mod interaction;
 pub use interaction::{MultiInteractionEnv, run_multi_interaction_file};

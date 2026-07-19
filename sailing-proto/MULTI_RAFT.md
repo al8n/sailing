@@ -164,15 +164,30 @@ holds). Rejoin instead goes through membership: conf-change the node OUT and bac
 recreates its leader-side progress at zero and catches it up by snapshot — the membership-level
 analogue of the references' new-replica-ID rule.
 
-**Deployment note (membership churn).** Hosts whose groups perform membership changes should
-enable BOTH `pre_vote` and `check_quorum` in each group's `Config` (they are per-group knobs on a
-multi-group host). A removed or partitioned member whose election timer fires campaigns at a
-higher term and, with an up-to-date log, deposes a live leader — the Raft-thesis §4.2.3
-disruptive-server problem, multiplied across co-hosted groups. `check_quorum` makes members
+**Deployment note (membership churn).** A removed or partitioned member whose election timer fires
+campaigns at a higher term and, with an up-to-date log, deposes a live leader — the Raft-thesis
+§4.2.3 disruptive-server problem, multiplied across co-hosted groups. `check_quorum` makes members
 ignore vote requests while they observe a live leader, and `pre_vote` stops the term inflation.
-The removal path's window is narrow (the leader's farewell append delivers the excising commit to
-the pruned peer), but partitioned members remain, and the defaults stay OFF for etcd-raft library
-parity. The removed-follower lifecycle e2es model the pair.
+Both are per-group knobs on a multi-group host; the library defaults stay OFF for etcd-raft parity,
+but **reshape-born groups default them ON** — the multi hosts force `pre_vote` + `check_quorum` on
+every split child and on the RESHAPE/rejoin subset of factory materializations, because a reshaping
+id makes membership churn steady-state, exactly where the disruptive-server window recurs. A factory
+serves both reshape births and fresh day-0 materializations, so the force is gated on the blueprint's
+provenance: an observer-shaped (fork-born) or reshaped-generation (`> 0`) blueprint is forced, while a
+day-0 full-voter blueprint keeps the caller's config byte-for-byte. Single-group and
+embedder-`with_group` deployments keep the etcd-parity defaults; an embedder that reshapes
+pre-created groups should construct them with the same two flags.
+
+The IGNORANCE half is cured on delivery: the leader's farewell carries the excising commit to the
+pruned peer (whose progress is already gone) — an append for a straggler, a commit-carrying heartbeat
+for a caught-up peer — and a LOST farewell in EITHER arm is re-driven on a bounded blind budget, so
+the removed peer applies its own removal and self-removes, never a bare "you are removed" assertion. The residual the retry cannot reach is precisely (a) the compacted /
+never-had-the-entry tail, where the farewell suffix is gone, and (b) contact from a RETIRED
+incarnation — a merged-away source or a forked-away stale id. Both are closed by the deferred
+courtesy snapshot (which re-baselines the peer regardless of log continuity) and the demux
+generation fence (which drops a below-floor incarnation's frames); the two share the reserved
+group-header generation stamp (WIRE.md §6). The removed-follower lifecycle e2es and the
+farewell-retry tests model the cure.
 
 Split shipped without shaping the Phase-0 container — the endpoint stages, the container
 relays, the drivers materialize; the container stayed the pure routing layer.

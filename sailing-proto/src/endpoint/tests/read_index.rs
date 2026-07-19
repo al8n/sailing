@@ -71,6 +71,84 @@ fn safe_read_confirmed_after_heartbeat_quorum() {
   );
 }
 
+/// Lease-neutrality: enabling CHECK-QUORUM for a Safe-mode group does NOT enable lease
+/// reads — the read mode is a separate replicated apply-time knob. A check-quorum leader in Safe
+/// mode still confirms a read only after a heartbeat quorum, exactly as with check-quorum off. So
+/// forcing check-quorum on for reshape-born groups never silently changes their read semantics.
+#[test]
+fn check_quorum_does_not_enable_lease_reads_for_a_safe_group() {
+  use crate::{AppendResponse, VoteResponse};
+
+  // A 3-voter CHECK-QUORUM leader with a current-term commit, in the default (Safe) read mode.
+  let cfg = cq_config(1, std::vec![1u64, 2, 3]);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  let ctx = bytes::Bytes::from_static(b"safe_cq");
+  ep.read_index(d, &log, &stable, ctx.clone())
+    .expect("a check-quorum leader with a current-term commit accepts the read");
+
+  // A Safe read must broadcast a heartbeat round (NOT confirm from a lease). Capture the token.
+  let mut round = None;
+  while let Some(out) = ep.poll_message() {
+    if let Message::Heartbeat(hb) = out.message()
+      && !hb.context().is_empty()
+    {
+      round = Some(bytes::Bytes::copy_from_slice(hb.context()));
+    }
+  }
+  let round = round.expect("a Safe read broadcasts a heartbeat round even under check-quorum");
+
+  // Check-quorum did NOT shortcut the read: no ReadState until a heartbeat quorum acks.
+  assert!(
+    ep.poll_event().is_none(),
+    "check-quorum must not enable a lease shortcut: no ReadState before a heartbeat quorum"
+  );
+
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(HeartbeatResponse::new(Term::new(1), 2u64, round)),
+  );
+  while ep.poll_message().is_some() {}
+  let confirmed = core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, Event::ReadState(_)));
+  assert!(
+    confirmed,
+    "the Safe read confirms via the heartbeat quorum, exactly as with check-quorum off"
+  );
+}
+
 /// Regression (the ReadIndex quorum proof keys on an INTERNAL round token, never the
 /// reusable user context): after a read with context X completes, the application may reuse X for a
 /// new read. A stale/duplicated `HeartbeatResponse` from the FIRST read's round must NOT confirm the

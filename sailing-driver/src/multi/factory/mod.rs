@@ -16,6 +16,15 @@ use sailing_proto::Config;
 /// one. The replica learns replicated state through the ordinary catch-up path (append or
 /// snapshot) from the soliciting group's leader; a blueprint never carries recovered state (see
 /// the CREATE-only rule on [`GroupFactory`]).
+///
+/// **Reshape-born prevention (forced at the host).** A factory materialization is a reshape/rejoin
+/// birth, so the multi hosts build the materialized group's endpoint with pre-vote + check-quorum
+/// FORCED on (`with_pre_vote(true).with_check_quorum(true)`) — a reshaping id's steady-state
+/// membership churn is exactly where an ignorant removed voter would otherwise depose a live leader.
+/// This is a FORCE at reshape birth (independent of the seed config's flags; `Config` carries no
+/// explicitly-set tracking to make it a soft default), and the split-child birth path forces the
+/// same. Embedder `with_group` groups keep their configured (etcd-parity) defaults; an embedder that
+/// reshapes pre-created groups should construct them with the same two flags.
 #[derive(Debug)]
 pub struct GroupBlueprint<I> {
   config: Config<I>,

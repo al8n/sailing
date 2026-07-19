@@ -61,6 +61,7 @@ use crate::{
 use super::{
   EngineMetrics, FloorSnapshot, GroupActivity, PairFloors, STORAGE_REDRIVES, blueprint_names,
   conf_names, group_idle, host_seed, map_merge_err, map_split_err, no_such_group, rejected,
+  reshape_born_factory_config, reshape_born_prevention,
 };
 
 #[cfg(all(test, feature = "tokio"))]
@@ -624,10 +625,15 @@ where
       let split_index = fork.split_index;
       let child = fork.child.cheap_clone();
       let seed = host_seed(self.coord.host_id());
+      // Reshape-born prevention: a split child is a reshaping participant, so it is FORCED
+      // to run pre-vote + check-quorum — an ignorant removed voter must not depose a live leader
+      // while reshaping keeps membership churn steady-state. Embedder `with_group` groups keep their
+      // configured (etcd-parity) defaults; this force applies at reshape birth only.
+      let child_config = reshape_born_prevention(fork.config);
       match self.create_group_from_fork(
         now,
         fork.child,
-        fork.config,
+        child_config,
         seed,
         fork.fsm,
         fork.blob,
@@ -1929,6 +1935,10 @@ where
         if let Some(fsm) = fsm {
           let generation = blueprint.generation();
           let (config, seed) = blueprint.into_parts();
+          // A factory materialization is reshape-born only for the recreated/reshaped
+          // (generation > 0) or fork-born (observer-shaped) subset; a fresh day-0 full-voter
+          // blueprint keeps the caller's config. The two-legged gate lives in the helper.
+          let config = reshape_born_factory_config(generation, config);
           admitted = self
             .create_group(now, group.cheap_clone(), config, seed, fsm, generation)
             .is_ok();

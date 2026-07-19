@@ -327,7 +327,8 @@ impl MultiWorld {
       // retired source stays hosted and inside the safety sweep, but alignment keeps a gkv cell only
       // if the LIVE population owns its key — an emptied live set would blank every husk record. This
       // is the source's final owned population (post-every-split, pre-merge); `aligned_applied` falls
-      // back to it so the cross-watermark leg still judges the husk's client content.
+      // back to it so the non-absorbed positional agreement branch still judges the husk's client
+      // content.
       meta.terminal_keys = Some(meta.keys.clone());
       (
         core::mem::take(&mut meta.keys),
