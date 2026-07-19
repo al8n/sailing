@@ -1154,6 +1154,16 @@ where
       self.config.max_inflight_msgs(),
       self.config.max_inflight_bytes(),
     );
+    // Mirror the log-applied re-add prune (see the ConfChange arm of `apply_committed`): this snapshot's
+    // ConfState is a fresh source of committed-membership truth, and it may RE-ADMIT a peer whose stale
+    // removal is PARKED here — a follower can carry a parked map across a demotion. Drop every entry the
+    // rebuilt tracker now tracks, so a later re-election never re-arms an obsolete removal against a
+    // CURRENT voter. Keep only still-untracked targets — the same `tracker.progress(peer).is_none()`
+    // predicate the log-applied prune and the `become_leader` reconcile use.
+    let tracker = &self.tracker;
+    self
+      .pending_farewells
+      .retain(|peer, _| tracker.progress(peer).is_none());
 
     // Step 7: ack the boundary. `durable_index == boundary` now holds (set above), so the centralized
     // persist-before-ack clamp `proven.min(ack_watermark())` resolves to the boundary — and the boundary

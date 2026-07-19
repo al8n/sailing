@@ -1219,6 +1219,55 @@ struct Reads<I> {
   pending_read_mode_index: Index,
 }
 
+/// Blind farewell retries AFTER the initial fire (so the total budget is `1 + FAREWELL_RETRY_SHOTS`
+/// shots). A removed peer's `Progress` is pruned at removal, so its ack is unobservable — the retry
+/// carries no delivery feedback and the budget is the sole terminator (the TiKV-redundancy analogue).
+const FAREWELL_RETRY_SHOTS: u8 = 2;
+
+/// Leader-scoped retry state for a farewell that may have been LOST in flight — the lost-farewell
+/// leg of the removed-replica churn cure (#95).
+///
+/// A committed removal prunes the removed peer's `Progress`, so the leader can never observe its
+/// ack. The retry is therefore a BLIND, bounded redundancy — not ack-tracking: re-deliver the SAME
+/// committed removal a few times (the append arm for a straggler, the commit-carrying heartbeat arm
+/// for a caught-up peer, derived from `matched`), spaced one election timeout apart, then stop and
+/// leave the durable catalog as the terminal reap. A retry that hits a compacted / over-budget wall
+/// in the append arm simply burns its shot; that tail is the courtesy snapshot's job, not this. Only
+/// ever re-delivers already-committed state: the peer still self-removes solely by APPLYING the
+/// removal, never by a bare assertion.
+///
+/// The budget PARKS across leadership changes (it is NOT cleared at step-down) and re-arms on
+/// re-election, so it survives the very disruption it cures: parking cures the SELF-recovery cycle —
+/// a removed disruptor that deposes this leader cannot hold a quorum, so this node re-wins and
+/// re-drives the surviving shots — while the shape where a DIFFERENT node (which applied the removal
+/// as a follower and so never fired a farewell) takes over remains with the durable catalog reap and
+/// the deferred courtesy snapshot (no unbounded reconstruction machinery). The budget is never
+/// refreshed: at most the original shots per removal across ALL terms.
+///
+/// A parked entry is RECONCILED against the live tracker before it re-drives: the `become_leader` re-arm
+/// retains only entries whose peer is still ABSENT (`tracker.progress(peer).is_none()`), and an
+/// `install_snapshot_now` membership rebuild prunes in place under the same predicate — both mirror the
+/// log-applied re-add prune. So an entry whose peer the tracker has since RE-ADMITTED (a later conf
+/// change, or a snapshot whose ConfState restored it) is dropped, never re-delivering a stale removal to
+/// a peer its CURRENT committed configuration made a voter again.
+#[derive(Debug, Clone)]
+struct FarewellRetry {
+  /// The removed peer's proven match at removal — frozen. It BOTH selects the arm (`matched < idx` ⇒
+  /// append, else the caught-up commit-carrying heartbeat) and anchors the append's `prev`, so the
+  /// prev-check passes by construction on every re-send (up to compaction of the tail below it).
+  matched: Index,
+  /// The removal index — the append re-delivers the suffix `(matched, idx]`; the caught-up heartbeat
+  /// carries the commit through it (`min(commit, matched) >= idx`).
+  idx: Index,
+  /// Blind retries left AFTER the initial fire; the budget is the terminator since delivery is
+  /// unobservable. Removed from the map once this reaches zero.
+  shots_left: u8,
+  /// When the next shot is due. `None` means DUE IMMEDIATELY — set at the fire site (`apply_committed`
+  /// has no `now`) and re-set at `become_leader`, so the next leader tick FRONT-LOADS the shot rather
+  /// than waiting; each fired shot then reschedules one election timeout out.
+  next_at: Option<Instant>,
+}
+
 /// The Sans-I/O Raft state machine for one node.
 ///
 /// `I` is unbounded on the struct; `I: NodeId` belongs only on the `impl` blocks that
@@ -1343,6 +1392,17 @@ where
   /// `AppendEntries` every pump until an ack; gating on this flag broadcasts each staged append once. The
   /// election no-op fans out directly (not via `flush_appends`), so it deliberately does NOT set the flag.
   replication_pending: bool,
+  /// Pending farewell retries, keyed by the removed peer. Populated on a leader for BOTH farewell arms
+  /// where the farewell first fires (the peer's `Progress` is already pruned, so this lives OUTSIDE the
+  /// tracker), re-driven on the leader's tick by re-calling `send_farewell` on a bounded blind budget.
+  /// It PARKS across leadership changes (not cleared at step-down) and re-arms at `become_leader` (see
+  /// [`FarewellRetry`]); only the SELF-removal step-down clears it (the node is leaving). A peer the
+  /// tracker RE-ADMITS is dropped (staleness guard), reconciled at THREE sites against the same
+  /// `tracker.progress(peer).is_none()` predicate: the log-applied conf change, the `become_leader`
+  /// re-arm, and an `install_snapshot_now` membership rebuild. May hold parked entries on a follower —
+  /// inert there (the leader-gated accessor reads false; the re-drive runs on a leader tick only).
+  /// Restart starts empty (volatile; the durable catalog is the backstop).
+  pending_farewells: BTreeMap<I, FarewellRetry>,
 }
 
 // Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
@@ -1500,6 +1560,7 @@ where
       },
       peers_scratch: Vec::new(),
       replication_pending: false,
+      pending_farewells: BTreeMap::new(),
     };
     ep.arm_election_timer(now);
     ep
@@ -2185,6 +2246,19 @@ where
       .iter()
       .any(|(id, p)| *id != me && (!p.state().is_replicate() || p.match_index() < last))
   }
+
+  /// Whether this node is CURRENTLY LEADER and still owes blind farewell re-deliveries — `true` iff a
+  /// committed removal's farewell (the append arm OR the caught-up commit-carrying heartbeat) is still
+  /// being re-driven on its bounded budget. The removed peer's `Progress` is pruned at removal, so its
+  /// ack is unobservable and the leader re-issues the farewell across the next couple of ticks; a
+  /// multi-group host must NOT quiesce the group while that budget is unspent, or the remaining shots
+  /// would be stranded until unrelated traffic wakes it. Leader-GATED: entries PARKED on a follower
+  /// (across a term change) read `false` here (a permanent follower must not hold the group awake
+  /// forever) and re-arm to fire if leadership returns; a group mid-leadership flap is not
+  /// quiesce-eligible anyway.
+  pub fn has_pending_farewells(&self) -> bool {
+    self.role.is_leader() && !self.pending_farewells.is_empty()
+  }
 }
 
 impl<I, F, R> Endpoint<I, F, R>
@@ -2287,6 +2361,9 @@ where
         // completion-time staleness re-check in `install_snapshot_now` is the final guard.)
         self.pending_log.clear();
         self.pending_stable.clear();
+        // Pending farewell retries PARK across this higher-term step-down (NOT cleared): the surviving
+        // shots re-arm and re-drive if this node re-wins leadership. Inert while a follower (the
+        // leader-gated accessor reads false; the re-drive runs only on a leader tick).
         // Drop all ReadIndex state too: a stale read confirmation must never leak across a term
         // change. Mirrors `step_down_to_follower` / `become_leader` (read confirmation is
         // leader-gated, so this is robustness, not a behavior change).
@@ -2521,6 +2598,13 @@ where
             self.election_deadline = Some(now.mono() + self.config.election_timeout());
           }
         }
+        // Re-drive any pending farewell retries on this beat. A CheckQuorum step-down just above PARKS
+        // the budget (it is NOT cleared, so a re-election can re-arm it), and `drive_pending_farewells`
+        // is role-guarded, so a demoted tick spends nothing here — the surviving shots outlast the
+        // demotion. Otherwise a removed peer whose farewell may have been lost gets its next blind
+        // re-delivery once due. Placed LAST in the leader tick, so a fatal farewell log read fail-stops
+        // with nothing after it — the next dispatch's top-level poison check halts the node.
+        self.drive_pending_farewells(now, log);
       }
       _ => {
         if self.election_deadline.is_some_and(|d| d <= now.mono()) {
@@ -2585,7 +2669,7 @@ where
   /// farewell Heartbeat — when the suffix cannot make ONE bounded frame: part of it is
   /// compacted below `first_index` (the append prev/entry range cannot cross the boundary,
   /// mirroring `maybe_send_append`'s snapshot hand-off — and a pruned peer gets no snapshot),
-  /// the read is cold (single-shot: no later pump re-drives a pruned peer), the range is wider
+  /// the read is cold (the normal pump never re-drives a pruned peer), the range is wider
   /// than one `MAX_READ_BATCH_ENTRIES` read batch (the send path's materialization bound), or
   /// the entries exceed the live append path's one-frame sizer (`entry_frame_cost` against
   /// `APPEND_FRAME_ENTRY_BUDGET`). Also `false` after a FATAL log read (`Err`), which poisons
@@ -2654,6 +2738,92 @@ where
       )),
     );
     true
+  }
+
+  /// Send the farewell to one pruned peer, picking the arm from `matched` vs `idx` — the SAME
+  /// selection the fire site and the blind re-drive both use, so the arm is derivable on every shot
+  /// without new state (`matched` is frozen at removal). `matched < idx`: the straggler needs the
+  /// missing suffix `(matched, idx]`, delivered as the append (including `send_farewell_append`'s
+  /// compacted / over-budget clamped-Heartbeat fallback). `matched >= idx`: the peer already HOLDS
+  /// every entry through the removal, so ONE commit-carrying Heartbeat with the per-peer clamp
+  /// `min(commit, matched)` (which is `>= idx`, so it delivers the commit) lets it apply. Either arm
+  /// delivers only committed state — the peer self-removes by APPLYING it, never by a bare assertion.
+  fn send_farewell<L: LogStore>(&mut self, log: &L, peer: I, matched: Index, idx: Index) {
+    if matched < idx && self.send_farewell_append(log, peer.cheap_clone(), matched, idx) {
+      return;
+    }
+    // The caught-up arm, OR the append arm's compacted / over-budget fallback: a single
+    // commit-carrying Heartbeat clamped at the peer's proven match. A heartbeat carries no prev-log
+    // check, so the clamp is the safety rule — a peer may only be told to commit what it holds. A
+    // fatal log read inside the append arm poisons; skip the send then (the node is inert).
+    if self.poison.poisoned {
+      return;
+    }
+    let (term, me) = (self.term, self.config.id());
+    self.send(
+      peer,
+      Message::Heartbeat(crate::Heartbeat::new(
+        term,
+        me,
+        core::cmp::min(self.commit, matched),
+        Bytes::new(),
+      )),
+    );
+  }
+
+  /// Re-drive pending farewell retries on the leader's tick. Each removed peer whose scheduled shot
+  /// has come due gets ONE more `send_farewell` re-delivering the SAME committed removal — the append
+  /// arm for a straggler, the commit-carrying heartbeat arm for a caught-up peer, picked from the
+  /// frozen `matched` vs `idx`. A freshly-populated or re-armed entry (`next_at == None` — neither the
+  /// fire site nor `become_leader` carries a `now`) is FRONT-LOADED: due immediately, it sends THIS
+  /// tick so the next shot lands within a heartbeat interval of the removal or re-election, strictly
+  /// before the removed peer's [T, 2T) election deadline could depose the leader. The retry is BLIND —
+  /// the peer's Progress is pruned so its ack is unobservable — so the send's outcome is ignored and the
+  /// bounded budget, not delivery, terminates the entry. A compacted / over-budget wall inside the
+  /// append arm just burns the shot; that residual is the courtesy snapshot's job. Only re-delivers
+  /// committed state — the peer self-removes by APPLYING the removal, never by a bare assertion.
+  fn drive_pending_farewells<L: LogStore>(&mut self, now: Now, log: &L) {
+    // Role guard, load-bearing: only a LEADER re-drives farewells. The budget PARKS across a demotion
+    // (it survives so re-election can re-arm it), so a tick that stepped this node down earlier in the
+    // same beat — a CheckQuorum step-down, notably — must NOT send, decrement, or spend a shot here.
+    // Making the leader-only invariant LOCAL keeps it independent of every caller's control flow.
+    if !self.role.is_leader() {
+      return;
+    }
+    if self.pending_farewells.is_empty() {
+      return;
+    }
+    let now_mono = now.mono();
+    let interval = self.config.election_timeout();
+    // Break the borrow on `self.pending_farewells` — the re-send goes through `&mut self`; restore
+    // the (retained) map afterward, mirroring the `peers_scratch` take/restore discipline.
+    let mut farewells = core::mem::take(&mut self.pending_farewells);
+    farewells.retain(|peer, retry| {
+      // A FRESH entry (`next_at == None`, just populated at the fire site or re-armed at
+      // `become_leader`) is DUE IMMEDIATELY — front-loaded to this tick so the next shot lands within
+      // one heartbeat interval of the removal (or of re-election), strictly before the removed peer's
+      // [T, 2T) election deadline could depose the live leader and strand the budget. A scheduled
+      // entry fires once its `next_at` elapses; a not-yet-due one is kept untouched.
+      let due = retry.next_at.is_none_or(|at| at <= now_mono);
+      if !due {
+        return true;
+      }
+      // Re-deliver the same committed removal (append or caught-up heartbeat, per the frozen
+      // `matched`) and burn one shot. A poisoned node sends no more (it is inert), but the shot still
+      // decrements — the whole map is discarded next dispatch. Drop the entry at zero shots, else
+      // reschedule one election timeout out.
+      if !self.poison.poisoned {
+        self.send_farewell(log, peer.cheap_clone(), retry.matched, retry.idx);
+      }
+      retry.shots_left -= 1;
+      if retry.shots_left == 0 {
+        false
+      } else {
+        retry.next_at = Some(now_mono + interval);
+        true
+      }
+    });
+    self.pending_farewells = farewells;
   }
 
   /// Apply all entries that have been committed but not yet applied.
@@ -3120,9 +3290,10 @@ where
                 // later send targets only tracked peers — so without it the removed node never
                 // learns the removal committed (`maybe_advance_commit` does not broadcast, and
                 // this fused apply prunes in the same pass). etcd avoids the gap by ordering
-                // bcastAppend (maybeCommit) before the async application; sailing's farewell
-                // is the same single best-effort shot, read from the OLD tracker while the
-                // Progress is still resolvable, in two shapes keyed on the peer's proven match:
+                // bcastAppend (maybeCommit) before the async application; sailing's farewell is
+                // the same best-effort delivery — re-driven on a bounded blind budget (see
+                // `drive_pending_farewells`) — read from the OLD tracker while the Progress is
+                // still resolvable, in two arms keyed on the peer's proven match:
                 //
                 //  - `match >= removal index`: the peer already HOLDS every entry through the
                 //    removal, so one Heartbeat carrying the broadcast rule's per-peer clamp
@@ -3137,16 +3308,16 @@ where
                 //    floor for it), so delivery is deterministic up to message loss; a
                 //    conflicting unacked tail above `match` is overwritten by the normal §5.3
                 //    append rules, and any truncation lands strictly above the peer's commit
-                //    (its commit never passed its proven match). Single-shot and BOUNDED
+                //    (its commit never passed its proven match). BOUNDED
                 //    (`send_farewell_append`): when the suffix is compacted, cold, wider than
                 //    one read batch, or over the one-frame budget, fall back to the clamped
                 //    Heartbeat — such a peer needed snapshot-level catch-up anyway, and there
                 //    is no multi-frame or snapshot farewell for a peer being pruned.
                 //
-                // Residual: the removed peer stays ignorant only when the farewell is LOST in
-                // flight, or its missing suffix is beyond one frame / one read batch or
-                // compacted — the embedder's catalog covers it (the references' lazy GC; the
-                // same floor as etcd's unretried bcastAppend-before-prune).
+                // Residual (the bounded retry re-drives a lost farewell — `drive_pending_farewells`):
+                // the removed peer stays ignorant only when EVERY shot is lost, or its missing suffix
+                // is compacted / beyond one frame or read batch — the embedder's catalog and courtesy
+                // snapshot cover that tail (the references' lazy GC; etcd's unretried floor).
                 // Leader-only: followers fold the same change without send authority. Fires
                 // exactly once per removal by construction: a joint removal keeps the outgoing
                 // voter's Progress until the final single-config application (leave_joint), so
@@ -3157,7 +3328,6 @@ where
                 // is no longer a voter, and round 0 never matches a live round).
                 if self.role.is_leader() {
                   let me = self.config.id();
-                  let (term, commit) = (self.term, self.commit);
                   let mut peers = core::mem::take(&mut self.peers_scratch);
                   peers.clear();
                   for (peer, pr) in self.tracker.progress_map() {
@@ -3171,22 +3341,25 @@ where
                     if self.poison.poisoned {
                       break;
                     }
-                    if matched < idx
-                      && self.send_farewell_append(log, peer.cheap_clone(), matched, idx)
-                    {
-                      continue;
-                    }
+                    self.send_farewell(log, peer.cheap_clone(), matched, idx);
+                    // The append arm's log read can poison; stop before tracking a dead node's retry.
                     if self.poison.poisoned {
                       break;
                     }
-                    self.send(
+                    // Track BOTH arms for the blind retry (shot 1 just fired): the removed peer's
+                    // Progress is pruned so its ack is unobservable, and a lost farewell — the append
+                    // OR the caught-up commit-carrying heartbeat — strands it. The arm is re-derived
+                    // from `matched` vs `idx` on each re-drive; `matched` is frozen at removal, so the
+                    // choice is deterministic. `next_at = None` ⇒ the next leader tick FRONT-LOADS shot
+                    // 2 (no `now` here), before the removed peer's [T, 2T) deadline could depose us.
+                    self.pending_farewells.insert(
                       peer,
-                      Message::Heartbeat(crate::Heartbeat::new(
-                        term,
-                        me.cheap_clone(),
-                        core::cmp::min(commit, matched),
-                        Bytes::new(),
-                      )),
+                      FarewellRetry {
+                        matched,
+                        idx,
+                        shots_left: FAREWELL_RETRY_SHOTS,
+                        next_at: None,
+                      },
                     );
                   }
                   self.peers_scratch = peers;
@@ -3216,6 +3389,16 @@ where
                   .snapshot
                   .snapshot_resend_after
                   .retain(|id, _| tracker.progress(id).is_some());
+                // Staleness guard: a farewelled peer this change RE-ADMITS is a live member again —
+                // drop its pending farewell retry so a later lost-farewell budget never re-delivers a
+                // removal it has since rejoined past. This is ONE of three tracker-reconciliation sites:
+                // the `become_leader` re-arm and `install_snapshot_now` mirror it against the SAME
+                // predicate, because a follower may carry a PARKED map across a demotion and the tracker
+                // can change (a snapshot install) while it does. The same tracker read as the resend
+                // prune above.
+                self
+                  .pending_farewells
+                  .retain(|peer, _| tracker.progress(peer).is_none());
               }
               // A committed, validly-decoded ConfChange that the Changer rejects is an unrecoverable
               // logic violation (e.g. an overlapping change that should have been prevented upstream).
@@ -3252,6 +3435,11 @@ where
               // Abort any in-progress leader transfer — the leader is being removed.
               self.transfer.lead_transferee = None;
               self.transfer.transfer_deadline = None;
+              // Self-removal step-down: DROP the pending farewell retries (unlike the other
+              // step-downs, which PARK them for re-election). This node is LEAVING the group — it will
+              // never re-win leadership here, so there is nothing to re-arm; the entries would only
+              // leak. A different surviving member owns the churn from here (catalog / courtesy snap).
+              self.pending_farewells.clear();
             }
             // If an in-flight leader transfer's target was removed or demoted by this conf change,
             // abort it (the target can no longer be elected, and proposals must not stay blocked until

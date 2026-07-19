@@ -1,7 +1,7 @@
 use super::{super::*, *};
 use crate::{
   ConfChangeSingle, ConfChangeV2, VoteResponse,
-  testkit::{CountSm, NoopStable, VecLog},
+  testkit::{AsyncStable, CountSm, NoopStable, VecLog},
 };
 
 /// At the log-index ceiling, `propose_conf_change` is refused with `LogIndexExhausted` rather than
@@ -1736,4 +1736,1266 @@ fn farewell_across_compaction_falls_back_to_clamped_heartbeat() {
     ),
     (_, other) => panic!("a compacted suffix must fall back to a Heartbeat, got {other:?}"),
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// pending-farewell-retry: the leader re-drives a possibly-lost farewell on a bounded
+// blind budget so a single dropped delivery does not strand a removed voter ignorant.
+// ---------------------------------------------------------------------------------------------
+
+/// Drive `make_three_node_leader` through a RemoveNode(3) where node 3 proved only match = 1 (below
+/// the removal index), so the fold fires an APPEND farewell (shot 1) and schedules blind retries.
+/// Returns the leader with its stores, the tick instant `d`, and the removal index; node 3's shot-1
+/// append is already drained.
+fn leader_after_removing_node3() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Instant, Index) {
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Message, Term};
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+
+  // Node 3 proves only the no-op@1 (match = 1); its ack of the conf entry never arrives.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new());
+  let idx = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect("RemoveNode(3) must be accepted");
+  ep.flush_appends(d, &log, &stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Node 2's ack completes the quorum WITHOUT node 3: the removal commits + applies, node 3
+  // (match = 1 < idx) is pruned lagging, and the append farewell (shot 1) rides out.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  assert!(ep.tracker.progress(&3u64).is_none(), "node 3 pruned");
+  while ep.poll_message().is_some() {} // drain the shot-1 append
+  while ep.poll_event().is_some() {}
+  (ep, log, stable, d, idx)
+}
+
+/// Collect every outgoing message addressed to `to`, draining (and discarding) the rest.
+fn drain_to(ep: &mut Endpoint<u64, CountSm>, to: u64) -> std::vec::Vec<Message<u64>> {
+  core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| o.to() == to)
+    .map(|o| o.into_parts().1)
+    .collect()
+}
+
+/// Populate-on-fire: the append farewell schedules a retry entry keyed on the pruned peer, carrying
+/// the full blind budget with `next_at` deferred to the first leader tick.
+#[test]
+fn farewell_retry_populated_on_append_fire() {
+  let (ep, _log, _stable, _d, idx) = leader_after_removing_node3();
+  let retry = ep
+    .pending_farewells
+    .get(&3u64)
+    .expect("the append farewell must schedule a retry for the pruned peer");
+  assert_eq!(
+    retry.matched,
+    Index::new(1),
+    "prev anchors at node 3's proven match"
+  );
+  assert_eq!(retry.idx, idx, "the retry re-delivers the removal index");
+  assert_eq!(
+    retry.shots_left, FAREWELL_RETRY_SHOTS,
+    "the initial fire leaves the full retry budget"
+  );
+  assert!(
+    retry.next_at.is_none(),
+    "scheduling is deferred to the first leader tick (no `now` at the fire site)"
+  );
+}
+
+/// Re-drive spacing + budget exhaustion: the first tick FRONT-LOADS the next shot immediately; then
+/// each election-timeout-spaced tick re-delivers exactly one append; the entry drops once spent.
+#[test]
+fn farewell_retry_spacing_and_budget_exhaustion() {
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, _idx) = leader_after_removing_node3();
+  let et = Duration::from_millis(1000); // the config's election_timeout
+
+  // Tick 1: front-loads shot 2 IMMEDIATELY (before the removed peer's election deadline could depose
+  // the leader), then schedules the next shot one election timeout out.
+  let t1 = d + Duration::from_millis(150);
+  ep.handle_timeout(t1, &mut log, &mut stable);
+  let to3 = drain_to(&mut ep, 3u64);
+  assert_eq!(to3.len(), 1, "the first leader tick front-loads shot 2");
+  assert!(
+    matches!(to3[0], Message::AppendEntries(_)),
+    "the re-delivery is the farewell append, not a heartbeat"
+  );
+  assert_eq!(
+    ep.pending_farewells.get(&3u64).unwrap().shots_left,
+    FAREWELL_RETRY_SHOTS - 1,
+    "the front-loaded shot decrements the budget"
+  );
+
+  // A tick BEFORE the next scheduled shot re-sends nothing (spacing holds).
+  ep.handle_timeout(t1 + Duration::from_millis(150), &mut log, &mut stable);
+  assert!(
+    drain_to(&mut ep, 3u64).is_empty(),
+    "no re-send before one election timeout elapses"
+  );
+
+  // Tick 2: at t1 + election_timeout, the last shot fires and the budget is exhausted → dropped.
+  ep.handle_timeout(t1 + et, &mut log, &mut stable);
+  assert_eq!(
+    drain_to(&mut ep, 3u64).len(),
+    1,
+    "the final shot re-delivers once"
+  );
+  assert!(
+    ep.pending_farewells.is_empty(),
+    "the budget is spent — the entry is dropped"
+  );
+
+  // A later tick re-sends nothing once the budget is gone.
+  ep.handle_timeout(t1 + et + et, &mut log, &mut stable);
+  assert!(
+    drain_to(&mut ep, 3u64).is_empty(),
+    "no re-send after budget exhaustion"
+  );
+}
+
+/// Leadership loss PARKS the budget (it is NOT cleared): a higher-term step-down leaves the entries
+/// in the map so a re-election can re-drive them, but the leader-gated `has_pending_farewells` reads
+/// false on the resulting follower (a parked follower must not hold the group quiesce-ineligible).
+#[test]
+fn farewell_retry_parks_across_leadership_loss() {
+  use crate::{Heartbeat, Message, Term};
+
+  let (mut ep, mut log, mut stable, d, _idx) = leader_after_removing_node3();
+  assert!(ep.has_pending_farewells(), "the leader owes re-deliveries");
+
+  // A higher-term Heartbeat steps the leader down (adopt term, become follower).
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::Heartbeat(Heartbeat::new(
+      Term::new(2),
+      2u64,
+      Index::ZERO,
+      bytes::Bytes::new(),
+    )),
+  );
+  assert!(
+    !ep.role().is_leader(),
+    "the higher term steps the leader down"
+  );
+  assert!(
+    ep.pending_farewells.contains_key(&3u64),
+    "the budget PARKS across the step-down"
+  );
+  assert!(
+    !ep.has_pending_farewells(),
+    "a parked follower must not hold the group quiesce-ineligible"
+  );
+}
+
+/// The CheckQuorum step-down (`step_down_to_follower`) PARKS the budget too — it is not cleared, so a
+/// later re-election can re-arm and re-drive the surviving shots.
+#[test]
+fn farewell_retry_survives_check_quorum_step_down() {
+  let (mut ep, _log, _stable, d, _idx) = leader_after_removing_node3();
+  assert!(ep.has_pending_farewells());
+  let shots_before = ep.pending_farewells.get(&3u64).unwrap().shots_left;
+  ep.step_down_to_follower(crate::Now::monotonic(d));
+  assert!(!ep.role().is_leader());
+  let parked = ep
+    .pending_farewells
+    .get(&3u64)
+    .expect("step_down_to_follower parks the budget");
+  assert_eq!(
+    parked.shots_left, shots_before,
+    "the demotion parks the budget WITHOUT spending a shot"
+  );
+  assert!(
+    !ep.has_pending_farewells(),
+    "a parked follower reads false through the leader-gated accessor"
+  );
+}
+
+/// `become_leader` RE-ARMS a parked entry: a surviving shot's wall is reset to `None` so it front-loads
+/// at the first post-re-election tick, and the leader-gated accessor flips false→true as leadership
+/// returns. The wall is armed to `Some` first so the reset is observable, not a no-op.
+#[test]
+fn farewell_retry_re_arm_resets_the_wall_and_regains_the_leader_gate() {
+  use crate::{Message, VoteResponse};
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, _idx) = leader_after_removing_node3();
+
+  // One leader tick front-loads a shot and ARMS a wall for the next one (next_at = Some).
+  let t1 = d + Duration::from_millis(150);
+  ep.handle_timeout(t1, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.pending_farewells.get(&3u64).unwrap().next_at.is_some(),
+    "the tick armed a wall for the next shot"
+  );
+
+  // Step down: the entry PARKS with its wall intact; the leader gate reads false.
+  ep.step_down_to_follower(crate::Now::monotonic(t1));
+  assert!(
+    ep.pending_farewells.get(&3u64).unwrap().next_at.is_some(),
+    "the parked wall is untouched"
+  );
+  assert!(
+    !ep.has_pending_farewells(),
+    "the leader gate reads false on a parked follower"
+  );
+
+  // Re-elect: become_leader RE-ARMS the wall to None and the leader gate reads true again.
+  let rd = ep
+    .poll_timeout()
+    .expect("the follower re-arms its election timer");
+  ep.handle_timeout(rd, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(ct, 2u64, false, false)),
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  assert!(ep.role().is_leader(), "the endpoint re-wins leadership");
+  assert_eq!(
+    ep.pending_farewells.get(&3u64).unwrap().next_at,
+    None,
+    "become_leader re-armed the wall to None so the shot front-loads at the first tick"
+  );
+  assert!(
+    ep.has_pending_farewells(),
+    "the leader gate reads true again on re-election"
+  );
+}
+
+/// Staleness guard: a peer re-admitted by a later conf change is dropped from the retry map.
+#[test]
+fn farewell_retry_cleared_when_peer_readded() {
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Message, Term};
+
+  let (mut ep, mut log, mut stable, d, _idx) = leader_after_removing_node3();
+  assert!(ep.pending_farewells.contains_key(&3u64));
+
+  // Re-add node 3 via a committed AddNode(3): the fold sees it re-enter the tracker.
+  let cc = ConfChange::new(ConfChangeType::AddNode, 3u64, bytes::Bytes::new());
+  let idx2 = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect("AddNode(3) must be accepted");
+  ep.flush_appends(d, &log, &stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx2,
+    )),
+  );
+  assert!(ep.tracker.progress(&3u64).is_some(), "node 3 is re-added");
+  assert!(
+    !ep.pending_farewells.contains_key(&3u64),
+    "a re-added peer's stale farewell retry is dropped"
+  );
+}
+
+/// The compacted wall burns a shot without panic: a retry whose suffix has been compacted below the
+/// peer's proven match returns false inside `send_farewell_append` and simply consumes a shot.
+#[test]
+fn farewell_retry_compacted_wall_burns_shot_without_panic() {
+  use crate::{Entry, EntryKind, Term};
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, idx) = leader_after_removing_node3();
+  let shots_before = ep.pending_farewells.get(&3u64).unwrap().shots_left;
+
+  // Extend the log with an (uncommitted) tail so compacting past the removal leaves it non-empty,
+  // then compact away everything at/below the removal — a retry's append now hits the compacted wall
+  // (`next < first_index`). Compact BEFORE the first tick, so the FRONT-LOADED shot hits the wall.
+  log.force_append(&[Entry::new(
+    Term::new(1),
+    idx.next(),
+    EntryKind::Empty,
+    bytes::Bytes::new(),
+  )]);
+  log.compact(idx);
+
+  // Tick 1 front-loads the shot, which hits the wall — `send_farewell_append` returns false and the
+  // append arm falls back to a clamped Heartbeat (`min(commit, matched) = matched < idx`, so it does
+  // NOT carry the removal past the compacted wall). No panic; the shot still burns.
+  ep.handle_timeout(d + Duration::from_millis(150), &mut log, &mut stable);
+  let to3 = drain_to(&mut ep, 3u64);
+  assert!(
+    to3
+      .iter()
+      .all(|m| matches!(m, Message::Heartbeat(hb) if hb.commit() < idx)),
+    "a compacted-wall retry falls back to a clamped Heartbeat below the removal, never an append"
+  );
+  assert_eq!(
+    ep.pending_farewells.get(&3u64).unwrap().shots_left,
+    shots_before - 1,
+    "the shot is still burned at the compacted wall"
+  );
+}
+
+/// The lost-farewell class, CURED by the retry end-to-end across two endpoints: the leader's shot-1
+/// farewell append is DROPPED (never handed to n3); the leader re-drives shot 2 on its next
+/// election-timeout beat; n3 — pre-vote ON, still ignorant — even fires its own election timer
+/// without inflating its term (a non-disruptive probe), then receives the retry and applies its OWN
+/// removal (the `ConfChanged → RemovedSelf` mirror). The removal is always n3's own applied
+/// committed state, never a bare assertion.
+#[test]
+fn farewell_retry_cures_dropped_farewell_without_disruptive_campaign() {
+  use crate::{AppendEntries, Config, Entry, EntryKind, Event, Message, Term};
+  use core::time::Duration;
+
+  // Leader side: remove n3; the shot-1 farewell append is DROPPED (we never deliver it to n3).
+  let (mut ep, mut log, mut stable, d, idx) = leader_after_removing_node3();
+
+  // Re-drive: the FIRST leader tick front-loads shot 2 immediately (before n3's election deadline).
+  ep.handle_timeout(d + Duration::from_millis(150), &mut log, &mut stable);
+  let mut to3 = drain_to(&mut ep, 3u64);
+  assert_eq!(
+    to3.len(),
+    1,
+    "the retry re-delivers exactly one farewell append"
+  );
+  let retry = to3.pop().unwrap();
+  assert!(
+    matches!(retry, Message::AppendEntries(_)),
+    "the retry re-issues the lost farewell append"
+  );
+
+  // n3 side, pre-vote ON, holding [no-op@1, conf@idx] but ignorant of its removal's commit.
+  let cfg3 = Config::try_new(
+    3u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_pre_vote(true);
+  let mut c = Endpoint::new(cfg3, Instant::ORIGIN, 9, CountSm::default());
+  let mut log3 = VecLog::default();
+  let mut stable3 = NoopStable::default();
+  c.handle_message(
+    Instant::ORIGIN,
+    &mut log3,
+    &mut stable3,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(1),
+          Index::new(1),
+          EntryKind::Empty,
+          bytes::Bytes::new()
+        ),
+        Entry::new(Term::new(1), idx, EntryKind::ConfChange, remove3_payload()),
+      ],
+      Index::new(1), // commit through the no-op only — n3 stays ignorant of its own removal
+    )),
+  );
+  c.handle_storage(Instant::ORIGIN, &mut log3, &mut stable3);
+  while c.poll_message().is_some() {}
+  while c.poll_event().is_some() {}
+  assert!(
+    c.tracker.is_voter(&3u64),
+    "n3 is still an (ignorant) voter before the retry lands"
+  );
+
+  // n3's election timer fires: pre-vote ON ⇒ a non-inflating probe, never a real campaign.
+  let td = c.poll_timeout().unwrap();
+  c.handle_timeout(td, &mut log3, &mut stable3);
+  assert_eq!(
+    c.term(),
+    Term::new(1),
+    "pre-vote must not inflate n3's term"
+  );
+  assert!(!c.role().is_leader(), "n3 never wins a disruptive election");
+  while c.poll_message().is_some() {}
+  while c.poll_event().is_some() {}
+
+  // The retry lands: n3 applies its OWN removal — the ConfChanged → RemovedSelf mirror.
+  c.handle_message(td, &mut log3, &mut stable3, 1u64, retry);
+  c.handle_storage(td, &mut log3, &mut stable3);
+  let removed = core::iter::from_fn(|| c.poll_event())
+    .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64)));
+  assert!(
+    removed,
+    "the retry makes n3 apply its own removal (ConfChanged excludes n3)"
+  );
+  assert_eq!(
+    c.term(),
+    Term::new(1),
+    "n3 self-removed without ever inflating its term"
+  );
+}
+
+/// The `has_pending_farewells` quiesce-eligibility read: true while a removal's farewell budget is
+/// unspent, false once it drains. A multi-group host consults this so a group cannot quiesce while it
+/// still owes blind re-deliveries (the removed peer's ack is unobservable).
+#[test]
+fn has_pending_farewells_tracks_the_retry_budget() {
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, _idx) = leader_after_removing_node3();
+  assert!(
+    ep.has_pending_farewells(),
+    "the leader owes farewell re-deliveries right after the removal"
+  );
+
+  let et = Duration::from_millis(1000);
+  // Tick 1 FRONT-LOADS shot 2 (the budget decrements to one remaining) — still owed.
+  let t1 = d + Duration::from_millis(150);
+  ep.handle_timeout(t1, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.has_pending_farewells(),
+    "still owed while a shot remains in the budget"
+  );
+
+  // Tick 2 fires the last shot → the budget drains.
+  ep.handle_timeout(t1 + et, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert!(
+    !ep.has_pending_farewells(),
+    "cleared once the blind budget drains"
+  );
+}
+
+/// Drive a RemoveNode(3) where node 3 is CAUGHT UP (it acked the conf entry, so `match = idx >=
+/// removal`): the fold fires the commit-carrying Heartbeat arm and — with the both-arms fix — ALSO
+/// populates the retry budget. Returns the leader with its stores, the tick instant, and the removal
+/// index; node 3's shot-1 heartbeat is already drained.
+fn leader_after_removing_caught_up_node3()
+-> (Endpoint<u64, CountSm>, VecLog, NoopStable, Instant, Index) {
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Message, Term};
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new());
+  let idx = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect("RemoveNode(3) must be accepted");
+  ep.flush_appends(d, &log, &stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Node 3 ACKS the conf entry (match = idx): its ack completes the quorum {1,3}, the removal commits
+  // + applies, and node 3 is pruned CAUGHT-UP (match >= idx → the commit-carrying heartbeat arm).
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  assert!(ep.tracker.progress(&3u64).is_none(), "node 3 pruned");
+  while ep.poll_message().is_some() {} // drain the shot-1 heartbeat
+  while ep.poll_event().is_some() {}
+  (ep, log, stable, d, idx)
+}
+
+/// Populate-on-fire, the CAUGHT-UP arm: a caught-up removal fires a commit-carrying Heartbeat and
+/// still schedules a retry — the both-arms fix, so a lost caught-up farewell is no longer stranded.
+#[test]
+fn farewell_retry_populated_on_caught_up_fire() {
+  let (ep, _log, _stable, _d, idx) = leader_after_removing_caught_up_node3();
+  let retry = ep
+    .pending_farewells
+    .get(&3u64)
+    .expect("the caught-up (heartbeat-arm) farewell must ALSO schedule a retry");
+  assert!(
+    retry.matched >= idx,
+    "a caught-up peer freezes matched >= idx, so every re-drive re-derives the heartbeat arm"
+  );
+  assert_eq!(retry.idx, idx);
+  assert_eq!(retry.shots_left, FAREWELL_RETRY_SHOTS);
+  assert!(retry.next_at.is_none());
+}
+
+/// The caught-up arm's re-drive emits a Heartbeat (not an append) — the arm is derived from the
+/// frozen `matched` on every shot.
+#[test]
+fn farewell_retry_caught_up_arm_redrives_a_heartbeat() {
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, _idx) = leader_after_removing_caught_up_node3();
+  let et = Duration::from_millis(1000);
+  let t1 = d + Duration::from_millis(150);
+  ep.handle_timeout(t1, &mut log, &mut stable); // schedule
+  while ep.poll_message().is_some() {}
+  ep.handle_timeout(t1 + et, &mut log, &mut stable); // shot 2
+  let to3 = drain_to(&mut ep, 3u64);
+  assert_eq!(
+    to3.len(),
+    1,
+    "the caught-up retry re-delivers exactly one farewell"
+  );
+  assert!(
+    matches!(to3[0], Message::Heartbeat(_)),
+    "the caught-up arm re-drives a Heartbeat, not an append"
+  );
+}
+
+/// The lost caught-up-farewell class, CURED by the retry: remove a CAUGHT-UP voter, DROP the shot-1
+/// commit-carrying heartbeat, re-drive shot 2, deliver it to n3 — n3 advances its commit, applies its
+/// OWN removal (the ConfChanged → RemovedSelf mirror), term unchanged. This is the leg the earlier
+/// design stranded (the caught-up arm never populated the budget).
+#[test]
+fn farewell_retry_cures_dropped_caught_up_heartbeat() {
+  use crate::{AppendEntries, Config, Entry, EntryKind, Event, Message, Term};
+  use core::time::Duration;
+
+  // Leader side: remove a caught-up n3; the shot-1 heartbeat is DROPPED (never handed to n3).
+  let (mut ep, mut log, mut stable, d, idx) = leader_after_removing_caught_up_node3();
+
+  // Re-drive: the FIRST leader tick front-loads shot 2 immediately.
+  ep.handle_timeout(d + Duration::from_millis(150), &mut log, &mut stable);
+  let mut to3 = drain_to(&mut ep, 3u64);
+  assert_eq!(
+    to3.len(),
+    1,
+    "the retry re-delivers exactly one farewell heartbeat"
+  );
+  let retry = to3.pop().unwrap();
+  assert!(
+    matches!(retry, Message::Heartbeat(_)),
+    "the caught-up retry is the commit-carrying Heartbeat"
+  );
+
+  // n3 side: it HOLDS [no-op@1, conf@idx] (it acked the entry) but is ignorant of the commit.
+  let cfg3 = Config::try_new(
+    3u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut c = Endpoint::new(cfg3, Instant::ORIGIN, 9, CountSm::default());
+  let mut log3 = VecLog::default();
+  let mut stable3 = NoopStable::default();
+  c.handle_message(
+    Instant::ORIGIN,
+    &mut log3,
+    &mut stable3,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(1),
+          Index::new(1),
+          EntryKind::Empty,
+          bytes::Bytes::new()
+        ),
+        Entry::new(Term::new(1), idx, EntryKind::ConfChange, remove3_payload()),
+      ],
+      Index::new(1), // n3 holds the conf entry but is ignorant of its commit
+    )),
+  );
+  c.handle_storage(Instant::ORIGIN, &mut log3, &mut stable3);
+  while c.poll_message().is_some() {}
+  while c.poll_event().is_some() {}
+  assert!(
+    c.commit_index() < idx,
+    "n3 has not yet learned the removal committed"
+  );
+  let td = c.poll_timeout().unwrap();
+
+  // The retried heartbeat (replacing the dropped shot 1) advances n3's commit and applies the removal.
+  c.handle_message(td, &mut log3, &mut stable3, 1u64, retry);
+  c.handle_storage(td, &mut log3, &mut stable3);
+  assert!(
+    c.commit_index() >= idx,
+    "the retried heartbeat advances n3's commit past the removal"
+  );
+  let removed = core::iter::from_fn(|| c.poll_event())
+    .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64)));
+  assert!(
+    removed,
+    "the retried heartbeat makes n3 apply its own removal (ConfChanged excludes n3)"
+  );
+  assert_eq!(
+    c.term(),
+    Term::new(1),
+    "n3 self-removed without inflating its term"
+  );
+}
+
+/// The adversarial ordering the front-load + parking cure (the config the retry protects: DEFAULT
+/// flags, pre_vote and check_quorum OFF): a removed voter whose shot-1 farewell was DROPPED campaigns
+/// at a higher term BEFORE any retry and deposes the live leader. The step-down PARKS the budget (it
+/// is not cleared); the old leader re-wins among the live members, `become_leader` re-arms the entry,
+/// and the FIRST post-re-election tick front-loads the farewell — the removed peer applies its removal
+/// and self-removes, so it can never campaign a second time.
+#[test]
+fn farewell_retry_survives_deposition_and_cures_on_re_election() {
+  use crate::{Entry, EntryKind, Event, Message, Term, VoteResponse};
+  use core::time::Duration;
+
+  // Node 1 leads and removes lagging node 3 (default flags); shot 1 is DROPPED (drained by the helper).
+  let (mut ep, mut log, mut stable, d, idx) = leader_after_removing_node3();
+  assert!(ep.has_pending_farewells());
+
+  // Node 3, ignorant of its removal (DEFAULT flags → no pre-vote), campaigns at a higher term.
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log(
+    std::vec![Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new()
+    )],
+    Index::new(1),
+  );
+  let n3d = n3.poll_timeout().unwrap();
+  n3.handle_timeout(n3d, &mut n3log, &mut n3stable);
+  let rv = core::iter::from_fn(|| n3.poll_message())
+    .find(|o| matches!(o.message(), Message::RequestVote(r) if !r.pre_vote()))
+    .expect("node 3 (pre-vote OFF) campaigns with a real vote")
+    .into_parts()
+    .1;
+  assert_eq!(
+    n3.term(),
+    Term::new(2),
+    "node 3 inflated the term (default flags, no pre-vote)"
+  );
+
+  // Deliver node 3's RequestVote to the leader: default flags mean NO in_lease block, so the leader
+  // adopts the higher term and STEPS DOWN — but the budget PARKS.
+  ep.handle_message(d, &mut log, &mut stable, 3u64, rv);
+  assert!(
+    !ep.role().is_leader(),
+    "the removed voter deposed the live leader"
+  );
+  assert!(
+    ep.pending_farewells.contains_key(&3u64),
+    "the budget PARKED across the deposition"
+  );
+  assert!(
+    !ep.has_pending_farewells(),
+    "parked on a follower — the leader-gated accessor reads false"
+  );
+
+  // The live group re-elects node 1 (among {1, 2}); become_leader re-arms the parked entry.
+  let rd = ep
+    .poll_timeout()
+    .expect("the deposed leader re-arms its election timer");
+  ep.handle_timeout(rd, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(ct, 2u64, false, false)),
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  assert!(
+    ep.role().is_leader(),
+    "the old leader re-wins among the live members"
+  );
+  assert_eq!(
+    ep.pending_farewells.get(&3u64).unwrap().next_at,
+    None,
+    "become_leader re-armed the parked entry to fire at the first tick"
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // The FIRST leader tick front-loads the farewell to node 3.
+  let ft = rd + Duration::from_millis(150);
+  ep.handle_timeout(ft, &mut log, &mut stable);
+  let farewell = drain_to(&mut ep, 3u64)
+    .into_iter()
+    .next()
+    .expect("the first post-re-election tick front-loads the farewell");
+
+  // Node 3 receives it, applies its OWN removal, and self-removes — never a second campaign.
+  n3.handle_message(n3d, &mut n3log, &mut n3stable, 1u64, farewell);
+  n3.handle_storage(n3d, &mut n3log, &mut n3stable);
+  let removed = core::iter::from_fn(|| n3.poll_event())
+    .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64)));
+  assert!(
+    removed,
+    "the front-loaded farewell makes node 3 apply its own removal (RemovedSelf)"
+  );
+  assert!(
+    !n3.tracker.is_voter(&3u64),
+    "node 3 is now a non-voter — it can never campaign a second time"
+  );
+  let _ = idx;
+}
+
+/// The round-1 (quiescence gate) × round-3 (parking) seam: a CheckQuorum step-down in the SAME
+/// `handle_timeout` tick that a farewell shot is DUE must not spend the shot as a follower. The role
+/// guard in `drive_pending_farewells` makes a demoted tick send, decrement, and remove nothing, so the
+/// parked budget outlives the demotion and re-election re-arms and delivers it. Without the guard the
+/// last shot dies post-demotion and the removed peer is never cured.
+#[test]
+fn farewell_retry_survives_a_checkquorum_demotion_in_the_same_tick() {
+  use crate::{
+    AppendResponse, ConfChange, ConfChangeType, Entry, EntryKind, Event, Message, Term,
+    VoteResponse,
+  };
+  use core::time::Duration;
+
+  // A CHECK-QUORUM leader (node 1) removes lagging node 3.
+  let cfg = cq_config(1, std::vec![1u64, 2, 3]);
+  let mut ep: Endpoint<u64, CountSm> = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new());
+  let idx = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect("RemoveNode(3) accepted");
+  ep.flush_appends(d, &log, &stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  assert!(ep.tracker.progress(&3u64).is_none(), "node 3 pruned");
+  while ep.poll_message().is_some() {} // drain shot 1
+  while ep.poll_event().is_some() {}
+  assert!(ep.role().is_leader() && ep.has_pending_farewells());
+
+  // Tick 1, quorum still active from node 2's acks: front-loads shot 2 (one shot remains) and, in the
+  // same beat, re-arms the CheckQuorum deadline — so the surviving shot's wall and the CQ deadline now
+  // coincide exactly one election timeout out.
+  let t1 = ep
+    .election_deadline
+    .expect("a check-quorum leader arms an election deadline");
+  ep.handle_timeout(t1, &mut log, &mut stable);
+  while ep.poll_message().is_some() {} // drain shot 2
+  assert!(
+    ep.role().is_leader(),
+    "quorum active at tick 1 keeps the leader"
+  );
+  assert_eq!(
+    ep.pending_farewells.get(&3u64).unwrap().shots_left,
+    1,
+    "exactly one shot remains"
+  );
+  let due_at = ep
+    .pending_farewells
+    .get(&3u64)
+    .unwrap()
+    .next_at
+    .expect("the surviving shot is armed");
+  assert_eq!(
+    ep.election_deadline,
+    Some(due_at),
+    "the last shot's wall coincides with the CheckQuorum deadline"
+  );
+
+  // Tick 2 at that instant: quorum is now INACTIVE (node 2's activity was reset at tick 1 and no new
+  // ack arrived), so the SAME tick takes the CheckQuorum demotion AND the last shot is due. The role
+  // guard must keep the demoted tick from spending it.
+  ep.handle_timeout(due_at, &mut log, &mut stable);
+  assert!(
+    ep.role().is_follower(),
+    "quorum inactive → CheckQuorum demotes this very tick"
+  );
+  assert!(
+    drain_to(&mut ep, 3u64).is_empty(),
+    "the demoted tick sent NO farewell (role guard)"
+  );
+  let parked = ep
+    .pending_farewells
+    .get(&3u64)
+    .expect("the demoted tick did NOT remove the entry");
+  assert_eq!(
+    parked.shots_left, 1,
+    "the demoted tick did NOT decrement the shot"
+  );
+  assert!(
+    !ep.has_pending_farewells(),
+    "the leader-gated accessor reads false on the demoted follower"
+  );
+
+  // Re-election re-arms the parked shot; the first leader tick delivers it.
+  let rd = ep.poll_timeout().unwrap();
+  ep.handle_timeout(rd, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(ct, 2u64, false, false)),
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  assert!(ep.role().is_leader(), "the endpoint re-wins leadership");
+  assert_eq!(
+    ep.pending_farewells.get(&3u64).unwrap().next_at,
+    None,
+    "become_leader re-armed the surviving shot"
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  let ft = rd + Duration::from_millis(150);
+  ep.handle_timeout(ft, &mut log, &mut stable);
+  let farewell = drain_to(&mut ep, 3u64)
+    .into_iter()
+    .next()
+    .expect("the first post-re-election tick delivers the surviving shot");
+
+  // Node 3 receives it and applies its own removal.
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log(
+    std::vec![Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new()
+    )],
+    Index::new(1),
+  );
+  let n3d = n3.poll_timeout().unwrap();
+  n3.handle_message(n3d, &mut n3log, &mut n3stable, 1u64, farewell);
+  n3.handle_storage(n3d, &mut n3log, &mut n3stable);
+  let removed = core::iter::from_fn(|| n3.poll_event())
+    .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64)));
+  assert!(
+    removed,
+    "the surviving shot, delivered after re-election, cures the removed peer"
+  );
+  let _ = idx;
+}
+
+/// A 3-voter leader (node 1) on an ASYNC stable that removed lagging node 3 (parking a farewell budget)
+/// and then stepped down — the parked-follower shape a snapshot install lands on. The async stable is
+/// what lets `install_snapshot_now` complete (its blob becomes durable) in these tests.
+fn async_parked_removal_of_node3() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable, Instant) {
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Message, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new());
+  let idx = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect("RemoveNode(3) accepted");
+  ep.flush_appends(d, &log, &stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  assert!(
+    ep.pending_farewells.contains_key(&3u64),
+    "the removal parked a farewell budget"
+  );
+  ep.step_down_to_follower(crate::Now::monotonic(d));
+  (ep, log, stable, d)
+}
+
+/// Edge 2 (the round-5 staleness-bypass close): a farewell entry whose peer is RE-ADMITTED by a
+/// snapshot install while the map is parked on a follower is pruned IN PLACE at the install —
+/// `install_snapshot_now` mirrors the log-applied re-add prune against the rebuilt tracker, independent
+/// of any re-election.
+#[test]
+fn farewell_retry_pruned_in_place_when_a_snapshot_readmits_the_peer() {
+  use crate::{ConfState, InstallSnapshot, Message, SnapshotMeta, Term};
+
+  let (mut ep, mut log, mut stable, d) = async_parked_removal_of_node3();
+  assert!(
+    ep.pending_farewells.contains_key(&3u64),
+    "the budget parks across the demotion"
+  );
+  assert!(
+    ep.tracker.progress(&3u64).is_none(),
+    "node 3 is removed before the install"
+  );
+
+  // A newer snapshot whose ConfState RE-ADMITS node 3 installs on the parked follower.
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      2u64,
+      meta,
+      encode_snapshot(9u64),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable); // SnapshotWritten -> install_snapshot_now
+  while ep.poll_message().is_some() {}
+
+  assert!(
+    ep.tracker.progress(&3u64).is_some(),
+    "the snapshot re-admitted node 3 as a voter"
+  );
+  assert!(
+    !ep.pending_farewells.contains_key(&3u64),
+    "install_snapshot_now pruned the obsolete removal IN PLACE"
+  );
+}
+
+/// The staleness bypass end to end: a removal parked across a demotion, a snapshot that RE-ADMITS its
+/// target, then re-election. The install drops the entry (edge 2) and `become_leader`'s reconcile would
+/// drop it anyway (edge 1), so no obsolete removal is ever re-armed against the current voter it names —
+/// closing the hazard where a rejoiner on the old prefix could commit it and self-remove.
+#[test]
+fn farewell_retry_dropped_across_a_snapshot_readmit_and_re_election() {
+  use crate::{ConfState, InstallSnapshot, Message, SnapshotMeta, Term, VoteResponse};
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d) = async_parked_removal_of_node3();
+  assert!(ep.pending_farewells.contains_key(&3u64));
+
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      2u64,
+      meta,
+      encode_snapshot(9u64),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert!(ep.tracker.progress(&3u64).is_some(), "node 3 re-admitted");
+  assert!(
+    !ep.pending_farewells.contains_key(&3u64),
+    "the entry was DROPPED at the install (edge 2)"
+  );
+
+  // Re-elect node 1 among the re-admitted {1, 2, 3}.
+  let rd = ep.poll_timeout().unwrap();
+  ep.handle_timeout(rd, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(ct, 2u64, false, false)),
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  assert!(ep.role().is_leader(), "re-elected");
+  assert!(
+    ep.pending_farewells.is_empty(),
+    "nothing for become_leader to re-arm — no obsolete removal survives"
+  );
+  assert!(
+    ep.tracker.progress(&3u64).is_some(),
+    "node 3 remains a tracked voter"
+  );
+
+  // The first leader tick emits NO farewell: the map is empty, so `drive_pending_farewells` sends none.
+  while ep.poll_message().is_some() {}
+  let ft = rd + Duration::from_millis(150);
+  ep.handle_timeout(ft, &mut log, &mut stable);
+  assert!(
+    ep.pending_farewells.is_empty(),
+    "still no farewell entry after the first leader tick"
+  );
+}
+
+/// The companion: the cure must not OVER-prune. A snapshot whose ConfState still EXCLUDES the removed
+/// peer leaves the entry intact — it survives the install (edge 2 keeps a still-untracked target),
+/// re-arms at re-election, and delivers its surviving shot.
+#[test]
+fn farewell_retry_survives_a_snapshot_that_keeps_the_peer_removed() {
+  use crate::{ConfState, InstallSnapshot, Message, SnapshotMeta, Term, VoteResponse};
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d) = async_parked_removal_of_node3();
+  let shots = ep.pending_farewells.get(&3u64).unwrap().shots_left;
+
+  // A snapshot that KEEPS node 3 removed (voters {1, 2}).
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      2u64,
+      meta,
+      encode_snapshot(9u64),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.tracker.progress(&3u64).is_none(),
+    "node 3 stays removed under this snapshot"
+  );
+  let parked = ep
+    .pending_farewells
+    .get(&3u64)
+    .expect("the entry SURVIVES a still-removed snapshot (the cure does not over-prune)");
+  assert_eq!(
+    parked.shots_left, shots,
+    "the surviving entry keeps its budget intact"
+  );
+
+  // Re-elect: become_leader re-arms the still-valid entry.
+  let rd = ep.poll_timeout().unwrap();
+  ep.handle_timeout(rd, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(ct, 2u64, false, false)),
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  assert_eq!(
+    ep.pending_farewells.get(&3u64).unwrap().next_at,
+    None,
+    "become_leader re-armed the still-valid entry"
+  );
+
+  // The first tick delivers the surviving shot to node 3 (a non-member -> the farewell is the only
+  // message it receives).
+  while ep.poll_message().is_some() {}
+  let ft = rd + Duration::from_millis(150);
+  ep.handle_timeout(ft, &mut log, &mut stable);
+  assert!(
+    !drain_to(&mut ep, 3u64).is_empty(),
+    "the surviving shot is delivered to the still-removed peer"
+  );
+}
+
+/// Edge 1 (the general staleness backstop): `become_leader`'s re-arm RECONCILES against the live tracker
+/// — an entry whose peer is currently TRACKED (re-admitted by ANY path while parked) is DROPPED, never
+/// re-armed. Constructed directly with a contrived entry for a live voter, because the log-apply and
+/// snapshot prunes preempt this at every natural mutation site; this red-proofs the backstop itself.
+#[test]
+fn become_leader_re_arm_drops_an_entry_whose_peer_is_tracked() {
+  use crate::{Message, VoteResponse};
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  assert!(
+    ep.tracker.progress(&2u64).is_some(),
+    "node 2 is a current voter (tracked)"
+  );
+  // Contrive a STALE parked entry for node 2 — a live voter the tracker still holds. No natural path
+  // produces this (the prunes preempt it); edge 1 must drop it at re-arm regardless.
+  ep.pending_farewells.insert(
+    2u64,
+    super::super::FarewellRetry {
+      matched: Index::new(1),
+      idx: Index::new(2),
+      shots_left: 1,
+      next_at: None,
+    },
+  );
+  ep.step_down_to_follower(crate::Now::monotonic(d));
+  assert!(
+    ep.pending_farewells.contains_key(&2u64),
+    "the entry parked across the demotion"
+  );
+
+  // Re-elect: become_leader's reconcile DROPS the entry because node 2 is tracked.
+  let rd = ep.poll_timeout().unwrap();
+  ep.handle_timeout(rd, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::VoteResponse(VoteResponse::new(ct, 3u64, false, false)),
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  assert!(ep.role().is_leader(), "re-elected");
+  assert!(
+    !ep.pending_farewells.contains_key(&2u64),
+    "become_leader dropped the entry for the tracked peer — never re-arming an obsolete removal"
+  );
 }
