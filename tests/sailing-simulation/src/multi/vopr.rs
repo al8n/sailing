@@ -694,13 +694,39 @@ struct MState {
 
 /// Run one deterministic multi-group VOPR episode. Panics (with seed + tick, each a real bug) on
 /// a safety-oracle violation, a calm-window livelock, or a quiesce failure.
+///
+/// The tracked-wedge exemption is scoped to PHASED (storm) profiles: only there may the run-end
+/// quiesce and the calm windows certify a group left in the filed under-hosted parked-absorb (#106)
+/// or fork-fence (#110) class instead of panicking. Every unphased profile has no phases, so this
+/// derives `false` and both liveness gates take the exact pre-seam path — the behavior-identity
+/// contract. [`run_multi_vopr_certifying_tracked_wedges`] opts a chosen unphased profile into the
+/// same exemption.
 pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVoprReport {
+  run_multi_vopr_inner(seed, ticks, profile, !profile.phases.is_empty())
+}
+
+/// Like [`run_multi_vopr`], but forces the tracked #106/#110 wedge exemption ON for an UNPHASED
+/// profile. The filed classes are reachable from any merge-heavy schedule — the removed-replica
+/// farewell retry's front-loaded delivery dismantles merge sources into husks SOONER, raising the
+/// filed class's incidence — so a non-storm merge profile certifies past them exactly as the storm
+/// profiles do. The predicate stays deliberately narrow (a genuine hosting shortfall only), so a
+/// non-merge livelock — or any wedge outside the tracked sets — still trips, and safety is never
+/// gated. The merge-liveness cure that removes the wedge tracks separately under #106/#110.
+pub fn run_multi_vopr_certifying_tracked_wedges(
+  seed: u64,
+  ticks: usize,
+  profile: MultiProfile,
+) -> MultiVoprReport {
+  run_multi_vopr_inner(seed, ticks, profile, true)
+}
+
+fn run_multi_vopr_inner(
+  seed: u64,
+  ticks: usize,
+  profile: MultiProfile,
+  exempt_tracked: bool,
+) -> MultiVoprReport {
   let mut prng = FaultPrng::new(seed ^ 0x4D56_4F50_525F_5631); // "MVOPR_V1"
-  // The tracked-wedge exemption is scoped to PHASED (storm) profiles: only there may the run-end
-  // quiesce and the calm windows certify a group left in the tracked under-hosted parked-absorb
-  // class (#106) instead of panicking. Every unphased profile has no phases, so this is `false` and
-  // both liveness gates take the exact pre-seam path — the behavior-identity contract.
-  let exempt_tracked = !profile.phases.is_empty();
   let nodes = 5 + (prng.next_u64() % 3); // 5..=7 hosts
   let mut w = MultiWorld::new(seed);
   w.set_snapshot_threshold(profile.snapshot_threshold);

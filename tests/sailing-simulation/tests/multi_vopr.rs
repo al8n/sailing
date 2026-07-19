@@ -10,7 +10,9 @@
 //! the report counters for the target shape (the drift-sweep pattern):
 //! `for seed in 0..16 { dbg!(run_multi_vopr(seed, 4_000, MultiProfile::default_multi())); }`
 
-use sailing_simulation::{MultiProfile, MultiVoprReport, run_multi_vopr};
+use sailing_simulation::{
+  MultiProfile, MultiVoprReport, run_multi_vopr, run_multi_vopr_certifying_tracked_wedges,
+};
 
 /// Enforce the single-group sweep's membership-oracle policy over a band's per-seed reports
 /// (`vopr_exercises_joint_snapshot_membership` is the reference shape): the oracle actually
@@ -397,8 +399,15 @@ fn merge_band_smoke() {
   let mut total_torn = 0u64;
   let mut total_crashes_inflight = 0u64;
   let mut total_flushes = 0u64;
+  // Certify past the filed #106 under-hosted parked-absorb and #110 fork-fence classes: they are
+  // reachable from any merge-heavy schedule, and the removed-replica farewell retry's front-loaded
+  // delivery dismantles merge sources into husks sooner, raising their incidence — so this non-storm
+  // profile opts into the same exemption the storm profiles carry. The predicate stays deliberately
+  // narrow, so a non-merge livelock (or any wedge outside the tracked sets) still trips; the band
+  // must exercise the exemption at least once (proven nonzero below).
+  let mut total_tracked_exempted = 0u64;
   for seed in 0..8u64 {
-    let r = run_multi_vopr(seed, 4_000, MultiProfile::merge_reshape());
+    let r = run_multi_vopr_certifying_tracked_wedges(seed, 4_000, MultiProfile::merge_reshape());
     std::eprintln!(
       "merge seed {seed}: prepared={} committed={} rolled_back={} registered={} resolved={} \
        aborted={} splits={} committed_load={} log_flushes={} stable_flushes={} torn={} \
@@ -427,7 +436,9 @@ fn merge_band_smoke() {
     total_flushes += r.log_flushes + r.stable_flushes;
     total_torn += r.torn_writes_fired;
     total_crashes_inflight += r.crashes_with_log_inflight + r.crashes_with_stable_inflight;
+    total_tracked_exempted += r.tracked_merge_wedges_exempted + r.fork_fence_couplings_exempted;
   }
+  std::eprintln!("merge band: total_tracked_exempted={total_tracked_exempted}");
   assert!(
     total_registered > 0,
     "the merge band never resolved an absorb — the merge verbs are inert"
@@ -450,16 +461,36 @@ fn merge_band_smoke() {
     total_crashes_inflight > 0,
     "the merge band never crashed mid-fsync-window — the crash×durability interleaving is vacuous"
   );
+  assert!(
+    total_tracked_exempted > 0,
+    "the merge band never reached the filed #106/#110 wedge — the tracked-wedge certification is \
+     vacuous; if the retry's front-loaded delivery no longer raises the husk incidence, revisit it"
+  );
 }
 
 /// Determinism holds under the merge profile too: the same (seed, ticks, profile) replays to
-/// the identical report, merge counters included.
+/// the identical report, merge counters included. The profile certifies past the filed #106/#110
+/// wedges (the merge-heavy schedule reaches the under-hosted parked-absorb husk, whose incidence the
+/// farewell retry's front-loaded delivery raises); the exemption is liveness-only and narrow (safety
+/// runs unconditionally), and determinism holds because both replays share the flag.
 #[test]
 fn merge_profile_same_seed_same_report() {
+  let r = run_multi_vopr_certifying_tracked_wedges(43, 3_000, MultiProfile::merge_reshape());
+  std::eprintln!(
+    "merge profile seed 43: tracked_merge_wedges_exempted={} fork_fence_couplings_exempted={} \
+     exemption_overlap={}",
+    r.tracked_merge_wedges_exempted,
+    r.fork_fence_couplings_exempted,
+    r.exemption_overlap,
+  );
   assert_eq!(
-    run_multi_vopr(43, 3_000, MultiProfile::merge_reshape()),
-    run_multi_vopr(43, 3_000, MultiProfile::merge_reshape()),
+    r,
+    run_multi_vopr_certifying_tracked_wedges(43, 3_000, MultiProfile::merge_reshape()),
     "run_multi_vopr must be a pure function of (seed, ticks, profile)"
+  );
+  assert!(
+    r.tracked_merge_wedges_exempted + r.fork_fence_couplings_exempted > 0,
+    "seed 43 must reach the filed wedge so the certification is a positive witness, not vacuous"
   );
 }
 
