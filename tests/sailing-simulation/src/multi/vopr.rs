@@ -916,8 +916,9 @@ fn calm_window(
       // every other group, so a genuine non-merge livelock still trips here). Unphased profiles pass
       // `false` and take the bare panic, byte-identically. SAFETY still runs unconditionally via the
       // full group-safety helper: even a leaderless exempted wedge's hosted replicas must pass
-      // agreement, the absorbed cross-watermark per-index own-client-cell agreement, and applied-history
-      // integrity — a liveness exemption never gates safety.
+      // agreement and applied-history integrity (the absorbed content is covered off-band by the
+      // run-end conservation ledger and the sorted absorbed branch) — a liveness exemption never gates
+      // safety.
       if exempt_tracked
         && (w.tracked_underhosted_merge_wedge(gid) || w.fork_fence_coupled_wedge(gid))
       {
@@ -997,10 +998,10 @@ fn calm_window(
       budget -= 1;
     }
     if w.live_groups().contains(&gid) {
-      // The full safety helper (agreement, absorbed cross-watermark per-index own-client-cell
-      // agreement, applied-history integrity) at the progress point, expected built exactly as the
-      // quiesce sweep builds it: a replica dismantled between this checkpoint and quiesce escapes the
-      // run-end sweep, so this is its last judge — agreement alone would let a divergent such replica slip.
+      // The full safety helper (agreement + applied-history integrity) at the progress point, expected
+      // built exactly as the quiesce sweep builds it: a replica dismantled between this checkpoint and
+      // quiesce escapes the run-end sweep, so this is its last judge — agreement alone would let a
+      // divergent such replica slip.
       let expected: BTreeSet<Vec<u8>> = st
         .expected
         .get(&gid)
@@ -1223,8 +1224,8 @@ fn quiesce(
   }
 
   // SAFETY runs UNCONDITIONALLY over every HOSTED gid — a liveness exemption (a tracked #106/#110
-  // wedge) gates only the CONVERGENCE demands below, NEVER safety (agreement + absorbed cross-watermark
-  // + applied-history integrity; see [`assert_group_safety`]). The worklist is the union over hosts,
+  // wedge) gates only the CONVERGENCE demands below, NEVER safety (agreement + applied-history
+  // integrity; see [`assert_group_safety`]). The worklist is the union over hosts,
   // RETIRED HUSKS INCLUDED: `live_groups` omits a merged-away source's frozen replica lingering after
   // other hosts resolved, but the wedge sets contain it and its hosted replicas must still be judged.
   let live_set: BTreeSet<u64> = live.iter().copied().collect();
@@ -1290,17 +1291,17 @@ fn quiesce(
 
 /// The UNCONDITIONAL per-group safety pass the quiesce runs on EVERY hosted replica of a group,
 /// exempt or not — a liveness exemption (a #106 under-hosted or #110 fork-fence wedge) gates the
-/// CONVERGENCE demands, NEVER this. Three legs, none needing a leader (an exempted wedge may be
-/// leaderless), so all read the hosting replicas directly:
+/// CONVERGENCE demands, NEVER this. Two legs, neither needing a leader (an exempted wedge may be
+/// leaderless), so both read the hosting replicas directly:
 ///   1. AGREEMENT — the hosting replicas' applied records agree (State Machine Safety, aligned
 ///      across splits/absorbs): positionally over the shared prefix for a live lineage, as sorted
-///      multisets at equal watermarks for an absorbed one,
-///   2. ABSORBED CROSS-WATERMARK — an absorbed lineage's replicas at UNEQUAL watermarks (where
-///      `agreement_holds`' equal-applied absorbed branch compares nothing) must AGREE at every log
-///      index they share over their OWN CLIENT (gkv) cells (keyed on index, not position — the arrival
-///      path can reorder; cross-watermark non-gkv content is not judged here), and
-///   3. INTEGRITY — no hosted replica applied a client command absent from `expected` (the set the
+///      multisets at equal watermarks for an absorbed one, and
+///   2. INTEGRITY — no hosted replica applied a client command absent from `expected` (the set the
 ///      fuzzer proposed for the group).
+///
+/// An absorbed lineage's UNEQUAL-watermark content is deliberately NOT judged per-index here — the
+/// state machine's indices are not cell identities (see the body) — and is carried off-band by the
+/// run-end conservation ledger.
 ///
 /// Panics with `seed` on a violation. Extracted so the exemption-does-not-gate-safety contract is
 /// unit-testable directly on a constructed exempted wedge.
@@ -1315,52 +1316,16 @@ pub(crate) fn assert_group_safety(
     "MULTI VOPR AGREEMENT FAILURE: group {gid} hosted replicas disagree (exempt or not)\n  \
      seed={seed}",
   );
-  // ABSORBED-lineage coverage, SCOPED honestly. `agreement_holds`' absorbed branch compares only
-  // EQUAL-applied replicas, so an exempted merge wedge (replicas at UNEQUAL watermarks) needs a
-  // cross-watermark leg. What runs here is per-index agreement over the group's OWN CLIENT (gkv) cells
-  // at shared indices — and a RETIRED source's husk replicas align against their TERMINAL pre-merge
-  // population (see `aligned_applied`), so their client cells are judged here rather than blanked by the
-  // emptied live set. Standard choreography converges tracked husks to the freeze coordinate — the
-  // every-peer barrier acks DURABLE state and the settle loop coalesces commit and apply, so husk pairs
-  // sit at EQUAL applied in this world (asserted in the husk regressions). A below-freeze
-  // matched-but-not-applied husk is a REAL-SYSTEM shape this model closes, so this leg's unequal-husk
-  // coverage is red-proofed at the relation level (the synthetic shared-index divergence and reorder
-  // cases), where for an absorbed source it is that shape's only client-content judge. What is
-  // DELIBERATELY NOT
-  // asserted at the per-replica cross-watermark grain is ABSORBED-content completeness: a record-keyed
-  // "every replica past a merge boundary holds the complete absorbed block" form was built and
-  // rejected because it false-trips on legitimate world behavior the accumulating ledger tolerates — a
-  // target that SPLITS after absorbing sends absorbed cells to a child that RETURN via a later merge,
-  // so a lower-watermark (but past-boundary) replica legitimately lacks them until it applies the
-  // return, and a COMPACTED replica drops them from its `applied()` view. Per-replica departed/return/
-  // compaction state is not cleanly accountable at this grain. The absorbed CONTENT is instead covered
-  // by: (1) `agreement_holds`' absorbed branch — replicas at the SAME watermark must hold the same
-  // MULTISET of raw cells, compared order-insensitively (the branch sorts each record first; absorbed
-  // cells included); (2) the run-end `finalize_merge_conservation_or_panic` — per merge and per
-  // absorbed key, every value of the source's run-end history, MINUS those also appearing in the
-  // run-end history of any split child of that source that took the key, must appear in the target's
-  // (unordered value containment — `assert_union` checks membership, never position). That exemption
-  // is a SUPERSET of true departures — the child's accumulated history also holds cells the child
-  // originated or inherited after the split — and is deliberately not narrowed (the dedup-by-value
-  // ledger cannot tell a genuine return to the FSM from record inheritance; narrowing would re-demand
-  // legitimately departed cells — see the ledger's own note). NOT checked, then: an absorbed-suffix
-  // divergence between replicas at DIFFERENT watermarks; cross-watermark NON-GKV content (a fold keeps
-  // non-gkv source cells at their SOURCE index, so index collisions there are representational, not
-  // divergence — covered at equal watermarks by (1) and by the integrity leg); the ORDER of absorbed
-  // content anywhere post-absorb (EVERY leg is order-insensitive — (1) and (2) compare unordered and
-  // this cross-watermark leg keys on log index over own-gkv cells; cells at an index present on only
-  // ONE side are not judged here — the run-end conservation ledger owns loss); and all-replica loss of
-  // ANY value sitting in both the source's and a matching
-  // child's history when it rides a later merge — the departed → returned-via-merge-back → re-merged
-  // chain, and equally a child-born or child-inherited cell that entered the source via a merge-back
-  // (exempt from (2)'s demand, invisible to (1) when every replica drops it alike).
-  if w.group_absorbed(gid) {
-    assert!(
-      w.absorbed_lineage_client_cells_agree_at_shared_indices(gid),
-      "MULTI VOPR AGREEMENT FAILURE: group {gid} absorbed replicas diverge across watermarks — own \
-       cells (exempt or not)\n  seed={seed}",
-    );
-  }
+  // ABSORBED-lineage coverage. The per-index cross-watermark leg was RETIRED because the state
+  // machine's indices are NOT cell identities: `LogSm::absorb` extends the record at the SOURCE's
+  // indices, `split` re-partitions in place, and a departed-then-returned own-tag cell collides with
+  // the target's own cell at one index even WITHOUT id reuse — so an index's content is
+  // watermark-relative, and any per-index cross-watermark comparison manufactures divergence from
+  // fold-timing asymmetry. The absorbed content is covered without it: unequal-watermark content by the
+  // run-end conservation ledger (`finalize_merge_conservation_or_panic` — values are globally unique and
+  // lineage-keyed, so containment is watermark-immune), equal-watermark identity by `agreement_holds`'
+  // sorted absorbed branch (same-watermark replicas must hold the same raw multiset), and
+  // applied-history integrity by the expected-set leg below.
   for node in w.hosting_nodes(gid) {
     for (_, cmd) in w.applied_of(node, gid) {
       if cmd.is_empty() {

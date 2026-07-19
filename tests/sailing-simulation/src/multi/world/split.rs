@@ -410,12 +410,12 @@ impl MultiWorld {
   /// A RETIRED source's live population is emptied at merge resolution, but a lagging husk replica
   /// still hosts its record and stays inside the safety sweep — so align against the TERMINAL
   /// pre-merge population when the live set is empty and one was stashed, else every husk record would
-  /// align gkv-empty and the cross-watermark leg would certify vacuously. The terminal set is the
+  /// align gkv-empty and its consumer would certify vacuously. The terminal set is the
   /// source's final owned population (post-every-split, pre-merge), so the split-erasure argument is
   /// unchanged: split-away keys stay filtered from every replica's view, pre-split husk replicas
   /// included, and every husk replica of the lineage aligns against the SAME set — views still differ
-  /// only by watermark. This heals every aligned consumer (the cross-watermark wrapper and
-  /// `agreement_holds`' non-absorbed positional branch for plain-source husks) at one seam.
+  /// only by watermark. This heals the aligned consumer (`agreement_holds`' non-absorbed positional
+  /// branch for plain-source husks) at one seam.
   pub(super) fn aligned_applied(&self, node: u64, gid: u64) -> AppliedLog {
     let raw = self.applied_of(node, gid);
     match self.groups.get(&gid) {
@@ -452,13 +452,10 @@ impl MultiWorld {
   /// INDEX they share, whatever the replication lag or number of onward splits. Under split-lag
   /// the application is index-ordered, so the shorter view is additionally an exact PREFIX of the
   /// longer — the positional relation the non-absorbed [`agreement_holds`](Self::agreement_holds)
-  /// branch reads. An ABSORBED lineage's arrival path (merge-fold vs capture restore) can apply
-  /// those cells OUT of index order, so its cross-watermark leg keys on the log index over the OWN-GKV
-  /// (client) cells instead (see
-  /// [`own_client_cells_agree_at_shared_indices`](Self::own_client_cells_agree_at_shared_indices); kept
-  /// non-gkv cells the fold leaves at source indices are judged only at equal watermarks). A genuine
-  /// divergence inside a gkv `own(k)` cell — a differing payload at a shared index — survives untouched
-  /// (live key, own tag) and still trips the oracle.
+  /// branch reads. An ABSORBED lineage whose replicas sit at UNEQUAL watermarks has NO per-index
+  /// cross-watermark leg — indices are not cell identities under `LogSm::absorb` (it extends the record
+  /// at the source's indices; see `assert_group_safety`), so that content is judged off-band by the
+  /// run-end conservation ledger and, at equal watermarks, by `agreement_holds`' sorted absorbed branch.
   pub(super) fn align_record(raw: AppliedLog, gid: u64, population: &BTreeSet<u16>) -> AppliedLog {
     raw
       .into_iter()
@@ -467,68 +464,6 @@ impl MultiWorld {
         None => true,
       })
       .collect()
-  }
-
-  /// Whether a set of ALIGNED records AGREE at every LOG INDEX they share, over the group's OWN
-  /// CLIENT (gkv) cells ONLY. Each entry is `(log_index, payload)`; NON-GKV cells are SKIPPED — a
-  /// fold keeps a non-gkv source cell at its SOURCE log index (whereas folded gkv cells carry the
-  /// source's gid tag and are dropped by [`align_record`](Self::align_record)), so the two logs'
-  /// index spaces merge for kept non-gkv cells and any per-index claim about them is false by
-  /// construction; they are covered instead by the equal-watermark sorted form in
-  /// [`agreement_holds`](Self::agreement_holds) and by the integrity leg. For OWN-GKV cells the
-  /// aligned record draws from exactly ONE log — the group's own — so "one index, one payload" is a
-  /// true invariant: a single record carrying two DIFFERENT gkv payloads at one index is real
-  /// corruption (self-conflict), and across every pair an index present in BOTH records must carry the
-  /// same payload. Indices present on only ONE side are NOT judged — a replica that compacted low
-  /// indices out of its `applied()` view legitimately lacks them, and a subset demand would false-trip
-  /// (loss is the run-end conservation ledger's business). The ARRIVAL PATH (merge-fold / capture
-  /// restore) can apply cells OUT of index order, so agreement is keyed on the log index — NOT position
-  /// (the equal-applied raw form in `agreement_holds` sorts for the same reason). It carries NO
-  /// equal-watermark requirement, so it judges the unequal watermarks an exempted merge wedge sits at.
-  pub(crate) fn own_client_cells_agree_at_shared_indices(records: &[AppliedLog]) -> bool {
-    let mut maps: Vec<BTreeMap<u64, &[u8]>> = Vec::with_capacity(records.len());
-    for record in records {
-      let mut map: BTreeMap<u64, &[u8]> = BTreeMap::new();
-      for (index, payload) in record {
-        // Only own-gkv (client) cells are index-canonical; a non-gkv cell the fold kept at its source
-        // index is excluded (the equal-watermark sorted form and the integrity leg cover it).
-        if super::super::decode_gkv(payload).is_none() {
-          continue;
-        }
-        if let Some(prev) = map.insert(*index, payload.as_slice())
-          && prev != payload.as_slice()
-        {
-          return false; // one replica applied two different client payloads at a single committed index
-        }
-      }
-      maps.push(map);
-    }
-    for i in 0..maps.len() {
-      for j in (i + 1)..maps.len() {
-        for (index, payload) in &maps[i] {
-          if let Some(other) = maps[j].get(index)
-            && other != payload
-          {
-            return false; // two replicas disagree at a shared committed client index
-          }
-        }
-      }
-    }
-    true
-  }
-
-  /// Whether every hosted replica of an absorbed `gid` agrees at the log indices it shares with the
-  /// others over their OWN CLIENT (gkv) cells — the cross-watermark agreement leg the unconditional
-  /// safety pass runs for absorbed groups. It catches a divergence between replicas at UNEQUAL
-  /// watermarks that `agreement_holds`' absorbed branch, which compares only EQUAL-applied replicas,
-  /// never puts side by side.
-  pub(crate) fn absorbed_lineage_client_cells_agree_at_shared_indices(&self, gid: u64) -> bool {
-    let records: Vec<AppliedLog> = self
-      .hosting_nodes(gid)
-      .into_iter()
-      .map(|n| self.aligned_applied(n, gid))
-      .collect();
-    Self::own_client_cells_agree_at_shared_indices(&records)
   }
 
   /// Record every replica's applied gkv cells into the conservation ledger (see the module

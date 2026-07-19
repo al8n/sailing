@@ -59,8 +59,8 @@ pub(crate) struct GroupMeta {
   /// live `keys` set is emptied (the same set `mem::take`n there, which the ledger snapshots as
   /// `absorbed_keys`). `Some` only for a MERGED-away source. Alignment falls back to it for a lagging
   /// husk replica so the emptied live population does not blank the husk's client cells and leave the
-  /// cross-watermark leg vacuous on exactly the retired husks the safety sweep judges (see
-  /// [`MultiWorld::aligned_applied`]). Never set for a recreatable group, so no incarnation ever reads
+  /// non-absorbed positional agreement branch vacuous on exactly the retired husks the safety sweep
+  /// judges (see [`MultiWorld::aligned_applied`]). Never set for a recreatable group, so no incarnation ever reads
   /// another's terminal set — a merged id is refused recreation, so its meta is never replaced.
   pub(crate) terminal_keys: Option<BTreeSet<u16>>,
   /// The transitive set of FOREIGN group tags whose cells legitimately ride this group's

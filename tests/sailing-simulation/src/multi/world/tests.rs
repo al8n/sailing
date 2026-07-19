@@ -3109,20 +3109,17 @@ fn merge_teardown_records_floors_and_drops_source_stores() {
   w.finalize_merge_conservation_or_panic(17);
 }
 
-/// The terminal-population fallback keeps a RETIRED-SOURCE HUSK's aligned record NON-VACUOUS — the
-/// MECHANISM the aligned consumers (the cross-watermark leg and the non-absorbed positional branch)
-/// read. A merge empties the source's LIVE key population at resolution, but a lagging husk replica
-/// stays hosted inside the safety sweep; without the fallback in `aligned_applied` every husk's aligned
-/// record would align gkv-EMPTY and those consumers would judge nothing. The every-peer freeze barrier
-/// (`peers_matched_through`) converges the tracked source replicas to the freeze coordinate, so these
-/// husks sit at the SAME watermark (asserted below) — where an ABSORBED husk's client content is
-/// independently judged by the absorbed agreement branch on RAW records. A BELOW-freeze
-/// matched-but-not-applied husk is protocol-reachable but simulator-unmodeled (the barrier acks durable
-/// state and the settle loop coalesces commit+apply), so the cross-watermark leg's coverage of that
-/// shape is red-proofed at the relation level; this deterministic test proves only equal-applied
-/// aligned-record NON-VACUITY — the mechanism those consumers read — NOT an unequal pair. Doctrine (the
-/// world cannot diverge two real replicas) means this red-proofs VACUITY, not divergence. Red-proof:
-/// revert `aligned_applied` to live-only and the `>= 2 gkv-non-empty` assert fails.
+/// An ABSORBED retired-source husk, converged to EQUAL applied, passes the full safety helper
+/// (agreement's sorted absorbed branch on RAW records + integrity) with the HONEST expected set — and
+/// the terminal-population fallback keeps its aligned record NON-VACUOUS. A merge empties the source's
+/// LIVE key population at resolution, but a lagging husk replica stays hosted inside the safety sweep;
+/// without the fallback in `aligned_applied` every husk record would align gkv-EMPTY. The every-peer
+/// freeze barrier (`peers_matched_through`) converges the tracked source replicas to the freeze
+/// coordinate, so these husks sit at the SAME watermark (asserted below), where the absorbed agreement
+/// branch judges their client content on raw records. The aligned-record fallback's live consumer is
+/// `agreement_holds`' non-absorbed positional branch, pinned by the plain-source sibling test; this test
+/// proves the absorbed husk's equal-applied full-helper pass. Red-proof: revert `aligned_applied` to
+/// live-only and the `>= 2 gkv-non-empty` assert fails.
 #[test]
 fn retired_husk_aligns_against_its_terminal_population() {
   // The gkv (client) cells an aligned record retains — what the aligned consumers judge (non-gkv conf
@@ -3233,10 +3230,6 @@ fn retired_husk_aligns_against_its_terminal_population() {
       "surviving husk {n} must be applied-equal (== node 3's {applied3})"
     );
   }
-  assert!(
-    w.absorbed_lineage_client_cells_agree_at_shared_indices(11),
-    "the retired absorbed lineage's husks agree per index"
-  );
   // The full safety helper passes over the husks with the HONEST expected set (11's own load plus the
   // 12 cell it absorbed) — the wrapper wiring end-to-end, not just the relation in isolation.
   let expected: BTreeSet<Vec<u8>> = [
@@ -3898,63 +3891,13 @@ fn exemption_does_not_gate_safety_on_a_wedged_group() {
   crate::multi::vopr::assert_group_safety(&w, 10, &expected, 41);
 }
 
-/// The cross-watermark per-index AGREEMENT relation over OWN CLIENT (gkv) cells (#H2), unit red-proofed
-/// on synthetic aligned records: gkv cells at every SHARED log index must carry the same payload
-/// (agree); a legitimate arrival-path REORDER (same index→payload, scrambled order) still agrees; a
-/// differing gkv payload at a shared index breaks it; one record holding two different gkv payloads at a
-/// single index is a self-conflict; and NON-GKV cells are EXCLUDED — a fold keeps them at source
-/// indices, so an index collision there is representational, not divergence. The world can't
-/// synthetically diverge two real replicas (the codebase's standing note), so this is red-proofed here.
-#[test]
-fn absorbed_cross_watermark_client_cell_agreement_holds_and_catches_divergence() {
-  let g = 105u64;
-  let gc = |i: u64, key: u16, val: u64| (i, crate::multi::encode_gkv(g, key, val));
-  // Unequal watermarks, agreeing on every shared client index → holds.
-  let short: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 11)];
-  let long: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 11), gc(3, 2, 12)];
-  assert!(
-    MultiWorld::own_client_cells_agree_at_shared_indices(&[short.clone(), long.clone()]),
-    "client cells agreeing at every shared log index agree across watermarks"
-  );
-  // A legitimate arrival-path reorder (the merge-fold / capture restore applies cells out of index
-  // order — the seed-0 shape minimized): same index→payload, scrambled order → still agrees. Keying on
-  // the index, not position, is the whole point.
-  let reordered: AppliedLog = std::vec![gc(1, 0, 10), gc(3, 2, 12), gc(2, 1, 11)];
-  assert!(
-    MultiWorld::own_client_cells_agree_at_shared_indices(&[short.clone(), reordered]),
-    "an out-of-order client record agreeing per index must NOT be judged a divergence"
-  );
-  // A genuine divergence at a shared index — same group, different value → breaks.
-  let divergent: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 999)];
-  assert!(
-    !MultiWorld::own_client_cells_agree_at_shared_indices(&[divergent, long]),
-    "a differing client payload at a shared index must break agreement even at unequal watermarks"
-  );
-  // One record carrying two DIFFERENT gkv payloads at a single index is a self-conflict → breaks (a
-  // folded gkv cell carries a foreign tag and is dropped by alignment, so this is real corruption).
-  let self_conflict: AppliedLog = std::vec![gc(1, 0, 10), gc(2, 1, 11), gc(2, 1, 22)];
-  assert!(
-    !MultiWorld::own_client_cells_agree_at_shared_indices(&[self_conflict]),
-    "one replica applying two client payloads at a single index must fail"
-  );
-  // NON-GKV cells are EXCLUDED (the seed-53 fold-collision minimized): a parked follower holds the
-  // target's own raw `t0`; the resolved host additionally holds the folded raw `s0` at the SAME index
-  // (the fold keeps the source's index). Neither decodes as gkv, so the leg does not judge them → holds.
-  let parked: AppliedLog = std::vec![(2, b"t0".to_vec())];
-  let resolved: AppliedLog = std::vec![(2, b"t0".to_vec()), (2, b"s0".to_vec())];
-  assert!(
-    MultiWorld::own_client_cells_agree_at_shared_indices(&[parked, resolved]),
-    "non-gkv cells kept at colliding fold indices are excluded from this leg"
-  );
-}
-
-/// The absorbed cross-watermark relation passes on a real EXEMPTED wedge sitting at unequal watermarks
-/// with AGREEING records (#H2 integration): the parked follower's aligned record agrees at every shared
-/// index with the resolved hosts', so the safety pass certifies it without a leader and without equal
-/// watermarks. Its load is non-gkv (`t0`/`s0`), so the CLIENT-cell leg is vacuous here BY CONSTRUCTION —
-/// integrity carries its client content; and its UNEQUAL watermarks come from the PARK COORDINATE (the
-/// follower pinned at k-1 while the resolved hosts moved past k), NOT the merge barrier's match/apply
-/// gap, so the two unequal shapes are not conflated.
+/// An EXEMPTED absorbed wedge sitting at UNEQUAL watermarks still passes the safety helper after the
+/// per-index cross-watermark leg was retired (indices are not cell identities — see
+/// `assert_group_safety`): the parked follower is certified without a leader and without equal
+/// watermarks by the surviving legs. Its load is non-gkv (`t0`/`s0`), so the integrity leg carries its
+/// client content; its UNEQUAL watermarks come from the PARK COORDINATE (the follower pinned at k-1 while
+/// the resolved hosts moved past k), NOT the merge barrier's match/apply gap, so the two unequal shapes
+/// are not conflated.
 #[test]
 fn exempted_absorbed_wedge_at_unequal_watermarks_passes_safety() {
   let (mut w, follower) = held_park_target(53, 11, 10);
@@ -3972,12 +3915,8 @@ fn exempted_absorbed_wedge_at_unequal_watermarks_passes_safety() {
     w.fork_fence_wedge_set().contains(&10),
     "the parked target is exempted"
   );
-  // The aligned records AGREE across the unequal watermarks → the relation holds and the safety pass
-  // passes (the target's own load, source's load folded on the resolved hosts, are the expected set).
-  assert!(
-    w.absorbed_lineage_client_cells_agree_at_shared_indices(10),
-    "agreeing absorbed replicas at unequal watermarks must pass the cross-watermark relation"
-  );
+  // The safety pass certifies the exempted wedge across unequal watermarks via the surviving legs (the
+  // target's own load plus the source's load folded on the resolved hosts are the expected set).
   let expected: BTreeSet<Vec<u8>> = [b"t0".to_vec(), b"s0".to_vec()].into_iter().collect();
   crate::multi::vopr::assert_group_safety(&w, 10, &expected, 53);
 }
