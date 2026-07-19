@@ -4465,3 +4465,93 @@ async fn a_build_panic_quarantines_the_factory_and_falls_through() {
   // poisoned.
   await_poisoned(&handles[1].group(900), "node 2's co-hosted sibling").await;
 }
+
+/// Integration through the real driver scheduler: a removed voter's farewell budget survives
+/// quiescence. A clean 3-voter majority {1,2,3} elects and commits; a present follower is removed.
+/// With the both-arms fix, removing a PRESENT voter always populates the retry budget — its farewell
+/// (a caught-up commit-carrying heartbeat, or an append if it lagged the commit) is re-driven on a
+/// bounded BLIND budget that drains by SHOT COUNT, not by an ack — so the leader holds the group
+/// quiesce-INELIGIBLE across the one-election-timeout window it would otherwise have quiesced in, even
+/// though the initial farewell was delivered. The removed peer applies its own removal and surfaces
+/// RemovedSelf (so it never campaigns), the live pair keeps its term (no disruption), and once the
+/// budget drains the group quiesces.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_removed_voter_holds_quiescence_through_the_farewell_budget() {
+  const SLOW_ELECTION: Duration = Duration::from_millis(1500);
+  const SLOW_HEARTBEAT: Duration = Duration::from_millis(300);
+
+  let addrs = addrs(46_000, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    metrics.push(driver.engine_metrics());
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  for (i, h) in handles.iter().enumerate() {
+    h.create_group(
+      100,
+      Config::try_new(i as u64 + 1, vec![1, 2, 3], SLOW_ELECTION, SLOW_HEARTBEAT).unwrap(),
+      i as u64 + 1, // distinct election-jitter seed per node (identical seeds → perpetual split vote)
+      CountSm::default(),
+      0,
+    )
+    .await
+    .expect("group 100 admitted");
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a").await, 1);
+  let leader = find_leader(&g100, "group 100 leader").await;
+  let leader_id = leader as u64 + 1;
+  let victim_id = (1u64..=3).find(|&v| v != leader_id).unwrap();
+  let victim_idx = (victim_id - 1) as usize;
+  let leader_term = g100[leader].status().await.expect("status").term;
+
+  // Remove a present follower.
+  g100[leader]
+    .conf_change(ConfChange::new(
+      ConfChangeType::RemoveNode,
+      victim_id,
+      Bytes::new(),
+    ))
+    .await
+    .expect("removal proposed");
+
+  // The removed peer applies its own removal and self-removes (so it never campaigns).
+  await_lifecycle(
+    handles[victim_idx].lifecycle(),
+    "the removed voter self-removes",
+    |ev| matches!(ev, LifecycleEvent::RemovedSelf { group } if *group == 100),
+  )
+  .await;
+
+  // The budget holds quiescence: for longer than the one-election-timeout eligibility window (past
+  // the point the now-idle group would otherwise quiesce), the leader does NOT quiesce group 100.
+  for _ in 0..7 {
+    tokio::time::sleep(SLOW_HEARTBEAT).await;
+    assert_eq!(
+      metrics[leader].quiesced_groups(),
+      0,
+      "the budget holds the group quiesce-ineligible while shots remain"
+    );
+  }
+  // No disruption: the live pair kept its term (the removed voter self-removed, never campaigned).
+  assert_eq!(
+    g100[leader].status().await.expect("status").term,
+    leader_term,
+    "the live group kept its term"
+  );
+
+  // Once the budget drains, the group becomes idle-eligible and quiesces through the real scheduler.
+  wait_for_quiesced(
+    &metrics[leader],
+    1,
+    "group 100 quiesces after the farewell budget drains",
+  )
+  .await;
+}

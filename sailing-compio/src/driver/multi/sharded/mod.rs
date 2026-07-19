@@ -670,6 +670,11 @@ where
   /// like the split milestone's in-apply fork, which is plane-local by construction — never
   /// hosts a replica on a plane no peer would ever dial. `generation` forwards unchanged, as on
   /// [`create_group`](Self::create_group).
+  ///
+  /// **Reshape-born prevention.** Split children (born in-plane) and factory-materialized groups run
+  /// pre-vote + check-quorum FORCED on at reshape birth (the plane driver applies it on the
+  /// fork/factory birth paths); this explicit embedder fork API forwards `config` unchanged, so an
+  /// embedder reshaping through it should set the same two flags itself.
   pub async fn create_group_from_fork(
     &self,
     gid: G,

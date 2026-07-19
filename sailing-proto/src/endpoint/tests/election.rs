@@ -1427,6 +1427,78 @@ fn check_quorum_active_quorum_stays_leader() {
   );
 }
 
+/// Quiesce → wake → first check-quorum tick (the quiesce-safety gate): a
+/// check-quorum leader that goes DORMANT past its check-quorum interval — a quiesced group stops
+/// being cranked by the multi driver — must not spuriously step down on the first post-wake tick.
+/// `recent_active` is not reset while dormant, so the pre-quiesce quorum activity (exactly the
+/// health that let the group quiesce) still satisfies the check. This is why flipping check-quorum
+/// on for reshape-born groups does not regress P4 quiescence.
+#[test]
+fn check_quorum_survives_a_dormant_window_without_spurious_step_down() {
+  let cfg = cq_config(1, std::vec![1u64, 2, 3]);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
+
+  // Become leader.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  let cq_deadline = ep
+    .election_deadline
+    .expect("CQ election_deadline must be armed");
+
+  // A quorum is active going INTO quiescence (peer 2 responded) — exactly the health a group needs
+  // to quiesce. `recent_active` is not reset while the group is dormant.
+  ep.handle_message(
+    Instant::ORIGIN + Duration::from_millis(1),
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.tracker
+      .progress(&2u64)
+      .map(|p| p.recent_active())
+      .unwrap_or(false),
+    "peer 2 is active before the group quiesces"
+  );
+
+  // DORMANCY: the group is not cranked for ten election timeouts, then WAKES on traffic and fires
+  // its first post-quiescence tick, far past the check-quorum interval.
+  let woke = cq_deadline + Duration::from_millis(1000) * 10;
+  ep.handle_timeout(woke, &mut log, &mut stable);
+  ep.handle_storage(woke, &mut log, &mut stable);
+
+  // The pre-quiesce quorum activity survived the dormant window, so the first post-wake check does
+  // NOT step down, and the check-quorum window re-arms for the next interval.
+  assert!(
+    ep.role().is_leader(),
+    "a check-quorum leader must not spuriously step down on the first post-quiescence tick"
+  );
+  assert!(
+    ep.election_deadline.is_some_and(|nd| nd > woke),
+    "the check-quorum window is re-armed after the wake tick"
+  );
+}
+
 /// Test CQ-3: `recent_active` is set when the leader receives a message from a peer.
 ///
 /// A leader receiving an AppendResponse/HeartbeatResponse from a peer marks that peer active.
