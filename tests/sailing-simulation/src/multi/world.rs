@@ -22,12 +22,15 @@ use sailing_proto::{
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-/// An in-flight group-tagged typed message: `(deliver_at, gid, from, to, message)`.
+/// An in-flight group-tagged typed message: `(deliver_at, gid, from, to, generation, message)`.
 struct GInFlight {
   deliver_at: Instant,
   gid: u64,
   from: u64,
   to: u64,
+  /// The SENDER's lineage generation for `gid` at send time — the wire's incarnation stamp
+  /// (WIRE.md §6), which the receiver's admission floor fences at delivery.
+  generation: u64,
   message: Message<u64>,
 }
 
@@ -96,6 +99,14 @@ pub struct MultiWorld {
   net_last_sched: BTreeMap<(u64, u64), Instant>,
   /// Messages dropped by the seeded network fault model (non-vacuity counter).
   net_dropped: u64,
+  /// Deliveries the GENERATION FENCE dropped: the sender's stamp for the gid was below the
+  /// RECEIVER's admission floor, so it speaks for a retired incarnation (the sim model of the
+  /// product's demux fence).
+  fenced_dropped: u64,
+  /// The DISRUPTION subset of [`fenced_dropped`]: retired-incarnation `(Pre)Vote`s. Every one of
+  /// these is a campaign that, unfenced, could have deposed a live leader; fenced, none reaches a
+  /// replica at all, so the reshape-removed husk's depose count is zero by construction.
+  fenced_votes_dropped: u64,
   /// Message duplications fired by the seeded network fault model (non-vacuity counter).
   net_duplicated: u64,
   /// Per-`(node, gid)` replica config, retained so a node crash can rebuild every hosted replica
@@ -216,6 +227,12 @@ pub struct MultiWorld {
   /// (`!floor_admits(floor, expected)`) while the source is unhosted, before any recreate. `0`/absent
   /// for an id that never reshaped, so the default (no-merge, no-split) profile is byte-identical.
   removal_floors: BTreeMap<u64, u64>,
+  /// Per-gid INCARNATION floor on the lifecycle-registry scale (`generation_of`): one past the
+  /// generation each retirement ended, so a straggler stamped by the retired incarnation is
+  /// fenced at the delivery seam while the recreation — which comes back at exactly this value —
+  /// admits (equal admits). The wire fence's model input; distinct from `removal_floors`, which
+  /// answers the CONTAINER-lineage question the merge/abort machinery asks.
+  incarnation_floors: BTreeMap<u64, u64>,
   /// Deferred merge-source teardowns `(node, source, target, capture boundary)` awaiting the
   /// target capture's durability on that host (the one-barrier batch model; see
   /// `sweep_merge_teardowns`).
@@ -316,6 +333,8 @@ impl MultiWorld {
       net_prng: NetPrng::new(seed.rotate_left(16) ^ 0x004E_4554),
       net_last_sched: BTreeMap::new(),
       net_dropped: 0,
+      fenced_dropped: 0,
+      fenced_votes_dropped: 0,
       net_duplicated: 0,
       configs: BTreeMap::new(),
       restarts: BTreeMap::new(),
@@ -341,6 +360,7 @@ impl MultiWorld {
       merges: Vec::new(),
       merge_floors: BTreeSet::new(),
       removal_floors: BTreeMap::new(),
+      incarnation_floors: BTreeMap::new(),
       pending_merge_teardowns: Vec::new(),
       active_freezes: BTreeMap::new(),
       merges_resolved: 0,
@@ -1020,6 +1040,23 @@ impl MultiWorld {
     self.generation_of(gid)
   }
 
+  /// `node`'s admission floor for `gid` on the INCARNATION scale the stamp uses: one past the
+  /// generation each retirement ended, plus the terminal `MERGED_FLOOR` for a source this host
+  /// resolved away (a merged id is never re-admitted, so its fence is terminal by construction).
+  ///
+  /// Deliberately NOT [`NodeStores::floor`]: that store answers on the CONTAINER's lineage scale
+  /// (a reshaped id's removal ceiling), while the world re-admits every recreation at container
+  /// generation 0 — the two scales do not order against each other, and comparing them would
+  /// fence a live incarnation's own traffic. The diligent-embedder HUSK feed is excluded for a
+  /// second reason: it is a pre-teardown hint about a source this host still runs, and the
+  /// product's demux reads only the engine's persisted record.
+  fn admission_floor(&self, node: u64, gid: u64) -> u64 {
+    if self.merge_floors.contains(&(node, gid)) {
+      return sailing_proto::MERGED_FLOOR;
+    }
+    self.incarnation_floors.get(&gid).copied().unwrap_or(0)
+  }
+
   /// Assemble the per-group [`ClusterView`](crate::ClusterView) from `gid`'s hosting nodes —
   /// field-for-field the shape `Cluster::view` builds, scoped to one group's replicas and their
   /// `(node, gid)` stores, so the UNCHANGED oracle suite judges each group independently.
@@ -1305,6 +1342,12 @@ impl MultiWorld {
   ///   (b) one-identity — a REAL-vote grant binds `(granter, gid, gen, term)` to one candidate
   ///       across every replica object this node ever hosts for the group.
   fn schedule_send(&mut self, from: u64, gid: u64, to: u64, message: Message<u64>) {
+    // The wire's incarnation stamp. The product reads the sender's committed generation for the
+    // gid; the world's truthful per-id incarnation is its lifecycle registry counter — the SAME
+    // value the one-identity grant key below uses, and the one `remove_group` retires. (The
+    // container's own lineage counter is NOT it here: the world re-admits every recreation at
+    // container generation 0, so that scale cannot order incarnations across a retirement.)
+    let generation = self.generation_of(gid);
     if let Message::AppendResponse(a) = &message
       && !a.reject()
     {
@@ -1343,6 +1386,7 @@ impl MultiWorld {
         gid,
         from,
         to,
+        generation,
         message,
       });
       return;
@@ -1384,6 +1428,7 @@ impl MultiWorld {
         gid,
         from,
         to,
+        generation,
         message: message.clone(),
       });
     }
@@ -1409,11 +1454,23 @@ impl MultiWorld {
       if self.parked.contains(&(m.from, m.gid)) || self.parked.contains(&(m.to, m.gid)) {
         continue; // a parked replica is delivery-isolated for its group (state retained)
       }
+      // THE GENERATION FENCE, modelled at the delivery seam exactly as the product models it at
+      // demux: a frame whose sender stamp is below the RECEIVER's durable admission floor speaks
+      // for a retired incarnation and is dropped, counted, never delivered. Equal admits. Ordered
+      // with the product's ordering — after the transport-level drops, before store resolution.
+      let admits = sailing_proto::floor_admits(self.admission_floor(m.to, m.gid), m.generation);
       let Some(host) = self.hosts.get_mut(&m.to) else {
         continue; // unknown node id — drop safely
       };
       if !host.contains_group(&m.gid) {
         continue; // unhosted group — silent drop, the connection-level tombstone/demux semantics
+      }
+      if !admits {
+        self.fenced_dropped += 1;
+        if matches!(m.message, Message::RequestVote(_)) {
+          self.fenced_votes_dropped += 1;
+        }
+        continue;
       }
       delivered = true;
       let log = self.logs.get_mut(&(m.to, m.gid)).expect("replica log");
