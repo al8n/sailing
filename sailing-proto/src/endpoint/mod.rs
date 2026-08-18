@@ -720,6 +720,21 @@ struct Durability<I> {
   /// The `OpId` of the FIRST HardState write that carried `last_submitted_term`. When a `Wrote` completion
   /// with `opid >= term_persist_opid` arrives (stable completions are ordered), that term is durable.
   term_persist_opid: OpId,
+  /// COMMIT-before-respond durability — the commit-axis twin of the three fields above, and the
+  /// reason a redundancy SHORTCUT can be restart-stable without a durable blob. `committed_persisted`
+  /// records what was SUBMITTED; these record what has landed. The highest commit PROVEN durable by a
+  /// completion at or past `commit_persist_opid`, the OpId of the first write that carried
+  /// `last_submitted_commit`. Seeded to the recovered commit at `restart` (it came from durable
+  /// HardState), `Index::ZERO` in `new`.
+  durable_commit_index: Index,
+  last_submitted_commit: Index,
+  commit_persist_opid: OpId,
+  /// A SUCCESS `SnapshotResponse` deferred until the redundancy SHORTCUT's evidence is crash-surviving:
+  /// `(leader, term, boundary)`. Released only once the term is durable, `durable_commit_index >=
+  /// boundary`, and `applied >= boundary` — see `shortcut_ack_ready`. Distinct from
+  /// `term_gated_snapshot_ack` because it waits on strictly more than the term, and because a
+  /// deferral here must never be mistaken for the ordinary term gate's.
+  shortcut_gated_snapshot_ack: Option<(I, Term, Index)>,
   /// Persist-before-ADVERTISE for the lease promise; exact mirror of the term machinery above.
   /// The in-memory lease-support floor: the max lease window this node will uphold this incarnation =
   /// `max(recovered durable floor, this run's own election_timeout if it enforces)`. Bumped at most ONCE
@@ -1121,6 +1136,13 @@ where
   /// placement), so a CLIMBING value is the local signal distinguishing a lineage conflict from a
   /// slow transfer. Saturating.
   refused_cross_lineage_installs: u64,
+  /// Diagnostic: how many EXCLUDING `InstallSnapshot`s the incarnation gate refused — a snapshot
+  /// whose ConfState leaves this node out AND whose generation is BELOW this replica's committed
+  /// one. Such a message is a cross-incarnation removal directive, which has no admissible form
+  /// (the safety envelope's V2 line): removal is only ever the peer's own apply of committed state
+  /// FROM ITS OWN incarnation. Silent on the wire, so a CLIMBING value is the local signal that
+  /// some retired incarnation is still trying to reap a live replica. Saturating.
+  refused_stale_removal_installs: u64,
 }
 
 // Hand-written so the impl does not require `F::Snapshot: Debug` (its only bound is `Data`, which is
@@ -1148,6 +1170,10 @@ where
       .field(
         "refused_cross_lineage_installs",
         &self.refused_cross_lineage_installs,
+      )
+      .field(
+        "refused_stale_removal_installs",
+        &self.refused_stale_removal_installs,
       )
       .finish()
   }
@@ -1485,6 +1511,7 @@ where
         snapshot_resend_after: BTreeMap::new(),
         unsendable_meta_frames: 0,
         refused_cross_lineage_installs: 0,
+        refused_stale_removal_installs: 0,
       },
       rng,
       votes: BTreeMap::new(),
@@ -1541,6 +1568,10 @@ where
         durable_lease_support: None,
         lease_support_persist_opid: OpId::ZERO,
         committed_persisted: Index::ZERO,
+        durable_commit_index: Index::ZERO,
+        last_submitted_commit: Index::ZERO,
+        commit_persist_opid: OpId::ZERO,
+        shortcut_gated_snapshot_ack: None,
         durable_index: Index::ZERO,
         durable_snapshot_index: Index::ZERO,
         inflight_append_upto: VecDeque::new(),
@@ -1762,6 +1793,16 @@ where
   #[inline]
   pub const fn refused_cross_lineage_install_count(&self) -> u64 {
     self.snapshot.refused_cross_lineage_installs
+  }
+
+  /// Diagnostic count of `InstallSnapshot`s refused by the incarnation gate: an EXCLUDING
+  /// ConfState (this node is in no role) carried by a snapshot whose generation is BELOW this
+  /// replica's committed one. A stale incarnation cannot authorize a live replica's removal, so the
+  /// message is dropped without touching state or storage; a CLIMBING value means some retired
+  /// incarnation is still live enough to be sending.
+  #[inline]
+  pub const fn refused_stale_removal_install_count(&self) -> u64 {
+    self.snapshot.refused_stale_removal_installs
   }
 
   /// Next outbound message, if any.

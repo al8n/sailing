@@ -261,6 +261,13 @@ where
       self.durable.last_submitted_lease_support = hard_state.lease_support().promised();
       self.durable.lease_support_persist_opid = id;
     }
+    // the same watermark on the COMMIT axis, so `on_stable_wrote` can tell when a raised commit has
+    // actually reached stable storage. That is what makes a redundancy shortcut restart-stable: the
+    // ack waits for THIS to land, not merely for the write to be submitted.
+    if hard_state.commit() > self.durable.last_submitted_commit {
+      self.durable.last_submitted_commit = hard_state.commit();
+      self.durable.commit_persist_opid = id;
+    }
     // Track the vote this write carries so `ensure_term_durable` can dedup an identical re-submit while
     // this write is still in the fsync window. Every write carries a vote, so record it unconditionally.
     self.durable.last_submitted_vote = hard_state.vote();
@@ -285,6 +292,7 @@ where
   /// never replicated), and `ack_watermark()` is the live durability cap (so it never
   /// reports a since-truncated index either).
   pub(crate) fn flush_term_gated_acks(&mut self) {
+    self.flush_shortcut_gated_ack();
     if matches!(self.durable.term_gated_snapshot_ack, Some((_, t, _)) if t != self.term) {
       self.durable.term_gated_snapshot_ack = None;
     }
@@ -376,6 +384,124 @@ where
       };
       self.durable.term_gated_snapshot_ack = Some((to, self.term, proven));
     }
+  }
+
+  /// FORCE the raised commit to stable storage now, rather than waiting for the batched
+  /// `handle_storage` choke point. The batched write is fine for an ordinary commit advance — a lost
+  /// suffix is re-advanced by the leader — but a redundancy shortcut has no leader coming back for
+  /// it: the peer it cures leaves the configuration, so the persist must be in flight before the ack
+  /// that ends the cure. Same builder and choke point as the batched write, so the watermarks and the
+  /// stamped floors behave identically; a no-op when the value is already submitted.
+  pub(crate) fn persist_commit_floor<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
+    if self.poison.poisoned || self.durable_commit() <= self.durable.committed_persisted {
+      return;
+    }
+    let opid = self.mint_op_id();
+    let hs = stable
+      .hard_state()
+      .with_term(self.term)
+      .with_vote(self.voted_for.cheap_clone())
+      .with_commit(self.durable_commit());
+    self.submit_write(stable, opid, hs);
+    self.durable.committed_persisted = self.durable_commit();
+  }
+
+  /// Whether a redundancy SHORTCUT's success ack may go out: its evidence must be crash-surviving.
+  ///
+  /// Three conditions, all necessary. The term, as for every success ack (§5.1). CRASH-SURVIVING
+  /// EVIDENCE for the boundary. And `applied >= boundary`, because an ack claims the state was
+  /// PROCESSED, not merely committed — a budget-cut, cold-read or parked apply simply defers.
+  ///
+  /// The evidence leg takes EITHER form, and both are needed for liveness as well as soundness. The
+  /// usual one is the persisted commit: the shortcut installs no blob, so the durable log plus a
+  /// durable commit at the boundary is what a restart reads back, via
+  /// `commit = min(hs.commit(), log.last_index()).max(applied)` in `reconcile_restart_log`'s caller.
+  /// The other is a durable SNAPSHOT covering the boundary, which a restart restores or compacts to —
+  /// equally crash-surviving, and required here or the gate can never open: the persisted value is
+  /// `durable_commit() = min(commit, durable_index)`, and the completion-time drop path can leave a
+  /// durable blob at the boundary with the log NOT re-baselined, so `durable_index` — and therefore
+  /// every commit this node can persist — stays below it forever.
+  #[inline]
+  pub(crate) fn shortcut_ack_ready(&self, boundary: Index) -> bool {
+    self.term_is_durable()
+      && (self.durable.durable_commit_index >= boundary
+        || self.durable.durable_snapshot_index >= boundary)
+      && self.applied >= boundary
+  }
+
+  /// THE ONE EXIT FOR EVERY NO-BLOB REDUNDANCY ACK. Emit a success `SnapshotResponse` if the
+  /// boundary's evidence is already durable and applied; otherwise DEFER until
+  /// [`flush_shortcut_gated_ack`] releases it.
+  ///
+  /// THE GATE IS THE CLASSIFIER, not `self.commit`. A redundancy arm can reach an ack with the
+  /// boundary at or below commit or above it, but `commit` is VOLATILE and the arm itself raises it,
+  /// so "at or below commit" does not mean "already true on disk" — a duplicate `InstallSnapshot`
+  /// landing inside the gate window would classify that way and ack on state a crash erases. Asking
+  /// the three legs instead answers the only question that matters, in both cases, at both sites.
+  ///
+  /// A BLOB-BACKED completion ack does NOT come here: the durable blob is its own restart-stable
+  /// evidence and it keeps `send_or_gate_snapshot_ack`. Only the no-blob shortcut, whose evidence is
+  /// the durable log plus the persisted commit, needs these legs.
+  ///
+  /// WHAT IS REPORTED is `max(commit, boundary)` clamped to `ack_watermark()` — the same extent the
+  /// immediate path always reported, so the leader's `match` still advances past `pending` — while
+  /// what is GATED is the boundary, the thing the snapshot proves and the thing a courtesy discharge
+  /// keys on. Recomputed at release, where `commit` can only be larger.
+  ///
+  /// THE TWO-SIDED CRASH ARGUMENT. A crash BEFORE the persist lands emits no ack at all: the sender's
+  /// courtesy debt is retained (only an ack discharges it) and the next window re-offers, so nothing
+  /// is lost but time. A crash AFTER it restarts with commit derived at the boundary from durable
+  /// state and re-applies the entry from the durable log, so the peer comes back already cured. There
+  /// is no window in which an ack exists without the state that makes it true.
+  pub(crate) fn send_or_gate_shortcut_snapshot_ack(&mut self, to: I, boundary: Index) {
+    if self.shortcut_ack_ready(boundary) {
+      let (term, me) = (self.term, self.config.id());
+      let match_index = core::cmp::max(self.commit, boundary).min(self.ack_watermark());
+      self.send(
+        to,
+        Message::SnapshotResponse(SnapshotResponse::new(term, me, false, match_index)),
+      );
+    } else {
+      // DUPLICATES KEEP THE MAX BOUNDARY. A same-boundary duplicate is an idempotent overwrite; a
+      // higher-boundary one supersedes, and the release predicate is monotone in the boundary, so
+      // holding the larger keeps the stricter gate and still discharges the smaller claim when it
+      // fires. One slot per leader is enough: acks are cumulative.
+      let boundary = match self.durable.shortcut_gated_snapshot_ack.as_ref() {
+        Some((prev_to, prev_term, prev)) if *prev_to == to && *prev_term == self.term => {
+          (*prev).max(boundary)
+        }
+        _ => boundary,
+      };
+      self.durable.shortcut_gated_snapshot_ack = Some((to, self.term, boundary));
+    }
+  }
+
+  /// Release a shortcut-gated ack once its evidence is durable AND applied. Called from the same
+  /// choke points that drive the ordinary term gate — `on_stable_wrote` for the durability half and
+  /// the `handle_storage` loop for the apply half — so a deferral resolves on ordinary progress with
+  /// no bespoke re-drive. A tag from a superseded term is dropped: that leadership is gone, and the
+  /// next leader's own offer carries the cure.
+  pub(crate) fn flush_shortcut_gated_ack(&mut self) {
+    if matches!(self.durable.shortcut_gated_snapshot_ack, Some((_, t, _)) if t != self.term) {
+      self.durable.shortcut_gated_snapshot_ack = None;
+      return;
+    }
+    let boundary = match self.durable.shortcut_gated_snapshot_ack.as_ref() {
+      Some((_, _, b)) => *b,
+      None => return,
+    };
+    if !self.shortcut_ack_ready(boundary) {
+      return;
+    }
+    let Some((to, _, _)) = self.durable.shortcut_gated_snapshot_ack.take() else {
+      return;
+    };
+    let (term, me) = (self.term, self.config.id());
+    let match_index = core::cmp::max(self.commit, boundary).min(self.ack_watermark());
+    self.send(
+      to,
+      Message::SnapshotResponse(SnapshotResponse::new(term, me, false, match_index)),
+    );
   }
 
   /// Persist the adopted `(term, vote)` if it is not already durable — the lazy term step-down write.
@@ -549,7 +675,7 @@ where
               .pending_install
               .take()
               .expect("checked Some above");
-            self.install_snapshot_now(log, meta, snap, leader);
+            self.install_snapshot_now(log, stable, meta, snap, leader);
             // Completion-time install can poison (log_term, SnapshotRestore, the log re-baseline) →
             // fail-stop the storage handler before any further drain / compaction / reclaim on a dead node.
             if self.poison.poisoned {
@@ -609,7 +735,7 @@ where
           .pending_install
           .take()
           .expect("checked Some above");
-        self.install_snapshot_now(log, meta, snap, leader);
+        self.install_snapshot_now(log, stable, meta, snap, leader);
         // The deferred (missed-completion) install can poison the same ways → fail-stop before reclaim.
         if self.poison.poisoned {
           return StorageProgress::Drained;
@@ -704,6 +830,12 @@ where
       self.submit_write(stable, opid, hs);
       self.durable.committed_persisted = self.durable_commit();
     }
+
+    // The APPLY half of the shortcut gate. `on_stable_wrote` covers the durability half; this covers
+    // the case where the ack was waiting only on apply — a budget cut, a cold read, or a parked merge
+    // apply — since `handle_storage` is exactly where that progress is driven. Cheap: a no-op unless a
+    // shortcut ack is outstanding.
+    self.flush_shortcut_gated_ack();
 
     // Invariant restore: a learner promoted to voter by an applied conf-change above may have been
     // left without an election timer; ensure a voter non-leader can always campaign.
@@ -815,6 +947,13 @@ where
       && opid >= self.durable.term_persist_opid
     {
       self.durable.durable_term = self.durable.last_submitted_term;
+    }
+    // the same advance on the COMMIT axis — a completion at/past the commit write makes the raised
+    // commit durable, which may release a shortcut-gated snapshot ack below.
+    if self.durable.last_submitted_commit > self.durable.durable_commit_index
+      && opid >= self.durable.commit_persist_opid
+    {
+      self.durable.durable_commit_index = self.durable.last_submitted_commit;
     }
     // the same advance for the lease-support floor — a completion at/past the floor write makes the
     // raised floor durable, releasing the persist-before-advertise gate so `on_heartbeat` may now advertise

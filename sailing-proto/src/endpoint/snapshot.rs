@@ -43,6 +43,59 @@ where
     stable.submit_snapshot(id, meta, data);
   }
 
+  /// Whether `conf` still names this node in ANY membership role — voter in either joint half,
+  /// learner, or incoming learner. Its complement is REMOVED-SELF, and it is deliberately the same
+  /// predicate the drivers' lifecycle mirror applies to a `ConfChanged`: a removal carried by a
+  /// snapshot must be indistinguishable downstream from one carried by a log entry. During a joint
+  /// phase the OUTGOING half still counts, so a leaving member reads as named until the final,
+  /// fully-departed configuration.
+  pub(crate) fn conf_names_self(&self, conf: &crate::ConfState<I>) -> bool {
+    let me = self.config.id();
+    conf.voters().contains(&me)
+      || conf.voters_outgoing().contains(&me)
+      || conf.learners().contains(&me)
+      || conf.learners_next().contains(&me)
+  }
+
+  /// Every id `conf` names in ANY role, across BOTH joint halves — the full membership dimension.
+  /// Deliberately not the voter set: a voter demoted to learner is still a member, and reading a
+  /// demotion as a removal would fire a removal event (and, downstream, mint a courtesy debt) for
+  /// a replica that is still very much part of the group.
+  pub(crate) fn conf_members(conf: &crate::ConfState<I>) -> std::collections::BTreeSet<I> {
+    let mut out = std::collections::BTreeSet::new();
+    for set in [
+      conf.voters(),
+      conf.voters_outgoing(),
+      conf.learners(),
+      conf.learners_next(),
+    ] {
+      out.extend(set.iter().map(CheapClone::cheap_clone));
+    }
+    out
+  }
+
+  /// THE MEMBERSHIP TRANSITION an admitted install performs: the ids this replica's own APPLIED
+  /// configuration names that the installed one does not.
+  ///
+  /// This is the difference between ABSENCE and REMOVAL, and the whole install-time membership
+  /// story rests on it. A snapshot whose ConfState simply does not mention a replica says nothing
+  /// on its own — it may be HISTORY, a capture from before that replica was ever admitted, which a
+  /// fresh joiner or a fork-born observer receives as ordinary catch-up. Only a peer the receiver
+  /// itself counted as a member a moment ago, and the installed configuration does not, has
+  /// actually been removed. The prior side is the receiver's own applied state, which is the
+  /// apply-time membership doctrine's authority, and an admitted install only ever advances, so
+  /// that prior state always sits at or below the boundary.
+  pub(crate) fn install_removed_members(
+    &self,
+    installed: &crate::ConfState<I>,
+  ) -> std::collections::BTreeSet<I> {
+    let installed = Self::conf_members(installed);
+    Self::conf_members(&self.tracker.conf_state())
+      .into_iter()
+      .filter(|id| !installed.contains(id))
+      .collect()
+  }
+
   /// Expose `pending_compact` for testing.
   #[cfg(test)]
   pub(crate) fn pending_compact(&self) -> Option<(OpId, Index)> {
@@ -459,6 +512,26 @@ where
     if self.poison.poisoned {
       return;
     }
+    // THE INCARNATION GATE (the churn cure's install leg — MULTI_RAFT.md, membership churn), run
+    // BEFORE the follower preamble so a refusal leaves state and storage byte-unchanged — not even
+    // a leader binding or a re-armed timer. An EXCLUDING ConfState (this node in no role) is a
+    // REMOVAL directive; carried by a snapshot whose generation is BELOW this replica's committed
+    // one, it speaks for an incarnation that is already gone, and a stale view must never reap a
+    // live replica. Equal ADMITS, always: within one incarnation the excluding snapshot is exactly
+    // the legitimate cure for a removed peer, and rejecting equal would recreate the
+    // membership-apply-time staleness the vote path warns about.
+    // A leader can never legitimately trip this on a group member: it holds every committed entry,
+    // so its captured generation is at least the receiver's, and a conf-change removal does not
+    // move the generation at all.
+    if !self.conf_names_self(is.snapshot().conf())
+      && is.snapshot().shape_gen() < self.split.shape_gen
+    {
+      self.snapshot.refused_stale_removal_installs = self
+        .snapshot
+        .refused_stale_removal_installs
+        .saturating_add(1);
+      return;
+    }
     // Preamble: mirror on_append_entries — reset to Follower, track leader, re-arm election timer.
     self.role = Role::Follower;
     self.set_leader(Some(is.leader()));
@@ -603,6 +676,28 @@ where
     //    a snapshot it already holds (its leader-side `match` is stale-low, so the leader keeps re-sending) —
     //    wasting a whole transfer and pinning the peer in Snapshot. A DIFFERENT term at the boundary is a
     //    DIVERGENT durable tail → NOT redundant → fall through and install (re-baseline over the tail).
+    // THE TWO ARMS ANSWER DIFFERENTLY. At or below `commit` there is nothing to advance and nothing
+    // to apply, by definition, so the ack is truthful on emission — unchanged. Above `commit`, the
+    // arm RAISES commit to the boundary, applies through it, PERSISTS the raise, and gates the ack on
+    // that write landing (and on `applied` reaching the boundary).
+    //
+    // Why a shortcut is available at all: a snapshot at a boundary is proof that boundary is
+    // committed — captures are committed prefixes by construction — and Log Matching makes the local
+    // durable prefix through it that same prefix, so this replica proves the boundary from evidence
+    // it already holds. That is the coordinate-is-commit-evidence rule the wire-echo work settled for
+    // sub-`first_index` coordinates on the append path.
+    //
+    // Why not install instead: `LogStore::restore` is a TOTAL discard by contract, so re-baselining
+    // here would destroy the durable, Log-Matching, already-ACKED tail above the boundary. The
+    // restart path deliberately does the opposite in exactly this shape — `reconcile_restart_log`
+    // answers `Compact(n)`, "preserving the committed tail above `N`" — so this arm IS the runtime
+    // half of that parity.
+    //
+    // Why the persist: the raise alone is volatile. `HardState` carries `commit` and restart
+    // recomputes `commit = min(hs.commit(), log.last_index()).max(applied)`, so a DURABLE commit at
+    // the boundary plus the durable log is crash-surviving evidence equal to a durable blob. Without
+    // the persist, an ack-then-crash reboots at a stale commit with the entry unapplied — a peer
+    // revived as a voter that nobody owes a cure.
     // Ack `max(commit, boundary)` (clamped to `ack_watermark()` inside `send_or_gate_snapshot_ack`, which an
     // async follower needs since it can have `commit > durable_index`): for the committed case that is
     // `commit`; for the Log-Matching case the boundary is durable + consistent and exceeds `commit`, so
@@ -639,7 +734,66 @@ where
       self.snapshot.snapshot_recv = None;
       stable.discard_snapshot_staging();
       let leader = is.leader();
-      self.send_or_gate_snapshot_ack(leader, core::cmp::max(self.commit, meta.last_index()));
+      // THE WORK SPLITS ON `commit`; THE ACK DOES NOT. Only the above-commit case has anything to do
+      // — raise, apply, persist — but BOTH cases leave through the one gate below, because
+      // `self.commit` is a VOLATILE classifier and cannot decide whether an ack is truthful.
+      //
+      // The at-or-below branch used to ack immediately, and that was unsound the moment this arm
+      // began raising commit: a DUPLICATE `InstallSnapshot` arriving inside the gate window — commit
+      // already raised to the boundary, its HardState write still in flight or apply still short —
+      // classifies as at-or-below against the raised value and would take the term-only path,
+      // handing the sender a discharge for state a crash erases. Routing every no-blob ack through
+      // the same three legs closes it by construction rather than by another branch.
+      //
+      // For a genuinely old boundary this is not a behavior change: `durable_commit_index` and
+      // `applied` are both already past it, so the gate releases in the same crank the immediate
+      // send would have used. What is retired is the claim that the old path was byte-identical —
+      // it was, except in exactly the window that made it wrong.
+      //
+      // ABOVE COMMIT: raise, apply, PERSIST, and gate the ack on that persist landing.
+      //
+      // A SNAPSHOT AT A BOUNDARY IS PROOF THAT BOUNDARY IS COMMITTED — a capture is a committed
+      // prefix by construction, so a sender only offers coordinates it has committed. With Log
+      // Matching (§5.3), which is precisely what this arm proved entry-for-entry through `boundary`,
+      // the local prefix through it IS that committed prefix. So this replica can prove the boundary
+      // LOCALLY, which is the whole reason a shortcut is available here at all. It is the same
+      // coordinate-is-commit-evidence doctrine the wire-echo work settled on the append path for
+      // sub-`first_index` coordinates.
+      //
+      // WHY NOT JUST INSTALL. Because installing would be the destructive answer to a question this
+      // replica has already answered. `LogStore::restore` is a TOTAL discard by contract
+      // (`restore_rebaselined` fail-stops any store that keeps a suffix), so re-baselining here would
+      // throw away the durable, Log-Matching, already-ACKED tail above the boundary — the
+      // non-quorum-durable-commit hole. The restart path deliberately does the opposite in exactly
+      // this shape: `reconcile_restart_log` returns `Compact(n)`, "preserving the committed tail
+      // above `N`". This arm IS that parity at runtime; turning it into an install would make the
+      // install path contradict the restart path.
+      //
+      // WHAT MAKES IT RESTART-STABLE. Not the raise — that is volatile — but the DURABLE commit
+      // behind it. `HardState` carries `commit`, and restart recomputes
+      // `commit = min(hs.commit(), log.last_index()).max(applied)`, so a persisted commit at the
+      // boundary plus the durable log is evidence every bit as crash-surviving as a durable blob,
+      // and strictly cheaper. The ack therefore waits for the write to LAND (and for apply to reach
+      // the boundary); the two-sided crash argument is at `send_or_gate_shortcut_snapshot_ack`.
+      //
+      // Trusting the sender's boundary at all is the same trust class as installing its blob would
+      // be — a forged boundary buys no more than a forged snapshot, and AUTHENTICATION is the
+      // boundary of the model (the R1-era adjudication). The guards above are untouched: only a
+      // redundancy the existing predicate ALREADY accepts — same lineage, token-legal, term-matched
+      // at `boundary` — reaches this.
+      if meta.last_index() > self.commit {
+        self.commit = meta.last_index();
+        if self.applied < self.commit {
+          self.apply_committed(log);
+        }
+        // `apply_committed` can self-poison on a fatal committed-range read / decode / FSM apply —
+        // fail-stop before acking rather than answering success from a dead node.
+        if self.poison.poisoned {
+          return;
+        }
+        self.persist_commit_floor(stable);
+      }
+      self.send_or_gate_shortcut_snapshot_ack(leader, meta.last_index());
       return;
     }
 
@@ -918,13 +1072,16 @@ where
   /// the core, not the storage layer, owns the ordering. Called only from `handle_storage`, with
   /// the matching `pending_install` tuple already `take`n out (so a failure leaves no partial deferred
   /// install behind).
-  pub(crate) fn install_snapshot_now<L: LogStore>(
+  pub(crate) fn install_snapshot_now<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     log: &mut L,
+    stable: &mut S,
     meta: SnapshotMeta<I>,
     snap: F::Snapshot,
     leader: I,
-  ) {
+  ) where
+    F::Snapshot: Data,
+  {
     if self.poison.poisoned {
       return;
     }
@@ -1032,7 +1189,24 @@ where
       // boundary above, so `ack_watermark()` already covers it; ack `max(commit, boundary)` (clamped to
       // `ack_watermark()` inside `send_or_gate_snapshot_ack`) so the leader's `match` advances past
       // `pending`. Persist-before-RESPOND: a non-durable term defers the ack via the term-gated queue.
-      self.send_or_gate_snapshot_ack(leader, core::cmp::max(self.commit, meta.last_index()));
+      //
+      // THE SAME WORK-SPLIT-THEN-ONE-GATE AS THE RECEIPT-TIME ARM, for the same reasons (see there).
+      // Above commit — arm (b), where the durable log outran commit — the boundary is locally proven
+      // committed, so raise, apply and persist rather than re-baselining over a durable Log-Matching
+      // tail the restart path would have preserved. At or below commit there is no work. Either way
+      // this is a NO-BLOB ack, so it leaves through the gate: volatile `commit` cannot classify a
+      // duplicate arriving inside the window as already-truthful.
+      if meta.last_index() > self.commit {
+        self.commit = meta.last_index();
+        if self.applied < self.commit {
+          self.apply_committed(log);
+        }
+        if self.poison.poisoned {
+          return;
+        }
+        self.persist_commit_floor(stable);
+      }
+      self.send_or_gate_shortcut_snapshot_ack(leader, meta.last_index());
       return;
     }
 
@@ -1140,11 +1314,36 @@ where
       return;
     }
 
+    // The membership transition this install performs, computed while the tracker still holds the
+    // PRIOR applied configuration (step 6 replaces it below).
+    let removed_members = self.install_removed_members(meta.conf());
+
     // Step 5: emit the application event.
     self
       .outputs
       .events
       .push_back(crate::Event::SnapshotInstalled(meta.clone()));
+    // A removal this replica just APPLIED — committed state that arrived as a snapshot instead of a
+    // log entry. Surface it through the very event the log-applied `ConfChange` fold emits, so the
+    // embedder's removed-self path fires identically whichever way the removal reached us; an
+    // install alone would silently disarm campaigning (the rebuilt tracker makes
+    // `is_voter(self)` false) and leave the application unaware it must tear the replica down.
+    //
+    // Keyed on the TRANSITION, never on mere absence from the installed ConfState (see
+    // `install_removed_members`). A fresh joiner or a fork-born observer routinely installs a
+    // HISTORICAL snapshot — one captured before it was ever admitted — whose ConfState cannot name
+    // it; reading that as removal would tell a replica that is mid-join to tear itself down, while
+    // the entries after the boundary were about to admit it normally. A membership-neutral install,
+    // and any install that only re-roles this replica, keep the single-event shape.
+    if removed_members.contains(&self.config.id()) {
+      self
+        .outputs
+        .events
+        .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
+          meta.last_index(),
+          meta.conf().clone(),
+        )));
+    }
 
     // Step 6: install the membership from the snapshot's ConfState — jump directly to the committed
     // membership at the snapshot point; the Tracker is rebuilt from the snapshot's conf.
