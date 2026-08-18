@@ -4512,7 +4512,10 @@ async fn a_removed_voter_holds_quiescence_through_the_farewell_budget() {
   let victim_idx = (victim_id - 1) as usize;
   let leader_term = g100[leader].status().await.expect("status").term;
 
-  // Remove a present follower.
+  // Remove a present follower. `armed` is the observable origin of the retry budget: the leader's
+  // apply-fold arms it in this call's own crank, so measuring the hold from here is at worst one
+  // crank early — which understates the hold and can only make the floor below easier to clear.
+  let armed = std::time::Instant::now();
   g100[leader]
     .conf_change(ConfChange::new(
       ConfChangeType::RemoveNode,
@@ -4530,16 +4533,35 @@ async fn a_removed_voter_holds_quiescence_through_the_farewell_budget() {
   )
   .await;
 
-  // The budget holds quiescence: for longer than the one-election-timeout eligibility window (past
-  // the point the now-idle group would otherwise quiesce), the leader does NOT quiesce group 100.
-  for _ in 0..7 {
-    tokio::time::sleep(SLOW_HEARTBEAT).await;
-    assert_eq!(
-      metrics[leader].quiesced_groups(),
-      0,
-      "the budget holds the group quiesce-ineligible while shots remain"
+  // The hold is a STATE invariant, so assert on state: poll until the gauge FIRST flips, then
+  // check WHEN it flipped. A premature quiesce breaks this loop early and shows up as a short
+  // hold; the deadline is a hang guard, never the assertion.
+  //
+  // The floor is what the budget is FOR, derived from the driver's own eligibility rule rather
+  // than from a chosen sleep. The quiesce sweep's inactivity clock starts at the last
+  // `(term, commit, applied)` change — the removal's own commit+apply — so a group with NO pending
+  // farewell becomes eligible exactly one election timeout later. `group_idle` refuses while
+  // `has_pending_farewells()` holds, and the budget's last shot cannot fire before the leader tick
+  // one election timeout after the front-loaded shot 2. So the flip must land at least one further
+  // leader tick past the farewell-free baseline: anything at or under `SLOW_ELECTION` would mean
+  // the budget extended nothing. Only the direction matters for stability — a slow machine delays
+  // the flip, never hastens it, and `armed` is taken before the conf change so it can only
+  // overstate the hold.
+  let hold_floor = SLOW_ELECTION + SLOW_HEARTBEAT;
+  let guard = armed + Duration::from_secs(30);
+  while metrics[leader].quiesced_groups() == 0 {
+    assert!(
+      std::time::Instant::now() < guard,
+      "group 100 never quiesced: the farewell budget never drained"
     );
+    tokio::time::sleep(Duration::from_millis(20)).await;
   }
+  let held = armed.elapsed();
+  assert!(
+    held >= hold_floor,
+    "the budget must hold the group quiesce-ineligible past the farewell-free baseline \
+     ({SLOW_ELECTION:?} of inactivity): quiesced after {held:?}, floor {hold_floor:?}"
+  );
   // No disruption: the live pair kept its term (the removed voter self-removed, never campaigned).
   assert_eq!(
     g100[leader].status().await.expect("status").term,
