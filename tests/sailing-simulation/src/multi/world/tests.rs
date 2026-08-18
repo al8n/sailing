@@ -3967,3 +3967,76 @@ fn redundant_fold_clear_keys_on_the_mint_token_not_hostedness() {
     "a token-bearing fork child's fence CLEARS — the fork resolved"
   );
 }
+
+/// THE DELIVERY-SEAM GENERATION FENCE, the sim's model of the product's demux fence. A frame
+/// stamped with a generation BELOW the receiver's persisted admission floor speaks for a RETIRED
+/// incarnation: it is dropped, counted, and never reaches the endpoint. A frame stamped AT the
+/// floor is a live member's and delivers — the equal-admits line, which is what keeps a live gid's
+/// reshape skew from re-creating the apply-time staleness bug.
+///
+/// The husk is constructed directly on the bus: the world's own retirement purges a removed gid's
+/// in-flight traffic, so the shape has to be injected to be observed at all.
+#[test]
+fn the_delivery_seam_fences_a_retired_incarnations_frames() {
+  use sailing_proto::{Index, Message, RequestVote, Term};
+  let mut w = MultiWorld::new(2);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  // The catalog retired every incarnation of 100 below generation 3; this live incarnation IS
+  // generation 3 (registry scale), so its own traffic clears the floor while anything stamped
+  // lower speaks for an incarnation that is gone.
+  w.incarnation_floors.insert(100, 3);
+  w.set_generation_for_test(100, 3);
+  assert!(w.run_until(600, |w| w.leader_of(100).is_some()));
+  assert_eq!(
+    w.fenced_dropped(),
+    0,
+    "the live incarnation's own traffic clears its floor"
+  );
+  let before_term = w.hosts[&2].group(&100).expect("hosted").term();
+  let husk_vote = || {
+    Message::RequestVote(RequestVote::new(
+      Term::new(before_term.get() + 5),
+      1u64,
+      Index::new(1),
+      Term::new(1),
+      false,
+      false,
+    ))
+  };
+
+  let fenced_before = w.fenced_dropped();
+  w.inject_for_test(1, 100, 0, 2, husk_vote());
+  w.tick();
+  assert_eq!(
+    w.fenced_dropped(),
+    fenced_before + 1,
+    "a below-floor stamp is fenced at the delivery seam"
+  );
+  assert_eq!(
+    w.fenced_votes_dropped(),
+    1,
+    "and counted in the disruption subset"
+  );
+  assert_eq!(
+    w.hosts[&2].group(&100).expect("hosted").term(),
+    before_term,
+    "the retired incarnation's campaign never reached the endpoint"
+  );
+
+  // AT the floor: a live member's frame, delivered.
+  w.inject_for_test(1, 100, 3, 2, husk_vote());
+  w.tick();
+  assert_eq!(
+    w.fenced_dropped(),
+    fenced_before + 1,
+    "at-floor is not below-floor"
+  );
+  assert!(
+    w.hosts[&2].group(&100).expect("hosted").term() > before_term,
+    "the at-floor campaign reached the endpoint"
+  );
+}

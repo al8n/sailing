@@ -224,6 +224,13 @@ impl MultiWorld {
       let floor = self.removal_floors.entry(gid).or_insert(0);
       *floor = (*floor).max(ceiling.saturating_add(1));
     }
+    // The INCARNATION floor the delivery-seam generation fence reads: this retirement ends
+    // `generation`, so a straggler still stamped by it speaks for an incarnation that is gone. A
+    // recreation comes back at `generation + 1` and admits at exactly this value (equal admits).
+    // Recorded for EVERY retirement, reshaped or not — the wire fence is not a reshape-only
+    // mechanism, and an id that never returns simply keeps a floor nothing ever tests.
+    let inc = self.incarnation_floors.entry(gid).or_insert(0);
+    *inc = (*inc).max(generation.saturating_add(1));
     {
       let meta = self
         .groups
@@ -721,6 +728,18 @@ impl MultiWorld {
   /// Group `gid`'s incarnation counter (0 until its first recreation).
   pub(crate) fn generation_of(&self, gid: u64) -> u64 {
     self.groups.get(&gid).map_or(0, |m| m.generation)
+  }
+
+  /// Test-only: place `gid`'s live incarnation at `generation`, so a fence test can stand a live
+  /// group above a floor without driving a whole retire/recreate cycle (which purges the very
+  /// stragglers the fence exists for).
+  #[cfg(test)]
+  pub(crate) fn set_generation_for_test(&mut self, gid: u64, generation: u64) {
+    self
+      .groups
+      .get_mut(&gid)
+      .expect("set_generation_for_test: unknown group")
+      .generation = generation;
   }
 
   /// Group `gid`'s reconciled committed voter set (the registry view).

@@ -617,6 +617,17 @@ pub struct MultiVoprReport {
   pub max_term_seen: u64,
   /// Seeded network faults that fired (drops + duplications).
   pub faults_fired: u64,
+  /// Deliveries the GENERATION FENCE dropped across the run: a sender speaking for an incarnation
+  /// the RECEIVER's durable admission floor has retired (the sim's model of the product's demux
+  /// fence). `0` in a band that never retires an incarnation whose replicas still send; nonzero in
+  /// the reshape/churn families, where it is the non-vacuity witness that the class OCCURRED.
+  pub fenced_frames_dropped: u64,
+  /// The DISRUPTION subset of [`fenced_frames_dropped`](Self::fenced_frames_dropped):
+  /// retired-incarnation `(Pre)Vote`s. Unfenced, each is a campaign a reshape-removed husk could
+  /// have deposed a live leader with; fenced, none reaches a replica at all — so the husk's depose
+  /// count is zero BY CONSTRUCTION, and this counter is what proves the class was exercised rather
+  /// than absent.
+  pub fenced_votes_dropped: u64,
   /// gid-tagged applied entries the cross-talk sweep judged (the isolation oracle's
   /// non-vacuity witness).
   pub cross_talk_checks: u64,
@@ -828,6 +839,8 @@ fn run_multi_vopr_inner(
     reads.scan(&w, &mut report, seed);
     report.max_term_seen = report.max_term_seen.max(w.max_term_all());
     report.faults_fired = w.net_dropped() + w.net_duplicated();
+    report.fenced_frames_dropped = w.fenced_dropped();
+    report.fenced_votes_dropped = w.fenced_votes_dropped();
 
     if iter + 1 >= next_calm {
       calm_window(
@@ -880,6 +893,8 @@ fn run_multi_vopr_inner(
   report.cross_talk_checks = w.cross_talk_checked();
   report.max_term_seen = report.max_term_seen.max(w.max_term_all());
   report.faults_fired = w.net_dropped() + w.net_duplicated();
+  report.fenced_frames_dropped = w.fenced_dropped();
+  report.fenced_votes_dropped = w.fenced_votes_dropped();
   // The async crash-suite non-vacuity witnesses (all 0 under the sync store mode): the flush phase
   // ran, torn writes stranded real batches, and crashes landed mid-window.
   report.log_flushes = w.log_flushes();

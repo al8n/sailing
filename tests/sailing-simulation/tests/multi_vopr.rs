@@ -211,6 +211,17 @@ fn reshape_band_smoke() {
       r.groups_created >= 2 && r.committed > 0,
       "seed {seed} vacuous: {r:?}"
     );
+    // THE FENCE WITNESS. Reshape is where a retired incarnation's traffic would arise, so this is
+    // the band that would show the fence rejecting something it must not. Zero is the assertion:
+    // a live incarnation's stamp always clears its own floor (equal admits), so nothing legitimate
+    // is ever fenced — and with it, the reshape-removed husk's DEPOSE count is zero by
+    // construction, since a below-floor campaign never reaches a replica at all. A nonzero count
+    // here means a stamp and a floor have drifted onto different scales.
+    assert_eq!(
+      (r.fenced_frames_dropped, r.fenced_votes_dropped),
+      (0, 0),
+      "seed {seed} fenced live traffic: {r:?}"
+    );
     total_splits += r.splits_applied;
   }
   assert!(
@@ -429,6 +440,13 @@ fn merge_band_smoke() {
     assert!(
       r.groups_created >= 2 && r.committed > 0,
       "seed {seed} vacuous: {r:?}"
+    );
+    // The fence witness (see the reshape band): a merged-away source is the OTHER retired class,
+    // and its live members must never be fenced while the merge is resolving.
+    assert_eq!(
+      (r.fenced_frames_dropped, r.fenced_votes_dropped),
+      (0, 0),
+      "seed {seed} fenced live traffic: {r:?}"
     );
     total_registered += r.merges_registered;
     total_rollbacks += r.merges_rolled_back;

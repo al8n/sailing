@@ -58,6 +58,42 @@ impl MultiWorld {
     self.net_dropped
   }
 
+  /// Deliveries the GENERATION FENCE dropped across the run — the sim's mirror of the
+  /// coordinators' `fenced_frames_dropped`. Nonzero only once a run has retired an incarnation
+  /// whose replicas were still sending.
+  pub(crate) fn fenced_dropped(&self) -> u64 {
+    self.fenced_dropped
+  }
+
+  /// The DISRUPTION subset of [`fenced_dropped`](Self::fenced_dropped): retired-incarnation
+  /// `(Pre)Vote`s the fence stopped before any replica saw them.
+  pub(crate) fn fenced_votes_dropped(&self) -> u64 {
+    self.fenced_votes_dropped
+  }
+
+  /// Put one message on the bus with an EXPLICIT sender incarnation stamp, bypassing
+  /// `schedule_send` (which reads the stamp off a live host). Test-only: the world's own
+  /// retirement purges a removed gid's in-flight traffic, so a retired incarnation's straggler —
+  /// the very shape the generation fence exists for — cannot otherwise be observed at the seam.
+  #[cfg(test)]
+  pub(crate) fn inject_for_test(
+    &mut self,
+    from: u64,
+    gid: u64,
+    generation: u64,
+    to: u64,
+    message: sailing_proto::Message<u64>,
+  ) {
+    self.bus.push_back(super::GInFlight {
+      deliver_at: self.now,
+      gid,
+      from,
+      to,
+      generation,
+      message,
+    });
+  }
+
   /// Message duplications fired by the seeded network fault model.
   pub(crate) fn net_duplicated(&self) -> u64 {
     self.net_duplicated
