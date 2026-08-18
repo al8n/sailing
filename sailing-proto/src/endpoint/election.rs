@@ -960,9 +960,13 @@ where
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
     // Self-match advance is deferred until the append is durable (on_log_appended). A log at the index
     // ceiling is corrupt/terminal — `append_leader_noop` poisons and returns `None`; fail-stop.
-    if self.append_leader_noop(now, log, last).is_none() {
+    let Some(noop_index) = self.append_leader_noop(now, log, last) else {
       return;
-    }
+    };
+    // Date this leader's knowledge: everything below its own no-op is INHERITED, and until that
+    // much has applied its applied configuration may be stale by a committed-but-unknown tail. The
+    // removal cures gate on it (see `term_start_index`).
+    self.term_start_index = noop_index;
 
     // (`set_leader` above emitted `LeaderChanged(Some(self))` — a candidate's leader belief is
     // always `None`, so the transition always fires.)
