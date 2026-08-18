@@ -7784,4 +7784,60 @@ fn a_demotion_to_learner_is_not_a_removal() {
     core::iter::from_fn(|| ep.poll_event()).all(|e| !matches!(e, Event::ConfChanged(_))),
     "a demotion is a role change, not a removal"
   );
+  assert!(
+    ep.courtesy_owed.is_empty(),
+    "and mints nothing against anyone"
+  );
+}
+
+/// F2 — a removal learned ONLY by snapshot mints the debt too. A replica offline across the whole
+/// conf change never replays the removal entry, so without this it would carry no debt for the
+/// departed peer; if it later led, it would owe that peer nothing, adopt its next campaign, and
+/// restart the disruption cycle. The boundary is the removal index, and it is payable by
+/// construction — this very snapshot's ConfState excludes the peer at exactly that index.
+///
+/// MUTATION: drop the mint loop at the install edge → the debt map is empty and the assertion
+/// fails.
+#[test]
+fn a_snapshot_only_removal_mints_the_courtesy_debt_at_the_boundary() {
+  use crate::{Index, Instant, Message, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _) = follower_at_generation(0);
+  assert!(
+    ep.courtesy_owed.is_empty(),
+    "nothing owed before the install"
+  );
+
+  // The install drops node 3 from a {1,2,3} prior configuration; node 2 (self) stays.
+  let boundary = Index::new(20);
+  let meta = SnapshotMeta::new(
+    boundary,
+    Term::new(6),
+    ConfState::from_voters(std::vec![1u64, 2]),
+  );
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_snapshot(99),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+  let debt = ep
+    .courtesy_owed
+    .get(&3u64)
+    .expect("the snapshot-only removal minted a debt for the departed peer");
+  assert_eq!(
+    debt.removal_index, boundary,
+    "at the snapshot boundary — the conservative index this very snapshot can pay"
+  );
+  assert!(
+    !ep.courtesy_owed.contains_key(&2u64),
+    "and never against self, which stayed a member"
+  );
 }

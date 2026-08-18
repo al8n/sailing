@@ -1250,6 +1250,84 @@ struct Reads<I> {
 /// carries no delivery feedback and the budget is the sole terminator (the TiKV-redundancy analogue).
 const FAREWELL_RETRY_SHOTS: u8 = 2;
 
+/// Election timeouts between two COURTESY offers to the same peer. Long enough that a removed
+/// peer's whole election cycle — campaign, lose, retry — fits inside one cooldown, so an ignorant
+/// peer's traffic cannot make the leader re-ship a whole blob per beat; short enough that one lost
+/// offer is re-made within a few seconds.
+const COURTESY_COOLDOWN_TIMEOUTS: u32 = 3;
+
+/// The most courtesy debts a replica carries at once. Debts are minted on EVERY replica (see the
+/// mint site) and discharged only by evidence, so a follower — which never offers and so never
+/// collects an acknowledgement — has no event that retires them. The cap makes that bounded without
+/// any new lifecycle: past it the OLDEST debt (lowest removal index, since log indexes only grow)
+/// is dropped to make room, and the peer it named falls to the embedder's catalog reap — the same
+/// backstop every other courtesy residual falls to. 64 is far above any realistic
+/// simultaneous-removal burst on one group, so in practice the cap is a safety net rather than a
+/// working limit.
+const COURTESY_DEBT_CAP: usize = 64;
+
+/// A leader's COMMITTED-EVIDENCE debt to one peer this group's own configuration removed (#95).
+///
+/// A debt is DISCHARGED BY EVIDENCE, never by a count of attempts. An earlier version carried a
+/// three-offer budget charged when the `InstallSnapshot` was ENQUEUED — but enqueueing is not
+/// delivering, so three lost frames retired the debt with the peer no better informed, and the peer
+/// then disrupted forever with no standing cure anywhere. Exactly four things end a debt now: the
+/// owed peer's completed ack at or past the EARLIEST boundary offered this removal generation,
+/// honored on any role; a committed re-add of the peer (both tracker-rebuild edges); this replica
+/// removing ITSELF; and the map's capacity eviction. Absent those, the debt is retained and
+/// retried — bounded not by a budget but by the per-peer cooldown.
+///
+/// THE ACK IS TRUTHFUL BY CONSTRUCTION, which is what makes it evidence: an offer is only ever made
+/// with a ConfState that excludes the peer, and the receiver reaches a success response on exactly
+/// two paths. Either it INSTALLED the blob and answers at completion, or the redundancy arm found the
+/// boundary already in its own durable history and answered from that — at or below its commit,
+/// where there is nothing left to do; or above it, only once the raised commit is DURABLE and apply
+/// has reached the boundary. Both paths are restart-stable, by a durable blob or by a durable commit
+/// over a durable log, so a completed non-reject ack at or past the floor means the peer processed
+/// committed state through an excluding boundary and will still have done so after a crash. The
+/// discharge predicate needs no help from the producer side.
+///
+/// The authorization primitive of the courtesy path. The trigger does NOT reason from a sender's
+/// absence from the tracker — absence is what an unknown, a never-member, and a departed member
+/// all look like, and treating them alike lets any authenticated peer conjure a snapshot out of
+/// this leader. It reasons from THIS leader's own applied committed removal instead: an entry is
+/// minted only at the apply-time fold that prunes the peer, so the map is a record of removals
+/// this replica itself committed and applied. Contact can never create an entry, only spend one.
+///
+/// Its lifecycle mirrors [`FarewellRetry`]'s to the letter, because it answers the same question
+/// about the same peers: PARKED across step-downs (a re-election re-arms and re-drives the
+/// remaining offers), reconciled at `become_leader` and pruned at BOTH tracker-rebuild edges (the
+/// log-applied conf change and a snapshot install) under the same
+/// `tracker.progress(peer).is_none()` predicate, cleared outright on SELF-removal, and empty after
+/// a restart (volatile; the durable catalog is the backstop).
+#[derive(Debug, Clone)]
+struct CourtesyDebt {
+  /// The log index of the committed removal that minted this debt. The offer is gated on a
+  /// durable snapshot at or past it: a capture from BEFORE the removal cannot carry the removal,
+  /// so shipping it would re-baseline the peer onto a configuration that still names it — leaving
+  /// it ignorant, armed, and now expensively so.
+  removal_index: Index,
+  /// The DISCHARGE FLOOR: the EARLIEST boundary offered for this removal generation, if any offer
+  /// has gone out. It is what an acknowledgement is measured against — a `SnapshotResponse` from
+  /// the owed peer at or past it is proof the peer installed a configuration that excludes it, and
+  /// proof is the ONLY thing that discharges a debt.
+  ///
+  /// SET ONCE, by the generation's first offer, and never raised by a retry: every offer of a
+  /// generation carries a cure, so an ack for the first one is valid evidence however many newer
+  /// blobs were sent after it. Only a re-removal moves the floor, and it does so by RESETTING this
+  /// to `None` along with the rest of the debt — a later generation's cure is a different claim.
+  offered_index: Option<Index>,
+  /// When the next offer may go out. `None` ⇒ due immediately (at mint, and after a re-election
+  /// re-arms it), so the first offer lands on the removed peer's first contact rather than one
+  /// cooldown later.
+  next_at: Option<Instant>,
+  /// The highest term this leader has SEEN the owed peer carry, learned from the contacts it
+  /// drops. It is the futility gate's input: an offer stamped below it is provably dead on
+  /// arrival, because the receiver's universal stale-term pre-pass discards anything staler than
+  /// its own term before a handler ever sees it. `None` until the peer is first heard from.
+  last_seen_term: Option<Term>,
+}
+
 /// Leader-scoped retry state for a farewell that may have been LOST in flight — the lost-farewell
 /// leg of the removed-replica churn cure (#95).
 ///
@@ -1439,15 +1517,28 @@ where
   /// the applied view may already be void. Once it has, the tail's own apply fold has run and the
   /// existing prune edges have reconciled both maps.
   ///
-  /// Every path that ACTS on a removal gates on it — the apply-time farewell FIRE (suppressed with
-  /// its initial shot left unspent, because a queued message cannot be retracted), the farewell
-  /// RE-DRIVE on the leader's beat, and both courtesy offer paths.
+  /// FOUR consumers gate on it, which is every path that acts on a removal:
+  ///   1. the apply-time farewell FIRE (`apply_committed`'s conf-change fold) — suppressed, with
+  ///      the initial shot left unspent, because a queued message cannot be retracted;
+  ///   2. the farewell RE-DRIVE on the leader's beat;
+  ///   3. the PROACTIVE courtesy offer on the leader's beat;
+  ///   4. the CONTACT-triggered courtesy offer.
   ///
-  /// ONE behavior is deliberately NOT gated, and the asymmetry is the point: ordinary message
-  /// handling. A leader whose membership view is unsettled must remain DEPOSABLE, or it can wedge a
-  /// group it can no longer commit in.
+  /// All four are SENDS THIS REPLICA MAKES. That is the whole licence: suppressing our own output
+  /// on stale information costs at most a delay, while suppressing another replica's traffic on the
+  /// same stale information can wedge the group — which is why nothing anywhere gates inbound
+  /// handling.
   term_start_index: Index,
   pending_farewells: BTreeMap<I, FarewellRetry>,
+  /// COURTESY debts owed to peers this group's committed configuration removed — the
+  /// compacted-removed-peer cure's authorization AND its discharge floor (see [`CourtesyDebt`]).
+  /// Populated at exactly the apply-time fold that populates `pending_farewells`, so the two maps
+  /// name the same peers for the same reason and the composition between them is a lookup, not a
+  /// race: the farewell's cheap append owns a peer while its budget lasts, and the courtesy trigger
+  /// consults this map only once `pending_farewells` no longer holds it. Bounded by
+  /// [`COURTESY_DEBT_CAP`] and by construction — only this replica's own committed removals mint
+  /// entries, and each is discharged by the evidence its cure produces.
+  courtesy_owed: BTreeMap<I, CourtesyDebt>,
 }
 
 // Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
@@ -1612,6 +1703,7 @@ where
       replication_pending: false,
       term_start_index: Index::ZERO,
       pending_farewells: BTreeMap::new(),
+      courtesy_owed: BTreeMap::new(),
     };
     ep.arm_election_timer(now);
     ep
@@ -1803,6 +1895,14 @@ where
   #[inline]
   pub const fn refused_stale_removal_install_count(&self) -> u64 {
     self.snapshot.refused_stale_removal_installs
+  }
+
+  /// Whether this leader still owes any peer a courtesy offer (leader-gated, like
+  /// [`has_pending_farewells`](Self::has_pending_farewells): the debts park on a follower and
+  /// re-arm at the next `become_leader`).
+  #[must_use]
+  pub fn has_courtesy_debts(&self) -> bool {
+    self.role.is_leader() && !self.courtesy_owed.is_empty()
   }
 
   /// Next outbound message, if any.
@@ -2337,6 +2437,25 @@ where
     self.mint_op_id()
   }
 
+  /// Mint a courtesy debt directly, for the cap's eviction test.
+  #[cfg(test)]
+  pub(crate) fn note_courtesy_debt_for_test(&mut self, peer: I, removal_index: Index) {
+    self.note_courtesy_debt(&peer, removal_index);
+  }
+
+  /// Spend a removed peer's whole farewell budget at once — the compacted class, where every shot
+  /// burns on the clamped-heartbeat fallback and teaches the peer nothing.
+  #[cfg(test)]
+  pub(crate) fn pending_farewells_clear_for_test(&mut self) {
+    self.pending_farewells.clear();
+  }
+
+  /// Drive the CheckQuorum step-down from a test (the courtesy trigger's leader gate).
+  #[cfg(test)]
+  pub(crate) fn step_down_to_follower_for_test(&mut self, now: impl Into<Now>) {
+    self.step_down_to_follower(now.into());
+  }
+
   /// Seed the op-id counter so the exhaustion fail-stop can be exercised without 2^64 mints.
   #[cfg(test)]
   pub(crate) fn set_next_op_id_for_test(&mut self, id: OpId) {
@@ -2422,6 +2541,8 @@ where
         // completion-time staleness re-check in `install_snapshot_now` is the final guard.)
         self.pending_log.clear();
         self.pending_stable.clear();
+        // Courtesy debts PARK across this higher-term step-down exactly as the farewell budget
+        // does (they are the same peers' unfinished business, and a re-election re-arms both).
         // Pending farewell retries PARK across this higher-term step-down (NOT cleared): the surviving
         // shots re-arm and re-drive if this node re-wins leadership. Inert while a follower (the
         // leader-gated accessor reads false; the re-drive runs only on a leader tick).
@@ -2491,10 +2612,30 @@ where
     // is reachable. Mark it active so it counts toward the next quorum_active check.
     // We do this AFTER the term pre-pass (so a higher-term message that steps us down doesn't
     // mark a peer active on the stale term's leader) and only if we're still the leader.
-    if self.role.is_leader()
-      && let Some(pr) = self.tracker.progress_mut(&from)
-    {
-      pr.set_recent_active(true);
+    if self.role.is_leader() {
+      if let Some(pr) = self.tracker.progress_mut(&from) {
+        pr.set_recent_active(true);
+      } else if self.courtesy_owed.contains_key(&from) {
+        // THE CONTACT-TRIGGERED COURTESY OFFER, deliberately placed AFTER the universal term
+        // handling above rather than before it. An earlier design classified an owed sender ahead
+        // of the term pre-pass and DROPPED its message, to get an offer out before the peer could
+        // depose this leader. That shield is gone: no local state may license suppressing another
+        // replica's reconciliation traffic, because a leader whose configuration history is stale
+        // cannot tell a departed peer from a re-added one, and suppressing the wrong one wedges the
+        // group (three successive topologies proved it). Reaching this point means the message was
+        // handled normally and this node is STILL the leader — so the sender is at or below our
+        // term, which is exactly the pre-vote announce path (an advertised future term never moves
+        // us) and the post-deposition path. A peer that genuinely out-terms us deposes us instead,
+        // and the re-elected leadership's first-tick proactive offer is what cures it.
+        //
+        // The contact also TEACHES: the sender's real term is recorded on its debt so the futility
+        // gate can refuse to spend a whole snapshot on an offer the peer would discard.
+        let seen = Self::sender_real_term(&msg);
+        if let Some(debt) = self.courtesy_owed.get_mut(&from) {
+          debt.last_seen_term = Some(debt.last_seen_term.map_or(seen, |prev| prev.max(seen)));
+        }
+        self.maybe_send_courtesy_snapshot(now, &from, stable);
+      }
     }
 
     #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for future variants
@@ -2666,6 +2807,15 @@ where
         // re-delivery once due. Placed LAST in the leader tick, so a fatal farewell log read fail-stops
         // with nothing after it — the next dispatch's top-level poison check halts the node.
         self.drive_pending_farewells(now, log);
+        // ...and re-drive the courtesy debts on the same beat. This is what closes the cure's loop
+        // under the etcd-parity defaults. A removed peer's campaigns lift the group's term through
+        // the LIVE members (this leader refuses to be lifted by it), and the member that then wins
+        // holds the debt by the universal mint — so its term now EXCEEDS the peer's and its offer
+        // is term-valid by construction, where every offer the previous leader could have made was
+        // futile. Front-loading it on the first tick after `become_leader` re-arms the debts is the
+        // farewell's own timing argument: one heartbeat interval is well inside the removed peer's
+        // [T, 2T) election deadline, so the offer lands before its next campaign.
+        self.drive_courtesy_offers(now, stable);
       }
       _ => {
         if self.election_deadline.is_some_and(|d| d <= now.mono()) {
@@ -2832,6 +2982,51 @@ where
     );
   }
 
+  /// Mint a courtesy debt learned from a SNAPSHOT install, at the snapshot's boundary. Unlike the
+  /// log-apply mint, this one replaces an existing debt only when the boundary is strictly LATER
+  /// (the log-applied removal it already records is then the more precise index); a replacement
+  /// resets the discharge floor, consistent with the re-removal rule.
+  fn note_courtesy_debt_at_boundary(&mut self, peer: &I, boundary: Index) {
+    if self
+      .courtesy_owed
+      .get(peer)
+      .is_some_and(|debt| debt.removal_index >= boundary)
+    {
+      return;
+    }
+    self.note_courtesy_debt(peer, boundary);
+  }
+
+  /// Mint (or refresh) the courtesy debt for a peer this replica's committed configuration just
+  /// removed, enforcing [`COURTESY_DEBT_CAP`]. A re-removal of the same peer REPLACES its debt: the
+  /// newer removal is the one an offer must carry, so the discharge floor resets with it and an ack
+  /// for the previous generation's blob no longer settles anything.
+  fn note_courtesy_debt(&mut self, peer: &I, removal_index: Index) {
+    if !self.courtesy_owed.contains_key(peer) && self.courtesy_owed.len() >= COURTESY_DEBT_CAP {
+      // Evict the OLDEST debt — the lowest removal index, log indexes being monotone. Its peer
+      // falls to the catalog reap.
+      if let Some(oldest) = self
+        .courtesy_owed
+        .iter()
+        .min_by_key(|(_, debt)| debt.removal_index)
+        .map(|(id, _)| id.cheap_clone())
+      {
+        self.courtesy_owed.remove(&oldest);
+      }
+    }
+    self.courtesy_owed.insert(
+      peer.cheap_clone(),
+      CourtesyDebt {
+        removal_index,
+        // Nothing offered yet, so nothing can be acknowledged yet.
+        offered_index: None,
+        next_at: None,
+        // A fresh debt has heard nothing yet, so nothing is known to be futile.
+        last_seen_term: None,
+      },
+    );
+  }
+
   /// Re-drive pending farewell retries on the leader's tick. Each removed peer whose scheduled shot
   /// has come due gets ONE more `send_farewell` re-delivering the SAME committed removal — the append
   /// arm for a straggler, the commit-carrying heartbeat arm for a caught-up peer, picked from the
@@ -2897,6 +3092,54 @@ where
       }
     });
     self.pending_farewells = farewells;
+  }
+
+  /// The term the SENDER actually holds, which is not always the term on the wire. A PRE-VOTE
+  /// request advertises the term its sender would campaign at — one above the term it holds — and
+  /// adopting the advertised value as the sender's own is exactly the disruption pre-vote exists to
+  /// avoid (the term pre-pass makes the same distinction). The futility gate needs the real term,
+  /// because that is what the sender's own pre-pass will compare an offer against.
+  fn sender_real_term(msg: &Message<I>) -> Term {
+    match msg {
+      Message::RequestVote(rv) if rv.pre_vote() => Term::new(rv.term().get().saturating_sub(1)),
+      other => other.term(),
+    }
+  }
+
+  /// Re-drive the courtesy debts on the leader's beat: every debt whose cooldown has elapsed gets
+  /// one offer ATTEMPT, which the offer path itself gates on snapshot eligibility and on futility.
+  /// An attempt that any gate refuses sends nothing, so this is safe to run every tick — the debts'
+  /// own `next_at` cooldowns bound what it can emit to one whole-blob frame per peer per window.
+  ///
+  /// Its reason for existing is the freshly-elected leader: `become_leader` re-arms the surviving
+  /// debts to due-immediately, and this is the tick that acts on them, without waiting for the
+  /// removed peer to make contact first. A peer that has already inflated its term never gets an
+  /// offer from a leader below it, so waiting for contact would wait forever; a leader that has
+  /// just won an election is above the term its electorate accepted, and that is exactly when the
+  /// offer becomes deliverable.
+  fn drive_courtesy_offers<S: StableStore<NodeId = I>>(&mut self, now: Now, stable: &S) {
+    if !self.role.is_leader() || self.courtesy_owed.is_empty() {
+      return;
+    }
+    // THE INHERITED-TAIL GATE (see `term_start_index`), and it bites hardest exactly here: this is
+    // the FIRST-TICK proactive path, which runs before a fresh leader has applied anything of its
+    // own. A debt the reconciling retain kept may name a peer a globally-committed AddNode in the
+    // inherited tail has already re-admitted, and offering it an excluding snapshot would tear down
+    // a current member. Wait for the tail; the AddNode's apply fold then prunes the debt through
+    // the existing re-add edge, so there is nothing left to offer and no new reconciliation to
+    // write. Suppression spends nothing.
+    if self.applied < self.term_start_index {
+      return;
+    }
+    let due: std::vec::Vec<I> = self
+      .courtesy_owed
+      .iter()
+      .filter(|(_, debt)| debt.next_at.is_none_or(|at| at <= now.mono()))
+      .map(|(peer, _)| peer.cheap_clone())
+      .collect();
+    for peer in due {
+      self.maybe_send_courtesy_snapshot(now, &peer, stable);
+    }
   }
 
   /// Apply all entries that have been committed but not yet applied.
@@ -3399,16 +3642,37 @@ where
                 // commit itself). No lease round: the farewell is not part of any CheckQuorum
                 // round, so its echo must not count toward the lease (and cannot: the responder
                 // is no longer a voter, and round 0 never matches a live round).
-                if self.role.is_leader() {
-                  let me = self.config.id();
-                  let mut peers = core::mem::take(&mut self.peers_scratch);
-                  peers.clear();
-                  for (peer, pr) in self.tracker.progress_map() {
-                    if *peer == me || new_tracker.progress(peer).is_some() {
-                      continue;
-                    }
-                    peers.push((peer.cheap_clone(), pr.match_index()));
+                // The pruned set: peers the OLD tracker knows that the NEW one does not. Computed
+                // on EVERY replica, because the courtesy debt below is universal even though the
+                // farewell beneath it is not. `*peer == me` is what keeps SELF out of both: a
+                // replica removing itself takes the self-removal path (step down, disarm, surface
+                // `ConfChanged`), and must never mint a debt naming itself — nothing would ever
+                // spend it, and a leader that later re-added itself would carry a debt against a
+                // current member.
+                let me = self.config.id();
+                let mut peers = core::mem::take(&mut self.peers_scratch);
+                peers.clear();
+                for (peer, pr) in self.tracker.progress_map() {
+                  if *peer == me || new_tracker.progress(peer).is_some() {
+                    continue;
                   }
+                  peers.push((peer.cheap_clone(), pr.match_index()));
+                }
+                // THE COURTESY DEBT IS MINTED ON EVERY REPLICA, not just the leader that applied
+                // the removal — the one place this cure's bookkeeping diverges from the farewell's,
+                // and deliberately so. The farewell needs the removed peer's proven `matched`,
+                // which only the leader's tracker holds, so its budget can never outlive that
+                // leader; the courtesy needs only the removal INDEX, which is apply-time knowledge
+                // every replica has. Minting it leader-only would inherit a residual it does not
+                // have to: a DIFFERENT member winning leadership later would owe the peer nothing,
+                // would adopt its next campaign in the term pre-pass, and the whole disruption
+                // cycle would recur at that leader. Universal minting means whoever leads holds the
+                // debt and refuses the cycle. Consulting and SPENDING stay leader-gated; on a
+                // follower the map is inert bookkeeping.
+                for (peer, _) in peers.iter() {
+                  self.note_courtesy_debt(peer, idx);
+                }
+                if self.role.is_leader() {
                   // THE INHERITED-TAIL GATE at the FIRE site. Draining an INHERITED RemoveNode
                   // during the pre-gate window would otherwise emit shot 1 the instant it applies —
                   // and a queued message cannot be retracted, so the re-add prune a few entries
@@ -3416,6 +3680,8 @@ where
                   // initial shot UNSPENT: if a re-add follows in the same tail, the prune discards
                   // the entry and nothing was ever said; if none does, the first post-gate drive
                   // delivers shot 1 through the ordinary path with the whole budget intact.
+                  // (The courtesy mint above needs no such treatment: it is send-free by
+                  // construction — it records a debt and emits nothing.)
                   let gated = self.applied < self.term_start_index;
                   for (peer, matched) in peers.drain(..) {
                     // A fatal farewell log read poisoned the node — no further sends.
@@ -3435,6 +3701,10 @@ where
                     // from `matched` vs `idx` on each re-drive; `matched` is frozen at removal, so the
                     // choice is deterministic. `next_at = None` ⇒ the next leader tick FRONT-LOADS shot
                     // 2 (no `now` here), before the removed peer's [T, 2T) deadline could depose us.
+                    // Both maps now name this peer (the debt was minted above), and the
+                    // composition between them is ordered by lookup rather than by timing: the
+                    // farewell's cheap append owns the peer while its shots last, and the courtesy
+                    // trigger consults the debt only once `pending_farewells` no longer holds it.
                     self.pending_farewells.insert(
                       peer,
                       FarewellRetry {
@@ -3452,12 +3722,13 @@ where
                       },
                     );
                   }
-                  self.peers_scratch = peers;
-                  // A farewell read fault is the same fatal class as any committed-range read:
-                  // fail-stop before the fold mutates further state (the node is inert).
-                  if self.poison.poisoned {
-                    break;
-                  }
+                }
+                peers.clear();
+                self.peers_scratch = peers;
+                // A farewell read fault is the same fatal class as any committed-range read:
+                // fail-stop before the fold mutates further state (the node is inert).
+                if self.poison.poisoned {
+                  break;
                 }
                 self.tracker = new_tracker;
                 // Membership-change lease revocation: the LeaseBased read lease is safe only because
@@ -3488,6 +3759,12 @@ where
                 // prune above.
                 self
                   .pending_farewells
+                  .retain(|peer, _| tracker.progress(peer).is_none());
+                // The courtesy debt prunes on the SAME predicate: a peer this change RE-ADMITTED
+                // is a current member again, and a debt naming it would authorize offering a
+                // removal its own configuration has since undone.
+                self
+                  .courtesy_owed
                   .retain(|peer, _| tracker.progress(peer).is_none());
               }
               // A committed, validly-decoded ConfChange that the Changer rejects is an unrecoverable
@@ -3530,6 +3807,7 @@ where
               // never re-win leadership here, so there is nothing to re-arm; the entries would only
               // leak. A different surviving member owns the churn from here (catalog / courtesy snap).
               self.pending_farewells.clear();
+              self.courtesy_owed.clear();
             }
             // If an in-flight leader transfer's target was removed or demoted by this conf change,
             // abort it (the target can no longer be elected, and proposals must not stay blocked until

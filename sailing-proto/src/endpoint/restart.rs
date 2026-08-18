@@ -630,6 +630,7 @@ where
       // leader-scoped and re-populated only after it (re-)wins an election and prunes a removed peer.
       term_start_index: Index::ZERO,
       pending_farewells: BTreeMap::new(),
+      courtesy_owed: BTreeMap::new(),
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
