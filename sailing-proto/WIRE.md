@@ -196,7 +196,7 @@ decode with `decode_exact` (trailing bytes reject); truncated input errors, neve
 Each `Message` rides one frame:
 
 ```text
-[ u32 payload length, BIG-endian ][ payload = [ u16 group length, BE ][ group id bytes ][ one encoded sailing.v1.Message ] ]
+[ u32 payload length, BIG-endian ][ payload = [ u16 group length, BE ][ group id bytes ][ varint generation ][ one encoded sailing.v1.Message ] ]
 ```
 
 - The length prefix is big-endian (conventional for network framing) and covers the WHOLE payload:
@@ -205,6 +205,11 @@ Each `Message` rides one frame:
   Raft group, so a multi-group host routes the frame to the right endpoint by reading the group id at a
   fixed offset — WITHOUT decoding the `Message`. A single-group host sends an empty tag
   (`group length == 0`); the group id is bounded 0..=1024 bytes.
+- `generation` is the sender's INCARNATION STAMP for that group — an unsigned LEB128 varint, `0`
+  for an unreshaped group and for every single-group host, so the common case costs one byte. It is
+  the demux fence's input (§6). A malformed stamp (truncated, longer than the 10-byte `u64`
+  ceiling, or a 10-byte encoding carrying bits above 2^64) is a framing violation and closes the
+  connection, exactly like a malformed group length — a stamp must never silently read as `0`.
 - Maximum payload: **64 MiB** (`MAX_FRAME_LEN`), covering the group header and the envelope. A receiver
   rejects a larger declared length at the header, before buffering any payload byte; a sender refuses to
   emit one (closing the connection at the source rather than flap-looping against the receiver's bound).
@@ -226,7 +231,7 @@ A multi-group sender may batch several groups' control messages to the same peer
 its payload opens with the `u16` big-endian marker `0xFFFF` followed by one or more entries:
 
 ```text
-[ 0xFF 0xFF ][ entry ]+    entry = [ u8 flags ][ u16 group length, BE (1..=1024) ][ group id bytes ][ u32 message length, BE ][ one encoded sailing.v1.Message ]
+[ 0xFF 0xFF ][ entry ]+    entry = [ u8 flags ][ u16 group length, BE (1..=1024) ][ group id bytes ][ varint generation ][ u32 message length, BE ][ one encoded sailing.v1.Message ]
 ```
 
 - **The marker cannot alias a group length.** A single-message payload opens with its group length,
@@ -240,6 +245,10 @@ its payload opens with the `u16` big-endian marker `0xFFFF` followed by one or m
 - `flags` bit 0 is QUIESCE: the sender stops exchanging this group's heartbeats after this beat, and
   the receiver's driver may stop arming the group's timers until traffic or a connection loss wakes
   it. All other bits must be zero on encode and are ignored on decode (forward room).
+- Every entry carries its OWN incarnation stamp, in the same varint form as §3's single-message
+  header: one coalesced frame batches several groups, whose lineages move independently, so a
+  per-frame stamp could not fence them apart. The heartbeat pair rides only here, which is what
+  makes the fence uniform across message classes.
 - Every entry carries a NON-empty group tag (`1..=1024` bytes): coalescing is a multi-group feature,
   so a single-group host closes on any coalesced frame — the same policy as any non-empty tag. A
   well-formed entry for a group the host does not carry is dropped ENTRY-by-entry; the frame's other
@@ -307,23 +316,45 @@ the floor is raised at REMOVAL (the removal ceiling), at MERGE resolution (the t
 (create/restore/fork walk the floor-first gate). A disk engine mirrors `multi::engine`'s reference
 semantics; losing a floor record re-admits a retired incarnation below its fence.
 
-## 6. Reserved: the group-header incarnation stamp (the generation fence)
+## 6. The group-header incarnation stamp (the generation fence)
 
-The next `LABEL_VERSION` bump grows the §3 group-demux header by one field:
+The §3 group-demux header — and every §3.1 coalesced entry — carries the sender's incarnation
+counter for the tagged group:
 
 ```
 [u16 group_len][group bytes][varint generation]
 ```
 
 `generation` is the SENDER's incarnation counter for that gid (the unified lineage/shape counter;
-`0` for an unreshaped group). It gives the receiver a demux-time fence for retired incarnations —
+`0` for an unreshaped group). It gives the receiver a demux-time fence for retired incarnations:
 `floor_admits(floor(gid), generation)` fails ⇒ drop the frame, exactly as a tombstoned gid's frame
 is dropped today — the durable, generation-exact form of the volatile removal tombstone, and the
 append/vote-plane counterpart of the snapshot path's lineage gate (which token-discriminates
 snapshot traffic alone).
 
-Reserved rather than landed: the field's ENFORCEMENT semantics — the comparator, tolerance for
-same-lineage generation skew (a mid-split replica legitimately trails by one), and per-message-class
-policy — are settled by the enforcement design that lands the bump, and a field whose semantics later
-change would burn a version byte for nothing. The hello's version fence (§4) makes the eventual bump safe: mixed-version
-peers reject at the handshake, never mis-parse the header.
+The enforcement semantics the field reserved are now settled:
+
+- **The comparator is the RETIREMENT FLOOR**, the durable `FloorStore::floor(gid)`, not the
+  receiver's current shape generation. Equal ADMITS (`generation >= floor`); only strictly-below
+  is refused, and the reserved `MERGED_FLOOR` sentinel is refused at any floor.
+- **Skew needs no tolerance window.** A live gid's floor does not move when its shape generation
+  bumps — splits, merges and forks advance the lineage counter, not the live id's floor — so a
+  replica trailing a reshape by one (or by N, after sleeping through chained reshapes) stamps its
+  own lower generation and still admits at an applied sibling. A below-floor stamp means exactly
+  one thing: the sender speaks for a RETIRED incarnation.
+- **Every message class is fenced.** A retired incarnation has no legitimate traffic into a
+  floored receiver: its appends are dead writes, its heartbeats are noise, its votes are the
+  disruption class. Class-peeking at demux would leave the append plane as a stale-incarnation
+  side channel. The husk's INBOUND cure traffic is unaffected — its OWN floor for the gid is
+  un-retired, so farewells and courtesy snapshots still admit at the husk.
+- **The drop is purely observational.** It bumps a per-coordinator counter (and, under the
+  `tracing` feature, emits a `(group, generation, peer)` event); nothing consumes it for control
+  flow, and the sender is never answered. Reaping the husk stays the embedder catalog's job.
+- **Conf-change VOTER removal does not bump the group generation**, so a conf-removed voter stamps
+  the same generation as live members and the fence cannot see it. That class is cured by the
+  farewell retry and the courtesy snapshot instead, never by the fence.
+
+The field landed IN PLACE under the current `LABEL_VERSION` (§4) rather than behind a bump: the
+crates are unpublished at 0.0.0, so no deployment can hold two builds claiming one version. The
+hello's version fence still governs any future true version change — mixed-version peers reject at
+the handshake, never mis-parse the header.

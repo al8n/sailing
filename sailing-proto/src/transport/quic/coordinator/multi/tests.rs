@@ -29,6 +29,9 @@ fn san(id: u64, c: &ClusterId) -> String {
 
 struct Stores {
   map: BTreeMap<u64, (VecLog, AsyncStable)>,
+  /// Per-gid admission floors, the demux fence's durable input. Empty (floor 0) unless a test
+  /// retires an incarnation, so every other test's behavior is unchanged.
+  floors: BTreeMap<u64, u64>,
 }
 
 impl GroupStores<u64, VecLog, AsyncStable> for Stores {
@@ -38,8 +41,8 @@ impl GroupStores<u64, VecLog, AsyncStable> for Stores {
 }
 
 impl FloorStore<u64> for Stores {
-  fn floor(&self, _gid: &u64) -> u64 {
-    0
+  fn floor(&self, gid: &u64) -> u64 {
+    self.floors.get(gid).copied().unwrap_or(0)
   }
 
   fn lineage(&self, _gid: &u64) -> u64 {
@@ -52,6 +55,7 @@ impl FloorStore<u64> for Stores {
 fn empty_stores() -> Stores {
   Stores {
     map: BTreeMap::new(),
+    floors: BTreeMap::new(),
   }
 }
 
@@ -102,6 +106,7 @@ fn coordinator_drives_isolated_groups() {
 
   let mut stores = Stores {
     map: BTreeMap::new(),
+    floors: BTreeMap::new(),
   };
   stores
     .map
@@ -174,6 +179,7 @@ fn multi_coord(ca: &TestClusterCa, id: u64, cluster: ClusterId) -> MCoord {
 fn group_stores(groups: &[u64]) -> Stores {
   let mut s = Stores {
     map: BTreeMap::new(),
+    floors: BTreeMap::new(),
   };
   for &g in groups {
     s.map.insert(g, (VecLog::default(), AsyncStable::default()));
@@ -1645,6 +1651,7 @@ fn merge_verbs_ride_the_coordinator() {
     MultiQuicCoordinator::<u64, u64, CountSm>::with_identity(opts, Some(seed), cluster);
   let mut stores = Stores {
     map: BTreeMap::new(),
+    floors: BTreeMap::new(),
   };
   for gid in [1u64, 2] {
     stores
@@ -1747,5 +1754,90 @@ fn merge_verbs_ride_the_coordinator() {
   assert!(
     coord.group(&1).is_some_and(|ep| !ep.has_abandoned()),
     "no abort applied — the target records no thaw obligation"
+  );
+}
+
+/// THE GENERATION FENCE over QUIC: a still-hosted group whose DURABLE floor has retired the
+/// sender's incarnation drops that group's entries at demux — counted, never dispatched — while a
+/// co-located live group's entries in the very same coalesced frame still deliver, and the shared
+/// connection survives. The stream sibling carries the full matrix (equal-admits, skew-immunity,
+/// per-class coverage); this pins the QUIC demux leg.
+#[test]
+fn a_below_floor_stamp_is_fenced_over_quic() {
+  use crate::GroupControl;
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut a = multi_coord(&ca, 1, cluster);
+  let mut b = multi_coord(&ca, 2, cluster);
+  for g in [100u64, 200] {
+    a.create_group(
+      g,
+      two_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+    b.create_group(
+      g,
+      two_voter(2),
+      Instant::ORIGIN,
+      2,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+  }
+  let mut sa = group_stores(&[100, 200]);
+  let mut sb = group_stores(&[100, 200]);
+  let mut now = Instant::ORIGIN;
+
+  a.connect(now, addr(2), 2u64).expect("dial");
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  now = elect_a(&mut a, &mut b, &mut sa, &mut sb, 100, now);
+  now = elect_a(&mut a, &mut b, &mut sa, &mut sb, 200, now);
+  let _ = drain_controls(&mut b);
+  assert_eq!(
+    b.fenced_frames_dropped(),
+    0,
+    "nothing fenced while gen-0 admits"
+  );
+
+  // b's catalog retires every incarnation below 3 for group 200; a keeps beating both groups at
+  // its own (unreshaped) generation 0.
+  sb.floors.insert(200, 3);
+  let d100 = a.group(&100).unwrap().poll_timeout().unwrap();
+  let d200 = a.group(&200).unwrap().poll_timeout().unwrap();
+  now = now.max(d100).max(d200);
+  {
+    let (l, s) = sa.stores(&100).unwrap();
+    a.handle_timeout(&100, now, l, s).unwrap();
+  }
+  {
+    let (l, s) = sa.stores(&200).unwrap();
+    a.handle_timeout(&200, now, l, s).unwrap();
+  }
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+
+  assert!(
+    b.fenced_frames_dropped() >= 1,
+    "the retired incarnation's entries were fenced"
+  );
+  assert_eq!(
+    drain_controls(&mut b),
+    std::vec![(100, GroupControl::Wake)],
+    "only the live group's entry dispatched"
+  );
+  assert!(
+    a.has_bound_conn(&2u64) && b.has_bound_conn(&1u64),
+    "a fenced entry never costs the shared connection"
+  );
+  assert_eq!(
+    b.poll_unknown_group(),
+    None,
+    "a fenced entry is never a placement signal"
   );
 }

@@ -488,7 +488,7 @@ fn tagged_frame_closes_on_a_single_group_host() {
   let mut tag = Vec::new();
   100u64.encode(&mut tag);
   let mut payload = Vec::new();
-  crate::transport::frame::write_group_header(&tag, &mut payload);
+  crate::transport::frame::write_group_header(&tag, 0, &mut payload);
   crate::wire::encode_message(&msg, &mut payload);
   let mut framed = Vec::new();
   crate::transport::frame::encode_frame(&payload, &mut framed);
@@ -525,7 +525,7 @@ fn coalesced_frame_closes_on_a_single_group_host() {
   crate::wire::encode_message(&msg, &mut msg_bytes);
   let mut payload = Vec::new();
   crate::transport::frame::write_coalesced_marker(&mut payload);
-  crate::transport::frame::write_coalesced_entry(0, &tag, &msg_bytes, &mut payload);
+  crate::transport::frame::write_coalesced_entry(0, &tag, 0, &msg_bytes, &mut payload);
   let mut framed = Vec::new();
   crate::transport::frame::encode_frame(&payload, &mut framed);
 

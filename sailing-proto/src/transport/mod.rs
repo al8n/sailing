@@ -34,9 +34,11 @@ pub use stream::{Intake, RecordIo, StreamTransport};
 pub use tls::TlsRecords;
 
 /// One batched control entry bound for a coalesced frame: `(entry flags, encoded group tag,
-/// message)` — the shape the multi coordinators batch per peer and the conn/bridge seams encode.
+/// sender incarnation stamp, message)` — the shape the multi coordinators batch per peer and the
+/// conn/bridge seams encode. The stamp rides per ENTRY because one coalesced frame carries several
+/// groups, each with its own lineage.
 #[cfg(feature = "tcp")]
-pub(crate) type CoalescedEntry<I> = (u8, std::vec::Vec<u8>, crate::Message<I>);
+pub(crate) type CoalescedEntry<I> = (u8, std::vec::Vec<u8>, u64, crate::Message<I>);
 
 /// Release excess capacity from a FULLY-DRAINED buffer that once absorbed a large burst.
 ///

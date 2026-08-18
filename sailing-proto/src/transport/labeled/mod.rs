@@ -27,15 +27,15 @@ const LABEL_MAGIC: u8 = 0xCA;
 /// permissible only while nothing is published; once any build ships, a version byte must never be
 /// reused.
 ///
-/// RESERVED NEXT (the generation fence — WIRE.md §6): the group-demux header grows a varint
-/// INCARNATION STAMP after the group bytes — the sender's generation for that gid — so a receiver
-/// can drop a retired incarnation's traffic at demux (`floor_admits`), the durable, generation-exact
-/// form of the volatile removal tombstone. It rides the demux header, not the `Message` payload,
-/// because lineage is group-plane metadata (the payload is deliberately group-unaware) — and it is
-/// the append/vote-plane counterpart of the snapshot door gate, which token-discriminates snapshot
-/// traffic alone. Enforcement semantics (the comparator, same-lineage skew tolerance, per-class
-/// policy) are settled by the enforcement design that lands the bump; the field costs one version
-/// byte under this same contract, which the hello fences.
+/// Version 3 also carries the GENERATION FENCE (WIRE.md §6): the group-demux header — and every
+/// coalesced entry — ends in a varint INCARNATION STAMP, the sender's generation for that gid, so a
+/// receiver drops a retired incarnation's traffic at demux (`floor_admits`), the durable,
+/// generation-exact form of the volatile removal tombstone. It rides the demux header, not the
+/// `Message` payload, because lineage is group-plane metadata (the payload is deliberately
+/// group-unaware) — and it is the append/vote-plane counterpart of the snapshot door gate, which
+/// token-discriminates snapshot traffic alone. The field landed IN PLACE rather than behind a
+/// fourth version: the crates are unpublished, so no deployment can hold two builds claiming one
+/// version, and the standing rule above still governs the next REAL change.
 const LABEL_VERSION: u8 = 3;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
 pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
