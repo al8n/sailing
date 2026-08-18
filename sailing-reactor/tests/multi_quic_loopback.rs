@@ -1591,3 +1591,343 @@ async fn restore_without_stored_state_fails_closed() {
   let g100 = handle.group(100);
   assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"y").await, 1);
 }
+
+/// FENCE INERTNESS over QUIC — the stream suite's sibling. A retired incarnation's frames are
+/// dropped at demux on a resolved member: every class, before the endpoint sees them, so the husk
+/// can neither depose nor be heard, and the observability counter names it.
+///
+/// Node 2 walks the real re-admission path (create at generation 5 → remove, which persists the
+/// removal floor → clear the tombstone → create at 6) and hosts a NON-MEMBER observer, so its own
+/// term never moves — any term it showed would have to have come from the husk. Node 1 hosts the
+/// SAME gid at generation 0 and campaigns forever, needing a vote it will never be granted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retired_incarnations_frames_are_fenced_over_quic() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_980, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut fenced = None;
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      fenced = Some(driver.engine_metrics());
+    }
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  let fenced = fenced.expect("node 2's metrics");
+
+  let observer = || Config::try_new_observer(2u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  handles[1]
+    .create_group(100, observer(), 2, CountSm::default(), 5)
+    .await
+    .expect("first incarnation admits");
+  assert!(
+    handles[1]
+      .remove_group(100)
+      .await
+      .expect("removal resolves"),
+    "node 2 hosted the first incarnation"
+  );
+  assert!(
+    handles[1]
+      .clear_tombstone(100)
+      .await
+      .expect("clear resolves"),
+    "the tombstone was set by the removal"
+  );
+  handles[1]
+    .create_group(100, observer(), 2, CountSm::default(), 6)
+    .await
+    .expect("the successor admits above its floor");
+
+  handles[0]
+    .create_group(
+      100,
+      Config::try_new(1u64, vec![1u64, 2], ELECTION, HEARTBEAT).unwrap(),
+      1,
+      CountSm::default(),
+      0,
+    )
+    .await
+    .expect("the husk admits locally");
+  let husk = handles[0].group(100);
+  let resolved = handles[1].group(100);
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while fenced.fenced_frames_dropped() == 0 {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the husk's frames never reached the fence — the link or the stamp is wrong"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+  tokio::time::sleep(Duration::from_millis(800)).await;
+  let after = resolved.status().await.expect("status");
+  assert_eq!(
+    after.term,
+    sailing_proto::Term::ZERO,
+    "the husk's campaigns never moved the resolved member's term"
+  );
+  assert!(
+    after.leader.is_none(),
+    "and never made it follow a retired incarnation"
+  );
+  assert!(
+    fenced.fenced_frames_dropped() > 1,
+    "the fence counter keeps naming the husk, beat after beat"
+  );
+  assert_ne!(
+    husk.status().await.expect("status").role,
+    Role::Leader,
+    "a fenced husk can never assemble a quorum"
+  );
+}
+
+/// THE COURTESY CURE over QUIC, PRE-VOTE variant — the announce-without-inflating shape (the
+/// stream sibling carries the full rationale); the default-flags variant is below. The victim's
+/// `SnapshotInstalled` is the offer's signature. The transport leg is the other half: the address
+/// book is bind-time and group-agnostic, so a route to a peer the configuration excluded still
+/// exists.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_courtesy_snapshot_cures_a_removed_peer_over_quic() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_990, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  for id in 1u64..=3 {
+    handles[(id - 1) as usize]
+      .create_group(
+        100,
+        Config::try_new(id, vec![1u64, 2, 3], ELECTION, HEARTBEAT)
+          .unwrap()
+          .with_snapshot_threshold(2)
+          .with_pre_vote(true),
+        id,
+        CountSm::default(),
+        0,
+      )
+      .await
+      .expect("group admission");
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let leader = find_leader(&g100, "group 100").await;
+  let victim = (0..3).find(|&i| i != leader).expect("a non-leader");
+
+  for _ in 0..8 {
+    let _ = g100[leader].submit(Bytes::from_static(b"load")).await;
+  }
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, victim as u64 + 1, Bytes::new());
+  g100[leader].conf_change(cc).await.expect("removal commits");
+  for _ in 0..8 {
+    let _ = g100[leader].submit(Bytes::from_static(b"load")).await;
+  }
+
+  await_lifecycle(handles[victim].lifecycle(), "courtesy removed-self", |ev| {
+    matches!(ev, LifecycleEvent::RemovedSelf { group: 100 })
+  })
+  .await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let mut installed = false;
+  while !installed {
+    while let Ok((gid, ev)) = handles[victim].events().try_recv() {
+      if gid == 100 && matches!(ev, sailing_proto::Event::SnapshotInstalled(_)) {
+        installed = true;
+      }
+    }
+    if installed {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the victim was cured, but not by a snapshot install — the courtesy arm did not run"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  assert_ne!(
+    g100[victim].status().await.expect("status").role,
+    Role::Leader,
+    "the cured peer never leads the group it was removed from"
+  );
+}
+
+/// F1 OVER QUIC — the stream sibling's scenario (see it for the full rationale): a joiner's
+/// catch-up snapshot predates its own `AddNode`, so the ConfState it installs cannot name it, and
+/// that must read as HISTORY rather than removal. The joiner installs, surfaces NO `RemovedSelf`,
+/// and ends a serving member.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_joiner_whose_catch_up_snapshot_predates_its_add_is_not_removed_over_quic() {
+  let ca = TestCa::new();
+  let addrs = addrs(45_000, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  for id in 1u64..=2 {
+    handles[(id - 1) as usize]
+      .create_group(
+        100,
+        Config::try_new(id, vec![1u64, 2], ELECTION, HEARTBEAT)
+          .unwrap()
+          .with_snapshot_threshold(2),
+        id,
+        CountSm::default(),
+        0,
+      )
+      .await
+      .expect("group admission");
+  }
+  let g12: Vec<_> = (0..2).map(|i| handles[i].group(100)).collect();
+  let leader = find_leader(&g12, "group 100").await;
+  for _ in 0..10 {
+    let _ = g12[leader].submit(Bytes::from_static(b"load")).await;
+  }
+
+  handles[2]
+    .create_group(
+      100,
+      Config::try_new_observer(3u64, vec![1u64, 2], ELECTION, HEARTBEAT)
+        .unwrap()
+        .with_snapshot_threshold(2),
+      3,
+      CountSm::default(),
+      0,
+    )
+    .await
+    .expect("the observer joiner admits");
+  g12[leader]
+    .conf_change(ConfChange::new(ConfChangeType::AddNode, 3u64, Bytes::new()))
+    .await
+    .expect("AddNode(3) commits");
+
+  let mut installed = false;
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  loop {
+    while let Ok((gid, ev)) = handles[2].events().try_recv() {
+      if gid == 100 && matches!(ev, sailing_proto::Event::SnapshotInstalled(_)) {
+        installed = true;
+      }
+    }
+    if let Ok(st) = handles[2].group(100).status().await
+      && installed
+      && st.conf_state.voters().contains(&3u64)
+      && st.commit_index > Index::ZERO
+      && st.applied_index == st.commit_index
+    {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the joiner never became a serving member"
+    );
+    while let Ok(ev) = handles[2].lifecycle().try_recv() {
+      assert!(
+        !matches!(ev, LifecycleEvent::RemovedSelf { group: 100 }),
+        "a snapshot that predates the joiner's admission is history, not a removal: {ev:?}"
+      );
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  assert!(
+    installed,
+    "the joiner caught up by snapshot — the install rule actually ran"
+  );
+  while let Ok(ev) = handles[2].lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::RemovedSelf { group: 100 }),
+      "no removal may surface even after the joiner is serving: {ev:?}"
+    );
+  }
+}
+
+/// THE COURTESY CURE at the etcd-parity DEFAULTS over QUIC — the stream sibling's scenario (see it
+/// for the full rationale): the removed peer campaigns for REAL and puts itself above the leader's
+/// term, the leader drops those campaigns without stepping down or spending its budget, and the
+/// cure arrives from the leader the term lift produces.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_courtesy_snapshot_cures_a_removed_peer_at_default_flags_over_quic() {
+  let ca = TestCa::new();
+  let addrs = addrs(45_010, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  for id in 1u64..=3 {
+    handles[(id - 1) as usize]
+      .create_group(
+        100,
+        Config::try_new(id, vec![1u64, 2, 3], ELECTION, HEARTBEAT)
+          .unwrap()
+          .with_snapshot_threshold(2),
+        id,
+        CountSm::default(),
+        0,
+      )
+      .await
+      .expect("group admission");
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let leader = find_leader(&g100, "group 100").await;
+  let victim = (0..3).find(|&i| i != leader).expect("a non-leader");
+
+  for _ in 0..8 {
+    let _ = g100[leader].submit(Bytes::from_static(b"load")).await;
+  }
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, victim as u64 + 1, Bytes::new());
+  g100[leader].conf_change(cc).await.expect("removal commits");
+  for _ in 0..8 {
+    let _ = g100[leader].submit(Bytes::from_static(b"load")).await;
+  }
+
+  await_lifecycle(
+    handles[victim].lifecycle(),
+    "default-flags removed-self",
+    |ev| matches!(ev, LifecycleEvent::RemovedSelf { group: 100 }),
+  )
+  .await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  let mut installed = false;
+  while !installed {
+    while let Ok((gid, ev)) = handles[victim].events().try_recv() {
+      if gid == 100 && matches!(ev, sailing_proto::Event::SnapshotInstalled(_)) {
+        installed = true;
+      }
+    }
+    if installed {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the victim was cured, but not by a snapshot install — the courtesy arm did not run"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  assert_ne!(
+    g100[victim].status().await.expect("status").role,
+    Role::Leader,
+    "the cured peer never leads the group it was removed from"
+  );
+}

@@ -581,3 +581,101 @@ async fn a_poisoned_group_surfaces_on_the_lifecycle_tail() {
 
   handle.shutdown().await.expect("the multi host tears down");
 }
+
+/// FENCE INERTNESS on the compio plane — the reactor suites' sibling, proving the thread-per-core
+/// driver publishes the same demux verdict. A retired incarnation's frames are dropped before the
+/// endpoint sees them, so the husk can neither depose nor be heard.
+///
+/// Node 2 reaches a floored, re-admitted incarnation through the public lifecycle path (create at
+/// generation 5 → remove, which persists the removal floor → clear the tombstone → create at 6)
+/// and hosts a NON-MEMBER observer, so its own term never moves — any term it showed would have to
+/// have come from the husk. Node 1 hosts the same gid at the generation the floor retired and
+/// campaigns forever, needing a vote it will never be granted.
+#[compio::test]
+async fn a_retired_incarnations_frames_are_fenced_on_compio() {
+  let addrs: Vec<SocketAddr> = (0..2)
+    .map(|i| format!("127.0.0.1:{}", 45_350 + i).parse().unwrap())
+    .collect();
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut fenced = None;
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (dialer, acceptor) = plain_factories(id);
+    let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _>::bind(
+      addrs[(id - 1) as usize],
+      peers,
+      dialer,
+      acceptor,
+      DriverConfig::default(),
+    )
+    .await
+    .expect("the empty multi host binds");
+    if id == 2 {
+      fenced = Some(driver.engine_metrics());
+    }
+    compio::runtime::spawn(driver.run()).detach();
+    handles.push(handle);
+  }
+  let fenced = fenced.expect("node 2's metrics");
+
+  let observer = || Config::try_new_observer(2u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  handles[1]
+    .create_group(100, observer(), 2, CountSm::default(), 5)
+    .await
+    .expect("first incarnation admits");
+  assert!(
+    handles[1]
+      .remove_group(100)
+      .await
+      .expect("removal resolves"),
+    "node 2 hosted the first incarnation"
+  );
+  assert!(
+    handles[1]
+      .clear_tombstone(100)
+      .await
+      .expect("clear resolves"),
+    "the tombstone was set by the removal"
+  );
+  handles[1]
+    .create_group(100, observer(), 2, CountSm::default(), 6)
+    .await
+    .expect("the successor admits above its floor");
+
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
+    .await
+    .expect("the husk admits locally");
+  let resolved = handles[1].group(100);
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while fenced.fenced_frames_dropped() == 0 {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the husk's frames never reached the fence — the link or the stamp is wrong"
+    );
+    compio::time::sleep(Duration::from_millis(50)).await;
+  }
+  compio::time::sleep(Duration::from_millis(600)).await;
+  let after = resolved.status().await.expect("status");
+  assert_eq!(
+    after.term,
+    sailing_proto::Term::ZERO,
+    "the husk's campaigns never moved the resolved member's term"
+  );
+  assert!(
+    after.leader.is_none(),
+    "and never made it follow a retired incarnation"
+  );
+  assert!(
+    fenced.fenced_frames_dropped() > 1,
+    "the fence counter keeps naming the husk, beat after beat"
+  );
+
+  for h in &handles {
+    h.shutdown().await.expect("the multi host tears down");
+  }
+}

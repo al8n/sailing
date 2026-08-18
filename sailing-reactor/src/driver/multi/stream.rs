@@ -816,6 +816,9 @@ where
     self
       .metrics
       .record(self.engine.barriers(), self.engine.ops_batched());
+    self
+      .metrics
+      .record_fenced(self.coord.fenced_frames_dropped());
   }
 
   /// One inbound bridge frame: feed bytes/EOF to the coordinator, which demuxes each frame's

@@ -306,6 +306,7 @@ struct EngineMetricsInner {
   barriers: AtomicU64,
   ops_batched: AtomicU64,
   quiesced_groups: AtomicU64,
+  fenced_frames_dropped: AtomicU64,
 }
 
 impl EngineMetrics {
@@ -330,10 +331,27 @@ impl EngineMetrics {
     self.inner.quiesced_groups.load(Ordering::Acquire)
   }
 
+  /// Inbound frames the demux GENERATION FENCE has dropped: a sender speaking for an incarnation
+  /// this host's durable admission floor has retired (WIRE.md §6). Purely observational — nothing
+  /// consumes it, and the sender is never answered — but a CLIMBING value names a husk that is
+  /// still running and still sending, which the embedder's catalog reap is what finally stops.
+  #[must_use]
+  pub fn fenced_frames_dropped(&self) -> u64 {
+    self.inner.fenced_frames_dropped.load(Ordering::Acquire)
+  }
+
   /// Publish the engine's current counters (driver-side, once per crank).
   pub(crate) fn record(&self, barriers: u64, ops_batched: u64) {
     self.inner.barriers.store(barriers, Ordering::Release);
     self.inner.ops_batched.store(ops_batched, Ordering::Release);
+  }
+
+  /// Publish the coordinator's fence-drop counter (driver-side, once per crank).
+  pub(crate) fn record_fenced(&self, fenced: u64) {
+    self
+      .inner
+      .fenced_frames_dropped
+      .store(fenced, Ordering::Release);
   }
 
   /// Publish the quiesced-group gauge (driver-side, once per quiesce sweep).

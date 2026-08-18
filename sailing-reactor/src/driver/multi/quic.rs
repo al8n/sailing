@@ -714,6 +714,9 @@ where
     self
       .metrics
       .record(self.engine.barriers(), self.engine.ops_batched());
+    self
+      .metrics
+      .record_fenced(self.coord.fenced_frames_dropped());
   }
 
   /// Dial every configured peer with no bound connection whose backoff has elapsed (the
