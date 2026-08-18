@@ -74,10 +74,15 @@ pub(crate) const ENTRY_WIRE_OVERHEAD_MAX: usize = 128;
 /// the same rule as the hello's peer id ([`MAX_ID_LEN`]).
 pub(crate) const MAX_GROUP_ID_LEN: usize = MAX_ID_LEN;
 
+/// The largest LEB128 encoding of the group header's `u64` incarnation stamp (`ceil(64 / 7)`).
+/// Lives here, beside the reserve it feeds, so the core's frame sizers see it without the
+/// transport features.
+pub(crate) const MAX_GENERATION_VARINT_LEN: usize = 10;
+
 /// The worst-case group-demux header the transport prepends to every frame payload:
-/// `[u16 group_len][group bytes]`. Reserved from the frame budget so a maximum-size message plus any
-/// group tag still fits one frame.
-pub(crate) const GROUP_HEADER_RESERVE: usize = 2 + MAX_GROUP_ID_LEN;
+/// `[u16 group_len][group bytes][varint generation]`. Reserved from the frame budget so a
+/// maximum-size message plus any group tag and incarnation stamp still fits one frame.
+pub(crate) const GROUP_HEADER_RESERVE: usize = 2 + MAX_GROUP_ID_LEN + MAX_GENERATION_VARINT_LEN;
 
 /// An upper bound on the `AppendEntries` bytes that are NOT entries: the header (`term`; the leader id
 /// as a length-delimited `bytes` field ≤ [`MAX_ID_LEN`]; `prev_log_index`; `prev_log_term`;

@@ -15,21 +15,60 @@ pub(crate) fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
   out.extend_from_slice(payload);
 }
 
-/// Prepend the multi-Raft group-demux header `[u16 BE group_len][group bytes]` to a frame payload
-/// being built. An empty group (`group_len == 0`) is the single-group / default tag. The caller
-/// guarantees `group.len() <= crate::wire::MAX_GROUP_ID_LEN` (a `GroupId` encoding is bounded by
-/// that; the single-group path passes an empty slice).
-pub(crate) fn write_group_header(group: &[u8], out: &mut Vec<u8>) {
+/// The largest LEB128 encoding of a `u64` — the ceiling the incarnation stamp reserves from every
+/// frame budget (see [`crate::wire::GROUP_HEADER_RESERVE`]).
+const MAX_GENERATION_VARINT_LEN: usize = crate::wire::MAX_GENERATION_VARINT_LEN;
+
+/// Append `v` as an unsigned LEB128 varint (the incarnation stamp's encoding).
+fn write_varint(mut v: u64, out: &mut Vec<u8>) {
+  while v >= 0x80 {
+    out.push((v as u8) | 0x80);
+    v >>= 7;
+  }
+  out.push(v as u8);
+}
+
+/// Read an unsigned LEB128 varint from the front of `buf`, returning `(value, bytes consumed)`.
+/// `None` on a truncated encoding, one longer than [`MAX_GENERATION_VARINT_LEN`], or a 10-byte
+/// encoding whose final byte carries bits above 2^64 — a canonical-range parse, so a peer cannot
+/// spend unbounded header bytes or wrap the stamp into a different generation.
+fn read_varint(buf: &[u8]) -> Option<(u64, usize)> {
+  let mut v: u64 = 0;
+  for (i, &b) in buf.iter().take(MAX_GENERATION_VARINT_LEN).enumerate() {
+    let payload = u64::from(b & 0x7F);
+    // The 10th byte contributes bits 63..=69; only bit 63 exists, so anything above it overflows.
+    if i == MAX_GENERATION_VARINT_LEN - 1 && payload > 1 {
+      return None;
+    }
+    v |= payload << (7 * i);
+    if b & 0x80 == 0 {
+      return Some((v, i + 1));
+    }
+  }
+  None
+}
+
+/// Prepend the multi-Raft group-demux header `[u16 BE group_len][group bytes][varint generation]`
+/// to a frame payload being built. An empty group (`group_len == 0`) is the single-group / default
+/// tag. `generation` is the sender's incarnation counter for that gid (`0` — one byte — for an
+/// unreshaped or single-group sender), which the receiver's demux fences against its durable
+/// admission floor (WIRE.md §6). The caller guarantees
+/// `group.len() <= crate::wire::MAX_GROUP_ID_LEN` (a `GroupId` encoding is bounded by that; the
+/// single-group path passes an empty slice).
+pub(crate) fn write_group_header(group: &[u8], generation: u64, out: &mut Vec<u8>) {
   debug_assert!(group.len() <= crate::wire::MAX_GROUP_ID_LEN);
   out.extend_from_slice(&(group.len() as u16).to_be_bytes());
   out.extend_from_slice(group);
+  write_varint(generation, out);
 }
 
-/// Split the group-demux header off a decoded frame, returning `(group_id_bytes, message_bytes)` as
-/// zero-copy slices of the same buffer. `Err(Decode)` if the header is truncated or declares a group
-/// past [`crate::wire::MAX_GROUP_ID_LEN`] — which includes the [`COALESCED_MARKER`] (0xFFFF), so a
-/// coalesced frame handed to the single-message parser errors instead of aliasing as a group tag.
-pub(crate) fn split_group_header(frame: Bytes) -> Result<(Bytes, Bytes), TransportError> {
+/// Split the group-demux header off a decoded frame, returning
+/// `(group_id_bytes, generation, message_bytes)` — the id and message as zero-copy slices of the
+/// same buffer. `Err(Decode)` if the header is truncated, declares a group past
+/// [`crate::wire::MAX_GROUP_ID_LEN`] — which includes the [`COALESCED_MARKER`] (0xFFFF), so a
+/// coalesced frame handed to the single-message parser errors instead of aliasing as a group tag —
+/// or carries a malformed incarnation stamp.
+pub(crate) fn split_group_header(frame: Bytes) -> Result<(Bytes, u64, Bytes), TransportError> {
   if frame.len() < 2 {
     return Err(TransportError::Decode);
   }
@@ -37,7 +76,11 @@ pub(crate) fn split_group_header(frame: Bytes) -> Result<(Bytes, Bytes), Transpo
   if group_len > crate::wire::MAX_GROUP_ID_LEN || frame.len() < 2 + group_len {
     return Err(TransportError::Decode);
   }
-  Ok((frame.slice(2..2 + group_len), frame.slice(2 + group_len..)))
+  let at = 2 + group_len;
+  let Some((generation, n)) = read_varint(&frame[at..]) else {
+    return Err(TransportError::Decode);
+  };
+  Ok((frame.slice(2..at), generation, frame.slice(at + n..)))
 }
 
 /// The `u16` big-endian value opening a COALESCED control frame's payload, where a single-message
@@ -77,27 +120,59 @@ pub(crate) fn write_coalesced_marker(out: &mut Vec<u8>) {
   out.extend_from_slice(&COALESCED_MARKER.to_be_bytes());
 }
 
-/// Append one coalesced entry `[u8 flags][u16 BE group_len][group bytes][u32 BE msg_len][msg]` to a
-/// payload opened by [`write_coalesced_marker`]. The caller guarantees a NON-empty group within
+/// Append one coalesced entry
+/// `[u8 flags][u16 BE group_len][group bytes][varint generation][u32 BE msg_len][msg]` to a
+/// payload opened by [`write_coalesced_marker`]. The entry carries the SAME incarnation stamp a
+/// single-message frame's group header does — the fence is uniform across message classes, and the
+/// heartbeat pair rides only here. The caller guarantees a NON-empty group within
 /// [`crate::wire::MAX_GROUP_ID_LEN`] (coalescing is a multi-group feature — the empty single-group
 /// tag never rides here) and only defined flag bits.
-pub(crate) fn write_coalesced_entry(flags: u8, group: &[u8], msg_bytes: &[u8], out: &mut Vec<u8>) {
+pub(crate) fn write_coalesced_entry(
+  flags: u8,
+  group: &[u8],
+  generation: u64,
+  msg_bytes: &[u8],
+  out: &mut Vec<u8>,
+) {
   debug_assert!(!group.is_empty() && group.len() <= crate::wire::MAX_GROUP_ID_LEN);
   debug_assert_eq!(flags & !COALESCED_FLAG_QUIESCE, 0, "undefined flag bits");
   out.push(flags);
   out.extend_from_slice(&(group.len() as u16).to_be_bytes());
   out.extend_from_slice(group);
+  write_varint(generation, out);
   out.extend_from_slice(&(msg_bytes.len() as u32).to_be_bytes());
   out.extend_from_slice(msg_bytes);
 }
 
-/// Split a coalesced frame into its `(flags, group_id_bytes, message_bytes)` entries, each a
-/// zero-copy slice of the frame (like [`split_group_header`]). A frame carrying ONLY the marker
-/// (zero entries) is the empty keep-alive PROBE and decodes to an empty list. `Err(Decode)` on a
-/// missing marker, a truncated entry, a group length of zero or past
-/// [`crate::wire::MAX_GROUP_ID_LEN`], or a message length overrunning the frame — any trailing
-/// remainder after the last complete entry is itself a truncated entry and rejects too.
-pub(crate) fn split_coalesced(frame: Bytes) -> Result<Vec<(u8, Bytes, Bytes)>, TransportError> {
+/// The encoded size of one coalesced entry carrying `group`, `generation` and a `msg_len`-byte
+/// message — the SINGLE sizer both senders (the connection and the QUIC bridge) and the
+/// coordinators' pre-size divert read, so the entry layout and the budget arithmetic can never
+/// drift apart.
+pub(crate) fn coalesced_entry_len(group_len: usize, generation: u64, msg_len: usize) -> usize {
+  1 + 2 + group_len + varint_len(generation) + 4 + msg_len
+}
+
+/// The LEB128 byte count of `v`.
+pub(crate) fn varint_len(v: u64) -> usize {
+  let mut n = 1;
+  let mut v = v >> 7;
+  while v != 0 {
+    n += 1;
+    v >>= 7;
+  }
+  n
+}
+
+/// Split a coalesced frame into its `(flags, group_id_bytes, generation, message_bytes)` entries,
+/// each a zero-copy slice of the frame (like [`split_group_header`]). A frame carrying ONLY the
+/// marker (zero entries) is the empty keep-alive PROBE and decodes to an empty list. `Err(Decode)`
+/// on a missing marker, a truncated entry, a group length of zero or past
+/// [`crate::wire::MAX_GROUP_ID_LEN`], a malformed incarnation stamp, or a message length
+/// overrunning the frame — any trailing remainder after the last complete entry is itself a
+/// truncated entry and rejects too.
+pub(crate) fn split_coalesced(
+  frame: Bytes,
+) -> Result<Vec<(u8, Bytes, u64, Bytes)>, TransportError> {
   if !is_coalesced_frame(&frame) {
     return Err(TransportError::Decode);
   }
@@ -121,11 +196,18 @@ pub(crate) fn split_coalesced(frame: Bytes) -> Result<Vec<(u8, Bytes, Bytes)>, T
       return Err(TransportError::Decode);
     }
     at += 3;
-    if frame.len() - at < group_len + 4 {
+    if frame.len() - at < group_len {
       return Err(TransportError::Decode);
     }
     let group = frame.slice(at..at + group_len);
     at += group_len;
+    let Some((generation, n)) = read_varint(&frame[at..]) else {
+      return Err(TransportError::Decode);
+    };
+    at += n;
+    if frame.len() - at < 4 {
+      return Err(TransportError::Decode);
+    }
     let msg_len =
       u32::from_be_bytes([frame[at], frame[at + 1], frame[at + 2], frame[at + 3]]) as usize;
     at += 4;
@@ -134,7 +216,7 @@ pub(crate) fn split_coalesced(frame: Bytes) -> Result<Vec<(u8, Bytes, Bytes)>, T
     }
     let msg = frame.slice(at..at + msg_len);
     at += msg_len;
-    entries.push((flags, group, msg));
+    entries.push((flags, group, generation, msg));
   }
   // An empty list (the bare marker) is the keep-alive PROBE: it decodes to zero entries and
   // dispatches nothing — only the receiver's transport-liveness clock advances.

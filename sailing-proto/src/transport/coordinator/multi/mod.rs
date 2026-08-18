@@ -118,6 +118,9 @@ where
   /// The groups currently queued in `unknown_pending` — the dedupe set (one signal per group
   /// until polled off), bounded by [`UNKNOWN_GROUP_SIGNAL_CAP`].
   unknown_seen: BTreeSet<G>,
+  /// Monotone count of frames the generation fence dropped (see
+  /// [`fenced_frames_dropped`](Self::fenced_frames_dropped)).
+  fenced_dropped: u64,
 }
 
 impl<G, I, F, R> MultiStreamCoordinator<G, I, F, R>
@@ -144,6 +147,7 @@ where
       retired: BTreeSet::new(),
       unknown_pending: VecDeque::new(),
       unknown_seen: BTreeSet::new(),
+      fenced_dropped: 0,
     }
   }
 
@@ -517,6 +521,13 @@ where
   /// [`poll_unknown_group`](Self::poll_unknown_group); a group tag that does not decode as `G`
   /// closes the connection as integrity-suspect (reported via
   /// [`poll_conn_closed`](Self::poll_conn_closed)).
+  ///
+  /// THE GENERATION FENCE: each frame carries its sender's incarnation stamp for the tagged gid,
+  /// checked against this host's DURABLE admission floor read through `stores` — a below-floor
+  /// stamp means the sender speaks for a RETIRED incarnation, so the frame drops exactly as a
+  /// tombstoned gid's does, counted by [`fenced_frames_dropped`](Self::fenced_frames_dropped).
+  /// Reading the floor is why `stores` is also a [`FloorStore`]: the fence must survive a restart,
+  /// which the volatile tombstone set does not.
   pub fn handle_conn_data<L, S, St>(
     &mut self,
     conn: ConnId,
@@ -527,14 +538,14 @@ where
   ) where
     L: LogStore,
     S: StableStore<NodeId = I>,
-    St: GroupStores<G, L, S>,
+    St: GroupStores<G, L, S> + FloorStore<G>,
   {
     let now: Now = now.into();
     let mut decoded = Vec::new();
     let _ = self
       .router
       .handle_conn_data(conn, bytes, eof, now.mono(), &mut decoded);
-    for (group_bytes, flags, from, msg) in decoded {
+    for (group_bytes, flags, generation, from, msg) in decoded {
       let Ok(group) = G::decode_exact(group_bytes) else {
         // A well-framed tag that is not a valid `G` is a systematic peer fault (a different
         // group-id type, or a single-group node on a multi-group cluster): every frame reproduces
@@ -559,6 +570,13 @@ where
       // removal). Ordered AFTER the integrity gates (a malformed tag or violating flag still
       // closes) and BEFORE store resolution.
       if self.retired.contains(&group) {
+        continue;
+      }
+      // THE GENERATION FENCE (see the method doc): the durable, restart-surviving counterpart of
+      // the tombstone above. Ordered right beside it — after the integrity gates, before store
+      // resolution — so a retired incarnation's frames of EVERY class go equally inert.
+      if !crate::floor_admits(stores.floor(&group), generation) {
+        self.note_fenced_frame(&group, generation, &from);
         continue;
       }
       if let Some((log, stable)) = stores.stores(&group) {
@@ -592,6 +610,30 @@ where
       }
     }
     self.flush();
+  }
+
+  /// How many inbound frames the generation fence has dropped — a below-floor incarnation stamp
+  /// for a gid this host has retired. Purely observational: nothing consumes it for control flow,
+  /// and the cure for the sender is the embedder's catalog reap, never a reply.
+  #[must_use]
+  pub fn fenced_frames_dropped(&self) -> u64 {
+    self.fenced_dropped
+  }
+
+  /// Record one fence drop: the counter plus, under the `tracing` feature, the
+  /// `(gid, generation, peer)` event the design's observability signal names.
+  fn note_fenced_frame(&mut self, group: &G, generation: u64, from: &I) {
+    self.fenced_dropped = self.fenced_dropped.saturating_add(1);
+    #[cfg(feature = "tracing")]
+    tracing::debug!(
+      target: "sailing::transport",
+      group = %group,
+      generation,
+      peer = ?from,
+      "retired-incarnation frame fenced at demux"
+    );
+    #[cfg(not(feature = "tracing"))]
+    let _ = (group, generation, from);
   }
 
   /// Strip the quiesce flag unless the dispatched beat was ACCEPTED as current-leader contact:
@@ -1204,15 +1246,17 @@ where
         };
         let mut gb = Vec::new();
         group.encode(&mut gb);
+        let generation = self.multi.group_gen(&group);
         self
           .hb_batches
           .entry(to)
           .or_default()
-          .push((flags, gb, msg));
+          .push((flags, gb, generation, msg));
       } else {
         group_bytes.clear();
         group.encode(&mut group_bytes);
-        self.router.route(&group_bytes, to, &msg);
+        let generation = self.multi.group_gen(&group);
+        self.router.route(&group_bytes, generation, to, &msg);
       }
     }
     for group in &stamped {
@@ -1239,10 +1283,14 @@ where
     let mut scratch = Vec::new();
     for (to, batch) in core::mem::take(&mut self.hb_batches) {
       let mut fitting: Vec<CoalescedEntry<I>> = Vec::with_capacity(batch.len());
-      for (flags, group_bytes, msg) in batch {
+      for (flags, group_bytes, generation, msg) in batch {
         scratch.clear();
         crate::wire::encode_message(&msg, &mut scratch);
-        let entry_len = 1 + 2 + group_bytes.len() + 4 + scratch.len();
+        let entry_len = crate::transport::frame::coalesced_entry_len(
+          group_bytes.len(),
+          generation,
+          scratch.len(),
+        );
         if entry_len > crate::transport::frame::COALESCED_FRAME_BUDGET {
           // Re-arm only for a group still hosted: a lifecycle removal between the stamp and this
           // divert must not leave a dormant intent behind for a re-created id.
@@ -1252,15 +1300,17 @@ where
           {
             self.quiesce_intents.insert(gid);
           }
-          self.router.route(&group_bytes, to.cheap_clone(), &msg);
+          self
+            .router
+            .route(&group_bytes, generation, to.cheap_clone(), &msg);
         } else {
-          fitting.push((flags, group_bytes, msg));
+          fitting.push((flags, group_bytes, generation, msg));
         }
       }
       match fitting.as_slice() {
         [] => {}
-        [(0, group_bytes, msg)] => {
-          self.router.route(group_bytes, to, msg);
+        [(0, group_bytes, generation, msg)] => {
+          self.router.route(group_bytes, *generation, to, msg);
         }
         _ => {
           self.router.route_coalesced(to, &fitting);

@@ -140,7 +140,7 @@ fn gates_app_frames_until_validated_then_decodes() {
   let mut d = dialer(7);
   let mut a = acceptor(9);
   // A message queued before the handshake settles must not decode on the peer prematurely.
-  d.send_message(&[], &sample_msg());
+  d.send_message(&[], 0, &sample_msg());
   assert!(d.is_handshaking() && a.is_handshaking());
 
   pump(&mut d, &mut a);
@@ -150,7 +150,7 @@ fn gates_app_frames_until_validated_then_decodes() {
 
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg()]);
 }
 
@@ -159,11 +159,11 @@ fn round_trips_a_message_after_handshake() {
   let mut d = dialer(7);
   let mut a = acceptor(9);
   pump(&mut d, &mut a); // settle the handshake first
-  d.send_message(&[], &sample_msg());
+  d.send_message(&[], 0, &sample_msg());
   pump(&mut d, &mut a);
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg()]);
 }
 
@@ -174,14 +174,15 @@ fn round_trips_a_tagged_message() {
   pump(&mut d, &mut a); // settle the handshake first
   // Stamp the frame with an 8-byte group tag (a u64 group id's `Data` encoding).
   let tag = enc_id(42);
-  d.send_message(&tag, &sample_msg());
+  d.send_message(&tag, 0, &sample_msg());
   pump(&mut d, &mut a);
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
   assert_eq!(msgs.len(), 1, "exactly one tagged message");
   assert_eq!(&msgs[0].0[..], &tag[..], "the tag bytes survive the wire");
   assert_eq!(msgs[0].1, 0, "a single-message frame yields flags 0");
-  assert_eq!(msgs[0].2, sample_msg());
+  assert_eq!(msgs[0].2, 0, "an unreshaped sender stamps generation 0");
+  assert_eq!(msgs[0].3, sample_msg());
 }
 
 /// The coalesced sender's oversized-entry fallback: an entry whose encoded size alone exceeds the
@@ -206,8 +207,8 @@ fn oversized_coalesced_entry_falls_back_to_a_normal_frame() {
     bytes::Bytes::from(std::vec![0xEE; 80 * 1024]),
   ));
   d.send_coalesced(&[
-    (0, tag.clone(), big.clone()),
-    (0, tag.clone(), sample_msg()),
+    (0, tag.clone(), 0, big.clone()),
+    (0, tag.clone(), 0, sample_msg()),
   ]);
   pump(&mut d, &mut a);
   let mut msgs = Vec::new();
@@ -216,11 +217,11 @@ fn oversized_coalesced_entry_falls_back_to_a_normal_frame() {
   assert!(
     msgs
       .iter()
-      .any(|(g, f, m)| g[..] == tag[..] && *f == 0 && *m == big),
+      .any(|(g, f, _, m)| g[..] == tag[..] && *f == 0 && *m == big),
     "the oversized entry arrived via a normal frame"
   );
   assert!(
-    msgs.iter().any(|(_, _, m)| *m == sample_msg()),
+    msgs.iter().any(|(_, _, _, m)| *m == sample_msg()),
     "the small entry still delivered"
   );
   assert!(!a.is_closed() && !d.is_closed(), "no reject churn");
@@ -284,6 +285,7 @@ fn oversized_frame_closes_the_conn_and_clears_the_encoder_cache() {
   );
   a.send_message(
     &[],
+    0,
     &Message::InstallSnapshot(crate::InstallSnapshot::new_chunk(
       Term::new(2),
       9,
@@ -325,8 +327,8 @@ fn backpressured_write_never_truncates_a_frame() {
   // The full framed message must still reach the wire intact across repeated drains, never a prefix
   // that a later frame could complete into a corrupted-but-valid message.
   let mut sender: Conn<u64, Throttle> = Conn::new(Throttle::new(3, Some(enc_id(7))));
-  sender.send_message(&[], &sample_msg());
-  sender.send_message(&[], &sample_msg());
+  sender.send_message(&[], 0, &sample_msg());
+  sender.send_message(&[], 0, &sample_msg());
 
   // Drain the wire in many small pulls, exactly as the throttle allows.
   let mut wire = Vec::new();
@@ -343,7 +345,7 @@ fn backpressured_write_never_truncates_a_frame() {
   receiver.handle_data(&wire, false, Instant::ORIGIN).unwrap();
   let mut msgs = Vec::new();
   receiver.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg(), sample_msg()]);
 }
 
@@ -353,7 +355,7 @@ fn outbound_cap_exceeded_closes_the_conn() {
   // trips, the connection closes instead of growing without bound.
   let mut conn: Conn<u64, Throttle> = Conn::new(Throttle::new(0, Some(enc_id(7))));
   conn.set_max_out_for_test(16);
-  conn.send_message(&[], &sample_msg()); // a heartbeat frame is well over 16 bytes
+  conn.send_message(&[], 0, &sample_msg()); // a heartbeat frame is well over 16 bytes
   assert!(
     conn.is_closed(),
     "exceeding the outbound cap closes the connection"
@@ -392,7 +394,7 @@ fn frames_in_the_final_read_before_eof_still_deliver() {
   let mut d = dialer(7);
   let mut a = acceptor(9);
   pump(&mut d, &mut a); // validated
-  d.send_message(&[], &sample_msg());
+  d.send_message(&[], 0, &sample_msg());
   let mut wire = Vec::new();
   d.poll_transmit(&mut wire);
   // The frame and the EOF arrive in the SAME read: a clean close retains the peer so the final
@@ -401,7 +403,7 @@ fn frames_in_the_final_read_before_eof_still_deliver() {
   assert!(a.is_closed());
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, _, m)| m).collect();
   assert_eq!(
     msgs,
     std::vec![sample_msg()],
@@ -493,8 +495,8 @@ fn pending_refeed_reassembles_across_a_tiny_receive_buffer() {
   // 8-byte receive cap: a multi-hundred-byte read is consumed in many Pending rounds, with
   // plaintext drained between each. Both messages must reassemble exactly.
   let mut sender: Conn<u64, TinyRecv> = Conn::new(TinyRecv::new(usize::MAX, Some(enc_id(7))));
-  sender.send_message(&[], &sample_msg());
-  sender.send_message(&[], &sample_msg());
+  sender.send_message(&[], 0, &sample_msg());
+  sender.send_message(&[], 0, &sample_msg());
   let mut wire = Vec::new();
   sender.poll_transmit(&mut wire);
   assert!(
@@ -506,7 +508,7 @@ fn pending_refeed_reassembles_across_a_tiny_receive_buffer() {
   receiver.handle_data(&wire, false, Instant::ORIGIN).unwrap();
   let mut msgs = Vec::new();
   receiver.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg(), sample_msg()]);
 }
 
@@ -581,7 +583,7 @@ fn peer_and_poll_decoded_are_inert_while_handshaking() {
   assert_eq!(d.peer(), None, "no peer is bound while handshaking");
   let mut msgs = Vec::new();
   d.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, _, m)| m).collect();
   assert!(
     msgs.is_empty(),
     "no application frame decodes before validation"
@@ -599,7 +601,7 @@ fn operations_on_a_closed_conn_are_inert() {
   // handle_data on a Closed conn short-circuits to Ok.
   a.handle_data(b"more", false, Instant::ORIGIN).unwrap();
   // send_message on a Closed conn is a no-op (the message is dropped).
-  a.send_message(&[], &sample_msg());
+  a.send_message(&[], 0, &sample_msg());
   let mut out = Vec::new();
   assert_eq!(
     a.poll_transmit(&mut out),
@@ -614,7 +616,7 @@ fn operations_on_a_closed_conn_are_inert() {
 #[test]
 fn fully_backpressured_drain_retains_bytes_without_closing() {
   let mut conn: Conn<u64, Throttle> = Conn::new(Throttle::new(0, Some(enc_id(7))));
-  conn.send_message(&[], &sample_msg());
+  conn.send_message(&[], 0, &sample_msg());
   assert!(
     !conn.is_closed(),
     "a stalled-but-under-cap send does not close the connection"

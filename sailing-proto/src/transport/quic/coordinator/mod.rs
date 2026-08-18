@@ -674,8 +674,10 @@ where
           // `None` and closes below, exactly like a malformed header or body.
           let decoded = super::super::frame::split_group_header(frame)
             .ok()
-            .filter(|(group, _)| group.is_empty())
-            .and_then(|(_group, message)| crate::wire::decode_message::<I>(message).ok());
+            .filter(|(group, _, _)| group.is_empty())
+            .and_then(|(_group, _generation, message)| {
+              crate::wire::decode_message::<I>(message).ok()
+            });
           match (from, decoded) {
             (Some(from), Some(msg)) => {
               self.endpoint.handle_message(now, log, stable, from, msg);
@@ -779,7 +781,8 @@ where
     for o in outgoing {
       let (to, msg) = o.into_parts();
       if let Some(h) = self.bridge.handle_for(&to) {
-        self.bridge.write_framed(std_now, h, &[], &msg);
+        // Empty tag, generation `0`: a single-group host has no lineage counter to stamp.
+        self.bridge.write_framed(std_now, h, &[], 0, &msg);
       }
     }
     self.bridge.service(std_now);

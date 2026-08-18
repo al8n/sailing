@@ -7,9 +7,9 @@
 use super::{
   CoalescedEntry, TransportError,
   frame::{
-    COALESCED_FRAME_BUDGET, FrameDecoder, MAX_FRAME_LEN, encode_frame, is_coalesced_frame,
-    split_coalesced, split_group_header, write_coalesced_entry, write_coalesced_marker,
-    write_group_header,
+    COALESCED_FRAME_BUDGET, FrameDecoder, MAX_FRAME_LEN, coalesced_entry_len, encode_frame,
+    is_coalesced_frame, split_coalesced, split_group_header, write_coalesced_entry,
+    write_coalesced_marker, write_group_header,
   },
   stream::{Intake, RecordIo},
 };
@@ -167,18 +167,19 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     Ok(())
   }
 
-  /// Decode any complete application frames into `out` as `(group_id_bytes, entry_flags, message)`
-  /// triples. Yields nothing until a peer is bound (`Validated`, or a CLEAN `Closed` retaining the
-  /// peer for the final drain); a frame that is not a group header plus exactly one `Message` — or
-  /// a well-formed coalesced control frame — closes the connection as integrity-suspect. The group
-  /// id (empty for a single-group host) selects the target Raft group; a single-message frame
-  /// yields flags `0`, while a coalesced frame expands to one triple per entry carrying that
-  /// entry's flags (the QUIESCE bit — a multi-group control surface a single-group owner never
-  /// sees, since every coalesced entry's tag is non-empty and the empty-tag-only policy closes
-  /// first).
+  /// Decode any complete application frames into `out` as
+  /// `(group_id_bytes, entry_flags, generation, message)` tuples. Yields nothing until a peer is
+  /// bound (`Validated`, or a CLEAN `Closed` retaining the peer for the final drain); a frame that
+  /// is not a group header plus exactly one `Message` — or a well-formed coalesced control frame —
+  /// closes the connection as integrity-suspect. The group id (empty for a single-group host)
+  /// selects the target Raft group and `generation` is the sender's incarnation stamp for it (the
+  /// demux fence's input); a single-message frame yields flags `0`, while a coalesced frame expands
+  /// to one tuple per entry carrying that entry's flags (the QUIESCE bit — a multi-group control
+  /// surface a single-group owner never sees, since every coalesced entry's tag is non-empty and
+  /// the empty-tag-only policy closes first).
   pub fn poll_decoded(
     &mut self,
-    out: &mut Vec<(bytes::Bytes, u8, Message<I>)>,
+    out: &mut Vec<(bytes::Bytes, u8, u64, Message<I>)>,
   ) -> Result<(), TransportError> {
     if self.peer().is_none() {
       return Ok(());
@@ -207,9 +208,9 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
             return Err(e);
           }
         };
-        for (flags, group, message) in entries {
+        for (flags, group, generation, message) in entries {
           match crate::wire::decode_message::<I>(message) {
-            Ok(msg) => out.push((group, flags, msg)),
+            Ok(msg) => out.push((group, flags, generation, msg)),
             Err(_) => {
               self.close_suspect();
               return Err(TransportError::Decode);
@@ -221,7 +222,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       // Split the transport's group-demux header off the front; the remainder is the encoded
       // `Message`. The group id selects the target Raft group in a multi-group host; a single-group
       // owner sends an empty tag and ignores it here.
-      let (group, message) = match split_group_header(frame) {
+      let (group, generation, message) = match split_group_header(frame) {
         Ok(split) => split,
         Err(e) => {
           self.close_suspect();
@@ -232,7 +233,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       // slices the message's `Bytes` fields (entry payloads, blobs, contexts, encoded ids) out
       // of the SAME allocation; a frame must carry exactly one well-formed envelope.
       match crate::wire::decode_message::<I>(message) {
-        Ok(msg) => out.push((group, 0, msg)),
+        Ok(msg) => out.push((group, 0, generation, msg)),
         Err(_) => {
           self.close_suspect();
           return Err(TransportError::Decode);
@@ -245,12 +246,12 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
   /// Encode + frame `msg` and queue it for transmission. A closed connection drops the message (it
   /// has no route); the router clears the peer binding so the consensus layer re-routes/retries.
   /// Bounds are enforced per frame by [`emit_frame`](Self::emit_frame) before anything is queued.
-  pub fn send_message(&mut self, group: &[u8], msg: &Message<I>) {
+  pub fn send_message(&mut self, group: &[u8], generation: u64, msg: &Message<I>) {
     if matches!(self.state, ConnState::Closed { .. }) {
       return;
     }
     let mut payload = Vec::new();
-    write_group_header(group, &mut payload);
+    write_group_header(group, generation, &mut payload);
     self.encoder.encode_message(msg, &mut payload);
     self.emit_frame(&payload);
   }
@@ -277,17 +278,17 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     let mut payload = Vec::new();
     write_coalesced_marker(&mut payload);
     let mut msg_scratch = Vec::new();
-    for (flags, group, msg) in entries {
+    for (flags, group, generation, msg) in entries {
       msg_scratch.clear();
       self.encoder.encode_message(msg, &mut msg_scratch);
-      let entry_len = 1 + 2 + group.len() + 4 + msg_scratch.len();
+      let entry_len = coalesced_entry_len(group.len(), *generation, msg_scratch.len());
       if entry_len > COALESCED_FRAME_BUDGET {
         debug_assert!(
           *flags == 0,
           "a flagged entry must be pre-sized by its coordinator"
         );
-        let mut normal = Vec::with_capacity(2 + group.len() + msg_scratch.len());
-        write_group_header(group, &mut normal);
+        let mut normal = Vec::with_capacity(entry_len);
+        write_group_header(group, *generation, &mut normal);
         normal.extend_from_slice(&msg_scratch);
         if !self.emit_frame(&normal) {
           return;
@@ -303,7 +304,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
         payload.clear();
         write_coalesced_marker(&mut payload);
       }
-      write_coalesced_entry(*flags, group, &msg_scratch, &mut payload);
+      write_coalesced_entry(*flags, group, *generation, &msg_scratch, &mut payload);
     }
     if payload.len() > 2 {
       self.emit_frame(&payload);

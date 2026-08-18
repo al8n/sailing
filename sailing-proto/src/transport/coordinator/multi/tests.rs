@@ -13,6 +13,9 @@ type MultiCoord = MultiStreamCoordinator<u64, u64, CountSm, TestRecord>;
 
 struct Stores {
   map: BTreeMap<u64, (VecLog, AsyncStable)>,
+  /// Per-gid admission floors, the demux fence's durable input. Empty (floor 0) unless a test
+  /// retires an incarnation, so every other test's behavior is unchanged.
+  floors: BTreeMap<u64, u64>,
 }
 
 impl GroupStores<u64, VecLog, AsyncStable> for Stores {
@@ -22,8 +25,8 @@ impl GroupStores<u64, VecLog, AsyncStable> for Stores {
 }
 
 impl FloorStore<u64> for Stores {
-  fn floor(&self, _gid: &u64) -> u64 {
-    0
+  fn floor(&self, gid: &u64) -> u64 {
+    self.floors.get(gid).copied().unwrap_or(0)
   }
 
   fn lineage(&self, _gid: &u64) -> u64 {
@@ -36,6 +39,7 @@ impl FloorStore<u64> for Stores {
 fn empty_stores() -> Stores {
   Stores {
     map: BTreeMap::new(),
+    floors: BTreeMap::new(),
   }
 }
 
@@ -77,6 +81,7 @@ fn coordinator_drives_isolated_groups() {
 
   let mut stores = Stores {
     map: BTreeMap::new(),
+    floors: BTreeMap::new(),
   };
   stores
     .map
@@ -147,8 +152,13 @@ fn label(id: u64, role_dialer: bool) -> TestRecord {
 /// A framed `[group header][Message]` payload, exactly as a peer `Conn::send_message` builds it —
 /// for hand-feeding a receiver a frame with a chosen (possibly malformed) group tag.
 fn crafted_frame(tag: &[u8], msg: &Message<u64>) -> Vec<u8> {
+  crafted_frame_at(tag, 0, msg)
+}
+
+/// [`crafted_frame`] with an explicit incarnation stamp — the fence's hand-fed input.
+fn crafted_frame_at(tag: &[u8], generation: u64, msg: &Message<u64>) -> Vec<u8> {
   let mut payload = Vec::new();
-  crate::transport::frame::write_group_header(tag, &mut payload);
+  crate::transport::frame::write_group_header(tag, generation, &mut payload);
   crate::wire::encode_message(msg, &mut payload);
   let mut framed = Vec::new();
   crate::transport::frame::encode_frame(&payload, &mut framed);
@@ -172,9 +182,11 @@ impl World {
     let mut b = MultiCoord::new();
     let mut sa = Stores {
       map: BTreeMap::new(),
+      floors: BTreeMap::new(),
     };
     let mut sb = Stores {
       map: BTreeMap::new(),
+      floors: BTreeMap::new(),
     };
     for &g in a_groups {
       a.create_group(
@@ -445,7 +457,7 @@ fn decode_entries(payload: &[u8]) -> Vec<(u8, u64, Message<u64>)> {
   crate::transport::frame::split_coalesced(bytes::Bytes::copy_from_slice(payload))
     .expect("well-formed coalesced payload")
     .into_iter()
-    .map(|(flags, group, msg)| {
+    .map(|(flags, group, _generation, msg)| {
       (
         flags,
         u64::decode_exact(group).expect("u64 tag"),
@@ -553,7 +565,7 @@ fn flagged_response_closes_the_connection() {
   sailing_encode_u64(100, &mut gb);
   let mut payload = Vec::new();
   crate::transport::frame::write_coalesced_marker(&mut payload);
-  crate::transport::frame::write_coalesced_entry(1, &gb, &msg_bytes, &mut payload);
+  crate::transport::frame::write_coalesced_entry(1, &gb, 0, &msg_bytes, &mut payload);
   let mut framed = Vec::new();
   crate::transport::frame::encode_frame(&payload, &mut framed);
 
@@ -594,7 +606,7 @@ fn flagged_beat_frame(term: u64, leader: u64) -> Vec<u8> {
   sailing_encode_u64(100, &mut gb);
   let mut payload = Vec::new();
   crate::transport::frame::write_coalesced_marker(&mut payload);
-  crate::transport::frame::write_coalesced_entry(1, &gb, &msg_bytes, &mut payload);
+  crate::transport::frame::write_coalesced_entry(1, &gb, 0, &msg_bytes, &mut payload);
   let mut framed = Vec::new();
   crate::transport::frame::encode_frame(&payload, &mut framed);
   framed
@@ -1016,9 +1028,9 @@ fn unhosted_coalesced_entry_drops_but_the_frame_delivers() {
   let mut payload = Vec::new();
   crate::transport::frame::write_coalesced_marker(&mut payload);
   let (tag, msg_bytes) = hb(999);
-  crate::transport::frame::write_coalesced_entry(0, &tag, &msg_bytes, &mut payload);
+  crate::transport::frame::write_coalesced_entry(0, &tag, 0, &msg_bytes, &mut payload);
   let (tag, msg_bytes) = hb(100);
-  crate::transport::frame::write_coalesced_entry(0, &tag, &msg_bytes, &mut payload);
+  crate::transport::frame::write_coalesced_entry(0, &tag, 0, &msg_bytes, &mut payload);
   let mut framed = Vec::new();
   crate::transport::frame::encode_frame(&payload, &mut framed);
 
@@ -2600,6 +2612,7 @@ fn merge_verbs_ride_the_coordinator() {
   let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
   let mut stores = Stores {
     map: BTreeMap::new(),
+    floors: BTreeMap::new(),
   };
   for gid in [1u64, 2] {
     stores
@@ -2715,6 +2728,7 @@ fn coordinator_teardown_inherits_the_participant_gate_without_tombstoning() {
   let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
   let mut stores = Stores {
     map: BTreeMap::new(),
+    floors: BTreeMap::new(),
   };
   for gid in [1u64, 2] {
     stores
@@ -2855,4 +2869,192 @@ fn a_forked_groups_hard_state_records_its_lineage_from_birth() {
     stable2.hard_state().lineage().is_none(),
     "an untokened fork records None — exact, not conservative"
   );
+}
+
+/// THE GENERATION FENCE, below the floor: a frame stamped with a RETIRED incarnation's generation
+/// is dropped at demux — the endpoint never sees it, the shared connection survives for the live
+/// groups, and the observability counter records the drop. The receiver's group is otherwise
+/// perfectly healthy: only the stamp distinguishes the husk's traffic from a live member's.
+#[test]
+fn a_below_floor_stamp_is_fenced_at_demux() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  // Retire incarnation 0 of group 100 on the receiver: anything below generation 3 is a husk.
+  w.sb.floors.insert(100, 3);
+
+  let before = w.b.group(&100).unwrap().term();
+  let vote = Message::RequestVote(crate::RequestVote::new(
+    Term::new(9),
+    1u64,
+    crate::Index::new(1),
+    Term::new(1),
+    false,
+    false,
+  ));
+  let mut tag = Vec::new();
+  crate::Data::encode(&100u64, &mut tag);
+  let framed = crafted_frame_at(&tag, 2, &vote);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+
+  assert_eq!(w.b.fenced_frames_dropped(), 1, "the fence counted the drop");
+  assert_eq!(
+    w.b.group(&100).unwrap().term(),
+    before,
+    "a retired incarnation's term-9 vote never reached the endpoint"
+  );
+  assert_eq!(
+    w.b.poll_conn_closed(),
+    None,
+    "fencing a frame never costs the shared connection"
+  );
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    None,
+    "a fenced frame is never a placement signal"
+  );
+}
+
+/// EQUAL ADMITS (WIRE.md §6): a frame stamped exactly AT the receiver's floor is a live member's,
+/// not a husk's, so it dispatches normally and the fence counts nothing. Rejecting equal would
+/// reintroduce the membership-apply-time staleness the vote path warns about.
+#[test]
+fn an_at_floor_stamp_is_admitted() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  w.sb.floors.insert(100, 3);
+
+  let vote = Message::RequestVote(crate::RequestVote::new(
+    Term::new(9),
+    1u64,
+    crate::Index::new(1),
+    Term::new(1),
+    false,
+    false,
+  ));
+  let mut tag = Vec::new();
+  crate::Data::encode(&100u64, &mut tag);
+  let framed = crafted_frame_at(&tag, 3, &vote);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+
+  assert_eq!(
+    w.b.fenced_frames_dropped(),
+    0,
+    "at-floor is not below-floor"
+  );
+  assert_eq!(
+    w.b.group(&100).unwrap().term(),
+    Term::new(9),
+    "the at-floor vote reached the endpoint and raised its term"
+  );
+}
+
+/// SKEW IMMUNITY: the comparator is the RETIREMENT floor, not the receiver's current shape
+/// generation, so a replica trailing a reshape stamps its own lower generation and still ADMITS at
+/// an applied sibling — a live gid's floor does not move when its shape generation bumps. Without
+/// this the fence would re-create the apply-time staleness bug: a mid-split straggler's campaign
+/// would be silently swallowed by every peer that applied the split first.
+#[test]
+fn a_reshape_trailing_stamp_still_admits_at_an_applied_sibling() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  // The receiver has applied two reshapes (lineage 2); its floor for the LIVE gid stays 0.
+  assert_eq!(
+    w.sb.floor(&100),
+    0,
+    "a live gid's floor is unmoved by reshape"
+  );
+
+  let vote = Message::RequestVote(crate::RequestVote::new(
+    Term::new(9),
+    1u64,
+    crate::Index::new(1),
+    Term::new(1),
+    false,
+    false,
+  ));
+  let mut tag = Vec::new();
+  crate::Data::encode(&100u64, &mut tag);
+  // The sender trails by one: it stamps generation 1 while the sibling sits at 2.
+  let framed = crafted_frame_at(&tag, 1, &vote);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+
+  assert_eq!(
+    w.b.fenced_frames_dropped(),
+    0,
+    "a trailing shape generation is not a retired incarnation"
+  );
+  assert_eq!(
+    w.b.group(&100).unwrap().term(),
+    Term::new(9),
+    "the trailing sibling's vote was delivered"
+  );
+}
+
+/// The fence covers EVERY message class, not just votes: a retired incarnation's appends are dead
+/// writes and its heartbeats are noise, and admitting either would leave the replication plane as
+/// a stale-incarnation side channel. Heartbeats ride COALESCED entries, so this also pins the
+/// per-entry stamp — the live group's entry in the same frame still dispatches.
+#[test]
+fn the_fence_covers_every_class_and_spares_the_frames_live_entries() {
+  let mut w = World::new(&[100, 200], &[100, 200]);
+  w.settle();
+  w.sb.floors.insert(100, 3);
+  let before = w.b.group(&100).unwrap().term();
+
+  let beat = |gid: u64, generation: u64, payload: &mut Vec<u8>| {
+    let hb = Message::Heartbeat(crate::Heartbeat::new(
+      Term::new(9),
+      1u64,
+      Index::ZERO,
+      Bytes::new(),
+    ));
+    let mut msg_bytes = Vec::new();
+    crate::wire::encode_message(&hb, &mut msg_bytes);
+    let mut gb = Vec::new();
+    sailing_encode_u64(gid, &mut gb);
+    crate::transport::frame::write_coalesced_entry(0, &gb, generation, &msg_bytes, payload);
+  };
+  let mut payload = Vec::new();
+  crate::transport::frame::write_coalesced_marker(&mut payload);
+  beat(100, 2, &mut payload); // the husk's beat — below the floor
+  beat(200, 0, &mut payload); // a live group's beat in the SAME frame
+  let mut framed = Vec::new();
+  crate::transport::frame::encode_frame(&payload, &mut framed);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+
+  // An append from the same husk, on its own frame.
+  let append = Message::AppendEntries(crate::AppendEntries::new(
+    Term::new(9),
+    1u64,
+    Index::ZERO,
+    Term::ZERO,
+    std::vec![],
+    Index::ZERO,
+  ));
+  let mut tag = Vec::new();
+  crate::Data::encode(&100u64, &mut tag);
+  let framed = crafted_frame_at(&tag, 2, &append);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+
+  assert_eq!(
+    w.b.fenced_frames_dropped(),
+    2,
+    "the husk's heartbeat AND its append were both fenced"
+  );
+  assert_eq!(
+    w.b.group(&100).unwrap().term(),
+    before,
+    "no class of the husk's traffic reached the endpoint"
+  );
+  assert_eq!(
+    w.b.group(&200).unwrap().term(),
+    Term::new(9),
+    "the live group's entry in the fenced frame still dispatched"
+  );
+  assert_eq!(w.b.poll_conn_closed(), None, "the connection survives");
 }

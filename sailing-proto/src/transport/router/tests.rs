@@ -73,11 +73,11 @@ fn binds_peer_on_validation_and_routes() {
   assert_eq!(router.conn_of(&7), Some(id), "peer 7 is bound to its conn");
 
   // Routing a message to peer 7 reaches that connection.
-  assert!(router.route(&[], 7, &hb(10)));
+  assert!(router.route(&[], 0, 7, &hb(10)));
   pump(&mut router, id, &mut peer);
   let mut got = Vec::new();
   peer.poll_decoded(&mut got).unwrap();
-  let got: std::vec::Vec<_> = got.into_iter().map(|(_, _, m)| m).collect();
+  let got: std::vec::Vec<_> = got.into_iter().map(|(_, _, _, m)| m).collect();
   assert_eq!(got, std::vec![hb(10)]);
 }
 
@@ -89,7 +89,7 @@ fn decodes_inbound_messages_with_their_peer() {
   let mut peer = Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
 
-  peer.send_message(&[], &hb(7));
+  peer.send_message(&[], 0, &hb(7));
   let mut delivered = Vec::new();
   for _ in 0..8 {
     let mut back = Vec::new();
@@ -101,13 +101,16 @@ fn decodes_inbound_messages_with_their_peer() {
       .handle_conn_data(id, &back, false, Instant::ORIGIN, &mut delivered)
       .unwrap();
   }
-  assert_eq!(delivered, std::vec![(bytes::Bytes::new(), 0u8, 7, hb(7))]);
+  assert_eq!(
+    delivered,
+    std::vec![(bytes::Bytes::new(), 0u8, 0u64, 7, hb(7))]
+  );
 }
 
 #[test]
 fn route_to_unknown_peer_is_dropped() {
   let mut router = R::new();
-  assert!(!router.route(&[], 99, &hb(1)), "no conn to peer 99");
+  assert!(!router.route(&[], 0, 99, &hb(1)), "no conn to peer 99");
 }
 
 #[test]
@@ -126,7 +129,7 @@ fn eof_clears_the_peer_route() {
     .unwrap();
   assert_eq!(router.conn_of(&7), None, "EOF clears the peer binding");
   assert!(
-    !router.route(&[], 7, &hb(10)),
+    !router.route(&[], 0, 7, &hb(10)),
     "no route into a closed connection"
   );
 }
@@ -145,7 +148,7 @@ fn newer_connection_wins_duplicate_peer() {
   let mut peer2 = Conn::new(dialer(7));
   pump(&mut router, id2, &mut peer2);
   assert_eq!(router.conn_of(&7), Some(id2), "newer conn wins");
-  assert!(router.route(&[], 7, &hb(10)));
+  assert!(router.route(&[], 0, 7, &hb(10)));
 }
 
 #[test]
@@ -167,7 +170,10 @@ fn older_connection_validating_late_does_not_evict_newer() {
     Some(id2),
     "a stale older duplicate cannot evict the healthy newer binding"
   );
-  assert!(router.route(&[], 7, &hb(10)), "the newer route still works");
+  assert!(
+    router.route(&[], 0, 7, &hb(10)),
+    "the newer route still works"
+  );
 }
 
 #[test]
@@ -300,7 +306,7 @@ fn duplicate_conn_id_registration_is_rejected_not_replaced() {
     "the original binding is untouched"
   );
   assert!(
-    router.route(&[], 7, &hb(10)),
+    router.route(&[], 0, 7, &hb(10)),
     "the original conn still routes"
   );
 }
@@ -382,7 +388,7 @@ fn route_that_trips_the_outbound_cap_drops_the_route() {
   assert_eq!(router.conn_of(&7), Some(id), "the peer bound on validation");
 
   assert!(
-    !router.route(&[], 7, &hb(10)),
+    !router.route(&[], 0, 7, &hb(10)),
     "a send that trips the outbound cap drops the route"
   );
   assert_eq!(

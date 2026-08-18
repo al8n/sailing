@@ -41,8 +41,8 @@ use rustls::pki_types::CertificateDer;
 
 use super::{
   super::frame::{
-    COALESCED_FRAME_BUDGET, MAX_FRAME_LEN, encode_frame, write_coalesced_entry,
-    write_coalesced_marker, write_group_header,
+    COALESCED_FRAME_BUDGET, MAX_FRAME_LEN, coalesced_entry_len, encode_frame,
+    write_coalesced_entry, write_coalesced_marker, write_group_header,
   },
   MAX_HELLO_LEN,
   conn::{ConnEntry, ConnTable, Phase},
@@ -885,13 +885,14 @@ impl<I: NodeId> Bridge<I> {
     now: Instant,
     h: ConnectionHandle,
     group: &[u8],
+    generation: u64,
     msg: &Message<I>,
   ) {
     if !self.is_validated(h) {
       return;
     }
     let mut payload = Vec::new();
-    write_group_header(group, &mut payload);
+    write_group_header(group, generation, &mut payload);
     self.encoder.encode_message(msg, &mut payload);
     if payload.len() > MAX_FRAME_LEN {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
@@ -935,10 +936,10 @@ impl<I: NodeId> Bridge<I> {
     write_coalesced_marker(&mut payload);
     let mut msg_scratch = Vec::new();
     let mut staged = false;
-    for (flags, group, msg) in entries {
+    for (flags, group, generation, msg) in entries {
       msg_scratch.clear();
       self.encoder.encode_message(msg, &mut msg_scratch);
-      let entry_len = 1 + 2 + group.len() + 4 + msg_scratch.len();
+      let entry_len = coalesced_entry_len(group.len(), *generation, msg_scratch.len());
       if entry_len > COALESCED_FRAME_BUDGET {
         // The receiver hard-rejects a coalesced frame past the budget, so an entry that alone
         // exceeds it falls back to a normal frame (the coordinators pre-size and divert these —
@@ -948,7 +949,7 @@ impl<I: NodeId> Bridge<I> {
           *flags == 0,
           "a flagged entry must be pre-sized by its coordinator"
         );
-        self.write_framed(now, h, group, msg);
+        self.write_framed(now, h, group, *generation, msg);
         staged = true;
         continue;
       }
@@ -961,7 +962,7 @@ impl<I: NodeId> Bridge<I> {
         payload.clear();
         write_coalesced_marker(&mut payload);
       }
-      write_coalesced_entry(*flags, group, &msg_scratch, &mut payload);
+      write_coalesced_entry(*flags, group, *generation, &msg_scratch, &mut payload);
     }
     if payload.len() > 2 {
       match self.stage_coalesced(now, h, &payload) {

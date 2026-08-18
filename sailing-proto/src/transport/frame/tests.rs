@@ -170,10 +170,14 @@ fn every_two_chunk_split_reassembles_three_frames() {
 #[test]
 fn group_header_round_trips() {
   let mut payload = Vec::new();
-  write_group_header(b"grp-id", &mut payload);
-  // Golden: the header is exactly `[u16 BE group_len][group bytes]`.
-  assert_eq!(&payload[..2], &[0x00, 0x06], "u16 BE length prefix");
-  assert_eq!(&payload[2..], b"grp-id");
+  write_group_header(b"grp-id", 0, &mut payload);
+  // Golden: the header is exactly `[u16 BE group_len][group bytes][varint generation]`, and the
+  // unreshaped common case costs exactly ONE added zero byte.
+  assert_eq!(
+    &payload[..],
+    b"\x00\x06grp-id\x00",
+    "the gen-0 header layout is byte-exact"
+  );
   payload.extend_from_slice(b"the-message-bytes");
 
   // Full wire cycle: frame it, reassemble it, then split the group header back off.
@@ -182,8 +186,9 @@ fn group_header_round_trips() {
   let mut dec = FrameDecoder::new();
   dec.push(&wire);
   let frame = dec.poll().unwrap().expect("one complete frame");
-  let (group, message) = split_group_header(frame).expect("well-formed header");
+  let (group, generation, message) = split_group_header(frame).expect("well-formed header");
   assert_eq!(&group[..], b"grp-id", "the group tag is byte-exact");
+  assert_eq!(generation, 0, "an unreshaped sender stamps 0");
   assert_eq!(
     &message[..],
     b"the-message-bytes",
@@ -191,18 +196,79 @@ fn group_header_round_trips() {
   );
 }
 
+/// A reshaped sender's stamp spans several varint bytes; the header stays self-delimiting, so the
+/// message remainder still splits byte-exactly behind it.
+#[test]
+fn group_header_multi_byte_generation_round_trips() {
+  let mut payload = Vec::new();
+  write_group_header(b"g", 300, &mut payload);
+  // Golden: 300 = 0b1_0010_1100 → LEB128 `AC 02`.
+  assert_eq!(
+    &payload[..],
+    &[0x00, 0x01, b'g', 0xAC, 0x02],
+    "the multi-byte stamp layout is byte-exact"
+  );
+  payload.extend_from_slice(b"msg");
+  let (group, generation, message) =
+    split_group_header(Bytes::from(payload)).expect("well-formed header");
+  assert_eq!(&group[..], b"g");
+  assert_eq!(generation, 300);
+  assert_eq!(&message[..], b"msg");
+
+  // Every varint width round-trips, the reserved terminal sentinel included (the fence refuses it
+  // at admission, never at the parse).
+  for generation in [1u64, 127, 128, 16_383, 16_384, u64::MAX - 1, u64::MAX] {
+    let mut buf = Vec::new();
+    write_group_header(b"gg", generation, &mut buf);
+    buf.extend_from_slice(b"m");
+    let (g, got, msg) = split_group_header(Bytes::from(buf)).expect("well-formed");
+    assert_eq!((&g[..], got, &msg[..]), (&b"gg"[..], generation, &b"m"[..]));
+  }
+}
+
+/// A malformed stamp is a framing violation, not a silently-zero generation: a truncated varint
+/// (every byte continues), one longer than the 10-byte `u64` ceiling, and a 10th byte carrying
+/// bits above 2^64 all reject.
+#[test]
+fn group_header_rejects_a_malformed_generation() {
+  // Truncated: the tag says one group byte, then a continuation byte with nothing after it.
+  assert!(matches!(
+    split_group_header(Bytes::from_static(&[0x00, 0x01, b'g', 0x80])),
+    Err(TransportError::Decode)
+  ));
+  // Eleven continuation bytes — past the u64 ceiling before any terminator.
+  let mut long = std::vec![0x00, 0x01, b'g'];
+  long.extend_from_slice(&[0x80; 11]);
+  long.push(0x00);
+  assert!(matches!(
+    split_group_header(Bytes::from(long)),
+    Err(TransportError::Decode)
+  ));
+  // A 10-byte encoding whose final byte carries bit 1 (value 2^64) would wrap into a DIFFERENT
+  // generation; the canonical-range parse refuses it.
+  let mut wrap = std::vec![0x00, 0x01, b'g'];
+  wrap.extend_from_slice(&[0x80; 9]);
+  wrap.push(0x02);
+  assert!(matches!(
+    split_group_header(Bytes::from(wrap)),
+    Err(TransportError::Decode)
+  ));
+}
+
 #[test]
 fn group_header_empty_tag_round_trips() {
   let mut payload = Vec::new();
-  write_group_header(&[], &mut payload);
+  write_group_header(&[], 0, &mut payload);
   assert_eq!(
     &payload[..],
-    &[0x00, 0x00],
-    "the single-group tag is a zero length"
+    &[0x00, 0x00, 0x00],
+    "the single-group tag is a zero length and a zero stamp"
   );
   payload.extend_from_slice(b"msg");
-  let (group, message) = split_group_header(Bytes::from(payload)).expect("well-formed header");
+  let (group, generation, message) =
+    split_group_header(Bytes::from(payload)).expect("well-formed header");
   assert!(group.is_empty(), "an empty tag splits to an empty group");
+  assert_eq!(generation, 0);
   assert_eq!(&message[..], b"msg");
 }
 
@@ -228,10 +294,13 @@ fn group_header_rejects_oversized_group() {
   ));
 
   // The bound is inclusive: exactly MAX_GROUP_ID_LEN splits cleanly.
-  let mut ok = std::vec![0xAB_u8; 2 + crate::wire::MAX_GROUP_ID_LEN + 1];
+  let mut ok = std::vec![0xAB_u8; 2 + crate::wire::MAX_GROUP_ID_LEN];
   ok[..2].copy_from_slice(&(crate::wire::MAX_GROUP_ID_LEN as u16).to_be_bytes());
-  let (group, message) = split_group_header(Bytes::from(ok)).expect("at the bound");
+  ok.push(0x00); // the generation stamp
+  ok.push(0xAB); // one message byte
+  let (group, generation, message) = split_group_header(Bytes::from(ok)).expect("at the bound");
   assert_eq!(group.len(), crate::wire::MAX_GROUP_ID_LEN);
+  assert_eq!(generation, 0);
   assert_eq!(message.len(), 1);
 }
 
@@ -244,12 +313,13 @@ fn group_header_rejects_length_past_end() {
   ));
 }
 
-/// A payload with the marker and `entries` coalesced records, as a sender builds it.
+/// A payload with the marker and `entries` coalesced records, as a sender builds it (every entry
+/// at generation 0 — the reshaped case has its own golden below).
 fn coalesced_payload(entries: &[(u8, &[u8], &[u8])]) -> Vec<u8> {
   let mut payload = Vec::new();
   write_coalesced_marker(&mut payload);
   for (flags, group, msg) in entries {
-    write_coalesced_entry(*flags, group, msg, &mut payload);
+    write_coalesced_entry(*flags, group, 0, msg, &mut payload);
   }
   payload
 }
@@ -268,7 +338,8 @@ fn coalesced_one_entry_round_trips() {
   assert_eq!(entries.len(), 1);
   assert_eq!(entries[0].0, COALESCED_FLAG_QUIESCE);
   assert_eq!(&entries[0].1[..], b"grp-id");
-  assert_eq!(&entries[0].2[..], b"the-message");
+  assert_eq!(entries[0].2, 0);
+  assert_eq!(&entries[0].3[..], b"the-message");
 }
 
 #[test]
@@ -277,24 +348,54 @@ fn coalesced_two_entry_frame_matches_golden_bytes() {
     (0x01, &[0xAA], &[0x01, 0x02]),
     (0x00, &[0xBB, 0xCC], &[0x03]),
   ]);
-  // Golden: [marker FF FF] then per entry [flags][u16 BE group_len][group][u32 BE msg_len][msg].
+  // Golden: [marker FF FF] then per entry
+  // [flags][u16 BE group_len][group][varint generation][u32 BE msg_len][msg].
   #[rustfmt::skip]
   let golden: &[u8] = &[
     0xFF, 0xFF,
-    0x01, 0x00, 0x01, 0xAA, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02,
-    0x00, 0x00, 0x02, 0xBB, 0xCC, 0x00, 0x00, 0x00, 0x01, 0x03,
+    0x01, 0x00, 0x01, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02,
+    0x00, 0x00, 0x02, 0xBB, 0xCC, 0x00, 0x00, 0x00, 0x00, 0x01, 0x03,
   ];
   assert_eq!(&payload[..], golden, "the coalesced layout is byte-exact");
   let entries = split_coalesced(Bytes::from(payload)).expect("well-formed");
   assert_eq!(entries.len(), 2);
   assert_eq!(
-    (entries[0].0, &entries[0].1[..], &entries[0].2[..]),
-    (0x01, &[0xAA][..], &[0x01, 0x02][..])
+    (
+      entries[0].0,
+      &entries[0].1[..],
+      entries[0].2,
+      &entries[0].3[..]
+    ),
+    (0x01, &[0xAA][..], 0, &[0x01, 0x02][..])
   );
   assert_eq!(
-    (entries[1].0, &entries[1].1[..], &entries[1].2[..]),
-    (0x00, &[0xBB, 0xCC][..], &[0x03][..])
+    (
+      entries[1].0,
+      &entries[1].1[..],
+      entries[1].2,
+      &entries[1].3[..]
+    ),
+    (0x00, &[0xBB, 0xCC][..], 0, &[0x03][..])
   );
+}
+
+/// Each coalesced entry carries its OWN stamp: one frame batches several groups, whose lineages
+/// move independently, so a shared per-frame stamp could not fence them apart.
+#[test]
+fn coalesced_entries_carry_independent_generations() {
+  let mut payload = Vec::new();
+  write_coalesced_marker(&mut payload);
+  write_coalesced_entry(0x00, &[0xAA], 0, &[0x01], &mut payload);
+  write_coalesced_entry(0x00, &[0xBB], 300, &[0x02], &mut payload);
+  #[rustfmt::skip]
+  let golden: &[u8] = &[
+    0xFF, 0xFF,
+    0x00, 0x00, 0x01, 0xAA, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01,
+    0x00, 0x00, 0x01, 0xBB, 0xAC, 0x02, 0x00, 0x00, 0x00, 0x01, 0x02,
+  ];
+  assert_eq!(&payload[..], golden, "per-entry stamps are byte-exact");
+  let entries = split_coalesced(Bytes::from(payload)).expect("well-formed");
+  assert_eq!((entries[0].2, entries[1].2), (0, 300));
 }
 
 #[test]
@@ -304,13 +405,14 @@ fn coalesced_many_entries_round_trip() {
   let mut payload = Vec::new();
   write_coalesced_marker(&mut payload);
   for i in 0..40 {
-    write_coalesced_entry((i % 2) as u8, &groups[i], &msgs[i], &mut payload);
+    write_coalesced_entry((i % 2) as u8, &groups[i], i as u64, &msgs[i], &mut payload);
   }
   let entries = split_coalesced(Bytes::from(payload)).expect("well-formed");
   assert_eq!(entries.len(), 40);
-  for (i, (flags, group, msg)) in entries.iter().enumerate() {
+  for (i, (flags, group, generation, msg)) in entries.iter().enumerate() {
     assert_eq!(*flags, (i % 2) as u8, "entry {i} flags");
     assert_eq!(&group[..], &groups[i][..], "entry {i} group");
+    assert_eq!(*generation, i as u64, "entry {i} generation");
     assert_eq!(&msg[..], &msgs[i][..], "entry {i} message");
   }
 }
@@ -319,7 +421,7 @@ fn coalesced_many_entries_round_trip() {
 fn coalesced_rejects_a_missing_marker() {
   // A single-message payload (group header first) is not a coalesced frame.
   let mut normal = Vec::new();
-  write_group_header(b"grp", &mut normal);
+  write_group_header(b"grp", 0, &mut normal);
   normal.extend_from_slice(b"msg");
   assert!(!is_coalesced_frame(&normal));
   assert!(matches!(
@@ -358,7 +460,7 @@ fn coalesced_rejects_truncated_entries() {
   // A cut anywhere INSIDE an entry is a truncated entry and rejects; a cut at an entry boundary is
   // a valid shorter frame. The two valid shorter forms are the bare marker (cut 2 — the empty
   // probe, zero entries) and the boundary after entry 1 (one entry).
-  let entry1_end = 2 + (1 + 2 + 2 + 4 + 2);
+  let entry1_end = 2 + (1 + 2 + 2 + 1 + 4 + 2);
   for cut in 2..whole.len() {
     let prefix = Bytes::copy_from_slice(&whole[..cut]);
     if cut == 2 {
@@ -379,6 +481,7 @@ fn coalesced_rejects_zero_and_oversized_group_lengths() {
   // group_len == 0: the empty single-group tag never rides a coalesced frame.
   let mut zero = std::vec![0xFF, 0xFF, 0x00];
   zero.extend_from_slice(&0u16.to_be_bytes());
+  zero.push(0x00);
   zero.extend_from_slice(&0u32.to_be_bytes());
   assert!(matches!(
     split_coalesced(Bytes::from(zero)),
@@ -389,6 +492,7 @@ fn coalesced_rejects_zero_and_oversized_group_lengths() {
   let mut big = std::vec![0xFF, 0xFF, 0x00];
   big.extend_from_slice(&(over as u16).to_be_bytes());
   big.extend_from_slice(&std::vec![0xAB; over]);
+  big.push(0x00);
   big.extend_from_slice(&0u32.to_be_bytes());
   assert!(matches!(
     split_coalesced(Bytes::from(big)),
@@ -398,17 +502,18 @@ fn coalesced_rejects_zero_and_oversized_group_lengths() {
   let mut ok = std::vec![0xFF, 0xFF, 0x00];
   ok.extend_from_slice(&(crate::wire::MAX_GROUP_ID_LEN as u16).to_be_bytes());
   ok.extend_from_slice(&std::vec![0xAB; crate::wire::MAX_GROUP_ID_LEN]);
+  ok.push(0x00);
   ok.extend_from_slice(&1u32.to_be_bytes());
   ok.push(0x77);
   let entries = split_coalesced(Bytes::from(ok)).expect("at the bound");
   assert_eq!(entries[0].1.len(), crate::wire::MAX_GROUP_ID_LEN);
-  assert_eq!(&entries[0].2[..], &[0x77]);
+  assert_eq!(&entries[0].3[..], &[0x77]);
 }
 
 #[test]
 fn coalesced_rejects_msg_len_overrunning_the_frame() {
   // The entry declares a 100-byte message but only 2 bytes follow.
-  let mut bad = std::vec![0xFF, 0xFF, 0x00, 0x00, 0x01, 0xAA];
+  let mut bad = std::vec![0xFF, 0xFF, 0x00, 0x00, 0x01, 0xAA, 0x00];
   bad.extend_from_slice(&100u32.to_be_bytes());
   bad.extend_from_slice(&[1, 2]);
   assert!(matches!(
@@ -422,12 +527,12 @@ fn coalesced_rejects_msg_len_overrunning_the_frame() {
 /// message decode could reject (an authenticated-peer allocation amplification).
 #[test]
 fn coalesced_rejects_payload_over_the_budget() {
-  // Minimal 9-byte entries (1 flags + 2 group_len + 1 group + 4 msg_len + 1 msg), repeated past
-  // the budget: structurally valid, rejected on size alone.
+  // Minimal 10-byte entries (1 flags + 2 group_len + 1 group + 1 generation + 4 msg_len + 1 msg),
+  // repeated past the budget: structurally valid, rejected on size alone.
   let mut payload = Vec::new();
   write_coalesced_marker(&mut payload);
   while payload.len() <= 2 + COALESCED_FRAME_BUDGET {
-    write_coalesced_entry(0, b"g", b"m", &mut payload);
+    write_coalesced_entry(0, b"g", 0, b"m", &mut payload);
   }
   assert!(matches!(
     split_coalesced(Bytes::from(payload)),
@@ -438,8 +543,8 @@ fn coalesced_rejects_payload_over_the_budget() {
   // produces.
   let mut ok = Vec::new();
   write_coalesced_marker(&mut ok);
-  while ok.len() + 9 <= 2 + COALESCED_FRAME_BUDGET {
-    write_coalesced_entry(0, b"g", b"m", &mut ok);
+  while ok.len() + coalesced_entry_len(1, 0, 1) <= 2 + COALESCED_FRAME_BUDGET {
+    write_coalesced_entry(0, b"g", 0, b"m", &mut ok);
   }
   let entries = split_coalesced(Bytes::from(ok)).expect("within budget");
   assert!(!entries.is_empty());

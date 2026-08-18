@@ -188,8 +188,9 @@ where
       .handle_conn_data(conn, bytes, eof, now.mono(), &mut decoded);
     // The entry flags are a multi-group control surface: every flag-bearing (coalesced) entry
     // carries a non-empty tag, so the empty-tag-only policy below already closes on all of them —
-    // a single-group host never acts on a flag.
-    for (group, _flags, from, msg) in decoded {
+    // a single-group host never acts on a flag. The incarnation stamp is the same kind of surface:
+    // a single-group host runs no lineage, so it stamps `0` and has no floor to fence against.
+    for (group, _flags, _generation, from, msg) in decoded {
       if !group.is_empty() {
         // A group-tagged frame on a single-group host: the peer is a multi-group node (a
         // deployment-shape mismatch), and feeding it through would inject a foreign group's
@@ -427,7 +428,8 @@ where
   fn flush(&mut self) {
     while let Some(out) = self.endpoint.poll_message() {
       let (to, msg) = out.into_parts();
-      self.router.route(&[], to, &msg);
+      // Empty tag, generation `0`: a single-group host has no lineage counter to stamp.
+      self.router.route(&[], 0, to, &msg);
     }
   }
 

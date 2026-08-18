@@ -38,6 +38,18 @@ impl GroupStores<u64, MemLog, MemStable<u64>> for Stores {
   }
 }
 
+/// These scenarios never reshape, so every id sits at generation 0 with no floor — the demux
+/// fence the coordinator reads through this seam admits everything.
+impl sailing_proto::FloorStore<u64> for Stores {
+  fn floor(&self, _gid: &u64) -> u64 {
+    0
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
 fn two_voter(id: u64) -> Config<u64> {
   Config::try_new(
     id,
