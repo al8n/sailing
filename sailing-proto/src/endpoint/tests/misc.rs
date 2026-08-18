@@ -1572,23 +1572,38 @@ fn tracing_subscriber_panic_does_not_drop_a_queued_event() {
     fn exit(&self, _: &tracing::span::Id) {}
   }
 
-  let cfg = Config::try_new(
-    1u64,
-    std::vec![1u64],
-    Duration::from_millis(1000),
-    Duration::from_millis(100),
-  )
-  .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
-  let mut log = VecLog::default();
-  let mut stable = AsyncStable::default();
-  let d = ep.poll_timeout().unwrap();
-  ep.handle_timeout(d, &mut log, &mut stable); // campaign
-  ep.handle_storage(d, &mut log, &mut stable); // self-vote durable -> become leader
-  assert!(ep.role().is_leader());
-  // Becoming leader queued a `LeaderChanged`; leave it undrained.
+  // A single-voter leader with its `LeaderChanged` still queued.
+  let leader = || {
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+    let mut log = VecLog::default();
+    let mut stable = AsyncStable::default();
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // campaign
+    ep.handle_storage(d, &mut log, &mut stable); // self-vote durable -> become leader
+    assert!(ep.role().is_leader());
+    ep
+  };
+  let mut warmup = leader();
+  let mut ep = leader();
 
   let unwound = tracing::subscriber::with_default(PanicOnEvent, || {
+    // Register the `LeaderChanged` callsite from THIS thread first, discarding the outcome.
+    // Installing a scoped subscriber raises tracing's GLOBAL max level, so every other test
+    // thread's macros go live at that instant — and with one registered dispatcher `tracing-core`
+    // computes a callsite's interest from whatever subscriber the REGISTERING thread happens to
+    // have. A sibling test reaching this callsite first would cache `Interest::never` (its thread
+    // has no subscriber) and the assertion below would observe no event at all. Once the callsite
+    // is REGISTERED no other thread recomputes it, so the rebuild that follows pins its interest
+    // under this subscriber for good.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| warmup.poll_event()));
+    tracing::callsite::rebuild_interest_cache();
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ep.poll_event())).is_err()
   });
   assert!(
