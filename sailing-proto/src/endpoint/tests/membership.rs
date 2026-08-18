@@ -2459,6 +2459,8 @@ fn farewell_retry_survives_deposition_and_cures_on_re_election() {
   while ep.poll_event().is_some() {}
 
   // The FIRST leader tick front-loads the farewell to node 3.
+  // The inherited-tail gate: this fresh leader's own no-op must apply before any cure runs.
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, rd, &[2u64]);
   let ft = rd + Duration::from_millis(150);
   ep.handle_timeout(ft, &mut log, &mut stable);
   let farewell = drain_to(&mut ep, 3u64)
@@ -2642,6 +2644,8 @@ fn farewell_retry_survives_a_checkquorum_demotion_in_the_same_tick() {
   ep.handle_storage(rd, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
+  // The inherited-tail gate: this fresh leader's own no-op must apply before any cure runs.
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, rd, &[2u64]);
   let ft = rd + Duration::from_millis(150);
   ep.handle_timeout(ft, &mut log, &mut stable);
   let farewell = drain_to(&mut ep, 3u64)
@@ -2869,6 +2873,8 @@ fn farewell_retry_dropped_across_a_snapshot_readmit_and_re_election() {
 
   // The first leader tick emits NO farewell: the map is empty, so `drive_pending_farewells` sends none.
   while ep.poll_message().is_some() {}
+  // The inherited-tail gate: this fresh leader's own no-op must apply before any cure runs.
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, rd, &[2u64]);
   let ft = rd + Duration::from_millis(150);
   ep.handle_timeout(ft, &mut log, &mut stable);
   assert!(
@@ -2943,6 +2949,8 @@ fn farewell_retry_survives_a_snapshot_that_keeps_the_peer_removed() {
   // The first tick delivers the surviving shot to node 3 (a non-member -> the farewell is the only
   // message it receives).
   while ep.poll_message().is_some() {}
+  // The inherited-tail gate: this fresh leader's own no-op must apply before any cure runs.
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, rd, &[2u64]);
   let ft = rd + Duration::from_millis(150);
   ep.handle_timeout(ft, &mut log, &mut stable);
   assert!(
@@ -2997,5 +3005,345 @@ fn become_leader_re_arm_drops_an_entry_whose_peer_is_tracked() {
   assert!(
     !ep.pending_farewells.contains_key(&2u64),
     "become_leader dropped the entry for the tracked peer — never re-arming an obsolete removal"
+  );
+}
+
+/// Drive a freshly-elected leader's own term-start no-op to COMMIT and APPLY. Every removal cure
+/// waits for this (the inherited-tail gate), and it is what a real leader does before it serves
+/// anything: until its own first entry applies, its applied configuration may be stale by the tail
+/// it inherited. `acks` are the peers whose `AppendResponse` completes the quorum.
+fn apply_the_term_start_noop<S: crate::StableStore<NodeId = u64>>(
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut VecLog,
+  stable: &mut S,
+  now: Instant,
+  acks: &[u64],
+) {
+  use crate::{AppendResponse, LogStore as _, Message, Term};
+  ep.handle_storage(now, log, stable);
+  let at = log.last_index();
+  let term = ep.term();
+  for &peer in acks {
+    ep.handle_message(
+      now,
+      log,
+      stable,
+      peer,
+      Message::AppendResponse(AppendResponse::new(
+        term,
+        peer,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        at,
+      )),
+    );
+  }
+  ep.handle_storage(now, log, stable);
+}
+
+/// THE FAREWELL-ARM VARIANT of the same race — the half that #112 shipped. Node 1 removed node 3
+/// as leader (so it holds a farewell budget AND a debt), was deposed (parking both), then took a
+/// committed-but-unknown-committed `AddNode(3)` into its tail from the new leader before re-winning.
+/// Its applied configuration still excludes node 3, so `become_leader`'s reconciling retains keep
+/// both records — and the front-loaded farewell would deliver a suffix ending at the removal index
+/// to a peer the committed configuration has re-admitted.
+///
+/// MUTATION: remove the gate from `drive_pending_farewells` → the first post-re-election tick
+/// front-loads a stale removal to a current member.
+#[test]
+fn no_farewell_is_front_loaded_while_an_inherited_readd_is_unapplied() {
+  use crate::{
+    AppendEntries, ConfChange, ConfChangeType, Entry, EntryKind, Message, Role, Term, VoteResponse,
+  };
+  use core::time::Duration;
+
+  // Node 1 removed node 3 as leader: BOTH cure records exist.
+  let (mut ep, mut log, mut stable, d, removal) = leader_after_removing_node3();
+  assert!(
+    ep.pending_farewells.contains_key(&3u64),
+    "the removal armed the budget"
+  );
+  while ep.poll_message().is_some() {}
+
+  // A live member deposes it; both records PARK.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::RequestVote(crate::RequestVote::new(
+      Term::new(2),
+      2u64,
+      removal,
+      Term::new(1),
+      false,
+      false,
+    )),
+  );
+  assert!(!ep.role().is_leader(), "deposed by a live member");
+
+  // The new leader replicates its no-op AND a re-add of node 3 — committed globally, but the
+  // commit index it carries here still sits at the removal, so neither has applied.
+  let readd = ConfChange::new(ConfChangeType::AddNode, 3u64, Bytes::new()).into_v2();
+  let mut payload = Vec::new();
+  crate::wire::encode_conf_change_v2(&readd, &mut payload);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      2u64,
+      removal,
+      Term::new(1),
+      std::vec![
+        Entry::new(Term::new(2), removal.next(), EntryKind::Empty, Bytes::new()),
+        Entry::new(
+          Term::new(2),
+          removal.next().next(),
+          EntryKind::ConfChange,
+          bytes::Bytes::from(payload)
+        ),
+      ],
+      removal,
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(ep.applied, removal, "the re-add is in the tail, unapplied");
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Node 1 re-wins. Both records survive the retains, which read the stale applied view.
+  let rd = ep.poll_timeout().expect("the deposed leader re-arms");
+  ep.handle_timeout(rd, &mut log, &mut stable);
+  ep.handle_storage(rd, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(ct, 2u64, false, false)),
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  assert_eq!(ep.role(), Role::Leader, "node 1 re-wins");
+  assert!(ep.applied < ep.term_start_index, "with an unapplied tail");
+  let shots_before = ep
+    .pending_farewells
+    .get(&3u64)
+    .expect("the parked farewell survived the retain")
+    .shots_left;
+  while ep.poll_message().is_some() {}
+
+  // THE WINDOW: the first ticks front-load NOTHING.
+  for i in 0..4 {
+    ep.handle_timeout(
+      rd + Duration::from_millis(150 * (i + 1)),
+      &mut log,
+      &mut stable,
+    );
+    assert!(
+      drain_to(&mut ep, 3u64).is_empty(),
+      "no stale farewell may reach a re-admitted member"
+    );
+  }
+  assert_eq!(
+    ep.pending_farewells.get(&3u64).map(|f| f.shots_left),
+    Some(shots_before),
+    "the farewell budget is untouched — no shot spent while suppressed"
+  );
+
+  // The tail applies; the fold's re-add prune clears both.
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, rd, &[2u64]);
+  assert!(
+    ep.tracker.progress(&3u64).is_some(),
+    "node 3 is a member again"
+  );
+  assert!(
+    !ep.pending_farewells.contains_key(&3u64),
+    "and the apply fold pruned the cure record"
+  );
+  while ep.poll_message().is_some() {}
+  for i in 0..4 {
+    ep.handle_timeout(
+      rd + Duration::from_millis(900 + 150 * i),
+      &mut log,
+      &mut stable,
+    );
+  }
+  assert!(
+    drain_to(&mut ep, 3u64)
+      .into_iter()
+      .all(|m| !matches!(m, Message::InstallSnapshot(_))),
+    "a re-admitted member is never cured of a removal it no longer has"
+  );
+}
+
+/// A fresh leader whose inherited tail holds `RemoveNode(3)`, optionally `AddNode(3)`, and its own
+/// no-op — all committed together and drained in ONE apply pass. This is the fire-site race: the
+/// removal's apply is where the farewell's first shot is emitted, and a queued message cannot be
+/// retracted by a prune that happens two entries later.
+fn leader_draining_an_inherited_removal(
+  readd: bool,
+) -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Index) {
+  use crate::{
+    AppendEntries, ConfChange, ConfChangeType, Entry, EntryKind, Message, Role, Term, VoteResponse,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let d = Instant::ORIGIN;
+
+  // The inherited tail, appended while a follower and NOT yet committed: no-op@1, RemoveNode(3)@2,
+  // and (optionally) AddNode(3)@3.
+  let mut entries = std::vec![
+    Entry::new(Term::new(1), Index::new(1), EntryKind::Empty, Bytes::new()),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::ConfChange,
+      remove3_payload()
+    ),
+  ];
+  if readd {
+    let cc = ConfChange::new(ConfChangeType::AddNode, 3u64, Bytes::new()).into_v2();
+    let mut payload = Vec::new();
+    crate::wire::encode_conf_change_v2(&cc, &mut payload);
+    entries.push(Entry::new(
+      Term::new(1),
+      Index::new(3),
+      EntryKind::ConfChange,
+      bytes::Bytes::from(payload),
+    ));
+  }
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::ZERO, // nothing known-committed yet
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(ep.applied, Index::ZERO, "the tail is entirely unapplied");
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // It wins leadership; its own no-op lands above the tail.
+  let ed = ep.poll_timeout().expect("a voter arms its timer");
+  ep.handle_timeout(ed, &mut log, &mut stable);
+  ep.handle_storage(ed, &mut log, &mut stable);
+  let ct = ep.term();
+  for peer in [2u64, 3u64] {
+    ep.handle_message(
+      ed,
+      &mut log,
+      &mut stable,
+      peer,
+      Message::VoteResponse(VoteResponse::new(ct, peer, false, false)),
+    );
+  }
+  ep.handle_storage(ed, &mut log, &mut stable);
+  assert_eq!(ep.role(), Role::Leader, "it won");
+  assert!(ep.applied < ep.term_start_index, "with the tail unapplied");
+  while ep.poll_message().is_some() {}
+  let term_start = ep.term_start_index;
+  (ep, log, stable, term_start)
+}
+
+/// F1 — THE FIRE SITE. Draining an inherited `RemoveNode(3)` that a `AddNode(3)` in the SAME tail
+/// undoes must emit nothing at all: the farewell's first shot is sent AT APPLY, so gating only the
+/// re-drives would leave the initial shot already on the wire when the re-add prunes the entry two
+/// entries later. The suppressed shot stays on the budget, and the prune then discards the whole
+/// entry — the removed-then-restored peer is never told anything.
+///
+/// MUTATION: unsuppress the apply-time send → a farewell reaches node 3 before the re-add applies,
+/// and node 3 tears itself down as a current member.
+#[test]
+fn an_inherited_removal_undone_in_the_same_tail_says_nothing_at_all() {
+  use crate::Message;
+  let (mut ep, mut log, mut stable, term_start) = leader_draining_an_inherited_removal(true);
+
+  // The whole tail commits and applies in ONE pass, removal and re-add together.
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, Instant::ORIGIN, &[2u64]);
+  assert!(ep.applied >= term_start, "the tail applied");
+  assert!(
+    ep.tracker.progress(&3u64).is_some(),
+    "node 3 is a member per the committed configuration"
+  );
+  assert!(
+    !ep.pending_farewells.contains_key(&3u64),
+    "the re-add's fold pruned the retry entry"
+  );
+  assert!(
+    drain_to(&mut ep, 3u64)
+      .into_iter()
+      .all(|m| !matches!(m, Message::AppendEntries(_) | Message::InstallSnapshot(_))),
+    "and NO farewell of either arm was ever emitted to a peer that is still a member"
+  );
+}
+
+/// The other half of the fire-site rule: a suppressed shot is DEFERRED, never lost. With no re-add
+/// in the tail the removal stands, and the first post-gate drive delivers shot 1 through the
+/// ordinary path — with the full budget, because suppression spent nothing.
+///
+/// MUTATION: mint the entry at the post-fire remainder instead of the full allowance → the peer
+/// gets one fewer delivery attempt than a removal is supposed to buy it.
+#[test]
+fn a_suppressed_initial_farewell_is_delivered_once_the_tail_applies() {
+  use core::time::Duration;
+  let (mut ep, mut log, mut stable, term_start) = leader_draining_an_inherited_removal(false);
+
+  // The removal applies; nothing is emitted yet, and the entry holds its FULL allowance.
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, Instant::ORIGIN, &[2u64]);
+  assert!(ep.applied >= term_start, "the tail applied");
+  assert!(
+    ep.tracker.progress(&3u64).is_none(),
+    "node 3 stays removed — no re-add followed"
+  );
+  let entry = ep
+    .pending_farewells
+    .get(&3u64)
+    .expect("the retry entry was minted");
+  assert_eq!(
+    entry.shots_left, 3,
+    "with the initial shot UNSPENT: the full allowance, not the post-fire remainder"
+  );
+  assert!(
+    drain_to(&mut ep, 3u64).is_empty(),
+    "and nothing went out during the window"
+  );
+
+  // The first post-gate drive delivers it.
+  ep.handle_timeout(
+    Instant::ORIGIN + Duration::from_millis(150),
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    drain_to(&mut ep, 3u64).len(),
+    1,
+    "the first drive past the gate delivers the deferred shot"
+  );
+  assert_eq!(
+    ep.pending_farewells.get(&3u64).map(|f| f.shots_left),
+    Some(2),
+    "and only then is it spent"
   );
 }

@@ -621,6 +621,7 @@ where
       replication_pending: false,
       // A restarted node is a Follower with no leadership history to re-drive; farewell retries are
       // leader-scoped and re-populated only after it (re-)wins an election and prunes a removed peer.
+      term_start_index: Index::ZERO,
       pending_farewells: BTreeMap::new(),
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the

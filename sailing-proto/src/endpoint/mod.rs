@@ -1402,6 +1402,25 @@ where
   /// re-arm, and an `install_snapshot_now` membership rebuild. May hold parked entries on a follower —
   /// inert there (the leader-gated accessor reads false; the re-drive runs on a leader tick only).
   /// Restart starts empty (volatile; the durable catalog is the backstop).
+  /// The index of THIS leader's own first entry of its term — the no-op `become_leader` appends.
+  /// `Index::ZERO` on a replica that has never led.
+  ///
+  /// Its job is to date the leader's knowledge. A fresh leader's tail can hold entries that were
+  /// COMMITTED globally while it was a follower but are not yet known-committed here, so its
+  /// APPLIED configuration is stale by exactly that tail — and every piece of volatile cure state
+  /// (the farewell budget, the courtesy debt) is reconciled against applied truth. Until
+  /// `applied >= term_start_index` the whole inherited tail has not applied, so a cure derived from
+  /// the applied view may already be void. Once it has, the tail's own apply fold has run and the
+  /// existing prune edges have reconciled both maps.
+  ///
+  /// Every path that ACTS on a removal gates on it — the apply-time farewell FIRE (suppressed with
+  /// its initial shot left unspent, because a queued message cannot be retracted), the farewell
+  /// RE-DRIVE on the leader's beat, and both courtesy offer paths.
+  ///
+  /// ONE behavior is deliberately NOT gated, and the asymmetry is the point: ordinary message
+  /// handling. A leader whose membership view is unsettled must remain DEPOSABLE, or it can wedge a
+  /// group it can no longer commit in.
+  term_start_index: Index,
   pending_farewells: BTreeMap<I, FarewellRetry>,
 }
 
@@ -1560,6 +1579,7 @@ where
       },
       peers_scratch: Vec::new(),
       replication_pending: false,
+      term_start_index: Index::ZERO,
       pending_farewells: BTreeMap::new(),
     };
     ep.arm_election_timer(now);
@@ -2783,6 +2803,18 @@ where
   /// append arm just burns the shot; that residual is the courtesy snapshot's job. Only re-delivers
   /// committed state — the peer self-removes by APPLYING the removal, never by a bare assertion.
   fn drive_pending_farewells<L: LogStore>(&mut self, now: Now, log: &L) {
+    // THE INHERITED-TAIL GATE (see `term_start_index`). A farewell re-delivers the removal as an
+    // append whose suffix ends at the removal index — a cure derived from THIS replica's applied
+    // configuration. A fresh leader's applied view is stale by its inherited tail, which can hold
+    // a globally-committed AddNode re-admitting the very peer this budget names: the reconciling
+    // retain at `become_leader` reads the applied tracker and keeps the entry, and delivering it
+    // would tear down a member the committed configuration includes. Wait for the tail. No new
+    // reconciliation is needed once it applies: the AddNode's own apply fold prunes this map
+    // through the existing re-add edge, so the entry is simply gone by the time this runs again.
+    // Suppression spends NOTHING — the budget is untouched, so the cure survives the wait intact.
+    if self.applied < self.term_start_index {
+      return;
+    }
     // Role guard, load-bearing: only a LEADER re-drives farewells. The budget PARKS across a demotion
     // (it survives so re-election can re-arm it), so a tick that stepped this node down earlier in the
     // same beat — a CheckQuorum step-down, notably — must NOT send, decrement, or spend a shot here.
@@ -3336,12 +3368,22 @@ where
                     }
                     peers.push((peer.cheap_clone(), pr.match_index()));
                   }
+                  // THE INHERITED-TAIL GATE at the FIRE site. Draining an INHERITED RemoveNode
+                  // during the pre-gate window would otherwise emit shot 1 the instant it applies —
+                  // and a queued message cannot be retracted, so the re-add prune a few entries
+                  // later comes too late to stop it. Suppress the send and mint the entry with its
+                  // initial shot UNSPENT: if a re-add follows in the same tail, the prune discards
+                  // the entry and nothing was ever said; if none does, the first post-gate drive
+                  // delivers shot 1 through the ordinary path with the whole budget intact.
+                  let gated = self.applied < self.term_start_index;
                   for (peer, matched) in peers.drain(..) {
                     // A fatal farewell log read poisoned the node — no further sends.
                     if self.poison.poisoned {
                       break;
                     }
-                    self.send_farewell(log, peer.cheap_clone(), matched, idx);
+                    if !gated {
+                      self.send_farewell(log, peer.cheap_clone(), matched, idx);
+                    }
                     // The append arm's log read can poison; stop before tracking a dead node's retry.
                     if self.poison.poisoned {
                       break;
@@ -3357,7 +3399,14 @@ where
                       FarewellRetry {
                         matched,
                         idx,
-                        shots_left: FAREWELL_RETRY_SHOTS,
+                        // A suppressed fire leaves its shot on the budget, so the entry carries the
+                        // FULL allowance (the unspent initial plus the retries) rather than the
+                        // post-fire remainder.
+                        shots_left: if gated {
+                          FAREWELL_RETRY_SHOTS + 1
+                        } else {
+                          FAREWELL_RETRY_SHOTS
+                        },
                         next_at: None,
                       },
                     );
