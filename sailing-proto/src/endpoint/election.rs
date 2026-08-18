@@ -70,6 +70,9 @@ where
     // Abort any in-progress leader transfer — leadership is changing, the transfer is moot.
     self.transfer.lead_transferee = None;
     self.transfer.transfer_deadline = None;
+    // Courtesy debts PARK across this step-down alongside the farewell budget below: they are
+    // committed-evidence obligations to the same peers, not pacing state, so a demotion must not
+    // discharge them — a re-election re-arms and re-drives whatever offers remain.
     // Pending farewell retries PARK across this step-down (NOT cleared): a re-election re-arms and
     // re-drives their surviving shots, curing the self-recovery cycle where a removed disruptor
     // deposes this leader and then loses (it cannot hold a quorum). Inert while a follower — the
@@ -649,6 +652,17 @@ where
       let still_removed = tracker.progress(peer).is_none();
       if still_removed {
         retry.next_at = None;
+      }
+      still_removed
+    });
+    // The courtesy debts get the SAME reconciling re-arm as the farewell budget above, against
+    // the same predicate: keep only peers this term's committed configuration still excludes, and
+    // make each due immediately so a re-elected leader's first contact from a departed peer
+    // re-offers at once. A peer the tracker has since re-admitted is dropped, never re-offered.
+    self.courtesy_owed.retain(|peer, debt| {
+      let still_removed = tracker.progress(peer).is_none();
+      if still_removed {
+        debt.next_at = None;
       }
       still_removed
     });

@@ -50,11 +50,17 @@ where
   /// phase the OUTGOING half still counts, so a leaving member reads as named until the final,
   /// fully-departed configuration.
   pub(crate) fn conf_names_self(&self, conf: &crate::ConfState<I>) -> bool {
-    let me = self.config.id();
-    conf.voters().contains(&me)
-      || conf.voters_outgoing().contains(&me)
-      || conf.learners().contains(&me)
-      || conf.learners_next().contains(&me)
+    self.conf_names(conf, &self.config.id())
+  }
+
+  /// Whether `conf` names `id` in ANY membership role — the general form of
+  /// [`conf_names_self`](Self::conf_names_self), used by the courtesy path to ask the same
+  /// question about the peer it is about to serve.
+  pub(crate) fn conf_names(&self, conf: &crate::ConfState<I>, id: &I) -> bool {
+    conf.voters().contains(id)
+      || conf.voters_outgoing().contains(id)
+      || conf.learners().contains(id)
+      || conf.learners_next().contains(id)
   }
 
   /// Every id `conf` names in ANY role, across BOTH joint halves — the full membership dimension.
@@ -133,6 +139,178 @@ where
       _ => 0,
     };
     self.send_snapshot_chunk(peer, stable, from)
+  }
+
+  /// THE COURTESY SNAPSHOT (#95, the compacted removed peer). A leader that hears from a peer it
+  /// OWES a courtesy debt offers that peer ONE whole-blob `InstallSnapshot` carrying the
+  /// post-removal ConfState. The peer installs it, applies the excluding membership, surfaces its
+  /// own removal and disarms — self-removal by APPLYING committed state, never by a bare
+  /// assertion, so the safety envelope is untouched: this path only ever ships a snapshot the
+  /// leader itself holds as durable committed state.
+  ///
+  /// AUTHORIZATION IS THE DEBT, NOT THE SENDER. The only peers this can ever offer to are those in
+  /// [`courtesy_owed`](Endpoint::courtesy_owed), which is minted solely at this replica's own
+  /// apply-time committed removals. A sender that is merely unknown to the tracker — a
+  /// never-member, a peer of another group, a fresh identity — is owed nothing and gets nothing:
+  /// no offer, no state change, no reply. Contact cannot mint a debt, so no amount of traffic (or
+  /// of distinct identities) grows this leader's work or its egress. That also takes sender-identity
+  /// binding at the transport OUT of this path's blast radius: it is a real hardening question, but
+  /// the courtesy path no longer trusts sender identity for authorization at all — an attacker who
+  /// forges an identity gains exactly what that identity is owed, which for anyone this group never
+  /// removed is nothing.
+  ///
+  /// It is the complement of the farewell retry, not a duplicate of it. The retry re-delivers the
+  /// removal as an append and fails exactly when the peer's suffix has been COMPACTED below
+  /// `first_index` — and that class implies a durable snapshot exists at or past the compaction
+  /// point, which is precisely what this sends. Both maps are populated at the same fold, so the
+  /// composition is a lookup: the retry OWNS the peer while its budget lasts (checked below) and
+  /// this takes over afterwards.
+  ///
+  /// DEFERS — no send, no offer spent, no cooldown started, debt left armed — when any leg says so:
+  /// - the peer is still inside `pending_farewells` (the cheaper cure owns it);
+  /// - the debt's cooldown has not elapsed;
+  /// - no durable snapshot exists yet (nothing has been compacted, so the retry's append arm can
+  ///   still reach the peer and there is no gap to close);
+  /// - the durable snapshot PREDATES the removal, by index or by still naming the peer in its
+  ///   ConfState (see the eligibility gate below);
+  /// - the store defers the read (cold blob) — the peer's next contact re-drives it;
+  /// - the blob does not fit ONE frame. v1 is whole-blob only: a chunked courtesy would need ack
+  ///   routing for a peer with no `Progress` to route through.
+  ///
+  /// Two residuals are left to the embedder's catalog reap, by the golden architecture's own
+  /// assignment: an oversized blob, and a leader that never captures a snapshot past the removal
+  /// at all. Both leave the peer ignorant-but-alive, the safe failure direction.
+  pub(crate) fn maybe_send_courtesy_snapshot<S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Now,
+    peer: &I,
+    stable: &S,
+  ) {
+    // THE AUTHORIZATION GATE. Absence from the tracker is what an unknown, a never-member and a
+    // departed member all look like; only the debt distinguishes them, and only a committed
+    // removal mints one.
+    let Some(debt) = self.courtesy_owed.get(peer) else {
+      return;
+    };
+    debug_assert!(self.role.is_leader() && self.tracker.progress(peer).is_none());
+    // THE INHERITED-TAIL GATE (see `Endpoint::term_start_index`): a fresh leader's applied
+    // configuration is stale by its inherited tail, which may already have re-admitted this very
+    // peer, so no cure may be derived from it until that tail applies. Suppression spends nothing;
+    // the apply fold's re-add edge then prunes any debt the tail voided.
+    if self.applied < self.term_start_index {
+      return;
+    }
+    let (removal_index, next_at, last_seen_term) =
+      (debt.removal_index, debt.next_at, debt.last_seen_term);
+    // The farewell retry owns the peer while its blind budget lasts: firing both would ship a whole
+    // blob alongside a cheap append that is very likely to land.
+    if self.pending_farewells.contains_key(peer) {
+      return;
+    }
+    if next_at.is_some_and(|at| now.mono() < at) {
+      return;
+    }
+    // THE FUTILITY GATE. Every message this endpoint sends carries THIS leader's term, and the
+    // receiver's universal stale-term pre-pass discards anything below its own before a handler
+    // ever runs — so an offer stamped at or below the term the peer has been seen carrying is
+    // provably dead on arrival. Emitting it anyway would convert the budget into pure waste and,
+    // three wasted offers later, evict the debt: the very peer the cure exists for would end up
+    // owed nothing, and its next campaign would find a leader with no answer. Suppressing spends
+    // NOTHING — no offer, no cooldown — so the debt survives intact for a leader that can pay it.
+    //
+    // Two alternatives this gate replaces, so nobody re-litigates them: stamping the peer's term
+    // would forge a term this leader does not hold, and a receiver-side exception for term-stale
+    // removal proofs re-opens the staleness wound the incarnation gate closed — a partitioned
+    // leader deposed before a RE-ADD, still holding the debt and an old excluding snapshot, could
+    // tear down a peer the CURRENT committed configuration includes.
+    //
+    // CONVERGENCE, and its cost, stated plainly. Under the etcd-parity defaults an ignorant removed
+    // peer's campaign carries a real higher term and DEPOSES this leader. That deposition is
+    // self-healing: the live members re-elect (the removed peer cannot win a quorum of a
+    // configuration it is not in), whoever wins holds the debt by the universal mint, and its
+    // first-tick PROACTIVE offer is term-valid by construction because a fresh leader's term
+    // exceeds the term its electorate accepted — so every deposition is followed within a heartbeat
+    // of the re-election by a fresh, valid offer. The cure lands on the FIRST DELIVERED offer, and
+    // the peer can never campaign again after it.
+    //
+    // Under persistent targeted loss of every courtesy frame the group degrades to one self-healing
+    // deposition per election-timeout window, with the debt RETAINED throughout — the one thing it
+    // can never degrade to is an uncured peer with no standing cure, which is precisely what a
+    // charge-on-enqueue budget produced. Under pre-vote — which every reshape-born group defaults
+    // to — the peer never inflates a term at all, its probes reach the leader as ordinary traffic,
+    // and the contact-triggered offer cures it with ZERO depositions.
+    //
+    // Suppressing the peer's traffic to avoid even that one deposition was tried and withdrawn: no
+    // local state can license muting another replica's reconciliation, because a leader with stale
+    // configuration history cannot distinguish a departed peer from a re-added one, and every
+    // variant of the idea composed into a wedge topology. Suppressing our OWN sends — this gate,
+    // the eligibility gate, the inherited-tail gate, the throttle — is always safe; that asymmetry
+    // is the design rule.
+    // The deliverability boundary is `>=`, not `>`: the receiver drops only what is STRICTLY below
+    // its own term, so an offer at exactly the peer's term still lands. That one term matters — it
+    // is the whole pre-vote case, where a peer announces itself without ever inflating and a
+    // same-term leader can cure it immediately.
+    if last_seen_term.is_some_and(|seen| self.term < seen) {
+      return;
+    }
+    // Read the whole blob in one bounded call. `MAX_SNAPSHOT_CHUNK_BYTES` is the store contract's
+    // per-call ceiling, so a blob larger than it cannot ride the whole-blob shape anyway.
+    let Some(read) = stable.snapshot_chunk(0, crate::config::MAX_SNAPSHOT_CHUNK_BYTES) else {
+      return; // nothing persisted yet
+    };
+    let Ok((meta, total, chunk)) = read else {
+      // A fatal store read on a COURTESY path must not poison a healthy leader: this is a liveness
+      // favour to a peer that is already gone, and the ordinary replication paths will surface a
+      // genuine store fault on their own next read.
+      return;
+    };
+    // THE ELIGIBILITY GATE: the blob must actually CARRY the removal. A capture taken before the
+    // removal committed re-baselines the peer onto a configuration that still names it — leaving it
+    // ignorant, still armed to campaign, and now at the cost of a whole snapshot. Both legs are
+    // checked because either alone can be satisfied by an unrelated capture: the boundary must
+    // cover the removal's index, and the ConfState it installs must be one this peer is out of.
+    // Ineligible DEFERS rather than spends — the debt stays armed and a later post-removal capture
+    // enables it. A leader that never captures past the removal never offers; that residual is the
+    // catalog reap's, the same class as the oversized-blob skip below.
+    if meta.last_index() < removal_index || self.conf_names(meta.conf(), peer) {
+      return;
+    }
+    let SnapshotChunkRead::Ready(blob) = chunk else {
+      return; // cold: the peer's next contact re-drives the offer
+    };
+    if blob.len() as u64 != total {
+      return; // the store could not hand back the whole blob in one call
+    }
+    // ONE frame, sized exactly as the chunked sender sizes its own — including the transport's
+    // group-demux header, so the multi-group wire bound is respected too. The legacy whole-blob
+    // shape is `total_len == 0`, so it is sized at that value.
+    let (term, me) = (self.term, self.config.id());
+    let encoded =
+      crate::wire::install_snapshot_encoded_len(term, &me, &meta, 0, 0, blob.len() as u64);
+    if encoded.saturating_add(crate::wire::GROUP_HEADER_RESERVE) > crate::wire::MAX_FRAME_BYTES {
+      return;
+    }
+    // Record the offer and start the cooldown. Nothing is SPENT here: enqueueing a frame is not
+    // delivering it, so an offer that is lost in flight must leave the debt exactly as it found it.
+    // The cooldown is the rate bound, not a budget — a retained debt costs one whole-blob frame per
+    // peer per cooldown on a capped map, the same cost class as heartbeating a tracked peer that
+    // has died, which a Raft leader does for as long as the peer stays in the configuration.
+    //
+    // THE DISCHARGE FLOOR IS SET ONCE PER GENERATION, never raised by a retry. Every offer this
+    // generation makes carries a boundary at or past the removal index with a ConfState that
+    // excludes the peer, so installing ANY of them cures the peer — which makes the EARLIEST
+    // boundary offered the correct floor. Raising it to each retry's newer blob would discard the
+    // valid evidence of a delayed ack for an earlier offer, leaving a cured peer owed forever. Only
+    // a re-removal moves the floor, and it does so by replacing the whole debt.
+    let interval = COURTESY_COOLDOWN_TIMEOUTS * self.config.election_timeout();
+    if let Some(debt) = self.courtesy_owed.get_mut(peer) {
+      debt.offered_index.get_or_insert(meta.last_index());
+      debt.next_at = Some(now.mono() + interval);
+    }
+    self.send(
+      peer.cheap_clone(),
+      Message::InstallSnapshot(InstallSnapshot::new(term, me, meta, blob)),
+    );
   }
 
   /// Send the snapshot chunk beginning at `from_offset`, bounded by `config.snapshot_chunk_bytes()`.
@@ -1363,6 +1541,35 @@ where
     self
       .pending_farewells
       .retain(|peer, _| tracker.progress(peer).is_none());
+    // The install edge reconciles the courtesy debts in BOTH directions, because a snapshot's
+    // ConfState is committed-membership truth about every peer at once:
+    //
+    //   PRUNE the re-admitted — a peer this ConfState names is a member again and is owed nothing.
+    self
+      .courtesy_owed
+      .retain(|peer, _| tracker.progress(peer).is_none());
+    //   MINT the newly-removed — every peer the transition dropped. Without this a removal learned
+    // ONLY by snapshot (a replica offline across the whole conf change, caught up wholesale)
+    // leaves no debt anywhere on that replica, so if it later leads it owes the departed peer
+    // nothing, adopts its next campaign in the term pre-pass, and the disruption cycle recurs at
+    // it — exactly the gap the universal log-apply mint closes for the replay path.
+    //
+    // The boundary is the removal index used, and it is the conservative choice in the only
+    // direction that matters: the removal committed at or below it, and THIS snapshot is by
+    // construction eligible to serve as the cure (its index IS the boundary and its ConfState
+    // excludes the peer), so a debt minted here can always be paid. An existing debt is replaced
+    // only by a strictly LATER boundary, matching the re-removal rule, and a replacement restarts
+    // the budget. Self is never minted: this replica does not owe itself a courtesy.
+    let me = self.config.id();
+    let boundary = meta.last_index();
+    let newly_removed: std::vec::Vec<I> = removed_members
+      .iter()
+      .filter(|peer| **peer != me)
+      .map(CheapClone::cheap_clone)
+      .collect();
+    for peer in newly_removed {
+      self.note_courtesy_debt_at_boundary(&peer, boundary);
+    }
 
     // Step 7: ack the boundary. `durable_index == boundary` now holds (set above), so the centralized
     // persist-before-ack clamp `proven.min(ack_watermark())` resolves to the boundary — and the boundary
@@ -1375,7 +1582,8 @@ where
     self.send_or_gate_snapshot_ack(leader, meta.last_index());
   }
 
-  /// Receive a `SnapshotResponse` from a follower (leader path).
+  /// Receive a `SnapshotResponse` from a follower (leader path), or from a peer this replica owes
+  /// a courtesy cure — that one discharge is honored on ANY role, ahead of the leader gate.
   pub(crate) fn on_snapshot_response<L, S>(
     &mut self,
     now: Now,
@@ -1389,6 +1597,44 @@ where
     F::Snapshot: Data,
   {
     if self.poison.poisoned {
+      return;
+    }
+    // THE COURTESY DEBT'S ONLY EVIDENCE-BASED DISCHARGE, routed ahead of BOTH the role gate and the
+    // tracker lookup below — a removed peer has no `Progress`, so its response would otherwise die
+    // at that bail, which is exactly why the old design had no delivery evidence to reason from.
+    // An install ack (not a reject, not a mid-transfer progress ack) at or past the EARLIEST
+    // boundary offered for this removal generation is proof the peer installed a configuration
+    // that excludes it, so the debt is discharged.
+    //
+    // ROLE-INDEPENDENT, because the debt is: the universal mint parks one on every replica, and a
+    // step-down between the offer and its ack must not throw the evidence away — the cure would
+    // then be re-offered forever to a peer that already installed it. Evidence is honored wherever
+    // the debt lives.
+    //
+    // A FLOOR MUST EXIST. An ack that arrives before this generation's first offer discharges
+    // nothing: it can only be evidence of some earlier generation's blob, which may still name the
+    // peer. Leaving the debt standing is the safe direction — at worst it costs one more offer,
+    // and the install is idempotent.
+    //
+    // The routing is NARROW: evict and RETURN. On no role does an owed sender's response reach
+    // tracker processing, and nothing else here reads an untracked sender — the only statement
+    // before this point is the poison bail, and every statement after it goes through the
+    // `progress_mut` lookup that an owed peer cannot satisfy.
+    //
+    // CFT, stated at the site: this trusts an authenticated peer's own report about its own state,
+    // which is exactly what the crash-fault model licenses — the peer is honest or it is crashed.
+    // A peer that acked without installing has chosen to stay disarmed, which costs only itself:
+    // the ack cannot move any commit index (the responder is not in the configuration and holds no
+    // `Progress`), so a lie here buys nothing but its own ignorance.
+    if !response.reject()
+      && !response.progress()
+      && self.courtesy_owed.get(&from).is_some_and(|debt| {
+        debt
+          .offered_index
+          .is_some_and(|floor| response.match_index() >= floor)
+      })
+    {
+      self.courtesy_owed.remove(&from);
       return;
     }
     if !self.role.is_leader() {

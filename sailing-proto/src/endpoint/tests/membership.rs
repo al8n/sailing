@@ -1,6 +1,6 @@
 use super::{super::*, *};
 use crate::{
-  ConfChangeSingle, ConfChangeV2, VoteResponse,
+  ConfChangeSingle, ConfChangeV2, SnapshotMeta, VoteResponse,
   testkit::{AsyncStable, CountSm, NoopStable, VecLog},
 };
 
@@ -2377,20 +2377,27 @@ fn farewell_retry_cures_dropped_caught_up_heartbeat() {
   );
 }
 
-/// The adversarial ordering the front-load + parking cure (the config the retry protects: DEFAULT
-/// flags, pre_vote and check_quorum OFF): a removed voter whose shot-1 farewell was DROPPED campaigns
-/// at a higher term BEFORE any retry and deposes the live leader. The step-down PARKS the budget (it
-/// is not cleared); the old leader re-wins among the live members, `become_leader` re-arms the entry,
-/// and the FIRST post-re-election tick front-loads the farewell — the removed peer applies its removal
-/// and self-removes, so it can never campaign a second time.
+/// THE ADVERSARIAL ORDERING, at the config the cure protects (DEFAULT flags — pre_vote and
+/// check_quorum both OFF, so a removed voter's campaign carries a real, higher term). The honest
+/// bound, stated as a test: that campaign DEPOSES the leader, exactly once, and the deposition is
+/// self-healing — the removed peer cannot win a quorum of a configuration it is not in, the live
+/// members re-elect, and the re-elected leadership holds the debt by the universal mint.
+///
+/// Nothing suppresses the peer's campaign to avoid that blip. Three successive topologies showed
+/// that no local state can license muting another replica's reconciliation traffic: a leader whose
+/// configuration history is stale cannot tell a departed peer from a re-added one, and every
+/// variant of the shield composed into a permanent wedge. One bounded availability blip is the
+/// price, and the first DELIVERED proactive offer is what makes it a one-time price.
 #[test]
-fn farewell_retry_survives_deposition_and_cures_on_re_election() {
-  use crate::{Entry, EntryKind, Event, Message, Term, VoteResponse};
-  use core::time::Duration;
+fn a_removed_voters_real_campaign_costs_exactly_one_deposition() {
+  use crate::{Entry, EntryKind, Message, Role, Term};
 
-  // Node 1 leads and removes lagging node 3 (default flags); shot 1 is DROPPED (drained by the helper).
-  let (mut ep, mut log, mut stable, d, idx) = leader_after_removing_node3();
+  let (mut ep, mut log, mut stable, d, _idx) = leader_after_removing_node3();
   assert!(ep.has_pending_farewells());
+  assert!(
+    ep.has_courtesy_debts(),
+    "the committed removal minted the courtesy debt beside the farewell budget"
+  );
 
   // Node 3, ignorant of its removal (DEFAULT flags → no pre-vote), campaigns at a higher term.
   let (mut n3, mut n3log, mut n3stable) = node3_with_log(
@@ -2409,29 +2416,117 @@ fn farewell_retry_survives_deposition_and_cures_on_re_election() {
     .expect("node 3 (pre-vote OFF) campaigns with a real vote")
     .into_parts()
     .1;
+  assert_eq!(n3.term(), Term::new(2), "it inflated its own term doing so");
+
+  // THE ONE DEPOSITION. The leader adopts and steps down — the universal term mechanism, untouched.
+  ep.handle_message(d, &mut log, &mut stable, 3u64, rv);
   assert_eq!(
-    n3.term(),
-    Term::new(2),
-    "node 3 inflated the term (default flags, no pre-vote)"
+    ep.role(),
+    Role::Follower,
+    "the campaign deposes, exactly as Raft says"
+  );
+  assert_eq!(ep.term(), Term::new(2), "adopting the higher term");
+  assert!(
+    ep.pending_farewells.contains_key(&3u64) && ep.courtesy_owed.contains_key(&3u64),
+    "and BOTH cure records park across it, to be re-armed on re-election"
   );
 
-  // Deliver node 3's RequestVote to the leader: default flags mean NO in_lease block, so the leader
-  // adopts the higher term and STEPS DOWN — but the budget PARKS.
-  ep.handle_message(d, &mut log, &mut stable, 3u64, rv);
+  // The live members re-elect: node 3 cannot win a quorum of a configuration it is not in.
+  let rd = ep.poll_timeout().expect("the deposed leader re-arms");
+  ep.handle_timeout(rd, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(crate::VoteResponse::new(ct, 2u64, false, false)),
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  assert!(ep.role().is_leader(), "the live pair re-elects");
+  assert!(ep.term() > n3.term(), "at a term above the removed peer's");
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, rd, &[2u64]);
+  while ep.poll_message().is_some() {}
+
+  // The cure lands from the re-elected leadership, and node 3 never campaigns again.
+  ep.handle_timeout(rd + Duration::from_millis(150), &mut log, &mut stable);
+  let farewell = drain_to(&mut ep, 3u64)
+    .into_iter()
+    .next()
+    .expect("the first post-re-election tick re-drives the cure");
+  n3.handle_message(n3d, &mut n3log, &mut n3stable, 1u64, farewell);
+  n3.handle_storage(n3d, &mut n3log, &mut n3stable);
+  assert!(
+    core::iter::from_fn(|| n3.poll_event())
+      .any(|e| matches!(e, crate::Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64))),
+    "node 3 applies its own removal"
+  );
+  let settled = n3.term();
+  for _ in 0..4 {
+    let Some(t) = n3.poll_timeout() else { break };
+    n3.handle_timeout(t, &mut n3log, &mut n3stable);
+    n3.handle_storage(t, &mut n3log, &mut n3stable);
+  }
+  assert_eq!(
+    n3.role(),
+    Role::Follower,
+    "NO SECOND deposition is ever possible"
+  );
+  assert_eq!(
+    n3.term(),
+    settled,
+    "the cured peer never inflates a term again"
+  );
+}
+
+/// PARKING across a deposition, driven from the one source that can still depose this leader: a
+/// LIVE member at a higher term (the removed peer's own campaign is now dropped, so it cannot).
+/// The step-down parks BOTH the farewell budget and the courtesy debt — they are the same peer's
+/// unfinished business — the old leader re-wins among the live members, `become_leader` re-arms
+/// both, and the FIRST post-re-election tick front-loads the farewell, so the removed peer applies
+/// its removal and self-removes.
+#[test]
+fn farewell_retry_survives_deposition_and_cures_on_re_election() {
+  use crate::{Entry, EntryKind, Event, Message, Term, VoteResponse};
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, idx) = leader_after_removing_node3();
+  assert!(ep.has_pending_farewells());
+
+  // A LIVE voter (node 2) campaigns at a higher term: not an owed peer, so the pre-pass applies
+  // verbatim and the leader steps down.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::RequestVote(crate::RequestVote::new(
+      Term::new(2),
+      2u64,
+      Index::new(1),
+      Term::new(1),
+      false,
+      false,
+    )),
+  );
   assert!(
     !ep.role().is_leader(),
-    "the removed voter deposed the live leader"
+    "a LIVE member's higher-term campaign still deposes (the pre-pass is unchanged for it)"
   );
   assert!(
     ep.pending_farewells.contains_key(&3u64),
     "the budget PARKED across the deposition"
   );
   assert!(
-    !ep.has_pending_farewells(),
-    "parked on a follower — the leader-gated accessor reads false"
+    ep.courtesy_owed.contains_key(&3u64),
+    "and so did the courtesy debt"
+  );
+  assert!(
+    !ep.has_pending_farewells() && !ep.has_courtesy_debts(),
+    "parked on a follower — the leader-gated accessors read false"
   );
 
-  // The live group re-elects node 1 (among {1, 2}); become_leader re-arms the parked entry.
+  // The live group re-elects node 1 (among {1, 2}); become_leader re-arms the parked entries.
   let rd = ep
     .poll_timeout()
     .expect("the deposed leader re-arms its election timer");
@@ -2454,6 +2549,11 @@ fn farewell_retry_survives_deposition_and_cures_on_re_election() {
     None,
     "become_leader re-armed the parked entry to fire at the first tick"
   );
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).unwrap().next_at,
+    None,
+    "and re-armed the courtesy debt on the same predicate"
+  );
   ep.handle_storage(rd, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
@@ -2469,6 +2569,16 @@ fn farewell_retry_survives_deposition_and_cures_on_re_election() {
     .expect("the first post-re-election tick front-loads the farewell");
 
   // Node 3 receives it, applies its OWN removal, and self-removes — never a second campaign.
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log(
+    std::vec![Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new()
+    )],
+    Index::new(1),
+  );
+  let n3d = Instant::ORIGIN;
   n3.handle_message(n3d, &mut n3log, &mut n3stable, 1u64, farewell);
   n3.handle_storage(n3d, &mut n3log, &mut n3stable);
   let removed = core::iter::from_fn(|| n3.poll_event())
@@ -3008,6 +3118,1612 @@ fn become_leader_re_arm_drops_an_entry_whose_peer_is_tracked() {
   );
 }
 
+// COURTESY SNAPSHOT (#95, the compacted removed peer) — the cure for the one class the farewell
+// retry cannot reach.
+
+/// A 3-voter leader on an `AsyncStable` (which has a real snapshot slot) that has COMMITTED and
+/// APPLIED RemoveNode(3), with node 3 pruned from the tracker. Returns the leader and its stores.
+fn leader_that_removed_node3() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable, Instant, Index) {
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Index, Message, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new());
+  let idx = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect("RemoveNode(3) must be accepted");
+  ep.flush_appends(d, &log, &stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.tracker.progress(&3u64).is_none(), "node 3 pruned");
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  (ep, log, stable, d, idx)
+}
+
+/// Put a durable snapshot carrying the POST-REMOVAL ConfState into the leader's store — the state
+/// the compacted class implies exists: a peer can only be past `first_index` because a capture at
+/// or beyond the compaction point was taken and persisted.
+fn give_leader_a_snapshot(
+  ep: &mut Endpoint<u64, CountSm>,
+  stable: &mut AsyncStable,
+  at: Index,
+  blob: bytes::Bytes,
+) -> SnapshotMeta<u64> {
+  use crate::{StableStore as _, Term};
+  let meta = SnapshotMeta::new(at, Term::new(1), ep.tracker.conf_state());
+  let opid = ep.mint_op_id_for_test();
+  stable.submit_snapshot(opid, meta.clone(), blob);
+  meta
+}
+
+/// A durable snapshot from BEFORE the removal: it predates the removal index AND its ConfState
+/// still names the peer, so it cannot carry the removal to anyone.
+fn give_leader_a_pre_removal_snapshot(
+  ep: &mut Endpoint<u64, CountSm>,
+  stable: &mut AsyncStable,
+  at: Index,
+) -> SnapshotMeta<u64> {
+  use crate::{StableStore as _, Term, conf::ConfState};
+  let meta = SnapshotMeta::new(
+    at,
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  let opid = ep.mint_op_id_for_test();
+  stable.submit_snapshot(opid, meta.clone(), encode_count_snapshot(7));
+  meta
+}
+
+/// Every courtesy `InstallSnapshot` the endpoint has queued for node 3, draining the rest (the
+/// leader also answers the contact below with an ordinary pre-vote rejection).
+fn courtesy_offers_to_node3(ep: &mut Endpoint<u64, CountSm>) -> Vec<Message<u64>> {
+  core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| o.to() == 3u64)
+    .map(|o| o.into_parts().1)
+    .filter(|m| matches!(m, Message::InstallSnapshot(_)))
+    .collect()
+}
+
+/// A pristine node-3 follower on an `AsyncStable` (the store that actually persists a blob), the
+/// shape a compacted removed peer presents to an install: nothing committed locally.
+fn node3_async() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    3u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  (
+    Endpoint::new(cfg, Instant::ORIGIN, 9, CountSm::default()),
+    VecLog::default(),
+    AsyncStable::default(),
+  )
+}
+
+/// Node 2 as a FOLLOWER that has applied the committed RemoveNode(3): the no-op@1 and the conf
+/// change@2 arrive from leader node 1 with commit at the change, so node 2's tracker becomes
+/// {1, 2} and the universal mint records the debt — all without node 2 ever leading.
+fn node2_that_applied_the_removal() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
+  use crate::{AppendEntries, Entry, EntryKind, Message, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 5, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let entries = std::vec![
+    Entry::new(Term::new(1), Index::new(1), EntryKind::Empty, Bytes::new()),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::ConfChange,
+      remove3_payload()
+    ),
+  ];
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    ep.tracker.progress(&3u64).is_none(),
+    "node 2 applied the removal"
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  (ep, log, stable)
+}
+
+/// [`node3_with_log`] on an `AsyncStable` — the store that actually persists a blob, so this
+/// node 3 can both CAMPAIGN from a real log and complete a deferred snapshot install.
+fn node3_with_log_async(
+  entries: Vec<crate::Entry>,
+  commit: Index,
+) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
+  use crate::{AppendEntries, Message, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    3u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut c = Endpoint::new(cfg, Instant::ORIGIN, 9, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  c.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      commit,
+    )),
+  );
+  c.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while c.poll_message().is_some() {}
+  while c.poll_event().is_some() {}
+  (c, log, stable)
+}
+
+/// Node 3 applying the committed removal OF ITSELF — the self-removal path, for the class-check
+/// that a replica never mints a debt naming itself.
+fn node3_that_applied_its_own_removal() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
+  use crate::{AppendEntries, Entry, EntryKind, Message, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    3u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 9, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let entries = std::vec![
+    Entry::new(Term::new(1), Index::new(1), EntryKind::Empty, Bytes::new()),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::ConfChange,
+      remove3_payload()
+    ),
+  ];
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  (ep, log, stable)
+}
+
+/// A removed peer's contact, in the shape an ignorant replica actually produces: a PRE-VOTE
+/// campaign at a higher advertised term. The leader neither adopts the term nor steps down (the
+/// pre-vote exemption), so the trigger runs while it is still the leader.
+fn removed_peer_contact() -> Message<u64> {
+  removed_peer_contact_from(3u64)
+}
+
+/// [`removed_peer_contact`] from an arbitrary sender id — the rotating-identity probe.
+///
+/// A PRE-VOTE advertising term 2, which is what a peer stuck at term 1 emits every time it probes:
+/// pre-vote never inflates the sender, so its REAL term stays 1 and a term-1 leader's offer is
+/// deliverable to it. (A peer that campaigns for REAL is the futility case, exercised separately.)
+fn removed_peer_contact_from(from: u64) -> Message<u64> {
+  use crate::{Index, RequestVote, Term};
+  Message::RequestVote(RequestVote::new(
+    Term::new(2),
+    from,
+    Index::new(2),
+    Term::new(1),
+    true,
+    false,
+  ))
+}
+
+/// THE COMPACTED-PEER CURE, end to end. Node 3's farewell budget is spent (its suffix is
+/// compacted, so every retry burned its shot on the clamped-heartbeat fallback and the map is
+/// empty). It then contacts the leader; the leader — whose committed configuration does not name
+/// it and whose tracker has no Progress for it — ships ONE whole-blob courtesy `InstallSnapshot`
+/// carrying the post-removal ConfState. Node 3 installs it, applies the excluding membership,
+/// surfaces its own removal, and never campaigns again. A SECOND contact inside the cooldown ships
+/// nothing: the throttle, not a delivery ack (which is unobservable — its Progress is pruned), is
+/// what bounds the offer.
+///
+/// MUTATION: drop the trigger in `handle_message` → node 3 gets no install, stays ignorant, and
+/// keeps campaigning; the assertions on the surfaced `ConfChanged` fail.
+#[test]
+fn a_courtesy_snapshot_cures_the_compacted_removed_peer() {
+  use crate::{Event, Message, Role, StableStore as _};
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  // The farewell budget is spent — the compacted class, per the retry's own residual.
+  ep.pending_farewells_clear_for_test();
+  let blob = encode_count_snapshot(7);
+  let meta = give_leader_a_snapshot(&mut ep, &mut stable, removal, blob.clone());
+  assert!(
+    !meta.conf().voters().contains(&3u64),
+    "the capture carries the post-removal configuration"
+  );
+
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let mut offers = courtesy_offers_to_node3(&mut ep);
+  assert_eq!(offers.len(), 1, "exactly one courtesy offer");
+  assert!(ep.role().is_leader(), "a pre-vote probe never deposes");
+  let offer = offers.pop().expect("one offer");
+  {
+    let Message::InstallSnapshot(is) = &offer else {
+      unreachable!("filtered above")
+    };
+    assert_eq!(is.total_len(), 0, "v1 courtesy is the whole-blob shape");
+    assert_eq!(is.data(), &blob, "the whole blob rides one frame");
+    assert!(
+      !is.snapshot().conf().voters().contains(&3u64),
+      "the offer carries the ConfState that excludes the peer"
+    );
+  }
+
+  // The throttle: a second contact inside the cooldown ships nothing.
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  assert!(
+    courtesy_offers_to_node3(&mut ep).is_empty(),
+    "one courtesy per peer per cooldown"
+  );
+
+  // Node 3 applies committed state and self-removes.
+  let (mut c, mut log3, mut stable3) = node3_async();
+  // Delivered VERBATIM: the exact message the leader emitted, never re-stamped or rebuilt.
+  c.handle_message(d, &mut log3, &mut stable3, 1u64, offer);
+  c.handle_storage(d, &mut log3, &mut stable3);
+  let removed = core::iter::from_fn(|| c.poll_event())
+    .any(|ev| matches!(ev, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64)));
+  assert!(
+    removed,
+    "the excluding install surfaces the removal to the embedder"
+  );
+  let before = c.term();
+  for _ in 0..4 {
+    let Some(t) = c.poll_timeout() else { break };
+    c.handle_timeout(t, &mut log3, &mut stable3);
+    c.handle_storage(t, &mut log3, &mut stable3);
+  }
+  assert_eq!(c.role(), Role::Follower, "the cured peer never campaigns");
+  assert_eq!(c.term(), before, "and never inflates the term");
+  assert!(stable3.durable_snapshot().is_some(), "the blob is durable");
+}
+
+/// COMPOSITION with the farewell retry: while node 3's blind budget is still live, the retry OWNS
+/// the peer and courtesy ships nothing. Firing both would put a whole blob on the wire beside a
+/// cheap append that is very likely to land — the courtesy is the POST-budget cure, not a parallel
+/// one.
+#[test]
+fn a_peer_inside_its_farewell_budget_gets_no_courtesy() {
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  assert!(
+    ep.has_pending_farewells(),
+    "the removal armed a blind retry budget"
+  );
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  assert!(
+    courtesy_offers_to_node3(&mut ep).is_empty(),
+    "the cheaper cure owns the peer while its budget lasts"
+  );
+}
+
+/// A blob the whole-blob shape cannot carry SKIPS silently: no send, no state change, no throttle
+/// entry burned (so a later, smaller capture is still offered at once). Chunked courtesy would
+/// need ack routing for a peer that has no `Progress` to route through, so v1 leaves the oversized
+/// residual to the embedder's catalog reap — the golden architecture's own assignment.
+#[test]
+fn an_oversized_courtesy_blob_skips_without_sending() {
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  // One byte past the store's per-call ceiling: the whole blob cannot be read in one call, so it
+  // can never ride one frame either.
+  let oversized =
+    bytes::BytesMut::zeroed(crate::config::MAX_SNAPSHOT_CHUNK_BYTES as usize + 1).freeze();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, oversized);
+
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  assert!(
+    courtesy_offers_to_node3(&mut ep).is_empty(),
+    "an unsendable courtesy leaves the wire untouched"
+  );
+  assert!(ep.role().is_leader(), "and the leader untouched");
+}
+
+/// A leader with NOTHING persisted offers nothing: no durable snapshot means nothing has been
+/// compacted, so the farewell append can still reach the peer and there is no gap to close.
+#[test]
+fn no_durable_snapshot_means_no_courtesy() {
+  let (mut ep, mut log, mut stable, d, _removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  assert!(
+    courtesy_offers_to_node3(&mut ep).is_empty(),
+    "nothing to offer, nothing sent"
+  );
+}
+
+/// A FOLLOWER never offers a courtesy snapshot: it holds no authority over membership, and a
+/// snapshot from a non-leader would be a bare assertion dressed as committed state. The trigger is
+/// leader-gated at the dispatch site, so an identical contact on a follower is inert.
+#[test]
+fn a_follower_never_offers_a_courtesy_snapshot() {
+  use crate::Role;
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  ep.step_down_to_follower_for_test(d);
+  assert_eq!(ep.role(), Role::Follower);
+
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  assert!(
+    courtesy_offers_to_node3(&mut ep).is_empty(),
+    "a follower offers nothing"
+  );
+}
+
+/// F1 — AUTHORIZATION IS THE DEBT. A peer this group NEVER removed — a never-member, a stranger
+/// that merely authenticated into the cluster, a peer of some other group — is owed nothing, so
+/// its traffic buys it nothing: no offer, no state change, and no entry conjured into the debt
+/// map. The old trigger authorized by ABSENCE (∉ conf ∧ ∉ tracker), and absence is exactly what a
+/// never-member looks like; the debt distinguishes them because only a committed removal mints one.
+///
+/// MUTATION: restore the absence test (`tracker.progress(from).is_none()`) as the trigger → the
+/// stranger is served a whole snapshot and the offer assertion fails.
+#[test]
+fn a_never_member_is_owed_nothing_and_gets_nothing() {
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  let (term, role) = (ep.term(), ep.role());
+
+  // Strangers 4..=9: authenticated senders this configuration has never named.
+  for stranger in 4u64..=9 {
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      stranger,
+      Message::RequestVote(crate::RequestVote::new(
+        Term::new(2),
+        stranger,
+        Index::new(2),
+        Term::new(1),
+        true,
+        false,
+      )),
+    );
+    assert!(
+      core::iter::from_fn(|| ep.poll_message())
+        .all(|o| !matches!(o.into_parts().1, Message::InstallSnapshot(_))),
+      "a never-member must never be offered a snapshot"
+    );
+  }
+  assert_eq!(
+    ep.courtesy_owed.len(),
+    1,
+    "contact cannot mint a debt — only this leader's own committed removals can"
+  );
+  assert!(
+    ep.courtesy_owed.contains_key(&3u64),
+    "and the one debt is the one removal that happened"
+  );
+  assert_eq!((ep.term(), ep.role()), (term, role), "and moves nothing");
+}
+
+/// F1, the rotating-identity form: cooldown bypass by minting fresh sender ids is structurally
+/// moot, because the cooldown is not what bounds the work — the debt is. A thousand identities are
+/// owed nothing a thousand times over, and the ONE real debt spends its own budget however many
+/// identities knock.
+#[test]
+fn rotating_identities_cannot_bypass_the_courtesy_budget() {
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+
+  let mut offers = 0usize;
+  for id in 100u64..200 {
+    ep.handle_message(d, &mut log, &mut stable, id, removed_peer_contact_from(id));
+    offers += core::iter::from_fn(|| ep.poll_message())
+      .filter(|o| matches!(o.message(), Message::InstallSnapshot(_)))
+      .count();
+  }
+  assert_eq!(offers, 0, "100 fresh identities bought 100 nothings");
+  assert_eq!(ep.courtesy_owed.len(), 1, "and grew the map by nothing");
+}
+
+/// A debt is discharged by EVIDENCE: the owed peer's own acknowledgement of the blob it was
+/// offered. That is the only thing that ends it short of a re-add, self-removal, or the cap — and
+/// it is what makes an offer lost in flight harmless, since nothing was consumed by sending it.
+///
+/// MUTATION: charge the debt at enqueue again → the assertion that a SECOND contact still offers
+/// (nothing was spent by the first) fails, or the debt is gone before any ack arrives.
+#[test]
+fn a_courtesy_debt_is_discharged_by_the_peers_acknowledgement() {
+  use crate::{SnapshotResponse, StableStore as _};
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+
+  // The offer goes out and the debt is RETAINED — sending proves nothing.
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let offers = courtesy_offers_to_node3(&mut ep);
+  assert_eq!(offers.len(), 1, "the contact drew an offer");
+  let Message::InstallSnapshot(is) = &offers[0] else {
+    unreachable!("filtered above")
+  };
+  let boundary = is.snapshot().last_index();
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).map(|dbt| dbt.offered_index),
+    Some(Some(boundary)),
+    "the debt records what it offered, and stands until that is acknowledged"
+  );
+
+  // The peer installs and acknowledges the boundary. THAT discharges the debt.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::SnapshotResponse(SnapshotResponse::new(ep.term(), 3u64, false, boundary)),
+  );
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "the peer's own acknowledgement is what ends the debt"
+  );
+
+  // Nothing more is ever sent to it, however long it keeps knocking.
+  let cooldown = 3 * ep.config.election_timeout();
+  let mut at = d;
+  for _ in 0..4 {
+    at = at + cooldown + core::time::Duration::from_millis(1);
+    ep.handle_timeout(at, &mut log, &mut stable);
+    ep.handle_message(at, &mut log, &mut stable, 3u64, removed_peer_contact());
+    assert!(
+      courtesy_offers_to_node3(&mut ep).is_empty(),
+      "a discharged debt offers nothing further"
+    );
+  }
+  let _ = stable.durable_snapshot();
+}
+
+/// A REJECT, and a mid-transfer PROGRESS ack, are not evidence of anything — only a completed
+/// install at or past the offered boundary is. Nor is an ack BELOW the boundary.
+#[test]
+fn only_a_completed_install_ack_discharges_the_debt() {
+  use crate::SnapshotResponse;
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let offers = courtesy_offers_to_node3(&mut ep);
+  let Message::InstallSnapshot(is) = &offers[0] else {
+    unreachable!("filtered above")
+  };
+  let boundary = is.snapshot().last_index();
+
+  for (what, response) in [
+    (
+      "a reject",
+      SnapshotResponse::new(ep.term(), 3u64, true, boundary),
+    ),
+    (
+      "a mid-transfer progress ack",
+      SnapshotResponse::new(ep.term(), 3u64, false, boundary).with_progress(true),
+    ),
+    (
+      "an ack below the offered boundary",
+      SnapshotResponse::new(
+        ep.term(),
+        3u64,
+        false,
+        Index::new(boundary.get().saturating_sub(1)),
+      ),
+    ),
+  ] {
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::SnapshotResponse(response),
+    );
+    assert!(
+      ep.courtesy_owed.contains_key(&3u64),
+      "{what} is not evidence the peer installed the removal"
+    );
+  }
+}
+
+/// RACE ONE — a DELAYED ack for an EARLIER offer. S1 is delivered and installed, but its ack is
+/// slow; the cooldown fires, S2 (a newer capture at a higher boundary) goes out, and S2 is lost.
+/// The delayed S1 ack then names a boundary BELOW the latest offer's and must still discharge:
+/// every offer of a generation carries a ConfState that excludes the peer, so installing ANY of
+/// them cured it. The floor is therefore the EARLIEST boundary offered, never the latest.
+///
+/// MUTATION: raise the floor to each retry's boundary → the S1 ack is measured against S2's index,
+/// fails, and a peer that is already cured stays owed the cure forever.
+#[test]
+fn a_delayed_ack_for_an_earlier_offer_discharges_the_debt() {
+  use crate::SnapshotResponse;
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+
+  // S1 — the generation's first offer. It is delivered and installed; the ack is still in flight.
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let s1 = courtesy_offers_to_node3(&mut ep);
+  assert_eq!(s1.len(), 1, "the contact offers the cure");
+  let Message::InstallSnapshot(is1) = &s1[0] else {
+    unreachable!("filtered above")
+  };
+  let b1 = is1.snapshot().last_index();
+
+  // The cooldown elapses with a NEWER capture in the store, so the retry offers a higher boundary.
+  give_leader_a_snapshot(
+    &mut ep,
+    &mut stable,
+    Index::new(removal.get() + 5),
+    encode_count_snapshot(9),
+  );
+  let due = ep
+    .courtesy_owed
+    .get(&3u64)
+    .and_then(|dbt| dbt.next_at)
+    .expect("the offer started a cooldown");
+  let mut at = due + Duration::from_millis(1);
+  ep.handle_timeout(at, &mut log, &mut stable);
+  let s2 = courtesy_offers_to_node3(&mut ep);
+  assert_eq!(s2.len(), 1, "the retained debt re-offers");
+  let Message::InstallSnapshot(is2) = &s2[0] else {
+    unreachable!("filtered above")
+  };
+  assert!(
+    is2.snapshot().last_index() > b1,
+    "and S2 carries the newer capture"
+  );
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).map(|dbt| dbt.offered_index),
+    Some(Some(b1)),
+    "yet the discharge floor is still the EARLIEST boundary offered this generation"
+  );
+  drop(s2); // S2 never arrives
+
+  // The delayed S1 ack lands: below S2's boundary, at S1's — and it is proof of a cure.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::SnapshotResponse(SnapshotResponse::new(ep.term(), 3u64, false, b1)),
+  );
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "an ack for ANY offer of this generation is evidence the peer installed a cure"
+  );
+
+  // And the cure is never offered again, contact or tick.
+  let window = COURTESY_COOLDOWN_TIMEOUTS * ep.config.election_timeout();
+  for _ in 0..4 {
+    at = at + window;
+    ep.handle_message(at, &mut log, &mut stable, 3u64, removed_peer_contact());
+    ep.handle_timeout(at, &mut log, &mut stable);
+    assert!(
+      courtesy_offers_to_node3(&mut ep).is_empty(),
+      "a discharged debt is never re-offered"
+    );
+  }
+}
+
+/// RACE TWO — the ack arrives after a STEP-DOWN. The offer goes out as leader, CheckQuorum steps
+/// this replica down at the SAME term, and node 3's ack lands on a follower. The universal mint
+/// parks the debt on every replica, so the evidence must be honored on whatever role holds it;
+/// discarding it because we are momentarily not the leader re-offers a whole blob to a peer that
+/// already installed the cure, once per window, for as long as the debt survives.
+///
+/// MUTATION: leave the discharge behind the leader gate → the debt outlives the step-down and the
+/// first tick after re-election offers again.
+#[test]
+fn an_ack_after_a_step_down_discharges_the_debt_on_the_follower() {
+  use crate::{Role, SnapshotResponse};
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let offers = courtesy_offers_to_node3(&mut ep);
+  assert_eq!(offers.len(), 1, "the offer goes out as leader");
+  let Message::InstallSnapshot(is) = &offers[0] else {
+    unreachable!("filtered above")
+  };
+  let boundary = is.snapshot().last_index();
+  let term = ep.term();
+
+  // CheckQuorum's step-down: no term bump, so the peer's ack still matches this term.
+  ep.step_down_to_follower(d.into());
+  assert_eq!(ep.role(), Role::Follower, "stepped down");
+  assert_eq!(ep.term(), term, "at the same term");
+
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::SnapshotResponse(SnapshotResponse::new(term, 3u64, false, boundary)),
+  );
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "evidence is honored wherever the debt lives, not only at a leader"
+  );
+
+  // Re-elected, the first tick has nothing left to offer.
+  let rd = re_elect_among_the_live_pair(&mut ep, &mut log, &mut stable);
+  ep.handle_timeout(rd + Duration::from_millis(150), &mut log, &mut stable);
+  assert!(
+    courtesy_offers_to_node3(&mut ep).is_empty(),
+    "a debt discharged on the follower is not resurrected by re-election"
+  );
+}
+
+/// THE FULL TRUTHFUL CHAIN across both replicas. Node 3 is the sharp shape: it already holds the
+/// removal entry DURABLY, but below its commit index, so the courtesy snapshot resolves REDUNDANT
+/// at the receiver and no blob is installed. The ack that comes back is only evidence because the
+/// redundancy arm advances commit and applies through the boundary first — the peer really does
+/// process its own removal, and only then does the sender's debt discharge.
+///
+/// MUTATION: drop the receiver's commit advance → node 3 acks without applying, stays a voter, and
+/// the leader discharges the debt on an ack that proves nothing: the cure is lost with both sides
+/// believing it landed.
+#[test]
+fn a_redundant_install_still_cures_the_peer_and_discharges_the_debt() {
+  use crate::{Entry, EntryKind, Event};
+
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+
+  // Node 3 holds the removal entry durably at `removal`, with commit still at zero.
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log_async(
+    std::vec![
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new()
+      ),
+      Entry::new(
+        Term::new(1),
+        removal,
+        EntryKind::ConfChange,
+        remove3_payload()
+      ),
+    ],
+    Index::ZERO,
+  );
+  assert!(
+    n3.commit < removal,
+    "the removal is durable but UNCOMMITTED"
+  );
+  assert!(n3.tracker.is_voter(&3u64), "so node 3 is still a voter");
+
+  // The offer goes out and reaches it.
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let offer = courtesy_offers_to_node3(&mut ep)
+    .into_iter()
+    .next()
+    .expect("the contact offers the cure");
+  let Message::InstallSnapshot(ref is) = offer else {
+    unreachable!("filtered above")
+  };
+  let boundary = is.snapshot().last_index();
+  n3.handle_message(Instant::ORIGIN, &mut n3log, &mut n3stable, 1u64, offer);
+  for _ in 0..4 {
+    n3.handle_storage(Instant::ORIGIN, &mut n3log, &mut n3stable);
+  }
+
+  // Redundant — no blob installed — yet the peer is genuinely cured, and the evidence behind the
+  // cure is DURABLE: the raised commit reached stable storage, which is what the ack waits on.
+  assert!(
+    n3stable.durable_snapshot().is_none(),
+    "the receiver short-circuits: it already held the boundary"
+  );
+  assert_eq!(n3.commit, boundary, "commit advanced to the boundary");
+  assert!(
+    n3stable.hard_state().commit() >= boundary,
+    "and the raise is DURABLE — the crash-surviving half of the shortcut's evidence"
+  );
+  assert!(
+    !n3.tracker.is_voter(&3u64),
+    "and the removal applied — the peer is out"
+  );
+  assert!(
+    core::iter::from_fn(|| n3.poll_event())
+      .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64))),
+    "the removal surfaced (what RemovedSelf is derived from)"
+  );
+
+  // The ack it produces is therefore truthful — and it discharges the debt.
+  let ack = core::iter::from_fn(|| n3.poll_message())
+    .map(|o| o.into_parts().1)
+    .find(|m| matches!(m, Message::SnapshotResponse(r) if !r.reject()))
+    .expect("a completed install ack goes back");
+  ep.handle_message(d, &mut log, &mut stable, 3u64, ack);
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "and the sender discharges a debt whose cure really landed"
+  );
+}
+
+/// RACE — ACK, THEN CRASH. The shortcut installs no blob, so the only thing standing between the
+/// discharged debt and a revived voter is the DURABLE commit. Node 3 acks a boundary-above-commit
+/// cure, the leader discharges, and node 3 then crashes and reboots from its durable state alone: it
+/// must come back with commit derived at the boundary, re-apply the removal from the durable log, and
+/// never be a voter again. The debt stays rightly discharged because the evidence really did survive.
+///
+/// The restart derivation is the load-bearing line: `commit = min(hs.commit(), log.last_index())
+/// .max(applied)`. Persisting the raise is what makes that resolve to the boundary.
+///
+/// MUTATION: drop the forced hard-state write → the ack still goes out (the batched choke point has
+/// not run), the reboot derives a stale commit, node 3 returns a VOTER with the removal unapplied,
+/// and nobody owes it a cure.
+#[test]
+fn an_acked_shortcut_cure_survives_the_peers_crash() {
+  use crate::{Config, Entry, EntryKind, StableStore as _};
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log_async(
+    std::vec![
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new()
+      ),
+      Entry::new(
+        Term::new(1),
+        removal,
+        EntryKind::ConfChange,
+        remove3_payload()
+      ),
+    ],
+    Index::ZERO,
+  );
+
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let offer = courtesy_offers_to_node3(&mut ep)
+    .into_iter()
+    .next()
+    .expect("the contact offers the cure");
+  n3.handle_message(Instant::ORIGIN, &mut n3log, &mut n3stable, 1u64, offer);
+  // Drive only as far as the ack, then CRASH THERE. Driving past it would persist the commit for
+  // unrelated reasons and hide the property under test: what matters is that the ack itself never
+  // appears before the evidence behind it is durable.
+  let mut ack = None;
+  for _ in 0..4 {
+    while let Some(out) = n3.poll_message() {
+      if matches!(out.message(), Message::SnapshotResponse(r) if !r.reject()) {
+        ack = Some(out.into_parts().1);
+      }
+    }
+    if ack.is_some() {
+      break;
+    }
+    n3.handle_storage(Instant::ORIGIN, &mut n3log, &mut n3stable);
+  }
+  while let Some(out) = n3.poll_message() {
+    if matches!(out.message(), Message::SnapshotResponse(r) if !r.reject()) {
+      ack = Some(out.into_parts().1);
+    }
+  }
+  let ack = ack.expect("the gated ack is released once the raise is durable");
+  ep.handle_message(d, &mut log, &mut stable, 3u64, ack);
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "the leader discharges on that ack"
+  );
+
+  // CRASH: everything not yet fsynced is lost. The reboot has only the durable log + HardState.
+  n3stable.discard_inflight();
+  drop(n3);
+  let cfg3 = Config::try_new(
+    3u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let rebooted = Endpoint::<u64, CountSm>::restart(
+    cfg3,
+    Instant::ORIGIN,
+    9,
+    CountSm::default(),
+    1,
+    &mut n3log,
+    &mut n3stable,
+  );
+  assert!(
+    n3stable.durable_snapshot().is_none(),
+    "no blob was ever installed — the durable log plus the persisted commit is the whole evidence"
+  );
+  assert!(
+    rebooted.commit >= removal,
+    "the reboot derives commit at the boundary from durable HardState"
+  );
+  assert!(
+    !rebooted.tracker.is_voter(&3u64),
+    "so the removal re-applies and the peer never revives as a voter"
+  );
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "and the discharge was right all along"
+  );
+}
+
+/// The other half: CRASH BEFORE THE PERSIST. With the commit write held in the fsync window the ack
+/// is never emitted, so the leader's debt is never discharged and the cure is simply retried. Losing
+/// the window costs a round, never the cure — which is what makes gating the ack (rather than
+/// emitting it optimistically) the cheap side of the trade.
+///
+/// MUTATION: emit the ack without waiting for the raise to land → the debt discharges on evidence
+/// that a crash erases, and the peer revives owed nothing.
+#[test]
+fn a_crash_before_the_persist_emits_no_ack_and_keeps_the_debt() {
+  use crate::{Entry, EntryKind};
+
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log_async(
+    std::vec![
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new()
+      ),
+      Entry::new(
+        Term::new(1),
+        removal,
+        EntryKind::ConfChange,
+        remove3_payload()
+      ),
+    ],
+    Index::ZERO,
+  );
+  // Every subsequent HardState write stays in the fsync window.
+  n3stable.hold_writes(true);
+
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let offer = courtesy_offers_to_node3(&mut ep)
+    .into_iter()
+    .next()
+    .expect("the contact offers the cure");
+  n3.handle_message(Instant::ORIGIN, &mut n3log, &mut n3stable, 1u64, offer);
+  for _ in 0..4 {
+    n3.handle_storage(Instant::ORIGIN, &mut n3log, &mut n3stable);
+  }
+  assert!(
+    !core::iter::from_fn(|| n3.poll_message())
+      .any(|o| matches!(o.message(), Message::SnapshotResponse(_))),
+    "no ack while the raise is un-fsynced — the evidence does not exist yet"
+  );
+  assert!(
+    ep.courtesy_owed.contains_key(&3u64),
+    "so the leader's debt stands, exactly as a lost offer leaves it"
+  );
+
+  // The write lands after all; the ordinary loop releases the ack and the cure completes.
+  n3stable.flush_held_writes();
+  let mut ack = None;
+  for _ in 0..4 {
+    n3.handle_storage(Instant::ORIGIN, &mut n3log, &mut n3stable);
+    while let Some(out) = n3.poll_message() {
+      if matches!(out.message(), Message::SnapshotResponse(r) if !r.reject()) {
+        ack = Some(out.into_parts().1);
+      }
+    }
+  }
+  let ack = ack.expect("the landed write releases the gated ack");
+  ep.handle_message(d, &mut log, &mut stable, 3u64, ack);
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "and only THEN does the debt discharge"
+  );
+}
+
+/// RACE — DUPLICATE, THEN CRASH AT THE FIRST OBSERVABLE ACK. The sender retries a courtesy offer on
+/// its cooldown, so a duplicate landing inside the gate window is the ordinary case, not an exotic
+/// one. The duplicate classifies at-or-below against the raised, still-volatile commit; the gate
+/// holds it anyway; and whichever ack finally emerges is backed by durable state — so crashing the
+/// instant it appears still leaves the peer cured and the discharge right.
+///
+/// MUTATION: restore the immediate at-or-below ack → the duplicate answers inside the window, the
+/// leader discharges, the crash erases the evidence, and node 3 reboots a voter nobody owes.
+#[test]
+fn a_duplicate_offer_then_a_crash_at_the_first_ack_still_leaves_the_peer_cured() {
+  use crate::{Config, Entry, EntryKind, StableStore as _};
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log_async(
+    std::vec![
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new()
+      ),
+      Entry::new(
+        Term::new(1),
+        removal,
+        EntryKind::ConfChange,
+        remove3_payload()
+      ),
+    ],
+    Index::ZERO,
+  );
+
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let offer = courtesy_offers_to_node3(&mut ep)
+    .into_iter()
+    .next()
+    .expect("the contact offers the cure");
+  let duplicate = offer.clone();
+
+  // First delivery opens the window; the DUPLICATE lands inside it, at-or-below the raised commit.
+  n3.handle_message(Instant::ORIGIN, &mut n3log, &mut n3stable, 1u64, offer);
+  assert_eq!(n3.commit, removal, "the first delivery raised commit");
+  n3.handle_message(Instant::ORIGIN, &mut n3log, &mut n3stable, 1u64, duplicate);
+  assert!(
+    !core::iter::from_fn(|| n3.poll_message())
+      .any(|o| matches!(o.message(), Message::SnapshotResponse(_))),
+    "neither delivery acks while the raise is un-fsynced"
+  );
+
+  // Drive only as far as the first observable ack, and crash exactly there.
+  let mut ack = None;
+  for _ in 0..4 {
+    n3.handle_storage(Instant::ORIGIN, &mut n3log, &mut n3stable);
+    while let Some(out) = n3.poll_message() {
+      if matches!(out.message(), Message::SnapshotResponse(r) if !r.reject()) {
+        ack = Some(out.into_parts().1);
+      }
+    }
+    if ack.is_some() {
+      break;
+    }
+  }
+  let ack = ack.expect("one ack emerges once the evidence is durable");
+  ep.handle_message(d, &mut log, &mut stable, 3u64, ack);
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "the leader discharges on it"
+  );
+
+  n3stable.discard_inflight();
+  drop(n3);
+  let cfg3 = Config::try_new(
+    3u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let rebooted = Endpoint::<u64, CountSm>::restart(
+    cfg3,
+    Instant::ORIGIN,
+    9,
+    CountSm::default(),
+    1,
+    &mut n3log,
+    &mut n3stable,
+  );
+  assert!(
+    n3stable.durable_snapshot().is_none(),
+    "still no blob — the durable log plus the persisted commit carried it"
+  );
+  assert!(
+    rebooted.commit >= removal,
+    "the reboot derives commit at the boundary"
+  );
+  assert!(
+    !rebooted.tracker.is_voter(&3u64),
+    "and the duplicate changed nothing: the peer stays removed"
+  );
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "so the discharge was right"
+  );
+}
+
+/// F2 — the offer must CARRY the removal. A durable snapshot captured BEFORE the removal fails
+/// both eligibility legs (its boundary predates the removal index and its ConfState still names
+/// the peer), so shipping it would re-baseline the peer onto a configuration that still includes
+/// it: ignorant, still armed, and now at the cost of a whole blob. It DEFERS instead — no send,
+/// and crucially no budget burned — and a later post-removal capture enables the offer.
+///
+/// MUTATION: drop the eligibility gate → the pre-removal blob is shipped, and the "no offer yet"
+/// assertion fails.
+#[test]
+fn a_pre_removal_snapshot_defers_without_spending_the_debt() {
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  // A capture from before the removal: index below it, and its ConfState still names node 3.
+  let stale = give_leader_a_pre_removal_snapshot(&mut ep, &mut stable, Index::new(1));
+  assert!(stale.last_index() < removal && stale.conf().voters().contains(&3u64));
+
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  assert!(
+    courtesy_offers_to_node3(&mut ep).is_empty(),
+    "a snapshot that predates the removal is not an offer"
+  );
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).map(|dbt| dbt.offered_index),
+    Some(None),
+    "nothing was offered, so nothing is outstanding"
+  );
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).and_then(|dbt| dbt.next_at),
+    None,
+    "and started no cooldown — the next contact retries at once"
+  );
+
+  // A post-removal capture exists: the SAME contact now cures.
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  let offers = courtesy_offers_to_node3(&mut ep);
+  assert_eq!(offers.len(), 1, "the eligible capture is offered at once");
+  let Message::InstallSnapshot(is) = &offers[0] else {
+    unreachable!("filtered above")
+  };
+  assert!(
+    is.snapshot().last_index() >= removal && !is.snapshot().conf().voters().contains(&3u64),
+    "and what it carries is the removal itself"
+  );
+}
+
+/// F2's second leg alone: a capture at or past the removal index whose ConfState STILL names the
+/// peer (a boundary that happens to sit past the index without covering the change) is equally
+/// ineligible. Index alone is not evidence — the installed configuration is.
+#[test]
+fn a_snapshot_still_naming_the_peer_defers() {
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  let meta = give_leader_a_pre_removal_snapshot(&mut ep, &mut stable, removal.next());
+  assert!(meta.last_index() > removal, "the index leg passes");
+
+  ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+  assert!(
+    courtesy_offers_to_node3(&mut ep).is_empty(),
+    "a ConfState that still names the peer cannot carry its removal"
+  );
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).map(|dbt| dbt.offered_index),
+    Some(None),
+    "and the debt is untouched — nothing was offered"
+  );
+}
+
+/// A follower that applies a removal of ANOTHER peer mints the debt too — the mint is universal,
+/// so whichever member leads next already owes the departed peer its cure. Without this a leader
+/// elected AFTER the removal would owe nothing, would adopt the peer's next campaign in the term
+/// pre-pass, and the whole disruption cycle would recur at it.
+#[test]
+fn a_follower_mints_the_courtesy_debt_when_it_applies_a_removal() {
+  use crate::Role;
+  let (n2, _log2, _stable2) = node2_that_applied_the_removal();
+  assert_eq!(n2.role(), Role::Follower, "node 2 never led");
+  assert!(
+    n2.courtesy_owed.contains_key(&3u64),
+    "a follower's apply-time knowledge is enough to owe the debt"
+  );
+  assert!(
+    !n2.has_courtesy_debts(),
+    "but consulting it stays leader-gated — inert on a follower"
+  );
+  assert!(
+    n2.pending_farewells.is_empty(),
+    "the FAREWELL stays leader-only: it needs the tracker's proven match, which a follower lacks"
+  );
+}
+
+/// THE SELF-REMOVAL CLASS-CHECK. A replica applying the removal of ITSELF must take the
+/// self-removal path — step down, disarm, surface the change — and must never mint a debt naming
+/// itself: nothing could ever spend it, and a later re-add would leave a debt against a current
+/// member. The mint's `*peer == me` skip is what makes it impossible, and the self-removal
+/// step-down clears the whole map as a belt.
+#[test]
+fn a_self_removal_never_mints_a_debt_for_self() {
+  use crate::{Event, Role};
+  let (mut n3, mut log3, mut stable3) = node3_that_applied_its_own_removal();
+  assert!(
+    core::iter::from_fn(|| n3.poll_event())
+      .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64))),
+    "the self-removal surfaces through the ordinary ConfChanged path"
+  );
+  assert!(
+    n3.courtesy_owed.is_empty(),
+    "a replica never owes itself a courtesy debt"
+  );
+  assert_eq!(n3.role(), Role::Follower, "and it is disarmed");
+  let _ = (&mut log3, &mut stable3);
+}
+
+/// THE DIFFERENT-LEADER HALF of the cure. The removal-era leader is out of the picture entirely:
+/// node 2 applied the removal as a FOLLOWER, then won leadership. Because the mint is universal it
+/// already owes node 3 the debt, so node 3's contact is answered with the cure from node 2's OWN
+/// apply-time evidence — no farewell budget, no help from the leader that did the removing.
+///
+/// MUTATION: put the mint back inside the leader gate → node 2 owes nothing and offers nothing.
+#[test]
+fn a_different_leader_cures_from_its_own_apply_time_debt() {
+  use crate::{Index, Message, Role, Term, VoteResponse};
+
+  // Node 2: applied the removal as a follower, then elected (its own vote plus node 1's — the
+  // post-removal configuration is {1, 2}).
+  let (mut n2, mut log2, mut stable2) = node2_that_applied_the_removal();
+  let removal = n2
+    .courtesy_owed
+    .get(&3u64)
+    .expect("the follower minted the debt")
+    .removal_index;
+  let d = n2.poll_timeout().expect("a voter arms its election timer");
+  n2.handle_timeout(d, &mut log2, &mut stable2);
+  n2.handle_storage(d, &mut log2, &mut stable2);
+  let ct = n2.term();
+  n2.handle_message(
+    d,
+    &mut log2,
+    &mut stable2,
+    1u64,
+    Message::VoteResponse(VoteResponse::new(ct, 1u64, false, false)),
+  );
+  n2.handle_storage(d, &mut log2, &mut stable2);
+  assert_eq!(
+    n2.role(),
+    Role::Leader,
+    "node 2 leads without node 1's help"
+  );
+  // Its own no-op must commit and apply before any cure may act on its applied configuration.
+  apply_the_term_start_noop(&mut n2, &mut log2, &mut stable2, d, &[1u64]);
+  assert!(
+    n2.has_courtesy_debts(),
+    "and carries the debt it minted as a follower into leadership"
+  );
+  while n2.poll_message().is_some() {}
+  while n2.poll_event().is_some() {}
+
+  // Node 2 has never sent node 3 a farewell — it was not the removal-era leader — so the courtesy
+  // path owns the peer from the first contact.
+  assert!(
+    n2.pending_farewells.is_empty(),
+    "no farewell budget: this leader never pruned node 3 from its own tracker as leader"
+  );
+  n2.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut n2, &mut stable2, removal, encode_count_snapshot(7));
+
+  // Node 3's REAL campaign (default flags: no pre-vote, so a genuine higher term).
+  let term_before = n2.term();
+  let campaign = Message::RequestVote(crate::RequestVote::new(
+    term_before,
+    3u64,
+    Index::new(2),
+    Term::new(1),
+    false,
+    false,
+  ));
+  n2.handle_message(d, &mut log2, &mut stable2, 3u64, campaign.clone());
+
+  assert_eq!(
+    n2.role(),
+    Role::Leader,
+    "a same-term campaign does not depose"
+  );
+  assert_eq!(
+    n2.term(),
+    term_before,
+    "and the same-term campaign moves nothing"
+  );
+  let mut offers: Vec<Message<u64>> = core::iter::from_fn(|| n2.poll_message())
+    .filter(|o| o.to() == 3u64)
+    .map(|o| o.into_parts().1)
+    .filter(|m| matches!(m, Message::InstallSnapshot(_)))
+    .collect();
+  assert_eq!(offers.len(), 1, "and the cure is offered from its own debt");
+  let offer = offers.pop().expect("one offer");
+  {
+    let Message::InstallSnapshot(is) = &offer else {
+      unreachable!("filtered above")
+    };
+    assert!(
+      !is.snapshot().conf().voters().contains(&3u64) && is.snapshot().last_index() >= removal,
+      "carrying the removal node 2 applied as a follower"
+    );
+  }
+
+  // Node 3 applies it and self-removes — cured with no participation from the removal-era leader.
+  // Delivered VERBATIM, exactly as node 2 emitted it.
+  let (mut n3, mut log3, mut stable3) = node3_async();
+  n3.handle_message(d, &mut log3, &mut stable3, 2u64, offer);
+  n3.handle_storage(d, &mut log3, &mut stable3);
+  assert!(
+    core::iter::from_fn(|| n3.poll_event())
+      .any(|e| matches!(e, crate::Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64))),
+    "the removed peer applies the excluding ConfState and surfaces its removal"
+  );
+  assert!(!n3.tracker.is_voter(&3u64), "and is disarmed for good");
+}
+
+/// F2 END TO END, at the config the cure protects (DEFAULT flags). Node 2 is offline across the
+/// whole `RemoveNode(3)` conf change and never replays it — it catches up WHOLESALE by snapshot.
+/// The install's membership transition is the only evidence of the removal it will ever see, and
+/// that is enough: the debt is minted at the boundary, so when node 2 later wins leadership it
+/// already owes node 3 the cure, drops node 3's real campaign without stepping down, and pays the
+/// debt from the very snapshot that taught it.
+///
+/// MUTATION: drop the install-edge mint → node 2 owes nothing, adopts node 3's term, and the
+/// no-step-down assertions fail.
+#[test]
+fn a_snapshot_only_removal_cures_the_peer_from_a_later_leader() {
+  use crate::{
+    Index, InstallSnapshot, Message, Role, SnapshotMeta, Term, VoteResponse, conf::ConfState,
+  };
+  use core::time::Duration;
+
+  // Node 2, a member of {1, 2, 3}, was offline across the removal.
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut n2 = Endpoint::new(cfg, Instant::ORIGIN, 5, CountSm::default());
+  let mut log2 = VecLog::default();
+  let mut stable2 = AsyncStable::default();
+  let d = Instant::ORIGIN;
+
+  // Catch-up by snapshot ALONE: the boundary's ConfState is the post-removal {1, 2}.
+  let boundary = Index::new(20);
+  let meta = SnapshotMeta::new(
+    boundary,
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2]),
+  );
+  n2.handle_message(
+    d,
+    &mut log2,
+    &mut stable2,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_count_snapshot(7),
+    )),
+  );
+  n2.handle_storage(d, &mut log2, &mut stable2);
+  assert_eq!(n2.commit, boundary, "node 2 caught up wholesale");
+  let debt = n2
+    .courtesy_owed
+    .get(&3u64)
+    .expect("the snapshot-only removal minted the debt");
+  assert_eq!(
+    debt.removal_index, boundary,
+    "at the snapshot boundary, the index this very snapshot pays"
+  );
+  assert!(
+    n2.pending_farewells.is_empty(),
+    "and no farewell budget — node 2 never led the removal"
+  );
+  while n2.poll_message().is_some() {}
+  while n2.poll_event().is_some() {}
+
+  // Node 2 wins leadership among the surviving {1, 2}.
+  let ed = n2.poll_timeout().expect("a voter arms its election timer");
+  n2.handle_timeout(ed, &mut log2, &mut stable2);
+  n2.handle_storage(ed, &mut log2, &mut stable2);
+  let ct = n2.term();
+  n2.handle_message(
+    ed,
+    &mut log2,
+    &mut stable2,
+    1u64,
+    Message::VoteResponse(VoteResponse::new(ct, 1u64, false, false)),
+  );
+  n2.handle_storage(ed, &mut log2, &mut stable2);
+  assert_eq!(n2.role(), Role::Leader, "node 2 leads");
+  apply_the_term_start_noop(&mut n2, &mut log2, &mut stable2, ed, &[1u64]);
+  while n2.poll_message().is_some() {}
+
+  // Node 3's REAL higher-term campaign: dropped, counted, and answered with the cure.
+  let term_before = n2.term();
+  n2.handle_message(
+    ed,
+    &mut log2,
+    &mut stable2,
+    3u64,
+    Message::RequestVote(crate::RequestVote::new(
+      term_before,
+      3u64,
+      Index::new(2),
+      Term::new(1),
+      false,
+      false,
+    )),
+  );
+  assert_eq!(
+    n2.role(),
+    Role::Leader,
+    "a snapshot-taught leader refuses to be deposed too"
+  );
+  assert_eq!(
+    n2.term(),
+    term_before,
+    "and the same-term campaign moves nothing"
+  );
+  let offers: Vec<_> = core::iter::from_fn(|| n2.poll_message())
+    .filter_map(|o| match o.into_parts() {
+      (3u64, Message::InstallSnapshot(is)) => Some(is),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    offers.len(),
+    1,
+    "and the debt is paid from the installed snapshot"
+  );
+  assert_eq!(
+    offers[0].snapshot().last_index(),
+    boundary,
+    "the offer IS the snapshot that taught node 2 the removal"
+  );
+  assert!(
+    !offers[0].snapshot().conf().voters().contains(&3u64),
+    "and it carries the configuration that excludes node 3"
+  );
+}
+
+/// THE FULL LOOP, at the etcd-parity defaults (pre_vote and check_quorum both OFF) and with NO
+/// message ever reconstructed: every message that crosses between the two endpoints here is the
+/// exact `Outgoing` the sender emitted, delivered verbatim to the peer it was addressed to.
+///
+/// A removed peer that campaigns for REAL puts itself above the leader's term, and from that
+/// moment every offer that leader could stamp is dead at the peer's own stale-term pre-pass. The
+/// futility gate stops it making offers that would be discarded, and the debt survives the
+/// deposition the campaign costs; the cure is then delivered by the re-elected leadership, whose
+/// first tick offers proactively at a term the peer accepts.
+///
+/// MUTATION: remove the futility gate → every window's offer burns against a peer whose stale-term
+/// pre-pass discards it, and the peer stays uncured for as long as that leader keeps the term.
+#[test]
+fn the_courtesy_cure_survives_a_real_campaign_and_lands_after_the_term_lift() {
+  use crate::{Entry, EntryKind, Event, Index, Message, Role, Term, VoteResponse};
+  use core::time::Duration;
+
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  while ep.poll_message().is_some() {}
+
+  // Node 3 is a REAL endpoint. Its campaign is its own emitted message, not a hand-built one.
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log_async(
+    std::vec![Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new()
+    )],
+    Index::new(1),
+  );
+  let n3d = n3.poll_timeout().unwrap();
+  n3.handle_timeout(n3d, &mut n3log, &mut n3stable);
+  let (to, campaign) = core::iter::from_fn(|| n3.poll_message())
+    .find(|o| matches!(o.message(), Message::RequestVote(r) if !r.pre_vote()))
+    .expect("node 3 campaigns for real (pre-vote off)")
+    .into_parts();
+  assert_eq!(to, 1u64, "addressed to the leader");
+  assert_eq!(
+    n3.term(),
+    Term::new(2),
+    "and it inflated its own term doing so"
+  );
+
+  // THE ONE DEPOSITION, and the futility gate doing its own job through it. The campaign is
+  // handled normally — Raft's universal term mechanism, untouched — so the leader adopts and steps
+  // down. What the cure guarantees is that this costs the BUDGET nothing: every offer this leader
+  // could have stamped (term 1) sat below node 3's term 2 and would have died at node 3's own
+  // pre-pass, so none was made and none was spent.
+  ep.handle_message(d, &mut log, &mut stable, 3u64, campaign);
+  assert_eq!(ep.role(), Role::Follower, "the campaign deposes, once");
+  assert_eq!(ep.term(), Term::new(2), "adopting the higher term");
+  assert!(
+    courtesy_offers_to_node3(&mut ep).is_empty(),
+    "a futile offer is not emitted"
+  );
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).unwrap().offered_index,
+    None,
+    "and nothing was offered, so nothing is outstanding"
+  );
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).unwrap().next_at,
+    None,
+    "nor starts a cooldown"
+  );
+
+  // THE TERM LIFT. A LIVE member campaigns and node 1 re-wins above node 3's term — node 3 cannot
+  // win itself, having no quorum in the configuration that removed it.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::RequestVote(crate::RequestVote::new(
+      Term::new(3),
+      2u64,
+      Index::new(3),
+      Term::new(1),
+      false,
+      false,
+    )),
+  );
+  let rd = ep.poll_timeout().expect("the deposed leader re-arms");
+  ep.handle_timeout(rd, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(ct, 2u64, false, false)),
+  );
+  ep.handle_storage(rd, &mut log, &mut stable);
+  assert!(ep.role().is_leader(), "node 1 re-wins");
+  assert!(ep.term() > n3.term(), "at a term above the removed peer's");
+  // The inherited-tail gate: the cure waits for this leader's OWN no-op to apply. Nothing about
+  // the assertions below changes — only that the first tick that may offer is the first tick after
+  // the leader's own first entry is applied truth.
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, rd, &[2u64]);
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).unwrap().next_at,
+    None,
+    "become_leader re-armed the surviving debt"
+  );
+  while ep.poll_message().is_some() {}
+
+  // THE PROACTIVE OFFER: the first leader tick makes it, with no contact from node 3 at all.
+  ep.handle_timeout(rd + Duration::from_millis(150), &mut log, &mut stable);
+  let (to, offer) = core::iter::from_fn(|| ep.poll_message())
+    .find(|o| matches!(o.message(), Message::InstallSnapshot(_)))
+    .expect("the first tick after re-election offers the cure proactively")
+    .into_parts();
+  assert_eq!(to, 3u64, "addressed to the removed peer");
+
+  // Delivered VERBATIM — the very Outgoing the leader emitted, to the endpoint it named.
+  n3.handle_message(n3d, &mut n3log, &mut n3stable, 1u64, offer);
+  n3.handle_storage(n3d, &mut n3log, &mut n3stable);
+  assert!(
+    core::iter::from_fn(|| n3.poll_event())
+      .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64))),
+    "node 3 installs the offer and surfaces its own removal"
+  );
+  assert!(!n3.tracker.is_voter(&3u64), "and is disarmed");
+
+  // No further campaigns, ever: a non-voter's timer fires and produces nothing.
+  let before = n3.term();
+  for _ in 0..4 {
+    let Some(t) = n3.poll_timeout() else { break };
+    n3.handle_timeout(t, &mut n3log, &mut n3stable);
+    n3.handle_storage(t, &mut n3log, &mut n3stable);
+  }
+  assert_eq!(
+    n3.role(),
+    Role::Follower,
+    "the cured peer never campaigns again"
+  );
+  assert_eq!(n3.term(), before, "and never inflates the term again");
+}
+
 /// Drive a freshly-elected leader's own term-start no-op to COMMIT and APPLY. Every removal cure
 /// waits for this (the inherited-tail gate), and it is what a real leader does before it serves
 /// anything: until its own first entry applies, its applied configuration may be stale by the tail
@@ -3181,6 +4897,204 @@ fn no_farewell_is_front_loaded_while_an_inherited_readd_is_unapplied() {
   );
 }
 
+/// A follower carrying a globally-COMMITTED but locally-unknown-committed `AddNode(3)` in its
+/// election-inherited tail, holding BOTH cure records for node 3. This is the race's setup: the
+/// old leader committed the re-add on a quorum that did not include this replica's knowledge, so
+/// its APPLIED configuration still excludes node 3 while its LOG already re-admits it.
+fn follower_with_an_inherited_readd() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
+  use crate::{AppendEntries, ConfChange, ConfChangeType, Entry, EntryKind, Message, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 5, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+
+  // 1..=2 arrive COMMITTED: the no-op and RemoveNode(3). Applying the removal mints both cures.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(Term::new(1), Index::new(1), EntryKind::Empty, Bytes::new()),
+        Entry::new(
+          Term::new(1),
+          Index::new(2),
+          EntryKind::ConfChange,
+          remove3_payload()
+        ),
+      ],
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    ep.courtesy_owed.contains_key(&3u64),
+    "the removal minted the debt"
+  );
+
+  // 3 arrives with commit STILL AT 2 — the AddNode(3) is in the tail, committed globally (the old
+  // leader had a quorum for it) but not known-committed here.
+  let readd = ConfChange::new(ConfChangeType::AddNode, 3u64, Bytes::new()).into_v2();
+  let mut payload = Vec::new();
+  crate::wire::encode_conf_change_v2(&readd, &mut payload);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::new(2),
+      Term::new(1),
+      std::vec![Entry::new(
+        Term::new(1),
+        Index::new(3),
+        EntryKind::ConfChange,
+        bytes::Bytes::from(payload)
+      )],
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(ep.applied, Index::new(2), "the re-add has NOT applied");
+  assert!(
+    ep.tracker.progress(&3u64).is_none(),
+    "so the applied configuration still excludes node 3 — the stale view"
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  (ep, log, stable)
+}
+
+/// THE RACE, cured. A fresh leader whose inherited tail holds a committed re-add must not act on
+/// its stale applied configuration: both cure records for node 3 survive `become_leader`'s
+/// reconciling retains (which read that stale view), and delivering either — the farewell's suffix
+/// ending at the removal, or the courtesy's excluding snapshot — would tear down a peer the
+/// committed configuration includes. Nothing is sent until the leader's own no-op applies, and by
+/// then the tail's own apply fold has pruned both records.
+///
+/// MUTATION: remove the inherited-tail gate from either drive → a stale cure goes out during the
+/// window and the "nothing sent" assertions fail.
+#[test]
+fn no_removal_cure_is_sent_while_an_inherited_readd_is_unapplied() {
+  use crate::{Message, Role, VoteResponse};
+  use core::time::Duration;
+  let (mut ep, mut log, mut stable) = follower_with_an_inherited_readd();
+
+  // It wins leadership. Its own no-op lands at 4; the inherited AddNode@3 is still unapplied.
+  let d = ep.poll_timeout().expect("a voter arms its timer");
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  let ct = ep.term();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::VoteResponse(VoteResponse::new(ct, 1u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(ep.role(), Role::Leader, "the follower won");
+  assert!(
+    ep.applied < ep.term_start_index,
+    "and its inherited tail has not applied"
+  );
+  // The reconciling retains kept BOTH records — they read the stale applied view.
+  assert!(
+    ep.courtesy_owed.contains_key(&3u64),
+    "the debt survived become_leader's retain"
+  );
+  // This fixture applied the removal as a FOLLOWER, so it carries the DEBT alone — the farewell is
+  // leader-only. The farewell-arm variant below carries a parked budget beside it.
+  assert!(
+    ep.pending_farewells.is_empty(),
+    "the courtesy-arm fixture: debt only"
+  );
+  give_leader_a_snapshot(
+    &mut ep,
+    &mut stable,
+    Index::new(2),
+    encode_count_snapshot(7),
+  );
+  while ep.poll_message().is_some() {}
+
+  // THE WINDOW. Ticks fire, and node 3 even makes contact — nothing is CURED. Its message is
+  // handled normally throughout; only our own sends are withheld.
+  for i in 0..4 {
+    ep.handle_timeout(
+      d + Duration::from_millis(150 * (i + 1)),
+      &mut log,
+      &mut stable,
+    );
+    ep.handle_message(d, &mut log, &mut stable, 3u64, removed_peer_contact());
+    assert!(
+      drain_to(&mut ep, 3u64)
+        .into_iter()
+        .all(|m| !matches!(m, Message::InstallSnapshot(_))),
+      "no stale cure may reach a peer the committed configuration re-admitted"
+    );
+  }
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).map(|dbt| dbt.offered_index),
+    Some(None),
+    "and nothing was ever offered"
+  );
+  assert_eq!(
+    ep.courtesy_owed.get(&3u64).and_then(|dbt| dbt.next_at),
+    None,
+    "with no cooldown started"
+  );
+  assert!(
+    ep.courtesy_owed.contains_key(&3u64),
+    "the record is still present, waiting"
+  );
+
+  // THE TAIL APPLIES: the no-op commits, the inherited AddNode applies with it, and the fold's
+  // own re-add prune reconciles both maps. No extra reconciliation code exists or is needed.
+  apply_the_term_start_noop(&mut ep, &mut log, &mut stable, d, &[1u64]);
+  assert!(
+    ep.applied >= ep.term_start_index,
+    "the inherited tail applied"
+  );
+  assert!(
+    ep.tracker.progress(&3u64).is_some(),
+    "node 3 is a member again per the committed configuration"
+  );
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "the apply fold pruned the debt"
+  );
+
+  // And still nothing stale ever goes out: later ticks cure nobody.
+  while ep.poll_message().is_some() {}
+  for i in 0..4 {
+    ep.handle_timeout(
+      d + Duration::from_millis(900 + 150 * i),
+      &mut log,
+      &mut stable,
+    );
+  }
+  assert!(
+    drain_to(&mut ep, 3u64)
+      .into_iter()
+      .all(|m| !matches!(m, Message::InstallSnapshot(_))),
+    "a re-admitted member is never offered a removal cure"
+  );
+}
+
 /// A fresh leader whose inherited tail holds `RemoveNode(3)`, optionally `AddNode(3)`, and its own
 /// no-op — all committed together and drained in ONE apply pass. This is the fire-site race: the
 /// removal's apply is where the farewell's first shot is emitted, and a queued message cannot be
@@ -3345,5 +5259,362 @@ fn a_suppressed_initial_farewell_is_delivered_once_the_tail_applies() {
     ep.pending_farewells.get(&3u64).map(|f| f.shots_left),
     Some(2),
     "and only then is it spent"
+  );
+}
+
+/// RECOVERY ALWAYS COMPLETES, because an owed sender's traffic is never suppressed. This pins the
+/// ABSENCE of the withdrawn drop, and it is deliberately trivial to satisfy — that is the point.
+///
+/// Three topologies in a row broke every attempt to mute a departed peer's messages. The last one
+/// needs no inherited tail at all: the gate is fully open, the re-add commits LATER through a
+/// quorum that excludes the stale debt-holder, and the debt-holder simply never learns of it. Any
+/// local licence to suppress — term-scoped, tail-scoped, vote-only — leaves such a leader unable
+/// to commit and unwilling to be deposed, and the only live current-majority can never form. With
+/// no suppression anywhere, the universal term mechanism does what it has always done.
+///
+/// Here A holds an applied `remove(B)` and its debt, and leads on the configuration it knows. B —
+/// re-added by a later commit A never saw — is elected at a higher term by the others, and then a
+/// voter fails, leaving exactly A and B alive.
+///
+/// MUTATION: reintroduce any suppression of an owed sender's messages → A discards B's append,
+/// never steps down, and the group is permanently unavailable.
+#[test]
+fn an_owed_senders_traffic_is_never_suppressed_so_recovery_always_completes() {
+  use crate::{
+    AppendEntries, ConfChange, ConfChangeType, Entry, EntryKind, Message, Role, Term, VoteResponse,
+  };
+
+  // A removed node 3 as leader and has fully applied it — the gate is OPEN, no inherited tail.
+  let (mut a, mut alog, mut astable, d, removal) = leader_that_removed_node3();
+  apply_the_term_start_noop(&mut a, &mut alog, &mut astable, d, &[2u64]);
+  assert!(
+    a.applied >= a.term_start_index,
+    "membership truth is settled — this is not the inherited-tail case"
+  );
+  assert!(
+    a.courtesy_owed.contains_key(&3u64),
+    "and A still owes node 3 a removal cure"
+  );
+  assert!(a.role().is_leader(), "A leads the configuration it knows");
+  while a.poll_message().is_some() {}
+
+  // Node 3 was RE-ADDED by a later commit that A never saw, and is elected at a higher term by the
+  // other members. Its replication is the message A must not refuse.
+  let higher = Term::new(a.term().get() + 1);
+  let readd = {
+    let cc = ConfChange::new(ConfChangeType::AddNode, 3u64, Bytes::new()).into_v2();
+    let mut payload = Vec::new();
+    crate::wire::encode_conf_change_v2(&cc, &mut payload);
+    Entry::new(
+      higher,
+      removal.next(),
+      EntryKind::ConfChange,
+      bytes::Bytes::from(payload),
+    )
+  };
+  a.handle_message(
+    d,
+    &mut alog,
+    &mut astable,
+    3u64,
+    Message::AppendEntries(AppendEntries::new(
+      higher,
+      3u64,
+      removal,
+      a.term(),
+      std::vec![readd],
+      removal.next(),
+    )),
+  );
+
+  // A took the byte-normal path: adopted, stepped down, and followed the current leader.
+  assert_eq!(
+    a.role(),
+    Role::Follower,
+    "A stepped down for the current leader"
+  );
+  assert_eq!(a.term(), higher, "adopting its term");
+  a.handle_storage(d, &mut alog, &mut astable);
+  assert!(
+    a.tracker.progress(&3u64).is_some(),
+    "and applied the re-add it had never seen"
+  );
+  assert!(
+    !a.courtesy_owed.contains_key(&3u64),
+    "A's own apply of the re-add pruned the debt"
+  );
+
+  // Availability: A acknowledges, so the current quorum {A, node 3} commits without the third
+  // member — and no cure was ever sent to node 3 at any point.
+  let acked = core::iter::from_fn(|| a.poll_message())
+    .any(|o| o.to() == 3u64 && matches!(o.message(), Message::AppendResponse(r) if !r.reject()));
+  assert!(acked, "A acknowledges the current leader's replication");
+  assert!(
+    drain_to(&mut a, 3u64)
+      .into_iter()
+      .all(|m| !matches!(m, Message::InstallSnapshot(_))),
+    "and never offered a removal cure to a peer the configuration restored"
+  );
+  let _ = VoteResponse::new(higher, 2u64, false, false);
+}
+
+/// Fire the ignorant peer's election timer until it emits a REAL campaign carrying a term strictly
+/// above `above` — the leader's. A removed peer's term lags after each re-election it triggers, so
+/// it must time out again before it can depose anyone; that is the cure's own doing, and the loop
+/// is what a real ignorant peer does while nobody tells it anything.
+fn campaign_above<S: crate::StableStore<NodeId = u64>>(
+  n3: &mut Endpoint<u64, CountSm>,
+  log: &mut VecLog,
+  stable: &mut S,
+  above: crate::Term,
+) -> (Message<u64>, Instant) {
+  for _ in 0..8 {
+    let t = n3
+      .poll_timeout()
+      .expect("the ignorant peer keeps its timer armed");
+    n3.handle_timeout(t, log, stable);
+    n3.handle_storage(t, log, stable);
+    let campaign = core::iter::from_fn(|| n3.poll_message())
+      .find(|o| matches!(o.message(), Message::RequestVote(r) if !r.pre_vote()));
+    if let Some(o) = campaign
+      && o.message().term() > above
+    {
+      return (o.into_parts().1, t);
+    }
+  }
+  panic!("the removed peer never out-termed the leader");
+}
+
+/// Re-elect a deposed leader among the live pair and drive its own no-op to applied, returning the
+/// tick at which its first cure may go out. The removed peer takes no part: it cannot win a quorum
+/// of a configuration it is not in.
+fn re_elect_among_the_live_pair<S: crate::StableStore<NodeId = u64>>(
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut VecLog,
+  stable: &mut S,
+) -> Instant {
+  use crate::{Message, VoteResponse};
+  let rd = ep.poll_timeout().expect("the deposed leader re-arms");
+  ep.handle_timeout(rd, log, stable);
+  ep.handle_storage(rd, log, stable);
+  let ct = ep.term();
+  ep.handle_message(
+    rd,
+    log,
+    stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(ct, 2u64, false, false)),
+  );
+  ep.handle_storage(rd, log, stable);
+  assert!(ep.role().is_leader(), "the live pair re-elects");
+  apply_the_term_start_noop(ep, log, stable, rd, &[2u64]);
+  while ep.poll_message().is_some() {}
+  rd
+}
+
+/// LOSING AN OFFER must cost nothing but time. The frame is dropped on the wire, the debt is still
+/// there — sending was never evidence of anything — and the next window offers again, and THAT one
+/// lands. Retention is what makes a lossy link merely slow instead of terminal.
+///
+/// MUTATION: discharge the debt at enqueue → the lost offer retires the cure, and the peer that
+/// never received a byte of it is owed nothing by anyone, forever.
+#[test]
+fn a_lost_offer_leaves_the_debt_standing_for_the_next_leadership() {
+  use crate::{Entry, EntryKind, Event, Role, Term};
+
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log_async(
+    std::vec![Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new()
+    )],
+    Index::new(1),
+  );
+
+  // Cycle 1: node 3 campaigns, deposes, the re-elected leader offers — and the offer is LOST.
+  let (campaign, n3d) = campaign_above(&mut n3, &mut n3log, &mut n3stable, ep.term());
+  ep.handle_message(d, &mut log, &mut stable, 3u64, campaign);
+  assert_eq!(ep.role(), Role::Follower, "deposition one");
+  let rd = re_elect_among_the_live_pair(&mut ep, &mut log, &mut stable);
+  ep.handle_timeout(rd + Duration::from_millis(150), &mut log, &mut stable);
+  let lost = courtesy_offers_to_node3(&mut ep);
+  assert_eq!(lost.len(), 1, "the first tick offered the cure");
+  drop(lost); // the frame never arrives
+
+  assert!(
+    ep.courtesy_owed.contains_key(&3u64),
+    "and the debt STANDS: enqueueing is not delivering"
+  );
+
+  // The cure is re-offered once the cooldown elapses — the debt was never spent, so the retry is
+  // simply the next window's send. (Driving a SECOND natural deposition here would prove the same
+  // retention with far more fragile term arithmetic; the persistent-loss regression below runs five
+  // such cycles end to end and asserts exactly that.)
+  let due = ep
+    .courtesy_owed
+    .get(&3u64)
+    .and_then(|dbt| dbt.next_at)
+    .expect("the retained debt is cooling, not spent");
+  ep.handle_timeout(due + Duration::from_millis(1), &mut log, &mut stable);
+  let offer = courtesy_offers_to_node3(&mut ep)
+    .into_iter()
+    .next()
+    .expect("the retained debt re-offers in the next window");
+  let Message::InstallSnapshot(ref is) = offer else {
+    unreachable!("filtered above")
+  };
+  assert!(
+    is.term() >= n3.term(),
+    "and it is offered at a term the peer accepts"
+  );
+  n3.handle_message(n3d, &mut n3log, &mut n3stable, 1u64, offer);
+  n3.handle_storage(n3d, &mut n3log, &mut n3stable);
+  assert!(
+    core::iter::from_fn(|| n3.poll_event())
+      .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64))),
+    "the cure lands on the first DELIVERED offer"
+  );
+
+  // No further deposition is possible: a cured peer is a non-voter.
+  let settled = n3.term();
+  for _ in 0..4 {
+    let Some(t) = n3.poll_timeout() else { break };
+    n3.handle_timeout(t, &mut n3log, &mut n3stable);
+    n3.handle_storage(t, &mut n3log, &mut n3stable);
+  }
+  assert_eq!(
+    n3.role(),
+    Role::Follower,
+    "and no further deposition is possible"
+  );
+  assert_eq!(n3.term(), settled, "and no further term inflation");
+}
+
+/// PERSISTENT TARGETED LOSS of every courtesy frame. The degradation is the honest bound: one
+/// self-healing deposition per election-timeout window, the debt retained throughout, and the send
+/// rate bounded to one whole-blob frame per window — never an uncured peer that nobody owes
+/// anything, which is exactly what a charge-on-enqueue budget produced after three lost frames.
+///
+/// MUTATION: charge the debt at enqueue → the debt is gone by cycle four and the peer disrupts
+/// forever with no standing cure.
+#[test]
+fn persistent_offer_loss_degrades_to_one_deposition_per_window_and_never_loses_the_cure() {
+  use crate::{Entry, EntryKind, Role, Term};
+
+  let (mut ep, mut log, mut stable, d, removal) = leader_that_removed_node3();
+  ep.pending_farewells_clear_for_test();
+  give_leader_a_snapshot(&mut ep, &mut stable, removal, encode_count_snapshot(7));
+  let (mut n3, mut n3log, mut n3stable) = node3_with_log_async(
+    std::vec![Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new()
+    )],
+    Index::new(1),
+  );
+
+  let mut depositions = 0usize;
+  let mut offers = 0usize;
+  let mut at = d;
+  for _ in 0..5 {
+    let (campaign, _) = campaign_above(&mut n3, &mut n3log, &mut n3stable, ep.term());
+    ep.handle_message(at, &mut log, &mut stable, 3u64, campaign);
+    assert_eq!(ep.role(), Role::Follower, "each campaign deposes");
+    depositions += 1;
+
+    at = re_elect_among_the_live_pair(&mut ep, &mut log, &mut stable);
+    // A whole window of ticks yields exactly ONE offer — the cooldown is the rate bound.
+    let mut in_window = 0usize;
+    for k in 0..6 {
+      ep.handle_timeout(
+        at + Duration::from_millis(150 * (k + 1)),
+        &mut log,
+        &mut stable,
+      );
+      in_window += courtesy_offers_to_node3(&mut ep).len(); // every frame is LOST
+    }
+    assert_eq!(
+      in_window, 1,
+      "one whole-blob offer per peer per cooldown window"
+    );
+    offers += in_window;
+
+    assert!(
+      ep.courtesy_owed.contains_key(&3u64),
+      "the debt is retained through every lost cycle"
+    );
+  }
+  assert_eq!(
+    depositions, 5,
+    "each deposition is self-healed by re-election"
+  );
+  assert_eq!(offers, 5, "and each cycle re-offered the cure");
+  assert!(
+    ep.role().is_leader() && ep.courtesy_owed.contains_key(&3u64),
+    "the group is serving and the cure still stands — never uncured-and-debtless"
+  );
+}
+
+/// The remaining eviction authorities, unchanged by the move to evidence: a committed re-add still
+/// discharges a debt, and the map's capacity still evicts the oldest.
+#[test]
+fn re_add_and_the_cap_remain_eviction_authorities() {
+  use crate::{AppendEntries, ConfChange, ConfChangeType, Entry, EntryKind, Message, Term};
+
+  // (a) the re-add edge.
+  let (mut ep, mut log, mut stable) = follower_with_an_inherited_readd();
+  assert!(
+    ep.courtesy_owed.contains_key(&3u64),
+    "the removal minted it"
+  );
+  let readd = {
+    let cc = ConfChange::new(ConfChangeType::AddNode, 3u64, Bytes::new()).into_v2();
+    let mut payload = Vec::new();
+    crate::wire::encode_conf_change_v2(&cc, &mut payload);
+    Entry::new(
+      Term::new(1),
+      Index::new(3),
+      EntryKind::ConfChange,
+      bytes::Bytes::from(payload),
+    )
+  };
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::new(2),
+      Term::new(1),
+      std::vec![readd],
+      Index::new(3),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    !ep.courtesy_owed.contains_key(&3u64),
+    "a committed re-add still discharges the debt"
+  );
+
+  // (b) the cap: 64 debts is the ceiling, and the OLDEST goes.
+  let (mut ep, _log, _stable, _d, removal) = leader_that_removed_node3();
+  for n in 0..70u64 {
+    ep.note_courtesy_debt_for_test(100 + n, Index::new(removal.get() + n));
+  }
+  assert_eq!(ep.courtesy_owed.len(), 64, "the cap holds");
+  assert!(
+    !ep.courtesy_owed.contains_key(&100u64),
+    "and the oldest debt is what was evicted"
+  );
+  assert!(
+    ep.courtesy_owed.contains_key(&169u64),
+    "while the newest is retained"
   );
 }
