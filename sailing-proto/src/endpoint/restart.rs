@@ -504,6 +504,7 @@ where
         snapshot_resend_after: BTreeMap::new(),
         unsendable_meta_frames: 0,
         refused_cross_lineage_installs: 0,
+        refused_stale_removal_installs: 0,
       },
       rng,
       votes: BTreeMap::new(),
@@ -569,6 +570,12 @@ where
         // Recovered commit is already durable in HardState — seed `committed_persisted` to it so
         // the handle_storage choke-point doesn't immediately re-persist an unchanged value.
         committed_persisted: commit,
+        // ...and the same recovered commit IS durable (it was read back from HardState), so a
+        // shortcut ack gated at or below it releases immediately after a restart.
+        durable_commit_index: commit,
+        last_submitted_commit: commit,
+        commit_persist_opid: OpId::ZERO,
+        shortcut_gated_snapshot_ack: None,
         durable_index: log.last_index(),
         // volatile — after restart the reconciled durable log (Restore/Compact) already covers any
         // durable snapshot, so `durable_index` alone is the recoverable prefix; the gap this closes only

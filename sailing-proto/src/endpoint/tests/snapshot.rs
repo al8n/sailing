@@ -1814,6 +1814,7 @@ fn stale_snapshot_response_is_clamped_to_durable_watermark() {
 
   // Second AppendEntries [4..=5] with leader_commit=5: commit jumps to 5, but the 4/5 append is NOT
   // yet durable (no handle_storage), so durable_index stays 3 → commit > durable_index.
+  log.hold_appends(true);
   ep.handle_message(
     d,
     &mut log,
@@ -1831,6 +1832,8 @@ fn stale_snapshot_response_is_clamped_to_durable_watermark() {
           EntryKind::Empty,
           bytes::Bytes::new()
         ),
+        // (hold_appends below keeps 4/5 un-fsynced across the storage cranks, so the clamp under
+        // test — report the DURABLE watermark, not the raw in-memory commit — stays exercised.)
         Entry::new(
           Term::new(2),
           Index::new(5),
@@ -1875,10 +1878,27 @@ fn stale_snapshot_response_is_clamped_to_durable_watermark() {
     )),
   );
 
-  let response = ep
-    .poll_message()
-    .expect("a stale InstallSnapshot emits a SnapshotResponse");
-  match response.message() {
+  // The ack is a NO-BLOB redundancy ack, so it leaves through the shortcut gate: `commit` is 5 in
+  // memory but nothing has persisted it yet, and the gate — not volatile commit — decides when the
+  // answer is truthful. One storage crank lands the commit-watermark write the choke point already
+  // submits, and the ack follows. (Before the gate existed this answered in the same crank; the
+  // difference is exactly the window a duplicate could have exploited.)
+  assert!(
+    !core::iter::from_fn(|| ep.poll_message())
+      .any(|o| matches!(o.message(), Message::SnapshotResponse(_))),
+    "no ack before the boundary's evidence is durable"
+  );
+  let mut acked = None;
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+    while let Some(out) = ep.poll_message() {
+      if let Message::SnapshotResponse(r) = out.message() {
+        acked = Some(*r);
+      }
+    }
+  }
+  let response = acked.expect("a stale InstallSnapshot emits a SnapshotResponse");
+  match Message::<u64>::SnapshotResponse(response) {
     Message::SnapshotResponse(s) => {
       assert!(
         !s.reject(),
@@ -3377,6 +3397,14 @@ fn install_with_stale_suffix_after_restore_poisons() {
 /// avoided. The follower acks `max(commit, boundary)` so the leader lifts `match` past `pending` and the
 /// peer leaves `ProgressState::Snapshot`.
 ///
+/// COMMIT ADVANCES with it. The short-circuit is not "ignore the snapshot": the boundary is proof
+/// the sender committed there (captures are committed prefixes), and Log Matching makes the local
+/// durable prefix through it that same prefix, so the arm commits and applies through the boundary
+/// BEFORE acking. An earlier revision left commit at 2 here, which made the ack a claim this
+/// replica had not made true — harmless-looking until the snapshot carries a membership change the
+/// receiver is the subject of, where it becomes a removed peer that acks its cure and never applies
+/// it. The log legs below are unchanged: advancing commit re-baselines nothing.
+///
 /// MUTATION: drop the receipt guard's Log-Matching clause so `redundant` is just `boundary <=
 /// min(commit, ack_watermark())`. Boundary 5 > commit 2, so the snapshot is no longer short-circuited at
 /// receipt: it STAGES a deferred install (`pending_install.is_some()`) and the receipt ack at 5 is never
@@ -3440,17 +3468,36 @@ fn redundant_install_below_durable_tip_keeps_the_log() {
     "a snapshot already covered by the durable log is short-circuited at receipt (never staged)"
   );
 
-  // The follower acks `max(commit 2, boundary 5) = 5` — above `pending`, so the leader lifts `match`
-  // and the peer leaves Snapshot state. Capture the last SnapshotResponse from the drain.
+  // NO ACK YET. The shortcut raised commit to the boundary and applied, but the ack waits for that
+  // raise to reach stable storage — a crash in this window must leave the sender's cure outstanding,
+  // not discharged by an ack whose evidence evaporated.
+  assert_eq!(
+    ep.commit,
+    Index::new(5),
+    "the shortcut commits through the boundary the snapshot proves committed"
+  );
+  assert_eq!(ep.applied, Index::new(5), "and applies through it");
+  assert!(
+    !core::iter::from_fn(|| ep.poll_message())
+      .any(|o| matches!(o.message(), Message::SnapshotResponse(_))),
+    "but no success ack may precede the commit persist"
+  );
+
+  // Drive storage: the HardState write lands, `durable_commit_index` reaches the boundary, and the
+  // gated ack is released on the ordinary loop — `max(commit 2, boundary 5) = 5`, above `pending`, so
+  // the leader lifts `match` and the peer leaves Snapshot state.
   let mut acked: Option<crate::SnapshotResponse<u64>> = None;
-  while let Some(out) = ep.poll_message() {
-    if out.to() == 1u64
-      && let Message::SnapshotResponse(sr) = out.message()
-    {
-      acked = Some(*sr);
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 1u64
+        && let Message::SnapshotResponse(sr) = out.message()
+      {
+        acked = Some(*sr);
+      }
     }
   }
-  let sr = acked.expect("the short-circuit emits a SnapshotResponse to the leader");
+  let sr = acked.expect("the persisted commit releases the gated SnapshotResponse");
   assert!(
     !sr.reject(),
     "the receipt short-circuit acks, never rejects"
@@ -3472,17 +3519,17 @@ fn redundant_install_below_durable_tip_keeps_the_log() {
     Index::new(1),
     "the log was not re-baselined onto the snapshot boundary"
   );
-  // (b) commit/applied are UNCHANGED — the snapshot was short-circuited, not applied.
-  assert_eq!(
-    ep.commit,
-    Index::new(2),
-    "a short-circuited snapshot must not move commit"
-  );
-  assert_eq!(
-    ep.applied,
-    Index::new(2),
-    "a short-circuited snapshot must not move applied"
-  );
+  // (b) The durable tail survives BYTE-FOR-BYTE alongside the raised commit — this is the
+  // install/restart parity leg. `reconcile_restart_log` answers `Compact(n)` in exactly this shape
+  // ("preserving the committed tail above `N`"); an install would have answered `Restore`, which is a
+  // total discard by contract. The shortcut is what keeps the two paths agreeing.
+  for i in 6u64..=9 {
+    assert_eq!(
+      log.term(Index::new(i)).unwrap(),
+      Term::new(2),
+      "entry {i} of the durably-acked tail survives unchanged"
+    );
+  }
   // (c) The follower's `ack_watermark()` is still the durable tip 9: nothing raised
   // `durable_snapshot_index` (no install ran), so the recoverable prefix is the durable log tail.
   assert_eq!(
@@ -3846,17 +3893,27 @@ fn redundant_install_caught_up_mid_transfer_dropped_at_completion() {
     Index::new(1),
     "the log was not re-baselined onto the snapshot boundary"
   );
-  // commit/applied are UNCHANGED — the install was dropped, not applied.
+  // ...and commit/applied ADVANCE to the boundary, which is what makes that ack truthful: the drop
+  // is not "ignore the snapshot", it is "prove the boundary from local evidence instead of
+  // re-baselining over the tail". The ack above was released only once the raised commit reached
+  // stable storage on this same drain.
   assert_eq!(
     ep.commit,
-    Index::new(2),
-    "a dropped install must not move commit"
+    Index::new(5),
+    "the completion-time shortcut commits through the boundary"
   );
   assert_eq!(
     ep.applied,
-    Index::new(2),
-    "a dropped install must not move applied"
+    Index::new(5),
+    "and applies through it before the ack is released"
   );
+  for i in 6u64..=9 {
+    assert_eq!(
+      log.term(Index::new(i)).unwrap(),
+      Term::new(2),
+      "entry {i} of the durably-acked tail survives unchanged"
+    );
+  }
 }
 
 /// Over-suppression guard for the redundancy arm (the must-STILL-install direction): same shape —
@@ -5104,7 +5161,7 @@ fn deferred_install_off_follower_preserves_log_and_campaign() {
   use super::super::{Pending, Role};
   use crate::{Entry, EntryKind, Index, Term, conf::ConfState};
 
-  let (mut ep, mut log, _stable) = make_follower();
+  let (mut ep, mut log, mut stable) = make_follower();
 
   // A visible, consistent log tail through index 15; commit and durable_index sit BELOW the snapshot
   // boundary (10) so the completion-time redundancy check does not drop the install on its own.
@@ -5136,7 +5193,7 @@ fn deferred_install_off_follower_preserves_log_and_campaign() {
     Term::new(1),
     ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
   );
-  ep.install_snapshot_now(&mut log, meta, 7u64, 1u64);
+  ep.install_snapshot_now(&mut log, &mut stable, meta, 7u64, 1u64);
 
   assert!(!ep.poison.poisoned, "the guarded drop must not poison");
   assert_eq!(
@@ -5719,12 +5776,28 @@ fn commit_catchup_mid_transfer_exits_via_a_full_ack() {
       blob.len() as u64,
     )),
   );
-  let ack = core::iter::from_fn(|| ep.poll_message())
-    .find_map(|o| match o.message() {
-      Message::SnapshotResponse(r) => Some(*r),
-      _ => None,
-    })
-    .expect("the covered transfer must answer, not stall");
+  // A no-blob redundancy ack: it leaves through the shortcut gate, so crank storage to land the
+  // commit-watermark write the choke point submits. "Must answer, not stall" is still the property —
+  // the gate defers by at most a crank and can never wedge, because the value the choke point
+  // persists (`min(commit, durable_index)`) is itself at or above the boundary here.
+  let mut ack = None;
+  for _ in 0..4 {
+    while let Some(out) = ep.poll_message() {
+      if let Message::SnapshotResponse(r) = out.message() {
+        ack = Some(*r);
+      }
+    }
+    if ack.is_some() {
+      break;
+    }
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while let Some(out) = ep.poll_message() {
+    if let Message::SnapshotResponse(r) = out.message() {
+      ack = Some(*r);
+    }
+  }
+  let ack = ack.expect("the covered transfer must answer, not stall");
   assert!(!ack.reject());
   assert!(
     ack.match_index() >= Index::new(5),
@@ -6620,4 +6693,1095 @@ fn a_different_lineage_orphan_still_blocks_adoption() {
   );
   assert!(ep.fork_id().is_none(), "no adoption");
   assert_ne!(ep.state_machine().count(), 500, "no foreign state landed");
+}
+
+/// Drive a follower to committed lineage `gen` by installing an ordinary (self-INCLUDING)
+/// snapshot at that generation — the monotone-max adoption every install performs — so the
+/// incarnation-gate tests below start from a replica with a real committed generation.
+fn follower_at_generation(
+  generation: u64,
+) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable, crate::Index) {
+  use crate::{Index, Instant, Message, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let boundary = Index::new(10);
+  let meta = SnapshotMeta::new(
+    boundary,
+    Term::new(4),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  )
+  .with_shape_gen(generation);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_snapshot(42),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(
+    ep.shape_gen(),
+    generation,
+    "the setup install adopted the lineage"
+  );
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+  (ep, log, stable, boundary)
+}
+
+/// An EXCLUDING install whose ConfState leaves this node out is a REMOVAL directive; minted
+/// against a generation BELOW the receiver's committed one, it speaks for an incarnation that is
+/// already gone. THE DESTROY-EDGE DUAL: a live replica at generation g′ refuses an authorization
+/// minted at g ≠ g′, so a stale view can never reap it. The refusal runs before any preamble, so
+/// nothing at all moves — not the role, not the leader binding, not the stores.
+#[test]
+fn a_stale_excluding_install_is_refused_with_no_state_change() {
+  use crate::{Index, Instant, Message, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, boundary) = follower_at_generation(5);
+
+  let before = (
+    ep.role(),
+    ep.term(),
+    ep.leader(),
+    ep.commit,
+    ep.applied,
+    ep.shape_gen(),
+    log.first_index(),
+    log.last_index(),
+    stable.durable_snapshot().map(|m| m.last_index()),
+  );
+
+  // Node 2 is absent from the ConfState, and the snapshot claims generation 4 < 5.
+  let stale = SnapshotMeta::new(
+    Index::new(20),
+    Term::new(6),
+    ConfState::from_voters(std::vec![1u64, 3u64]),
+  )
+  .with_shape_gen(4);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      stale,
+      encode_snapshot(99),
+    )),
+  );
+
+  assert_eq!(
+    ep.refused_stale_removal_install_count(),
+    1,
+    "the incarnation gate refused the cross-incarnation removal"
+  );
+  assert_eq!(
+    (
+      ep.role(),
+      ep.term(),
+      ep.leader(),
+      ep.commit,
+      ep.applied,
+      ep.shape_gen(),
+      log.first_index(),
+      log.last_index(),
+      stable.durable_snapshot().map(|m| m.last_index()),
+    ),
+    before,
+    "a refused install leaves state and storage byte-unchanged"
+  );
+  assert!(ep.poll_event().is_none(), "no event escapes a refusal");
+  assert!(
+    ep.poll_message().is_none(),
+    "a refusal is silent on the wire"
+  );
+  assert_eq!(boundary, Index::new(10), "the setup boundary still stands");
+}
+
+/// EQUAL ADMITS (WIRE.md §6): within ONE incarnation the excluding install is exactly the
+/// legitimate cure for a removed peer that can no longer be reached by log append (its suffix is
+/// compacted away), so the gate must never reject on equality — doing so would recreate the
+/// membership-apply-time staleness the vote path warns about, and would break the courtesy
+/// snapshot before it ever ran.
+#[test]
+fn an_equal_generation_excluding_install_admits() {
+  use crate::{Index, Instant, Message, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _) = follower_at_generation(5);
+
+  let meta = SnapshotMeta::new(
+    Index::new(20),
+    Term::new(6),
+    ConfState::from_voters(std::vec![1u64, 3u64]),
+  )
+  .with_shape_gen(5);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_snapshot(99),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+  assert_eq!(
+    ep.refused_stale_removal_install_count(),
+    0,
+    "at-generation is not below-generation"
+  );
+  assert_eq!(ep.commit, Index::new(20), "the install landed");
+}
+
+/// An admitted excluding install surfaces the removal through the SAME event the log-applied
+/// `ConfChange` fold emits, so the embedder's removed-self path fires identically whichever way
+/// the removal arrived — and the rebuilt tracker disarms campaigning, so the peer cannot depose
+/// the live leader on its way out. The peer self-removes by APPLYING committed state; the sender
+/// merely carried it.
+#[test]
+fn an_admitted_excluding_install_surfaces_removal_and_disarms() {
+  use crate::{Event, Index, Instant, Message, Role, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _) = follower_at_generation(5);
+
+  let conf = ConfState::from_voters(std::vec![1u64, 3u64]);
+  let meta = SnapshotMeta::new(Index::new(20), Term::new(6), conf.clone()).with_shape_gen(6);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_snapshot(99),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+  let mut installed = false;
+  let mut removed = None;
+  while let Some(ev) = ep.poll_event() {
+    match ev {
+      Event::SnapshotInstalled(_) => installed = true,
+      Event::ConfChanged(cc) => removed = Some(cc),
+      _ => {}
+    }
+  }
+  assert!(installed, "the install still reports SnapshotInstalled");
+  let cc = removed.expect("an excluding install surfaces the membership change");
+  assert_eq!(
+    cc.index(),
+    Index::new(20),
+    "stamped at the snapshot boundary"
+  );
+  assert_eq!(cc.conf(), &conf, "carrying the post-removal configuration");
+  assert!(
+    !cc.conf().voters().contains(&2u64),
+    "the surfaced configuration is the one that excludes this node"
+  );
+
+  // Disarmed: a non-voter never campaigns, whatever its timers do.
+  let before_term = ep.term();
+  for _ in 0..4 {
+    let d = match ep.poll_timeout() {
+      Some(d) => d,
+      None => break,
+    };
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.role(),
+    Role::Follower,
+    "a removed replica never campaigns"
+  );
+  assert_eq!(ep.term(), before_term, "and never inflates the term");
+}
+
+/// THE FORGED-AHEAD DIRECTION of the destroy-edge dual. An excluding install claiming a generation
+/// ABOVE every committed lineage cannot be minted legitimately — the counter is committed state,
+/// so no honest capture can carry a generation its own group never reached — and this test forges
+/// one to PIN the behavior. It is admitted, and that is safe: the frame reached the endpoint only
+/// because the transport authenticated its sender into this cluster, and an authenticated peer
+/// that is willing to fabricate a lineage could equally fabricate a whole ConfState at the real
+/// generation. The generation gate's job is the CROSS-INCARNATION case a stale-but-honest sender
+/// produces, not authentication; the trust boundary is the hello and the transport's cluster
+/// certificate. What the gate does guarantee stands: nothing BELOW the committed generation can
+/// remove this replica, so no retired incarnation — the only class that can outlive its own
+/// authority — can reap a live one.
+#[test]
+fn a_forged_ahead_excluding_install_is_admitted_at_the_trust_boundary() {
+  use crate::{Index, Instant, Message, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _) = follower_at_generation(5);
+
+  let meta = SnapshotMeta::new(
+    Index::new(20),
+    Term::new(6),
+    ConfState::from_voters(std::vec![1u64, 3u64]),
+  )
+  .with_shape_gen(9_999);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_snapshot(99),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+  assert_eq!(
+    ep.refused_stale_removal_install_count(),
+    0,
+    "the gate fences BELOW only — an ahead generation is not its class"
+  );
+  assert_eq!(ep.commit, Index::new(20), "the forged install was adopted");
+  assert_eq!(
+    ep.shape_gen(),
+    9_999,
+    "monotone-max adopts the carried generation, as it always has"
+  );
+}
+
+/// F1 — ABSENCE IS HISTORY, TRANSITION IS REMOVAL. A fresh joiner installs a catch-up snapshot
+/// captured BEFORE it was ever admitted: the ConfState cannot name it, but nothing was removed —
+/// the entries after the boundary are what admit it. The old rule keyed on absence and told a
+/// mid-join replica to tear itself down; the transition rule sees an empty removed-set and says
+/// nothing.
+///
+/// The joiner is the OBSERVER shape the factory and fork paths mandate (self absent from its own
+/// bootstrap voters), which is exactly the shape whose prior configuration does not name it.
+///
+/// MUTATION: key the event on `!conf_names_self(meta.conf())` again → the joiner is told it was
+/// removed while it is still joining.
+#[test]
+fn a_historical_snapshot_never_removes_a_joiner_that_was_never_a_member() {
+  use crate::{Config, Event, Index, Instant, Message, Term, conf::ConfState};
+  use core::time::Duration;
+
+  // Node 4 joins as a non-member observer: its own bootstrap conf is {1, 2, 3}.
+  let cfg = Config::try_new_observer(
+    4u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 4, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  assert!(
+    !ep.conf_names_self(&ep.tracker.conf_state()),
+    "the joiner is not in its own prior configuration"
+  );
+
+  // The leader's catch-up snapshot predates the AddNode(4): its ConfState is {1, 2, 3}.
+  let meta = SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_snapshot(42),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+  let mut installed = false;
+  let mut removal = false;
+  while let Some(ev) = ep.poll_event() {
+    match ev {
+      Event::SnapshotInstalled(_) => installed = true,
+      Event::ConfChanged(_) => removal = true,
+      _ => {}
+    }
+  }
+  assert!(installed, "the catch-up snapshot installed");
+  assert!(
+    !removal,
+    "a snapshot that predates the joiner's admission is history, not a removal"
+  );
+  assert_eq!(ep.commit, Index::new(10), "and it caught the joiner up");
+}
+
+/// The same rule from the other side: a replica that IS in its own prior configuration and is NOT
+/// in the installed one has genuinely transitioned out, so the removal still surfaces. This is the
+/// courtesy install's own shape, and the leg that must not regress while F1 narrows the rule.
+#[test]
+fn a_genuine_member_to_nonmember_install_still_surfaces_removal() {
+  use crate::{Event, Index, Instant, Message, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _) = follower_at_generation(0);
+  assert!(
+    ep.conf_names_self(&ep.tracker.conf_state()),
+    "node 2 IS in its own prior configuration"
+  );
+
+  let meta = SnapshotMeta::new(
+    Index::new(20),
+    Term::new(6),
+    ConfState::from_voters(std::vec![1u64, 3]),
+  );
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_snapshot(99),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    core::iter::from_fn(|| ep.poll_event())
+      .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&2u64))),
+    "a real member-to-nonmember transition still surfaces the removal"
+  );
+}
+
+/// A follower whose DURABLE log already holds the snapshot's boundary while `commit` still sits
+/// below it takes the redundancy short-circuit — no staging, no install. Answering there without
+/// moving commit makes the ack a LIE: the sender reads `match >= boundary` as "this peer holds and
+/// has processed my state", while the peer has applied nothing through it. For a REMOVED peer that
+/// is the whole cure lost — it never applies its own removal, stays a voter, and keeps disrupting
+/// behind an ack that reads as success.
+///
+/// The arm therefore advances commit to the boundary and applies through it first. Sound because a
+/// snapshot at a boundary is proof that boundary is COMMITTED (captures are committed prefixes by
+/// construction) and Log Matching makes the local durable prefix through it that same prefix — the
+/// coordinate-is-commit-evidence rule the wire-echo work settled for sub-`first_index` coordinates.
+///
+/// MUTATION: drop the commit advance → commit stays 0, no `ConfChanged` surfaces, node 3 remains a
+/// voter, and the ack still goes out — the untruthful ack this closes.
+#[test]
+fn a_redundant_snapshot_above_commit_commits_and_applies_before_acking() {
+  use crate::{
+    AppendEntries, ConfChange, ConfChangeType, Config, Entry, EntryKind, Event, Index, Instant,
+    Message, SnapshotMeta, Term,
+    conf::ConfState,
+    testkit::{AsyncStable, CountSm, VecLog},
+  };
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    3u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::<u64, CountSm>::new(cfg, Instant::ORIGIN, 9, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+
+  // The removal entry is DURABLE at index 2 — and UNCOMMITTED: the append carried commit 0.
+  let v2 = ConfChange::new(ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new()).into_v2();
+  let mut payload = Vec::new();
+  crate::wire::encode_conf_change_v2(&v2, &mut payload);
+  let entries = std::vec![
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new()
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::ConfChange,
+      bytes::Bytes::from(payload)
+    ),
+  ];
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::ZERO,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  assert_eq!(ep.commit, Index::ZERO, "commit is BELOW the durable tail");
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(2),
+    "and the removal entry is durable"
+  );
+  assert!(ep.tracker.is_voter(&3u64), "so node 3 is still a voter");
+
+  // The courtesy offer: an excluding capture at exactly that boundary, same term as the entry.
+  let meta = SnapshotMeta::new(
+    Index::new(2),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2]),
+  );
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_count_snapshot(7),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+  assert!(
+    stable.durable_snapshot().is_none(),
+    "the redundancy arm short-circuits: no blob is installed"
+  );
+  assert_eq!(
+    ep.commit,
+    Index::new(2),
+    "commit ADVANCED to the boundary the snapshot proves committed"
+  );
+  assert!(
+    ep.applied >= Index::new(2),
+    "and the prefix applied through it"
+  );
+  assert!(
+    !ep.tracker.is_voter(&3u64),
+    "so the removal actually took effect"
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_event())
+      .any(|e| matches!(e, Event::ConfChanged(cc) if !cc.conf().voters().contains(&3u64))),
+    "and the removal surfaced to the embedder (what RemovedSelf is derived from)"
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_message()).any(|o| matches!(
+      o.into_parts().1,
+      Message::SnapshotResponse(r) if !r.reject() && r.match_index() >= Index::new(2)
+    )),
+    "and only THEN is the success ack emitted"
+  );
+}
+
+/// The already-committed leg is untouched. A redundancy whose boundary is at or below `commit` has
+/// nothing to advance and nothing new to apply, so it behaves exactly as before: no install, no
+/// state movement, and the same ack.
+///
+/// MUTATION: advance unconditionally (drop the `boundary > commit` guard) → commit would regress
+/// toward the boundary on a follower whose commit runs ahead, which this pins against.
+#[test]
+fn a_redundant_snapshot_at_or_below_commit_acks_without_moving_commit() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+    testkit::{AsyncStable, CountSm, VecLog},
+  };
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    3u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::<u64, CountSm>::new(cfg, Instant::ORIGIN, 9, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let entries = std::vec![
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new()
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::Empty,
+      bytes::Bytes::new()
+    ),
+  ];
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  let (commit_before, applied_before) = (ep.commit, ep.applied);
+  assert_eq!(commit_before, Index::new(2), "already committed through 2");
+
+  let meta = SnapshotMeta::new(
+    Index::new(1),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_count_snapshot(7),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+  assert!(
+    stable.durable_snapshot().is_none(),
+    "still a short-circuit, still no install"
+  );
+  assert_eq!(ep.commit, commit_before, "commit does not move");
+  assert_eq!(ep.applied, applied_before, "and nothing re-applies");
+  assert!(
+    core::iter::from_fn(|| ep.poll_message()).any(|o| matches!(
+      o.into_parts().1,
+      Message::SnapshotResponse(r) if !r.reject() && r.match_index() >= commit_before
+    )),
+    "and the ack is the same one it always was"
+  );
+}
+
+/// THE APPLY HALF OF THE SHORTCUT GATE. A raised, persisted commit is not enough: the ack claims the
+/// state was PROCESSED. With apply unable to progress — here a cold read, the store's deferral — the
+/// ack must be WITHHELD even though the commit write has landed, and released later by ordinary
+/// storage/apply progress with no bespoke re-drive.
+///
+/// MUTATION: drop `applied >= boundary` from `shortcut_ack_ready` → the ack goes out while the
+/// removal is still unapplied, which is the untruthful ack in its subtlest form.
+#[test]
+fn a_shortcut_ack_waits_for_apply_to_reach_the_boundary() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+    testkit::{AsyncStable, CountSm, FailTermLog},
+  };
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::<u64, CountSm>::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  // `FailTermLog` is a `VecLog` with the cold-read lever — the deterministic apply deferral.
+  let mut log = FailTermLog::default();
+  let mut stable = AsyncStable::default();
+  let d = Instant::ORIGIN;
+
+  // The async-follower shape: durable [1..=5] at term 1, commit held at 2.
+  let tail: Vec<Entry> = (1u64..=5)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while ep.poll_message().is_some() {}
+  assert_eq!(ep.commit, Index::new(2), "commit below the durable tip");
+  assert_eq!(ep.applied, Index::new(2), "and applied tracks it");
+
+  // Apply can no longer make progress: every committed-range read is cold.
+  log.return_cold_on_read();
+
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_count_snapshot(7),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(ep.commit, Index::new(5), "the shortcut raised commit");
+  assert!(
+    ep.applied < Index::new(5),
+    "but the cold read left apply short of the boundary"
+  );
+  assert!(
+    !core::iter::from_fn(|| ep.poll_message())
+      .any(|o| matches!(o.message(), Message::SnapshotResponse(_))),
+    "so the ack is WITHHELD — a persisted commit alone is not a processed one"
+  );
+
+  // The range becomes resident; ordinary storage progress applies through the boundary and releases
+  // the ack. No bespoke re-drive: this is the same loop that would have run anyway.
+  log.clear_cold_on_read();
+  let mut acked = None;
+  for _ in 0..6 {
+    ep.handle_storage(d, &mut log, &mut stable);
+    while let Some(out) = ep.poll_message() {
+      if let Message::SnapshotResponse(r) = out.message() {
+        acked = Some(r.match_index());
+      }
+    }
+  }
+  assert_eq!(ep.applied, Index::new(5), "apply reached the boundary");
+  assert_eq!(
+    acked,
+    Some(Index::new(5)),
+    "and only then was the gated ack released"
+  );
+}
+
+/// Count every `SnapshotResponse` the endpoint has queued, draining the outbox.
+fn drain_snapshot_acks(ep: &mut Endpoint<u64, CountSm>) -> Vec<Index> {
+  core::iter::from_fn(|| ep.poll_message())
+    .filter_map(|o| match o.message() {
+      Message::SnapshotResponse(r) if !r.reject() => Some(r.match_index()),
+      _ => None,
+    })
+    .collect()
+}
+
+/// THE DUPLICATE WINDOW, at the RECEIPT site, with the commit write held. The first delivery raises
+/// commit to the boundary and submits the persist; the SECOND delivery of the same snapshot now
+/// classifies as at-or-below against that RAISED, still-volatile commit. If the at-or-below case
+/// answered immediately it would hand the sender an ack for state a crash erases — the bypass. The
+/// gate, not `self.commit`, decides: nothing is acked until the write lands, and then exactly once.
+///
+/// MUTATION: restore the immediate at-or-below ack → the duplicate answers inside the window and the
+/// "no ack while held" assertion fails.
+#[test]
+fn a_duplicate_inside_the_gate_window_does_not_ack_at_the_receipt_site() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+    testkit::{AsyncStable, CountSm, VecLog},
+  };
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::<u64, CountSm>::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let d = Instant::ORIGIN;
+
+  let tail: Vec<Entry> = (1u64..=5)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while ep.poll_message().is_some() {}
+
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  let offer = || {
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta.clone(),
+      encode_count_snapshot(7),
+    ))
+  };
+
+  // Everything from here stays in the fsync window.
+  stable.hold_writes(true);
+  ep.handle_message(d, &mut log, &mut stable, 1u64, offer());
+  assert_eq!(ep.commit, Index::new(5), "the first delivery raised commit");
+  // THE DUPLICATE, inside the window: boundary 5 is now at-or-below the raised commit.
+  ep.handle_message(d, &mut log, &mut stable, 1u64, offer());
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(
+    drain_snapshot_acks(&mut ep).is_empty(),
+    "NEITHER delivery may ack while the boundary's evidence is un-fsynced"
+  );
+
+  // The write lands: exactly ONE ack, at the boundary.
+  stable.flush_held_writes();
+  let mut acks = Vec::new();
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+    acks.extend(drain_snapshot_acks(&mut ep));
+  }
+  assert_eq!(
+    acks,
+    std::vec![Index::new(5)],
+    "and the duplicate collapses into exactly one ack — the slot keeps the max boundary"
+  );
+}
+
+/// THE SAME WINDOW HELD OPEN BY APPLY instead of durability, at the RECEIPT site. The commit write
+/// lands, but a cold read keeps `applied` short of the boundary, so the duplicate must not ack past
+/// the apply leg either — an ack claims the state was PROCESSED.
+///
+/// MUTATION: drop the applied leg → the duplicate answers while the removal is still unapplied.
+#[test]
+fn a_duplicate_does_not_ack_past_the_apply_gate_at_the_receipt_site() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+    testkit::{AsyncStable, CountSm, FailTermLog},
+  };
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::<u64, CountSm>::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = AsyncStable::default();
+  let d = Instant::ORIGIN;
+
+  let tail: Vec<Entry> = (1u64..=5)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while ep.poll_message().is_some() {}
+  log.return_cold_on_read();
+
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  let offer = || {
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta.clone(),
+      encode_count_snapshot(7),
+    ))
+  };
+  ep.handle_message(d, &mut log, &mut stable, 1u64, offer());
+  ep.handle_message(d, &mut log, &mut stable, 1u64, offer());
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(ep.commit, Index::new(5), "commit was raised and persisted");
+  assert!(ep.applied < Index::new(5), "but apply is cold");
+  assert!(
+    drain_snapshot_acks(&mut ep).is_empty(),
+    "so neither the first delivery nor the duplicate may ack"
+  );
+
+  log.clear_cold_on_read();
+  let mut acks = Vec::new();
+  for _ in 0..6 {
+    ep.handle_storage(d, &mut log, &mut stable);
+    acks.extend(drain_snapshot_acks(&mut ep));
+  }
+  assert_eq!(ep.applied, Index::new(5), "apply reached the boundary");
+  assert_eq!(
+    acks,
+    std::vec![Index::new(5)],
+    "and exactly one ack followed it"
+  );
+}
+
+/// THE WINDOW AT THE COMPLETION SITE, probed at the receipt site — the two arms share one gate.
+///
+/// The completion site has NO durability window of its own, and that is worth pinning: reaching it
+/// means the blob is durable, so `durable_snapshot_index` already covers the boundary and the
+/// evidence leg is satisfied by the snapshot rather than the persisted commit. Its window is the
+/// APPLY leg — the ack still claims the state was processed. A duplicate arriving there classifies
+/// at-or-below against the completion's raised, volatile commit and must be held by the same gate.
+///
+/// MUTATION: restore the immediate at-or-below ack → the duplicate answers while apply is short.
+#[test]
+fn a_duplicate_inside_the_completion_sites_window_does_not_ack() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+    testkit::{AsyncStable, CountSm, FailTermLog},
+  };
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::<u64, CountSm>::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = AsyncStable::default();
+  let d = Instant::ORIGIN;
+
+  // Commit 2 with entries [1..=4] durable; the snapshot at boundary 5 arrives FIRST, so it stages a
+  // deferred install (nothing covers 5 yet).
+  let head: Vec<Entry> = (1u64..=4)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      head,
+      Index::new(2),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while ep.poll_message().is_some() {}
+
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  let offer = || {
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta.clone(),
+      encode_count_snapshot(7),
+    ))
+  };
+  ep.handle_message(d, &mut log, &mut stable, 1u64, offer());
+  assert!(
+    ep.snapshot.pending_install.is_some(),
+    "the blob is staged — nothing covered the boundary yet"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The in-window append makes [5] durable and Log-Matching, so the completion resolves REDUNDANT.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::new(4),
+      Term::new(1),
+      std::vec![Entry::new(
+        Term::new(1),
+        Index::new(5),
+        EntryKind::Empty,
+        bytes::Bytes::new()
+      )],
+      Index::new(2),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+  // Apply cannot progress from here — the completion's own window.
+  log.return_cold_on_read();
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the completion ran and took the redundancy arm"
+  );
+  assert_eq!(ep.commit, Index::new(5), "which raised commit");
+  assert!(
+    ep.durable.durable_snapshot_index >= Index::new(5),
+    "the durable BLOB already satisfies the evidence leg — this site has no durability window"
+  );
+  assert!(
+    ep.applied < Index::new(5),
+    "but apply is short of the boundary"
+  );
+
+  // THE DUPLICATE, into that window.
+  ep.handle_message(d, &mut log, &mut stable, 1u64, offer());
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(
+    drain_snapshot_acks(&mut ep).is_empty(),
+    "the completion's state is not yet applied, so the duplicate is held by the same gate"
+  );
+
+  log.clear_cold_on_read();
+  let mut acks = Vec::new();
+  for _ in 0..6 {
+    ep.handle_storage(d, &mut log, &mut stable);
+    acks.extend(drain_snapshot_acks(&mut ep));
+  }
+  assert_eq!(ep.applied, Index::new(5), "apply reached the boundary");
+  assert_eq!(
+    acks,
+    std::vec![Index::new(5)],
+    "and exactly one ack followed it"
+  );
+}
+
+/// A voter DEMOTED to learner has not been removed: the transition is computed over the full
+/// membership dimension (voters ∪ learners, both joint halves), so a demotion yields an empty
+/// removed-set — no removal event, and no courtesy debt minted against a replica that is still
+/// very much part of the group.
+#[test]
+fn a_demotion_to_learner_is_not_a_removal() {
+  use crate::{Event, Index, Instant, Message, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _) = follower_at_generation(0);
+
+  let demoted = ConfState::new(
+    std::vec![1u64, 3],
+    std::vec![2u64],
+    std::vec![],
+    std::vec![],
+    false,
+  );
+  let meta = SnapshotMeta::new(Index::new(20), Term::new(6), demoted);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1u64,
+      meta,
+      encode_snapshot(99),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    core::iter::from_fn(|| ep.poll_event()).all(|e| !matches!(e, Event::ConfChanged(_))),
+    "a demotion is a role change, not a removal"
+  );
 }
