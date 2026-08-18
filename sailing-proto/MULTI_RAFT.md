@@ -117,7 +117,7 @@ Adopted patterns, by source:
 Tag the **transport frame envelope**, not the protobuf `Message` (normative layout: WIRE.md §3):
 
 ```
-[u32 BE total_len][u16 BE group_len][group id bytes][protobuf Message body]
+[u32 BE total_len][u16 BE group_len][group id bytes][varint generation][protobuf Message body]
 ```
 
 The router picks the target `Endpoint` *before* decoding the Raft payload — groups may
@@ -130,7 +130,12 @@ was a clean break: the version byte was RESET to 1 as the group-tagged baseline 
 published; the pre-group formats burned 1..=5, and a byte must never be reused once anything
 ships). The header's front-of-payload position composed directly into the coalesced control
 frame that landed in Phase 4 — `[len][0xFFFF][(flags, group_len, group, msg_len, msg)+]`, WIRE.md
-§3.1, behind the version-2 hello bump — which a protobuf-embedded tag could not have.
+§3.1, behind the version-2 hello bump — which a protobuf-embedded tag could not have. The header
+later grew the sender's INCARNATION STAMP (`varint generation`, one zero byte on the unreshaped
+common path) in place under the same version, the input to the demux generation fence described
+under membership churn below; WIRE.md §6 is normative for its enforcement, and every coalesced
+entry carries its own stamp because one frame batches several groups' independently-moving
+lineages.
 
 ## Phased roadmap
 
@@ -181,13 +186,87 @@ pre-created groups should construct them with the same two flags.
 The IGNORANCE half is cured on delivery: the leader's farewell carries the excising commit to the
 pruned peer (whose progress is already gone) — an append for a straggler, a commit-carrying heartbeat
 for a caught-up peer — and a LOST farewell in EITHER arm is re-driven on a bounded blind budget, so
-the removed peer applies its own removal and self-removes, never a bare "you are removed" assertion. The residual the retry cannot reach is precisely (a) the compacted /
-never-had-the-entry tail, where the farewell suffix is gone, and (b) contact from a RETIRED
-incarnation — a merged-away source or a forked-away stale id. Both are closed by the deferred
-courtesy snapshot (which re-baselines the peer regardless of log continuity) and the demux
-generation fence (which drops a below-floor incarnation's frames); the two share the reserved
-group-header generation stamp (WIRE.md §6). The removed-follower lifecycle e2es and the
-farewell-retry tests model the cure.
+the removed peer applies its own removal and self-removes, never a bare "you are removed" assertion.
+Two residuals the retry cannot reach are now closed too:
+
+- **The compacted / never-had-the-entry tail**, where the farewell suffix is gone below
+  `first_index` and every retry shot burns on the clamped-heartbeat fallback. The COURTESY SNAPSHOT
+  closes it: a leader that hears from a sender its committed configuration does not name — and that
+  the farewell budget no longer owns — offers one whole-blob `InstallSnapshot` carrying the
+  post-removal ConfState, rate-bounded to one per peer per three election timeouts. The peer installs
+  it — or, when its own durable log already holds that boundary, commits and applies through it
+  without a transfer, the boundary being proof it was committed — applies the excluding membership,
+  surfaces the SAME `ConfChanged` a log-applied removal emits (so `RemovedSelf` fires whichever way
+  the removal arrived), and disarms. Every no-transfer answer is withheld until its evidence is
+  crash-surviving: the term durable, the boundary covered by a persisted commit or a durable blob,
+  and apply past it. That gate — not the receiver's volatile commit index — is what decides an ack is
+  truthful, so a retried offer arriving mid-window cannot slip out an answer the way a branch on
+  volatile state would. Both paths therefore leave evidence a crash preserves, which is what lets the
+  ack discharge a debt; the shortcut also preserves the durably-acked tail above the boundary,
+  keeping the install path in agreement with what a restart would have derived. An offer is only ever made at a term the
+  peer will accept, since anything staler dies at the peer's own term pre-pass. The cost is bounded
+  and stated: at the etcd-parity defaults an ignorant removed peer's campaign deposes the leader,
+  and every such deposition is self-healing — the peer cannot win a quorum of a configuration it is
+  not in, so the live members re-elect and the new leadership's first-tick proactive offer, made at
+  the lifted term, follows within a heartbeat. The cure lands on the FIRST DELIVERED offer, after
+  which the peer can never campaign again. A debt is discharged only by evidence — the peer's own
+  completed acknowledgement at or past the earliest boundary offered for that removal, honored
+  whatever role this replica now holds, a committed re-add, self-removal, or the map's capacity
+  eviction — never by a count of attempts, so under persistent targeted loss of every courtesy frame
+  the group degrades to one self-healing deposition per election-timeout window with the cure still
+  standing, never to an uncured peer nobody owes anything. Under pre-vote, which every reshape-born
+  group defaults to, the peer never inflates a term and the cure lands with zero depositions. Nothing suppresses the removed peer's own traffic
+  to shorten that: a leader with stale configuration history cannot tell a departed peer from a
+  re-added one, so muting inbound reconciliation can wedge the group, while suppressing our own
+  sends can only delay a cure. A snapshot re-baselines
+  regardless of log continuity, which is exactly why it reaches where the append cannot; and the
+  compacted class implies the snapshot exists, since a peer is only below `first_index` because a
+  capture past the compaction point was taken.
+- **Contact from a RETIRED incarnation** — a merged-away source or a forked-away stale id. The
+  DEMUX GENERATION FENCE closes it: every frame's group header carries the sender's committed
+  generation for that gid (WIRE.md §6), and a receiver drops any frame whose stamp is below its
+  DURABLE admission floor, of every message class, before the endpoint sees it. A retired
+  incarnation is therefore structurally inert at every up-to-date peer, durably and across
+  restarts, rather than merely eventually reaped. The comparator is the RETIREMENT floor, not the
+  live shape generation, so a replica trailing a reshape still admits at an applied sibling; equal
+  always admits.
+
+Both cures act only on FULLY-APPLIED configuration truth: a freshly-elected leader's applied view
+is stale by whatever its election-inherited tail holds — possibly a committed re-add of the very
+peer a cure names — so every removal cure (the farewell re-drive and the courtesy offer alike)
+waits until that leader's own first entry applies, at which point the tail's apply fold has already
+pruned whatever it voided.
+
+Both refuse rather than destroy, and neither ever authorizes removal by assertion: the fence only
+DROPS frames, and the courtesy install only delivers a committed snapshot the peer removes itself by
+APPLYING. The install path additionally REFUSES an excluding ConfState carried at a generation below
+the receiver's committed one — a cross-incarnation removal directive has no admissible form, so a
+stale view can never reap a live replica.
+
+**The residuals that remain**, both belonging to the embedder's durable catalog reap rather than to
+any wire mechanism: a courtesy blob too large for one frame is SKIPPED (chunked courtesy would need
+ack routing for a peer that has no Progress to route through), a leader that never captures a
+snapshot past the removal never has an eligible one to offer, and a removal applied by a follower
+that later leads fires no farewell at all, because only the leader that applied the removal holds
+the peer's proven `match` the append arm anchors on. That last residual is the FAREWELL's alone:
+the courtesy debt needs only the removal INDEX, which is apply-time knowledge every replica has, so
+it is minted on all of them — at BOTH edges where a replica learns a removal, the log-applied conf
+change and a snapshot install whose membership transition drops the peer (the boundary is the index
+then, and that same snapshot is by construction able to pay the debt). Whichever member leads next
+therefore already owes the departed peer its cure, and the disruption cycle cannot recur at a later
+leader the way the farewell gap can. The install edge reconciles both directions: it prunes debts
+for peers the new configuration RE-ADMITS and mints them for peers it drops.
+
+The install's removal event keys on that same transition, never on mere absence from the installed
+ConfState: a fresh joiner or a fork-born observer routinely installs a snapshot captured before it
+was ever admitted, and reading that as a removal would tell a replica mid-join to tear itself down.
+Absence is history; only a member-to-nonmember transition against the receiver's own applied
+configuration is removal — measured across the full membership dimension, so a voter demoted to
+learner is a role change and not a departure. Neither can strand data — an ignorant-but-alive replica holds every committed entry it ever
+acked and cannot win an election it should not (§5.4.1 plus the `become_leader` voter re-check).
+
+The removed-follower lifecycle e2es, the farewell-retry tests, the courtesy-cure e2es, and the
+fence-inertness e2es model the cure on both transports.
 
 Split shipped without shaping the Phase-0 container — the endpoint stages, the container
 relays, the drivers materialize; the container stayed the pure routing layer.
