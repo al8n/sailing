@@ -478,6 +478,17 @@ where
   {
     return Err(CreateGroupError::NodeIdMismatch);
   }
+  // A gid named as the absorbed source of an outstanding capture debt admits NOTHING: its
+  // preserved stores are the union's only restart derivation, and any admission here — an
+  // embedder create, a restore over those very stores, a fork materialization, a solicited
+  // factory build (whose driver gate consults this same refusal transitively) — would revive a
+  // husk beside the already-absorbed union. Self-releasing at the debt's discharge.
+  if groups.values().any(|ep| {
+    ep.capture_debt()
+      .is_some_and(|m| m.source().as_ref() == encoded.as_slice())
+  }) {
+    return Err(CreateGroupError::AbsorbPending);
+  }
   Ok(())
 }
 
@@ -714,6 +725,16 @@ where
     {
       return Err(RemoveError::MergeParked);
     }
+    // Leg 3b: a TARGET holding an outstanding capture debt — the fence-deferred absorb's window.
+    // The debt's discharge is the only path that floors and tears down the consumed source, so
+    // removing the holder strands that source's stores forever (un-floored, `Retired`-unreachable).
+    if self
+      .groups
+      .get(gid)
+      .is_some_and(|ep| ep.capture_debt().is_some())
+    {
+      return Err(RemoveError::OwesCapture);
+    }
     // Leg 4: any OTHER hosted endpoint's park names gid as its source — the cross-endpoint leg,
     // covering the window where gid's own replica has not observed its own freeze yet.
     if self.park_names_source(gid) {
@@ -822,10 +843,30 @@ where
     let mut key = Vec::new();
     gid.encode(&mut key);
     let key = Bytes::from(key);
+    self.groups.iter().any(|(g, ep)| {
+      g != gid
+        && (ep.pending_merge().is_some_and(|p| p.source_bytes() == key)
+          // The debt window: the park was consumed by a fence-deferred absorb, but the named
+          // source's stores remain the union's only restart derivation until the discharge —
+          // the naming outlives the park exactly that long.
+          || ep.capture_debt().is_some_and(|m| m.source() == key))
+    })
+  }
+
+  /// Whether any hosted target's outstanding capture debt names `gid` as its absorbed source —
+  /// the debt-window naming the lifecycle surfaces consult: the id's preserved stores are the
+  /// absorbed union's only restart derivation until the discharge, so nothing may re-host,
+  /// re-materialize, or tombstone it meanwhile. The wire demux treats a debt-named id like a
+  /// tombstone (frames drop silently, no unknown-group advisory is minted), and the factory's
+  /// pre-build gate refuses it.
+  pub fn debt_names(&self, gid: &G) -> bool {
+    let mut key = Vec::new();
+    gid.encode(&mut key);
+    let key = Bytes::from(key);
     self
       .groups
-      .iter()
-      .any(|(g, ep)| g != gid && ep.pending_merge().is_some_and(|p| p.source_bytes() == key))
+      .values()
+      .any(|ep| ep.capture_debt().is_some_and(|m| m.source() == key))
   }
 
   /// Whether `source` owes a LOCALLY-DRIVABLE target-role thaw — the shared residual belt of the

@@ -572,6 +572,14 @@ where
       if self.retired.contains(&group) {
         continue;
       }
+      // THE DEBT-WINDOW FENCE: a fence-deferred absorb consumed this id's endpoint while its
+      // stores await the union's capture — not yet tombstoned (the floor moves only at the
+      // discharge), but every frame for it is exactly as moot, and an unknown-group advisory
+      // here would prompt the embedder (or the factory, whose own gate also refuses) to revive
+      // a husk beside the absorbed union. Same posture as the tombstone: drop silently.
+      if self.multi.debt_names(&group) {
+        continue;
+      }
       // THE GENERATION FENCE (see the method doc): the durable, restart-surviving counterpart of
       // the tombstone above. Ordered right beside it — after the integrity gates, before store
       // resolution — so a retired incarnation's frames of EVERY class go equally inert.
@@ -991,6 +999,12 @@ where
       self.purge_unknown_signal(source);
     }
     resolutions
+  }
+
+  /// Whether any hosted target's outstanding capture debt names `gid` as its absorbed source
+  /// (see [`MultiRaft::debt_names`]) — the drivers' factory and lifecycle gates consult this.
+  pub fn debt_names(&self, gid: &G) -> bool {
+    self.multi.debt_names(gid)
   }
 
   /// The next committed, relay-ready fork from any hosted group (see

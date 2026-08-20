@@ -934,6 +934,12 @@ where
     resolutions
   }
 
+  /// Whether any hosted target's outstanding capture debt names `gid` as its absorbed source
+  /// (see [`MultiRaft::debt_names`]) — the drivers' factory and lifecycle gates consult this.
+  pub fn debt_names(&self, gid: &G) -> bool {
+    self.multi.debt_names(gid)
+  }
+
   /// The next committed, relay-ready fork from any hosted group (see
   /// [`MultiRaft::poll_pending_fork`]) — the driver drains this every crank BEFORE its storage
   /// crank, so the same crank's engine flush covers the materialization.
@@ -1340,6 +1346,13 @@ where
             // straggler's say-so would undo the removal). Ordered AFTER the integrity gates (a
             // malformed tag or violating flag still closes) and BEFORE store resolution.
             if self.retired.contains(&group) {
+              continue;
+            }
+            // THE DEBT-WINDOW FENCE (see the stream sibling): a fence-deferred absorb consumed
+            // this id's endpoint while its stores await the union's capture — not yet
+            // tombstoned, but every frame for it is exactly as moot, and an unknown-group
+            // advisory would prompt reviving a husk beside the absorbed union. Drop silently.
+            if self.multi.debt_names(&group) {
               continue;
             }
             // THE GENERATION FENCE (see the stream sibling): the durable, restart-surviving

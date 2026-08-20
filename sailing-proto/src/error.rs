@@ -117,6 +117,14 @@ pub enum CreateGroupError {
   /// `RaftGroupDeletedError`, CockroachDB's tombstone check): re-admission is never implicit.
   #[error("the group id is tombstoned by a removal; clear the tombstone to re-admit it")]
   Retired,
+  /// The id is named as the absorbed SOURCE of an outstanding capture debt on this host: a
+  /// fence-deferred absorb consumed its endpoint, and its preserved stores remain the union's
+  /// only restart derivation until the debt discharges. Admitting an incarnation now — a
+  /// solicited factory build, an embedder create, a restore off those very stores — would
+  /// revive a husk beside the already-absorbed union. Self-clearing: the debt's discharge (or a
+  /// crash, which re-parks the merge) releases the id to its ordinary floors.
+  #[error("the group id is the absorbed source of an outstanding capture debt")]
+  AbsorbPending,
   /// The requested incarnation is below the id's persisted admission floor — a removal or merge
   /// fenced it. Unlike [`Retired`](Self::Retired), no consent call cures this; only a
   /// catalog-supplied incarnation at or above the floor — and below the reserved `u64::MAX`
@@ -204,12 +212,22 @@ pub enum RemoveError {
   /// admits.
   #[error("the group is a target parked on a merge commit and cannot be torn down")]
   MergeParked,
-  /// Another hosted group's parked `CommitMerge` names THIS group as its merge source — the
-  /// cross-endpoint leg, which fires even before this group's own replica has observed its freeze.
-  /// Removing it strands that park (its replicas are log-complete, so the install-supersede route
-  /// never fires). Resolve or roll back the naming merge first; recovery for a genuinely-dead
-  /// participant is the embedder's catalog, exactly like any dead group.
-  #[error("a parked merge names this group as its source and it cannot be torn down")]
+  /// The group is a merge TARGET holding an outstanding capture debt: the union it absorbed is
+  /// applied but not yet locally durable, and the debt's discharge is the ONLY path that floors
+  /// and tears down the consumed source. Removing the holder would strand that source's stores
+  /// forever — un-floored, unhosted, and unreachable by `Retired` (which needs the terminal
+  /// floor). Let the debt discharge first (the fence's own resolution drives it), after which
+  /// the SAME removal admits.
+  #[error("the group owes its absorb capture and cannot be torn down")]
+  OwesCapture,
+  /// Another hosted group's parked `CommitMerge` — or its outstanding capture debt, after a
+  /// fence-deferred absorb consumed the endpoint — names THIS group as its merge source. The
+  /// cross-endpoint leg: it fires even before this group's own replica has observed its freeze,
+  /// and it outlives the park through the debt window, where the named id's stores are the
+  /// absorbed union's only restart derivation. Removing (tombstoning) it strands the park or the
+  /// debt. Resolve or roll back the naming merge first — a debt discharges on its fence's own
+  /// resolution; recovery for a genuinely-dead participant is the embedder's catalog.
+  #[error("an in-flight absorb names this group as its source and it cannot be torn down")]
   SpokenFor,
   /// Another hosted endpoint is a merge SOURCE that names THIS group as its TARGET — either
   /// applied-frozen (its `frozen_for` claim is this group) or with an append-pending `PrepareMerge`

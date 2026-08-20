@@ -1945,6 +1945,9 @@ where
         // BEFORE build, so the local fork stays the id's one materializer (the solicitation falls to
         // the lifecycle tail and the sender retries).
         && !self.coord.is_split_reserved(&group)
+        // The debt-window gate: a gid named as an outstanding capture debt's absorbed source
+        // must not be re-materialized beside the union its stores still back.
+        && !self.coord.debt_names(&group)
       {
         // The resource phase, on a fresh borrow so a caught build panic can quarantine the factory
         // released above. Reached only after the blueprint cleared every gate.
