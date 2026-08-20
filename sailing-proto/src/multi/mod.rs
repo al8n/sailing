@@ -2099,6 +2099,32 @@ where
     S: StableStore<NodeId = I>,
     F::Snapshot: Data,
   {
+    // RECEIPT-TIME REVALIDATION of the cure-admission hint, at the one edge where sibling
+    // state is readable before the adopt consumes it. The hint is derived at resolver cranks,
+    // but its sibling-reading gate legs can go stale WITHIN a message batch — a source group's
+    // append arms `freeze_pending` at append-OBSERVATION, so a source append followed by this
+    // target's cure blob, with no crank between, would adopt and erase the live thaw
+    // obligation the freeze-active predicate protects. The endpoint-local legs (the walk's
+    // watermark, the fork barrier) cannot stale through siblings and are not re-run.
+    if matches!(msg, Message::InstallSnapshot(_))
+      && self
+        .groups
+        .get(gid)
+        .is_some_and(|ep| ep.merge_park_unresolvable().is_some())
+    {
+      let hosted_crossing = self.groups.get(gid).is_some_and(|t| {
+        t.crossing_sources().iter().any(|b| {
+          G::decode_exact(b.clone())
+            .map(|g| self.groups.contains_key(&g))
+            .unwrap_or(true)
+        })
+      });
+      if (hosted_crossing || self.obligation_names_hosted_frozen(gid))
+        && let Some(ep) = self.groups.get_mut(gid)
+      {
+        ep.note_merge_park_unresolvable(false);
+      }
+    }
     self
       .groups
       .get_mut(gid)?

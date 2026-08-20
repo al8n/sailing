@@ -11621,3 +11621,170 @@ fn a_blob_beyond_local_commit_defers_until_the_walk_catches_up() {
     "the caught-up walk finds the hosted crossing and withholds"
   );
 }
+
+/// The back-to-back freeze race: a source group's append arms its freeze at OBSERVATION, and a
+/// cure blob for the target can follow in the same message batch with no resolver crank
+/// between — the crank-derived hint is stale exactly then. Receipt-time revalidation at the
+/// container's dispatch edge clears it, so the adopt never erases the live thaw obligation the
+/// freeze-active predicate protects.
+#[test]
+fn a_same_batch_freeze_clears_the_stale_cure_admission() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  // The obligation's counterparty, hosted and (initially) unfrozen.
+  m.create_group(42, 0, single_node_cfg(1), now, 8, SplitSm::default())
+    .unwrap();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(
+      {
+        let mut b = Vec::new();
+        42u64.encode(&mut b);
+        Bytes::from(b)
+      },
+      1,
+      1,
+    );
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::RollbackMerge,
+      abort,
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(3),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(41, Index::new(5), 1, 2),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(4), crate::EntryKind::Normal, cmd),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(4));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  assert!(
+    m.group(&1).unwrap().has_abandoned(),
+    "the abort armed the obligation"
+  );
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+
+  // With 42 unfrozen, the hint stands after the crank.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    Some(Index::new(3))
+  );
+
+  // SAME BATCH, no crank: 42's freeze arms at append-observation…
+  let mut slog = VecLog::default();
+  let mut sstable = AsyncStable::default();
+  stores
+    .0
+    .insert(42, (VecLog::default(), AsyncStable::default()));
+  {
+    let (sl, ss) = stores.0.get_mut(&42).unwrap();
+    core::mem::swap(sl, &mut slog);
+    core::mem::swap(ss, &mut sstable);
+  }
+  {
+    let (sl, ss) = stores.0.get_mut(&42).unwrap();
+    m.handle_message(
+      &42,
+      now,
+      sl,
+      ss,
+      9u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        Term::new(1),
+        9u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![crate::Entry::new(
+          Term::new(1),
+          Index::new(1),
+          crate::EntryKind::PrepareMerge,
+          {
+            let p = crate::PrepareMergePayload::new(
+              {
+                let mut b = Vec::new();
+                40u64.encode(&mut b);
+                Bytes::from(b)
+              },
+              1,
+            );
+            let mut buf = Vec::new();
+            crate::wire::encode_prepare_merge_payload(&p, &mut buf);
+            Bytes::from(buf)
+          },
+        )],
+        Index::ZERO,
+      )),
+    )
+    .unwrap();
+  }
+  assert!(
+    m.group(&42).unwrap().merge_freeze_active(),
+    "the freeze armed at observation"
+  );
+
+  // …and the cure blob follows immediately. The receipt edge revalidates and refuses.
+  let meta = crate::SnapshotMeta::new(
+    Index::new(4),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(2);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta,
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+  }
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_some(),
+    "the stale hint was cleared at receipt: no adopt, the obligation survives"
+  );
+  assert!(
+    m.group(&1).unwrap().has_abandoned(),
+    "the live thaw obligation is intact"
+  );
+}
