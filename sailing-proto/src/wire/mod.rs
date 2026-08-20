@@ -901,6 +901,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       lease_round: m.lease_round(),
       lease_support_secs: m.lease_support().as_secs(),
       lease_support_nanos: u64::from(m.lease_support().subsec_nanos()),
+      stuck_boundary: m.stuck_boundary().get(),
       ..Default::default()
     }),
     Message::InstallSnapshot(m) => Body::from(pb::InstallSnapshot {
@@ -1009,7 +1010,8 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
           .with_lease_support(core::time::Duration::new(
             m.lease_support_secs,
             m.lease_support_nanos as u32,
-          )),
+          ))
+          .with_stuck_boundary(Index::new(m.stuck_boundary)),
       )
     }
     Body::InstallSnapshot(m) => {

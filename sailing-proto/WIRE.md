@@ -45,6 +45,13 @@ reference — this section pins the SEMANTICS:
   **strictly ascending by decoded value** — duplicates and disorder reject, so one set has
   exactly one accepted encoding.
 - `lease_support_nanos` must be `< 1_000_000_000`.
+- `HeartbeatResponse.stuck_boundary` (7) is the index of a `CommitMerge` park the respondent cannot
+  resolve locally — the coordinate a cure must cover. `0` (absent on the wire, so an ordinary
+  response is byte-identical to before the field existed) means no such park stands. It carries no
+  authority — it is a LIVENESS hint, so a peer that skips the unknown field loses only the cure's
+  promptness, never safety. The field landed IN PLACE under the current `LABEL_VERSION` (see §4, and
+  the same precedent at the end of §6) — the crates are unpublished at 0.0.0, so no deployment can
+  hold two builds claiming one version.
 - `Entry.timestamp` is the leader's append-time clock (nanos since its monotonic ORIGIN), read
   ONLY by the LeaseGuard read mode to age an entry across a leader change. It is `0` (and absent
   on the wire) in every other mode, so a non-LeaseGuard `Entry` is byte-identical to before the

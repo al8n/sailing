@@ -155,6 +155,13 @@ pub(crate) struct MergeState {
   /// covering blob in place of the impossible fold. Volatile, re-derived every resolver crank;
   /// meaningless without `pending_apply`.
   pub(crate) park_unresolvable: bool,
+  /// When the next UNSOLICITED park advertisement is due (see
+  /// [`Endpoint::drive_stuck_advertisement`]). `None` means DUE IMMEDIATELY — a freshly-classified
+  /// park advertises on the first tick that sees it, rather than waiting out a period. Charged by
+  /// BOTH carriers, so a heartbeat-stamped boundary and the unsolicited belt share one cadence;
+  /// cleared the moment the hint clears, so a later park never inherits a stale deadline. Volatile
+  /// pacing state, meaningless without `park_unresolvable`.
+  pub(crate) stuck_advert_next_at: Option<Instant>,
   /// An absorbed-but-uncaptured union's outstanding durability obligation: the fold ran and the
   /// apply drain resumed, but a standing replay fence (a parked fork's barrier, an undischarged
   /// abort obligation) deferred the forced capture — so the consumed source's stores remain the

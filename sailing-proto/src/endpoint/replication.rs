@@ -916,14 +916,85 @@ where
     } else {
       Duration::ZERO
     };
+    // Ride the ack the leader already asked for with the wedged-park boundary, when one stands. A
+    // locally-unresolvable park is invisible to every leader-side signal — the replica is not
+    // log-lagging (the park sits ABOVE a fully-replicated log, so `has_lagging_peer` reads false),
+    // and its apply drain is a purely local stall — so without this stamp the cure has no carrier.
+    // ZERO whenever no such park stands, which is absent on the wire.
+    let stuck_boundary = self.merge_park_unresolvable().unwrap_or(Index::ZERO);
     self.send(
       hb.leader(),
       Message::HeartbeatResponse(
         HeartbeatResponse::new(term, me, ctx)
           .with_lease_round(hb.lease_round())
-          .with_lease_support(lease_support),
+          .with_lease_support(lease_support)
+          .with_stuck_boundary(stuck_boundary),
       ),
     );
+    // A stamped boundary satisfies this period's advertisement: a leader that beats is already
+    // hearing it, so the unsolicited belt must not double up on the same period.
+    if stuck_boundary != Index::ZERO {
+      self.note_stuck_advertised(now);
+    }
+  }
+
+  /// Re-drive the wedged-park advertisement on a slow tick, for the group whose leader has stopped
+  /// soliciting acks at all: a quiesced leader emits no beats, so the stamp above never fires, and
+  /// a park that no local crank can resolve would sit unseen for the group's whole idle life. One
+  /// unsolicited `HeartbeatResponse` per election-timeout keeps the boundary in front of the leader
+  /// at a cadence bounded by the park's own lifetime — the park is what holds this replica's apply
+  /// drain, so the emission dies with the thing it reports.
+  ///
+  /// The lease fields are pinned ZERO and are NEVER echoed from a remembered round. The leader's
+  /// lease accounting accepts any response whose round MATCHES the round it currently holds open as
+  /// a fresh support promise for that round, and a slow-beating leader holds one round open for
+  /// arbitrarily long — so echoing a round this replica saw earlier would extend a `LeaseBased`
+  /// lease on support that was never promised at that time. A ZERO `lease_support` fails the
+  /// accounting conjunction outright, independent of whatever round the leader happens to hold.
+  ///
+  /// Addressed to the known leader only. A leaderless replica has nobody to tell (a campaign or an
+  /// incoming beat re-seats the leader and the next tick advertises), and a LEADER that is itself
+  /// parked needs no advertisement — it is the consumer.
+  pub(crate) fn drive_stuck_advertisement(&mut self, now: Now) {
+    let Some(boundary) = self.merge_park_unresolvable() else {
+      // Cease the moment the hint clears, and drop the schedule so a later park advertises at once
+      // rather than inheriting a stale deadline.
+      self.merge.stuck_advert_next_at = None;
+      return;
+    };
+    if self.role.is_leader() {
+      return;
+    }
+    let Some(leader) = self.leader.as_ref().map(CheapClone::cheap_clone) else {
+      return;
+    };
+    let now_mono = now.mono();
+    // `None` is DUE IMMEDIATELY (a freshly-classified park advertises on the first tick that sees
+    // it); each emission then schedules the next one election timeout out.
+    if self
+      .merge
+      .stuck_advert_next_at
+      .is_some_and(|at| at > now_mono)
+    {
+      return;
+    }
+    self.note_stuck_advertised(now);
+    let (term, me) = (self.term, self.config.id());
+    self.send(
+      leader,
+      // An EMPTY context too: a non-empty one is a ReadIndex correlation token, and this response
+      // answers no read round.
+      Message::HeartbeatResponse(
+        HeartbeatResponse::new(term, me, Bytes::new()).with_stuck_boundary(boundary),
+      ),
+    );
+  }
+
+  /// Charge the current period against the advertisement schedule — the next unsolicited emission
+  /// is due one election timeout out. Called by both carriers, so a solicited stamp and the
+  /// unsolicited belt share ONE cadence instead of stacking.
+  fn note_stuck_advertised(&mut self, now: Now) {
+    self.merge.stuck_advert_next_at = Some(now.mono() + self.config.election_timeout());
   }
 
   pub(crate) fn on_append_entries<L: LogStore, S: StableStore<NodeId = I>>(

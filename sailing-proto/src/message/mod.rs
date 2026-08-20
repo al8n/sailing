@@ -370,12 +370,14 @@ pub struct HeartbeatResponse<I> {
   context: Bytes,
   lease_round: u64,
   lease_support: Duration,
+  stuck_boundary: Index,
 }
 
 impl<I: CheapClone> HeartbeatResponse<I> {
-  /// Construct. `lease_round` defaults to 0 and `lease_support` to ZERO; the follower echoes the
-  /// heartbeat's round via [`Self::with_lease_round`] and advertises its lease support via
-  /// [`Self::with_lease_support`].
+  /// Construct. `lease_round` defaults to 0, `lease_support` to ZERO and `stuck_boundary` to ZERO;
+  /// the follower echoes the heartbeat's round via [`Self::with_lease_round`], advertises its lease
+  /// support via [`Self::with_lease_support`], and advertises a wedged merge park via
+  /// [`Self::with_stuck_boundary`].
   pub fn new(term: Term, from: I, context: Bytes) -> Self {
     Self {
       term,
@@ -383,6 +385,7 @@ impl<I: CheapClone> HeartbeatResponse<I> {
       context,
       lease_round: 0,
       lease_support: Duration::ZERO,
+      stuck_boundary: Index::ZERO,
     }
   }
 
@@ -402,6 +405,15 @@ impl<I: CheapClone> HeartbeatResponse<I> {
   #[inline(always)]
   pub fn with_lease_support(mut self, lease_support: Duration) -> Self {
     self.lease_support = lease_support;
+    self
+  }
+
+  /// Advertise the boundary of a merge park this replica cannot resolve locally (builder) — the
+  /// index of the parked `CommitMerge`, which is also the coordinate a cure must cover. `ZERO`
+  /// (the default, absent on the wire) means no such park stands.
+  #[inline(always)]
+  pub const fn with_stuck_boundary(mut self, stuck_boundary: Index) -> Self {
+    self.stuck_boundary = stuck_boundary;
     self
   }
 
@@ -439,6 +451,13 @@ impl<I: CheapClone> HeartbeatResponse<I> {
   #[inline(always)]
   pub const fn lease_support(&self) -> Duration {
     self.lease_support
+  }
+
+  /// The boundary of a merge park the respondent cannot resolve locally, or `ZERO` when none
+  /// stands. See [`Self::with_stuck_boundary`].
+  #[inline(always)]
+  pub const fn stuck_boundary(&self) -> Index {
+    self.stuck_boundary
   }
 }
 

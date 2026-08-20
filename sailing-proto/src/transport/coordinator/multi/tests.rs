@@ -933,7 +933,7 @@ fn empty_append_and_append_response_are_wake_class() {
     "an AppendResponse is WAKE-class"
   );
 
-  // The heartbeat response stays the sole absorbed kind.
+  // An idle heartbeat response stays the sole absorbed shape.
   let hbr = Message::HeartbeatResponse(crate::HeartbeatResponse::new(
     term,
     2u64,
@@ -946,6 +946,50 @@ fn empty_append_and_append_response_are_wake_class() {
     w.a.poll_group_control(),
     None,
     "a HeartbeatResponse stays absorbed"
+  );
+}
+
+/// The wedged-park exception, both directions through the real delivery path: an idle
+/// `HeartbeatResponse` is absorbed, and the SAME response carrying a nonzero `stuck_boundary`
+/// wakes the leader's group. The advertiser is not log-lagging — its park sits above a fully
+/// replicated log — so no other leader-side signal can see it; absorbing the advertisement would
+/// let the group settle with that replica wedged forever and the only party able to cure it asleep.
+#[test]
+fn a_wedged_park_advertisement_is_wake_class() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  w.elect_a(100);
+  while w.a.poll_group_control().is_some() {}
+  while w.b.poll_group_control().is_some() {}
+  let term = w.a.group(&100).unwrap().term();
+  let mut gb = Vec::new();
+  sailing_encode_u64(100, &mut gb);
+
+  let idle = Message::HeartbeatResponse(crate::HeartbeatResponse::new(
+    term,
+    2u64,
+    bytes::Bytes::new(),
+  ));
+  let frame = crafted_frame(&gb, &idle);
+  w.a
+    .handle_conn_data(ConnId(1), &frame, false, w.now, &mut w.sa);
+  assert_eq!(
+    w.a.poll_group_control(),
+    None,
+    "a response advertising nothing is absorbed"
+  );
+
+  let advertising = Message::HeartbeatResponse(
+    crate::HeartbeatResponse::new(term, 2u64, bytes::Bytes::new())
+      .with_stuck_boundary(Index::new(7)),
+  );
+  let frame = crafted_frame(&gb, &advertising);
+  w.a
+    .handle_conn_data(ConnId(1), &frame, false, w.now, &mut w.sa);
+  assert_eq!(
+    w.a.poll_group_control(),
+    Some((100, GroupControl::Wake)),
+    "a response advertising a wedged park wakes the group"
   );
 }
 

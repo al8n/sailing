@@ -1057,3 +1057,114 @@ fn pending_freeze_stops_lease_renewal() {
     "a pending freeze must stop the renewal arming the lease"
   );
 }
+
+/// The unsolicited wedged-park advertisement is LEASE-NEUTRAL. The leader's accounting credits a
+/// response as a fresh support promise when its round MATCHES the round the leader currently holds
+/// open AND its `lease_support` is nonzero — and a leader that has stopped beating (the very
+/// condition the belt exists for) holds one round open arbitrarily long. So an advertisement that
+/// echoed a remembered round would let a `LeaseBased` leader extend its read lease on support this
+/// replica never promised at that moment. Pinning BOTH fields to zero fails the conjunction
+/// outright, whatever round the leader happens to be holding.
+///
+/// Each pin is independently sufficient, so both half-pinned shapes are exercised here alongside
+/// the emitted one.
+///
+/// MUTATION: drop either conjunct in `on_heartbeat_response` → the corresponding half-pinned shape
+/// lands in `lease_acks` and moves `lease_valid_until`.
+#[test]
+fn an_unsolicited_park_advertisement_does_not_extend_the_lease() {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseBased)
+  .with_check_quorum(true);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // Open a round and let it stand — the leader beats no further, exactly the shape the belt covers.
+  let at = ep.poll_timeout().expect("heartbeat timer armed");
+  ep.handle_timeout(at, &mut log, &mut stable);
+  let mut round = None;
+  while let Some(out) = ep.poll_message() {
+    if let Message::Heartbeat(hb) = out.message() {
+      round = Some(hb.lease_round());
+    }
+  }
+  let round = round.expect("the beat carried a lease round");
+  assert_ne!(round, 0, "the open round is distinguishable from a pin");
+  let before = ep.check_quorum_lease.lease_valid_until;
+
+  let advertisement = |lease_round: u64, support: Duration| {
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+        .with_stuck_boundary(Index::new(7))
+        .with_lease_round(lease_round)
+        .with_lease_support(support),
+    )
+  };
+  // The shape the follower actually emits, then each half-pinned shape: every one must be inert.
+  for (lease_round, support, why) in [
+    (
+      0,
+      Duration::ZERO,
+      "an advertisement is not a support promise",
+    ),
+    (
+      round,
+      Duration::ZERO,
+      "a ZERO support is refused even at the open round",
+    ),
+    (
+      0,
+      Duration::from_millis(1000),
+      "real support is refused off the open round",
+    ),
+  ] {
+    ep.handle_message(
+      at,
+      &mut log,
+      &mut stable,
+      2u64,
+      advertisement(lease_round, support),
+    );
+    assert!(!ep.check_quorum_lease.lease_acks.contains(&2u64), "{why}");
+    assert_eq!(ep.check_quorum_lease.lease_valid_until, before, "{why}");
+  }
+
+  // The conjunction IS live, so the assertions above are not vacuous: the same message with BOTH
+  // fields filled is banked — which is precisely what the pins withhold.
+  ep.handle_message(
+    at,
+    &mut log,
+    &mut stable,
+    2u64,
+    advertisement(round, Duration::from_millis(1000)),
+  );
+  assert!(
+    ep.check_quorum_lease.lease_acks.contains(&2u64),
+    "an echoed round with support is exactly what the pin avoids"
+  );
+  assert!(
+    ep.check_quorum_lease.lease_valid_until.is_some(),
+    "…and it forms the lease"
+  );
+}
