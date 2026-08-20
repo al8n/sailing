@@ -552,3 +552,86 @@ fn installed_snapshot_adopts_shape_gen() {
   assert_eq!(ep.applied_index(), Index::new(7), "the install landed");
   assert_eq!(ep.shape_gen(), 4, "the installed meta's lineage is adopted");
 }
+
+/// A snapshot install past a QUEUED fork's split index supersedes its durability barrier: the
+/// restore has already discarded the split entry — the replay derivation the barrier protects —
+/// so past that point the fence protects nothing and could only wedge every later capture. The
+/// queue entry is KEPT (the child stays materializable from the in-memory blob), and a fork
+/// already POPPED into the driver's flush window keeps its barrier — `resolve_fork` lifts it
+/// when the flush (or the drop) completes, exactly as before.
+#[test]
+fn snapshot_install_supersedes_a_queued_forks_barrier() {
+  use crate::{InstallSnapshot, Message, SnapshotMeta, conf::ConfState};
+  let (mut ep, mut log, mut stable) = follower_cfg(KeyedSm::default());
+  let entries = std::vec![
+    Entry::new(Term::new(1), Index::new(1), EntryKind::Normal, key_cmd(3)),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::Split,
+      split_entry_data(77, 0, 1, 9),
+    ),
+    Entry::new(Term::new(1), Index::new(3), EntryKind::Normal, key_cmd(4)),
+    Entry::new(
+      Term::new(1),
+      Index::new(4),
+      EntryKind::Split,
+      split_entry_data(78, 0, 2, 8),
+    ),
+  ];
+  deliver_committed(&mut ep, &mut log, &mut stable, entries);
+  assert!(!ep.is_poisoned());
+
+  // The first fork enters the driver's flush window; the second stays queued.
+  let (popped, _half) = ep.pop_pending_fork().expect("the first fork pops");
+  assert_eq!(popped.index, Index::new(2));
+  assert_eq!(
+    ep.split
+      .outstanding
+      .iter()
+      .copied()
+      .collect::<std::vec::Vec<_>>(),
+    std::vec![Index::new(2), Index::new(4)],
+    "both barriers stand before the install"
+  );
+
+  let meta = SnapshotMeta::new(
+    Index::new(10),
+    Term::new(3),
+    ConfState::from_voters(std::vec![1u64, 2u64]),
+  )
+  .with_shape_gen(2);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(3),
+      1u64,
+      meta,
+      sm_blob(&KeyedSm::default()),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(!ep.is_poisoned());
+  assert_eq!(ep.applied_index(), Index::new(10), "the install landed");
+
+  assert_eq!(
+    ep.split
+      .outstanding
+      .iter()
+      .copied()
+      .collect::<std::vec::Vec<_>>(),
+    std::vec![Index::new(2)],
+    "the queued fork's barrier cleared with its replay source; the popped fork's is retained"
+  );
+  assert_eq!(
+    ep.peek_pending_fork().expect("the queue is kept").index,
+    Index::new(4),
+    "the queued fork stays materializable from its in-memory blob"
+  );
+  // The popped fork's lift completes through the ordinary flush report — no stale fence remains.
+  ep.resolve_fork(Index::new(2));
+  assert!(ep.split.outstanding.is_empty());
+}

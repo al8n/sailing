@@ -3691,7 +3691,12 @@ where
       };
       let already_staged = tep
         .pending_compact_boundary()
-        .is_some_and(|b| b >= boundary);
+        .is_some_and(|b| b >= boundary)
+        // A COMPLETED install (or capture) at-or-past the boundary is the after-durable form of
+        // the same evidence — the soundest producer of the three; without this leg an install
+        // into a debt-holder would orphan the debt (the restore discards the boundary's
+        // CommitMerge, so a crash then loses the volatile debt with no re-park left).
+        || tep.durable_snapshot_covers(boundary);
       if !already_staged {
         if tep.capture_blocked_at(boundary) {
           continue;
