@@ -57,6 +57,45 @@ fn assert_membership_band_bounds(band: &str, reports: &[MultiVoprReport]) {
   );
 }
 
+/// The RETIRED exemption, kept as an assertion. The merge-liveness cure closed both filed classes —
+/// #110's fork-fence coupling resolves through the fence-deferred absorb (`Absorbed` → capture debt
+/// → `Merged`), and #106's under-hosted park advertises its boundary and adopts the leader's
+/// covering snapshot — so a run that still carries either shape at run end has REGRESSED. The
+/// classifiers stay wired precisely so that regression is ATTRIBUTED: the failure names the class,
+/// the seed and the counts, instead of surfacing as a generic quiesce failure.
+///
+/// The one residual the cure's design leaves open — a covering blob past the one-frame bound, which
+/// the leader must decline to send — is unreachable at the sim's tiny FSM blob sizes, so nothing
+/// here needs softening to an inequality; it stays tracked on #106.
+fn assert_no_tracked_exemption(band: &str, seed: u64, r: &MultiVoprReport) {
+  assert_eq!(
+    r.fork_fence_couplings_exempted, 0,
+    "{band} seed {seed} reached a FORK-FENCE coupling (#110), the class the fence-deferred absorb \
+     retired — overlap with #106 = {}, under-hosted = {}: {r:?}",
+    r.exemption_overlap, r.tracked_merge_wedges_exempted,
+  );
+  assert_eq!(
+    r.tracked_merge_wedges_exempted, 0,
+    "{band} seed {seed} reached an UNDER-HOSTED parked absorb (#106), the class the advertised \
+     boundary and its covering snapshot retired: {r:?}",
+  );
+}
+
+/// The retirement assertion fires per CLASS: a #110-only report trips it though the #106 counter
+/// stayed zero, so neither class can ride a green band behind the other.
+#[test]
+#[should_panic(expected = "reached a FORK-FENCE coupling (#110)")]
+fn the_retired_exemption_fires_on_a_fork_fence_coupling() {
+  assert_no_tracked_exemption(
+    "fabricated",
+    5,
+    &MultiVoprReport {
+      fork_fence_couplings_exempted: 2,
+      ..MultiVoprReport::default()
+    },
+  );
+}
+
 /// The fold sums ACROSS reports: the first report alone carries the comparisons, the second
 /// alone the tolerated decline, and only their sum is the passing shape.
 #[test]
@@ -400,6 +439,18 @@ fn soak_reshape_profile() {
 /// witness proves parked commits resolved to real absorbs, so the union verdict inside every
 /// run judged real source→target handovers rather than an empty work list (and the rollback
 /// witness proves the race arm drew).
+///
+/// THE EXEMPTION IS RETIRED HERE: the band ran through
+/// [`run_multi_vopr_certifying_tracked_wedges`] while the filed #106/#110 wedges were reachable from
+/// this merge-heavy schedule; the cure closed both, so it is back on the plain [`run_multi_vopr`] and
+/// a reached wedge is a FAILURE again — the quiesce panics naming the stuck gids and dumping each
+/// one's merge block (frozen/parked, its counterpart's live and hosting status), which is the
+/// attribution the certifying runner's counters used to provide.
+///
+/// Certifying is not merely redundant here, it is WEAKER: the exemption lets the quiesce drive
+/// exit as soon as every non-exempt group has converged, so a park that the cure resolves in the
+/// remaining budget is left standing and counted. The classifiers keep earning their place on the
+/// paths that still certify — see [`merge_profile_same_seed_same_report`].
 #[test]
 fn merge_band_smoke() {
   let mut total_registered = 0u64;
@@ -410,16 +461,9 @@ fn merge_band_smoke() {
   let mut total_torn = 0u64;
   let mut total_crashes_inflight = 0u64;
   let mut total_flushes = 0u64;
-  // Certify past the filed #106 under-hosted parked-absorb and #110 fork-fence classes: they are
-  // reachable from any merge-heavy schedule, and the removed-replica farewell retry's front-loaded
-  // delivery dismantles merge sources into husks sooner, raising their incidence — so this non-storm
-  // profile opts into the same exemption the storm profiles carry. The predicate stays deliberately
-  // narrow, so a non-merge livelock (or any wedge outside the tracked sets) still trips; the band
-  // must exercise the exemption at least once (proven nonzero below).
-  let mut total_tracked_exempted = 0u64;
   let mut total_absorbed = 0u64;
   for seed in 0..8u64 {
-    let r = run_multi_vopr_certifying_tracked_wedges(seed, 4_000, MultiProfile::merge_reshape());
+    let r = run_multi_vopr(seed, 4_000, MultiProfile::merge_reshape());
     std::eprintln!(
       "merge seed {seed}: prepared={} committed={} rolled_back={} registered={} resolved={} \
        aborted={} splits={} committed_load={} log_flushes={} stable_flushes={} torn={} \
@@ -455,12 +499,12 @@ fn merge_band_smoke() {
     total_flushes += r.log_flushes + r.stable_flushes;
     total_torn += r.torn_writes_fired;
     total_crashes_inflight += r.crashes_with_log_inflight + r.crashes_with_stable_inflight;
-    total_tracked_exempted += r.tracked_merge_wedges_exempted + r.fork_fence_couplings_exempted;
+    // Structurally zero on the plain runner (the classifiers never run) — the assertion states the
+    // retirement rather than measuring it, and fails loudly if the runner is ever swapped back.
+    assert_no_tracked_exemption("merge band", seed, &r);
     total_absorbed += r.merges_absorbed;
   }
-  std::eprintln!(
-    "merge band: total_tracked_exempted={total_tracked_exempted} total_absorbed={total_absorbed}"
-  );
+  std::eprintln!("merge band: total_absorbed={total_absorbed}");
   assert!(
     total_registered > 0,
     "the merge band never resolved an absorb — the merge verbs are inert"
@@ -483,11 +527,10 @@ fn merge_band_smoke() {
     total_crashes_inflight > 0,
     "the merge band never crashed mid-fsync-window — the crash×durability interleaving is vacuous"
   );
-  // The fork-fence and abort-fence park classes now resolve through the fence-deferred absorb
-  // (`Absorbed` -> debt -> `Merged`), so the band's positive witness is the defer FIRING rather
-  // than the wedge being reached; the under-hosted class (no local source to fold) remains the
-  // tracked exemption until its install-based cure lands, and the certifying runner keeps every
-  // wedge outside the tracked sets a hard failure either way.
+  // The fork-fence and abort-fence park classes resolve through the fence-deferred absorb
+  // (`Absorbed` -> debt -> `Merged`), so the band's positive witness is the defer FIRING — the
+  // complement of the per-seed retirement assertion above, which pins that no seed reached the
+  // wedge those defers replaced.
   assert!(
     total_absorbed > 0,
     "the merge band never deferred a fenced absorb — the debt path is inert on the very \
@@ -496,21 +539,19 @@ fn merge_band_smoke() {
 }
 
 /// Determinism holds under the merge profile too: the same (seed, ticks, profile) replays to
-/// the identical report, merge counters included. The profile certifies past the filed #106/#110
-/// wedges (the merge-heavy schedule reaches the under-hosted parked-absorb husk, whose incidence the
-/// farewell retry's front-loaded delivery raises); the exemption is liveness-only and narrow (safety
-/// runs unconditionally), and determinism holds because both replays share the flag.
+/// the identical report, merge counters included. This is the ONE band still on the certifying
+/// runner, deliberately: it is where the classifiers stay wired and ASSERTED — the merge-heavy
+/// schedule the filed #106/#110 shapes were reachable from, run with both classes computed and both
+/// counters required zero, so a regression is named by its class here rather than read off a generic
+/// quiesce dump. Determinism holds because both replays share the flag.
 #[test]
 fn merge_profile_same_seed_same_report() {
   let r = run_multi_vopr_certifying_tracked_wedges(43, 3_000, MultiProfile::merge_reshape());
   std::eprintln!(
-    "merge profile seed 43: tracked_merge_wedges_exempted={} fork_fence_couplings_exempted={} \
-     exemption_overlap={} merges_absorbed={}",
-    r.tracked_merge_wedges_exempted,
-    r.fork_fence_couplings_exempted,
-    r.exemption_overlap,
-    r.merges_absorbed,
+    "merge profile seed 43: merges_absorbed={}",
+    r.merges_absorbed
   );
+  assert_no_tracked_exemption("merge profile determinism", 43, &r);
   assert_eq!(
     r,
     run_multi_vopr_certifying_tracked_wedges(43, 3_000, MultiProfile::merge_reshape()),
