@@ -3204,3 +3204,155 @@ fn an_uncovered_cure_debt_defers_without_spending() {
     "a blob below the boundary cannot carry the union — defer"
   );
 }
+
+/// Ack `upto` from `peer`, raising its `Progress` to the leader's log tip — the caught-up
+/// condition the transfer's immediate-`TimeoutNow` arm reads.
+fn ack_peer_through(
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  peer: u64,
+  upto: Index,
+) {
+  use crate::AppendResponse;
+  ep.handle_message(
+    Instant::ORIGIN,
+    log,
+    stable,
+    peer,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      peer,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      upto,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, log, stable);
+}
+
+/// Tell this leader that `peer` is itself wedged on a park, minting the cure debt that excludes it
+/// from the handoff candidates.
+fn advertise_stuck(
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  peer: u64,
+  boundary: Index,
+) {
+  use crate::HeartbeatResponse;
+  ep.handle_message(
+    Instant::ORIGIN,
+    log,
+    stable,
+    peer,
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), peer, bytes::Bytes::new()).with_stuck_boundary(boundary),
+    ),
+  );
+  while ep.poll_message().is_some() {}
+}
+
+/// Drain the outbox, returning every `TimeoutNow` recipient in emission order.
+fn drain_timeout_now_targets(ep: &mut Endpoint<u64, CountSm>) -> std::vec::Vec<u64> {
+  let mut targets = std::vec::Vec::new();
+  while let Some(out) = ep.poll_message() {
+    if matches!(out.message(), Message::TimeoutNow(_)) {
+      targets.push(out.to());
+    }
+  }
+  targets
+}
+
+/// The parked LEADER's only exit: nobody installs a cure blob to a leader, so it hands leadership
+/// to the highest-matched voter that is not itself advertising a park. Exactly one forced handoff
+/// per term — the second tick, still in the same term with the attempt in flight, arms nothing.
+#[test]
+fn a_parked_leader_hands_off_to_a_curable_peer_once_per_term() {
+  let (mut ep, mut log, mut stable, k) = make_parked_target(2);
+  // Peer 2 alone acked through the park boundary (`make_parked_target`'s ack), so it is the
+  // uniquely highest-matched voter; peer 3 has matched nothing.
+  ep.note_merge_park_unresolvable(true);
+  assert_eq!(
+    ep.merge_park_unresolvable(),
+    Some(k),
+    "the leader is parked"
+  );
+
+  ep.handle_timeout(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(
+    drain_timeout_now_targets(&mut ep),
+    std::vec![2u64],
+    "the caught-up, non-advertising voter takes the token"
+  );
+  assert_eq!(ep.transfer.lead_transferee, Some(2u64));
+
+  // Same term, attempt still in flight: nothing more is armed and no second campaigner is
+  // authorized.
+  ep.handle_timeout(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    drain_timeout_now_targets(&mut ep).is_empty(),
+    "one forced handoff per term"
+  );
+  assert_eq!(ep.transfer.lead_transferee, Some(2u64));
+}
+
+/// An advertising peer is wedged the same way this leader is, so seating it would move the wedge
+/// rather than cure it. With both voters caught up, the debt alone decides the target — in either
+/// direction, so the exclusion carries the choice rather than a tie-break.
+#[test]
+fn an_advertising_voter_is_never_the_handoff_target() {
+  for (wedged, expected) in [(3u64, 2u64), (2u64, 3u64)] {
+    let (mut ep, mut log, mut stable, k) = make_parked_target(2);
+    ack_peer_through(&mut ep, &mut log, &mut stable, 3u64, k);
+    while ep.poll_message().is_some() {}
+    advertise_stuck(&mut ep, &mut log, &mut stable, wedged, k);
+    ep.note_merge_park_unresolvable(true);
+
+    ep.handle_timeout(Instant::ORIGIN, &mut log, &mut stable);
+    assert_eq!(
+      drain_timeout_now_targets(&mut ep),
+      std::vec![expected],
+      "peer {wedged} advertises a park of its own and cannot be the exit"
+    );
+  }
+}
+
+/// Every voter wedged ⇒ nothing is armed. Churning leadership between hosts that are all
+/// uncurable buys no progress and pays the proposal freeze every term; the group stays
+/// degraded-alive under the container's blocked-park signal instead.
+#[test]
+fn a_wholly_wedged_group_arms_no_handoff() {
+  let (mut ep, mut log, mut stable, k) = make_parked_target(2);
+  ack_peer_through(&mut ep, &mut log, &mut stable, 3u64, k);
+  while ep.poll_message().is_some() {}
+  advertise_stuck(&mut ep, &mut log, &mut stable, 2u64, k);
+  advertise_stuck(&mut ep, &mut log, &mut stable, 3u64, k);
+  ep.note_merge_park_unresolvable(true);
+
+  ep.handle_timeout(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    drain_timeout_now_targets(&mut ep).is_empty(),
+    "no candidate, no handoff"
+  );
+  assert_eq!(
+    ep.transfer.lead_transferee, None,
+    "nothing armed means no proposal freeze and no lease revocation"
+  );
+  assert!(ep.role().is_leader(), "the wedged leader stays seated");
+}
+
+/// The leg is park-gated, not merely leader-gated: an unparked leader (or one whose park the
+/// resolver can still land locally) never spends a handoff.
+#[test]
+fn an_unhinted_leader_arms_no_handoff() {
+  let (mut ep, mut log, mut stable, _k) = make_parked_target(2);
+  assert!(
+    ep.pending_merge().is_some() && ep.merge_park_unresolvable().is_none(),
+    "parked, but the resolver has not called it unresolvable"
+  );
+  ep.handle_timeout(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(drain_timeout_now_targets(&mut ep).is_empty());
+  assert_eq!(ep.transfer.lead_transferee, None);
+}
