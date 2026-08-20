@@ -11868,3 +11868,69 @@ fn an_undecodable_crossing_id_fail_stops_the_target() {
     "a poisoned park never advertises"
   );
 }
+
+/// A structurally malformed committed `CommitMerge` above the park fail-stops the target at the
+/// first resolver crank: the parked drain can never reach the entry to poison it, and any
+/// answer short of the fail-stop wedges the park forever behind a withheld cure while
+/// misreporting an unhosted-source hold.
+#[test]
+fn a_malformed_crossing_payload_fail_stops_the_target() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(41, Index::new(5), 1, 1),
+    ),
+    // Structurally malformed payload bytes: not a decodable CommitMergePayload at all.
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(3),
+      crate::EntryKind::CommitMerge,
+      Bytes::from_static(&[0xFF, 0xFF, 0xFF]),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(4), crate::EntryKind::Normal, cmd),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(4));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+
+  let _ = m.service_merge_applies(now, &mut stores);
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.is_poisoned(),
+    "first-crank fail-stop, never a silent wedge"
+  );
+  assert_eq!(
+    tep.merge_park_unresolvable(),
+    None,
+    "a poisoned park never advertises"
+  );
+}
