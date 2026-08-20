@@ -91,6 +91,16 @@ impl PendingMergeApply {
   }
 }
 
+/// A log walk's interruption class: a BENIGN unreadable page (cold read, briefly-empty — legal
+/// under the store contract, retried) versus a genuine store fault (fail-stop).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanInterrupt {
+  /// Legal transient unreadiness — defer and retry.
+  Retry,
+  /// A store error — poison.
+  Fault,
+}
+
 /// The resolve arm's fence classification at a parked absorb — see
 /// [`Endpoint::absorb_capture_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +198,12 @@ pub(crate) struct MergeState {
   /// The crossing walk's high-water mark: entries at-or-below it were already examined, so each
   /// crank scans only the committed delta — O(new entries) amortized for the park's life.
   pub(crate) crossing_scan_upto: Index,
+  /// Whether the walk reached this crank's committed frontier — the hint demands it: an
+  /// advertisement off a partial walk would authorize an adopt across entries never examined.
+  pub(crate) crossing_scan_current: bool,
+  /// A crossing's payload failed to decode: committed-corrupt content the parked drain can
+  /// never reach to poison. Sticky fail-closed — the hint stays withheld for the park's life.
+  pub(crate) crossing_decode_failed: bool,
   /// An absorbed-but-uncaptured union's outstanding durability obligation: the fold ran and the
   /// apply drain resumed, but a standing replay fence (a parked fork's barrier, an undischarged
   /// abort obligation) deferred the forced capture — so the consumed source's stores remain the
@@ -560,6 +576,17 @@ where
     log: &L,
     applied: Index,
   ) -> Result<Option<Index>, PoisonReason> {
+    Self::scan_freeze_pending_read(log, applied).map_err(|_| PoisonReason::LogRead)
+  }
+
+  /// The read-detailed form of [`scan_freeze_pending`](Self::scan_freeze_pending), for callers
+  /// that must tell a BENIGN unreadable page (defer byte-unchanged, retry later) from a genuine
+  /// store fault (fail-stop): a parked drain never reaches the suffix to raise the fault
+  /// itself, so a caller that collapsed the two would retry a broken store forever.
+  pub(crate) fn scan_freeze_pending_read<L: LogStore>(
+    log: &L,
+    applied: Index,
+  ) -> Result<Option<Index>, ScanInterrupt> {
     let last = log.last_index();
     let mut idx = applied.next();
     while idx <= last {
@@ -568,7 +595,8 @@ where
         .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
       let chunk = match log.entries(idx..read_end, 1 << 20) {
         Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
-        _ => return Err(PoisonReason::LogRead),
+        Ok(_) => return Err(ScanInterrupt::Retry),
+        Err(_) => return Err(ScanInterrupt::Fault),
       };
       for e in chunk.iter() {
         if e.kind() == EntryKind::PrepareMerge {
@@ -578,7 +606,7 @@ where
       idx = chunk
         .last()
         .map(|e| e.index().next())
-        .ok_or(PoisonReason::LogRead)?;
+        .ok_or(ScanInterrupt::Retry)?;
     }
     Ok(None)
   }
@@ -843,13 +871,18 @@ where
         .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
       let chunk = match log.entries(idx..read_end, 1 << 20) {
         Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
-        _ => return,
+        _ => {
+          self.merge.crossing_scan_current = false;
+          return;
+        }
       };
       for e in chunk.iter() {
-        if e.kind() == EntryKind::CommitMerge
-          && let Ok(p) = crate::wire::decode_commit_merge_payload(e.data_bytes())
-        {
-          self.merge.crossing_sources.push(p.source_bytes());
+        if e.kind() == EntryKind::CommitMerge {
+          match crate::wire::decode_commit_merge_payload(e.data_bytes()) {
+            Ok(p) => self.merge.crossing_sources.push(p.source_bytes()),
+            // Committed-corrupt content the parked drain can never reach: sticky fail-closed.
+            Err(_) => self.merge.crossing_decode_failed = true,
+          }
         }
       }
       match chunk.last() {
@@ -857,9 +890,19 @@ where
           self.merge.crossing_scan_upto = e.index();
           idx = e.index().next();
         }
-        None => return,
+        None => {
+          self.merge.crossing_scan_current = false;
+          return;
+        }
       }
     }
+    self.merge.crossing_scan_current = true;
+  }
+
+  /// Whether this crank's walk reached the committed frontier with every payload decoded — the
+  /// hint's completeness leg.
+  pub(crate) fn crossing_scan_current(&self) -> bool {
+    self.merge.crossing_scan_current && !self.merge.crossing_decode_failed
   }
 
   /// The committed crossings recorded so far (see [`MergeState::crossing_sources`]).
@@ -910,6 +953,8 @@ where
     };
     self.merge.crossing_sources.clear();
     self.merge.crossing_scan_upto = Index::ZERO;
+    self.merge.crossing_scan_current = false;
+    self.merge.crossing_decode_failed = false;
     if !self.fsm.absorb(source_fsm) {
       self.poison(PoisonReason::MergeUnsupported);
       return None;
@@ -945,6 +990,8 @@ where
     };
     self.merge.crossing_sources.clear();
     self.merge.crossing_scan_upto = Index::ZERO;
+    self.merge.crossing_scan_current = false;
+    self.merge.crossing_decode_failed = false;
     self.applied = pending.at();
     self
       .outputs

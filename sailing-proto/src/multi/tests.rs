@@ -11448,6 +11448,29 @@ fn a_crossing_with_a_hosted_source_withholds_the_cure() {
     None,
     "the hosted crossing withholds the hint, outcome-blind"
   );
+  // ONE composed signal per transition, carrying the ACTIONABLE identity: the hosted
+  // crossing's id (whose lifecycle releases the wedge) and the park coordinate — the generic
+  // unhosted-source cause is suppressed while the crossing outranks it, and further cranks
+  // emit nothing new.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let mut blocked = std::vec::Vec::new();
+  while let Some(b) = m.poll_merge_blocked() {
+    blocked.push(b);
+  }
+  assert_eq!(
+    blocked.len(),
+    1,
+    "one emission for a stable hold: {blocked:?}"
+  );
+  assert!(
+    matches!(
+      &blocked[0],
+      b if b.cause == MergeBlockedCause::CrossedHostedSource
+        && b.source == 42
+        && b.boundary == Index::new(2)
+    ),
+    "the signal names the hosted crossing and the park coordinate: {blocked:?}"
+  );
 
   // The hosted crossing leaves; the hint appears on the next crank.
   m.remove_group(&42, &mut empty_stores()).unwrap();
@@ -11456,5 +11479,113 @@ fn a_crossing_with_a_hosted_source_withholds_the_cure() {
     m.group(&1).unwrap().merge_park_unresolvable(),
     Some(Index::new(2)),
     "with no hosted crossing the park advertises"
+  );
+}
+
+/// A cure blob beyond the locally proven commit never adopts — the crossing walk is
+/// committed-capped, so entries between local commit and the blob's boundary were never
+/// examined and one could be a hosted crossing. The delivery is not wasted: the redundancy
+/// arm's raise advances commit off the blob's own evidence, the walk catches up next crank,
+/// and the hint re-evaluates against the newly visible crossing.
+#[test]
+fn a_blob_beyond_local_commit_defers_until_the_walk_catches_up() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m.create_group(42, 0, single_node_cfg(1), now, 8, SplitSm::default())
+    .unwrap();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(41, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+    // Durable but locally UNPROVEN: a crossing naming a HOSTED source, above commit.
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(6), 1, 2),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    Some(Index::new(2)),
+    "the capped walk sees no crossing yet — the hint stands"
+  );
+
+  // The cure blob covers the unproven tail: it must NOT adopt across the unexamined crossing.
+  let meta = crate::SnapshotMeta::new(
+    Index::new(4),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(2);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta,
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.pending_merge().is_some(),
+    "no adopt beyond the proven commit — the unexamined crossing stays protected"
+  );
+  assert!(
+    tep.commit_index() >= Index::new(4),
+    "the delivery still advanced commit off the blob's evidence"
+  );
+  assert!(
+    m.contains_group(&42),
+    "the hosted crossing's source is untouched"
+  );
+
+  // The walk catches up on the next crank and the hint re-gates on the now-visible crossing.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    None,
+    "the caught-up walk finds the hosted crossing and withholds"
   );
 }

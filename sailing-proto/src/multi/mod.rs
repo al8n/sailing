@@ -958,7 +958,12 @@ where
     gid.encode(&mut key);
     let key = Bytes::from(key);
     for ep in self.groups.values_mut() {
-      if ep.pending_merge().is_some_and(|p| p.source_bytes() == key) {
+      // BOTH namings clear: a park whose own source just got a host is merely pending
+      // catch-up, and a park whose CROSSING set names the admitted gid must stop advertising
+      // before a same-iteration cure delivery adopts across a now-hosted crossing.
+      if ep.pending_merge().is_some_and(|p| p.source_bytes() == key)
+        || ep.crossing_sources().contains(&key)
+      {
         ep.note_merge_park_unresolvable(false);
       }
     }
@@ -3455,26 +3460,46 @@ where
       // re-derivation no scan can soundly make — so ANY hosted crossing withholds the hint and
       // the park waits (its exit is the hosted replica's own lifecycle, or the propagated
       // terminal floor). A decode failure withholds too: fail-closed.
-      let hosted_crossing = w1_unresolvable
-        && self.groups.get(&tgid).is_some_and(|t| {
-          t.crossing_sources().iter().any(|b| {
-            G::decode_exact(b.clone())
-              .map(|g| self.groups.contains_key(&g))
-              .unwrap_or(true)
+      let hosted_crossing: Option<G> = if w1_unresolvable {
+        self.groups.get(&tgid).and_then(|t| {
+          t.crossing_sources().iter().find_map(|b| {
+            match G::decode_exact(b.clone()) {
+              Ok(g) if self.groups.contains_key(&g) => Some(Some(g)),
+              // Undecodable = fail-closed, but there is no identity to name; the sticky
+              // decode flag already withholds the hint, so signal nothing extra here.
+              Err(_) => Some(None),
+              Ok(_) => None,
+            }
           })
-        });
-      let advertise = w1_unresolvable
-        && !hosted_crossing
+        })
+      } else {
+        None
+      }
+      .flatten();
+      let crossing_blocks = w1_unresolvable
         && self
           .groups
           .get(&tgid)
-          .is_some_and(|t| !t.fork_barrier_standing())
+          .is_some_and(|t| !t.crossing_scan_current())
+        || hosted_crossing.is_some();
+      let advertise = w1_unresolvable
+        && !crossing_blocks
+        && self.groups.get(&tgid).is_some_and(|t| {
+          // The walk must have reached this crank's committed frontier with every payload
+          // decoded: an advertisement off a partial or corrupt walk would authorize an adopt
+          // across entries never examined — fail-closed.
+          t.crossing_scan_current() && !t.fork_barrier_standing()
+        })
         && !self.obligation_names_hosted_frozen(&tgid);
-      if hosted_crossing {
+      // ONE composed cause per crank: a hosted crossing outranks and SUPPRESSES the generic
+      // unhosted-source signal (the actionable identity is the crossing's — its lifecycle is
+      // what releases this wedge — carried with the PARK coordinate; the edge-dedup then holds
+      // it to one emission per transition).
+      if let Some(crossing) = hosted_crossing.as_ref() {
         self.note_merge_blocked(
           &tgid,
-          &source,
-          boundary,
+          crossing,
+          park_at,
           MergeBlockedCause::CrossedHostedSource,
         );
       }
@@ -3483,10 +3508,11 @@ where
       }
       match verdict {
         Verdict::Wait => {
-          // Only the STRUCTURAL wait is signalled. The other `Wait` — an abort window still
-          // undecided — is the merge's ordinary decision latency and closes with the next
-          // committed coordinate.
-          if w1_unresolvable {
+          // Only the STRUCTURAL wait is signalled — and only when no hosted crossing outranks
+          // it (the composed cause above carries the actionable identity then). The other
+          // `Wait` — an abort window still undecided — is the merge's ordinary decision
+          // latency and closes with the next committed coordinate.
+          if w1_unresolvable && hosted_crossing.is_none() {
             self.note_merge_blocked(&tgid, &source, park_at, MergeBlockedCause::SourceUnhosted);
           }
         }
