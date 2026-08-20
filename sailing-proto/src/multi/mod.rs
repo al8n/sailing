@@ -3498,6 +3498,12 @@ where
         && let Some(tep) = self.groups.get_mut(&tgid)
       {
         tep.advance_crossing_scan(&*tlog);
+        // The walk fail-stops on committed-corrupt content (a payload the parked drain could
+        // never reach to poison itself) — latch it like every other in-service poison.
+        if tep.is_poisoned() {
+          self.note_if_poisoned(&tgid);
+          continue;
+        }
       }
       // The crossing leg is OUTCOME-BLIND by design: an adopt over a crossing whose source is
       // hosted here would leave that replica a live-voting husk of a lineage the blob absorbed

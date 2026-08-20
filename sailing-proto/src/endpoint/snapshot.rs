@@ -1424,7 +1424,6 @@ where
     self.merge.crossing_sources.clear();
     self.merge.crossing_scan_upto = Index::ZERO;
     self.merge.crossing_scan_current = false;
-    self.merge.crossing_decode_failed = false;
     if self.fsm.restore(snap).is_err() {
       self.poison(PoisonReason::SnapshotRestore);
       return false;
@@ -1736,7 +1735,6 @@ where
     self.merge.crossing_sources.clear();
     self.merge.crossing_scan_upto = Index::ZERO;
     self.merge.crossing_scan_current = false;
-    self.merge.crossing_decode_failed = false;
     // The re-baseline discarded every abort entry at-or-below the boundary — the ONLY restart
     // re-derivation of the `abandoned` obligation. The install sits past the committed+applied abort,
     // proving the source thawed past the abandoned freeze (the capturing leader's own service drove
