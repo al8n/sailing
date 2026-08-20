@@ -985,6 +985,12 @@ where
     self.multi.poll_merge_blocked()
   }
 
+  /// The held-merge queue's head WITHOUT consuming it (see [`MultiRaft::peek_merge_blocked`]) —
+  /// the drivers' delivered-before-consumed read: publish first, consume only on acceptance.
+  pub fn peek_merge_blocked(&self) -> Option<crate::MergeBlocked<G>> {
+    self.multi.peek_merge_blocked()
+  }
+
   /// Initiate a linearizable read on `group`; the resulting `ReadState` surfaces via
   /// [`poll_event`](Self::poll_event) stamped with the group. `None` if no such group.
   #[must_use = "`None` means no group with this id is hosted — the call did nothing"]

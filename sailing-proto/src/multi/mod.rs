@@ -1585,6 +1585,15 @@ where
     self.merge_blocked.pop_front()
   }
 
+  /// The queue's head WITHOUT consuming it — the drivers' delivered-before-consumed read. The
+  /// hold itself is re-derived every crank, but the once-per-TRANSITION dedupe is not: a
+  /// signal popped ahead of a full lifecycle tail would never re-enqueue while its cause
+  /// stands, silencing a hold that needs embedder action. Peek, publish, and consume only on
+  /// acceptance.
+  pub fn peek_merge_blocked(&self) -> Option<MergeBlocked<G>> {
+    self.merge_blocked.front().cloned()
+  }
+
   /// Queue one [`MergeBlocked`] iff `cause` DIFFERS from the last one signalled for `target`. The
   /// container re-derives every hold on every crank, so without this edge the queue would grow by
   /// one entry per crank for as long as the hold stands; with it, a stable hold costs exactly one
@@ -2106,7 +2115,7 @@ where
       && self
         .groups
         .get(gid)
-        .is_some_and(|ep| ep.merge_park_unresolvable().is_some())
+        .is_some_and(|ep| ep.pending_merge().is_some())
     {
       let hosted_crossing = self.groups.get(gid).is_some_and(|t| {
         t.crossing_sources().iter().any(|b| {
@@ -2119,6 +2128,14 @@ where
         && let Some(ep) = self.groups.get_mut(gid)
       {
         ep.note_merge_park_unresolvable(false);
+        // Drop the WHOLE message, not just the hint — and key the gate on the PARK, not the
+        // hint: the hint is edge-consumed at the first refusal, while the sibling condition
+        // outlives it, and any later install's ordinary DESTRUCTIVE completion would supersede
+        // the park and clear covered obligations — exactly what the sibling state proved
+        // unsafe (a hosted crossing the blob would husk, or a live frozen counterparty whose
+        // thaw drive the clear would erase). Silent, like every receipt refusal: the paced
+        // resend re-drives once the sibling hold resolves through its own lifecycle.
+        return Some(());
       }
     }
     self
@@ -3588,9 +3605,14 @@ where
           // The freeze then applies through the normal drain and the NEXT crank resolves.
           if let Some((slog, _)) = stores.stores(&source)
             && let Some(sep) = self.groups.get_mut(&source)
-            && sep.advance_commit_on_freeze_identity(&*slog, boundary, freeze_term)
           {
-            self.mark_dirty(&source);
+            if sep.advance_commit_on_freeze_identity(&*slog, boundary, freeze_term) {
+              self.mark_dirty(&source);
+            }
+            // The identity read can poison the source (a fatal log-term fault) while
+            // answering false — latch it like every other in-service fail-stop, or the
+            // post-service drain has nothing to surface.
+            self.note_if_poisoned(&source);
           }
         }
         Verdict::Abort => {
@@ -4124,9 +4146,39 @@ where
         self.note_if_poisoned(&tgid);
         continue;
       };
-      let already_staged = tep
-        .pending_compact_boundary()
-        .is_some_and(|b| b >= boundary)
+      // A HELD DEBT-CURE INSTALL discharges the chain THIS crank: submit it through the
+      // ordinary deferral here, so its slot write and the discharge's terminal floors below
+      // ride one driver flush (either both durable or neither — a crash before it loses only
+      // the volatile hold and the unchanged log re-derives the debts). Its meta covers every
+      // debt boundary by construction (a genuinely-newer blob exceeds commit, which the
+      // absorb's fold already carried past each boundary), and installs are exempt from the
+      // capture fences — the completion's re-baseline retires covered replay obligations
+      // itself, exactly as any install does.
+      let cure_submitted = tep.debt_cure_held();
+      if cure_submitted {
+        match stores.stores(&tgid) {
+          Some((_, stable)) => {
+            if let Some(tep) = self.groups.get_mut(&tgid) {
+              tep.submit_debt_cure_install(stable);
+            }
+          }
+          None => {
+            if let Some(tep) = self.groups.get_mut(&tgid) {
+              tep.poison(PoisonReason::SnapshotCapture);
+            }
+            self.note_if_poisoned(&tgid);
+            self.mark_dirty(&tgid);
+            continue;
+          }
+        }
+      }
+      let Some(tep) = self.groups.get(&tgid) else {
+        continue;
+      };
+      let already_staged = cure_submitted
+        || tep
+          .pending_compact_boundary()
+          .is_some_and(|b| b >= boundary)
         // A COMPLETED install (or capture) at-or-past the boundary is the after-durable form of
         // the same evidence — the soundest producer of the three; without this leg an install
         // into a debt-holder would orphan the debt (the restore discards the boundary's

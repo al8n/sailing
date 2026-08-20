@@ -685,16 +685,25 @@ where
         .lifecycle_tx
         .try_send(LifecycleEvent::Poisoned { group });
     }
-    // A structurally held merge surfaces on the same best-effort tail, once per transition of
-    // its cause. A full tail drops the observation and nothing stalls: the container re-derives
-    // the hold every crank and its resolution never depended on this being read.
-    while let Some(blocked) = self.coord.poll_merge_blocked() {
-      let _ = self.lifecycle_tx.try_send(LifecycleEvent::MergeBlocked {
-        target: blocked.target,
-        source: blocked.source,
-        boundary: blocked.boundary,
-        cause: blocked.cause,
-      });
+    // A structurally held merge surfaces on the same tail, once per transition of its cause —
+    // DELIVERED-BEFORE-CONSUMED like the conflict signal: the hold is re-derived every crank,
+    // but the once-per-transition dedupe is not, so popping ahead of a full tail would silence
+    // a hold that needs embedder action for as long as its cause stands. Consume only on
+    // acceptance; a resolved hold's queued signal is purged at the coordinator.
+    while let Some(blocked) = self.coord.peek_merge_blocked() {
+      if self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::MergeBlocked {
+          target: blocked.target,
+          source: blocked.source,
+          boundary: blocked.boundary,
+          cause: blocked.cause,
+        })
+        .is_err()
+      {
+        break;
+      }
+      let _ = self.coord.poll_merge_blocked();
     }
   }
 
@@ -863,13 +872,20 @@ where
         .lifecycle_tx
         .try_send(LifecycleEvent::Poisoned { group });
     }
-    while let Some(blocked) = self.coord.poll_merge_blocked() {
-      let _ = self.lifecycle_tx.try_send(LifecycleEvent::MergeBlocked {
-        target: blocked.target,
-        source: blocked.source,
-        boundary: blocked.boundary,
-        cause: blocked.cause,
-      });
+    while let Some(blocked) = self.coord.peek_merge_blocked() {
+      if self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::MergeBlocked {
+          target: blocked.target,
+          source: blocked.source,
+          boundary: blocked.boundary,
+          cause: blocked.cause,
+        })
+        .is_err()
+      {
+        break;
+      }
+      let _ = self.coord.poll_merge_blocked();
     }
     self.flush_pending = self.engine.has_staged() || more;
     self

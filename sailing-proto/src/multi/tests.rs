@@ -10969,14 +10969,14 @@ fn a_replayed_chain_resolves_the_inner_park_beneath_a_pending_freeze() {
   assert_eq!(tep.state_machine().units, 2, "the union folded first");
 }
 
-/// A destructive install is refused while a capture debt stands: the debtor's applied already
-/// covers every debt boundary, so a genuinely-newer blob is pure catch-up — and staging it
-/// would put a covering snapshot in the durable slot whose restart re-baselines past the
-/// `CommitMerge` with the volatile debts lost and the source floors still non-terminal. The
-/// refusal is silent (the sender's paced resend re-drives), and the same install admits once
-/// the chain discharges through the debtor's own forced capture.
+/// A covering install at a debt holder is HELD, then becomes the discharge itself: submitting
+/// it straight to the slot would hand a restart a covering blob beside the intact log — the
+/// shape that Restores past the `CommitMerge` with the volatile debts lost and the source
+/// floors still non-terminal. The debt pass submits the hold in the SAME crank it drains the
+/// chain, so slot and floors ride one flush — and the fence NEVER lifts here: a partitioned
+/// debtor whose witness was compacted away has exactly this install as its only cure.
 #[test]
-fn a_debt_holder_refuses_a_destructive_install_until_the_discharge() {
+fn a_covering_install_at_a_debt_holder_becomes_the_discharge() {
   let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
   defer_to_absorbed(&mut m, &mut stores, d);
   let units_before = m.group(&1).unwrap().state_machine().units;
@@ -10988,50 +10988,7 @@ fn a_debt_holder_refuses_a_destructive_install_until_the_discharge() {
   .with_shape_gen(1);
   {
     let (l, s) = stores.0.get_mut(&1).unwrap();
-    m.handle_message(
-      &1,
-      d,
-      l,
-      s,
-      9u64,
-      Message::InstallSnapshot(crate::InstallSnapshot::new(
-        Term::new(2),
-        9u64,
-        meta.clone(),
-        fork_blob(9),
-      )),
-    )
-    .unwrap();
-    drain_storage(&mut m, 1, d, l, s);
-  }
-  let tep = m.group(&1).unwrap();
-  assert_eq!(
-    tep.state_machine().units,
-    units_before,
-    "the destructive install was refused, nothing restored"
-  );
-  assert!(tep.capture_debt().is_some(), "the debt stands untouched");
-  while m.poll_message().is_some() {}
-
-  // The fence lifts, the debt discharges through the debtor's own capture, and the SAME
-  // install then admits.
-  m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived");
-  m.lift_fork_barrier(&1, fork.split_index);
-  let resolutions = m.service_merge_applies(d, &mut stores);
-  assert!(
-    resolutions.iter().any(|r| matches!(
-      r,
-      MergeResolution::Merged {
-        source: 2,
-        target: 1
-      }
-    )),
-    "the debt discharged: {resolutions:?}"
-  );
-  {
-    let (l, s) = stores.0.get_mut(&1).unwrap();
-    drain_storage(&mut m, 1, d, l, s);
+    let slot_before = s.snapshot().map(|(sm, _)| sm.last_index());
     m.handle_message(
       &1,
       d,
@@ -11047,15 +11004,45 @@ fn a_debt_holder_refuses_a_destructive_install_until_the_discharge() {
     )
     .unwrap();
     drain_storage(&mut m, 1, d, l, s);
+    assert_eq!(
+      s.snapshot().map(|(sm, _)| sm.last_index()),
+      slot_before,
+      "the hold is VOLATILE: nothing reached the durable slot"
+    );
+  }
+  let tep = m.group(&1).unwrap();
+  assert_eq!(
+    tep.state_machine().units,
+    units_before,
+    "held, not installed: nothing restored yet"
+  );
+  assert!(tep.capture_debt().is_some(), "the debt stands untouched");
+  while m.poll_message().is_some() {}
+
+  // The next crank: the hold submits and the WHOLE chain discharges — with the fork fence
+  // still standing (it never lifts in this test; the install is the only cure).
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }],
+    "the held install IS the discharge"
+  );
+  assert!(m.group(&1).unwrap().capture_debt().is_none());
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, d, l, s);
     assert!(
       l.first_index() > Index::new(1),
-      "the post-discharge install re-baselined"
+      "the completion re-baselined past the window"
     );
   }
   assert_eq!(
     m.group(&1).unwrap().state_machine().units,
     9,
-    "the same blob admits once nothing rides the old log"
+    "the blob's state is the new baseline"
   );
 }
 
@@ -11631,6 +11618,209 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
     5,
     "adopt-equivalent: the same union, no re-cure"
   );
+}
+
+/// A log whose TERM read faults at one index — the AdvanceSource identity read's fatal seam.
+struct FaultTermLog(VecLog, Option<Index>);
+
+#[derive(Debug)]
+struct TermErr;
+
+impl core::fmt::Display for TermErr {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("term read fault")
+  }
+}
+
+impl core::error::Error for TermErr {}
+
+impl crate::LogStore for FaultTermLog {
+  type Error = TermErr;
+
+  fn first_index(&self) -> Index {
+    self.0.first_index()
+  }
+
+  fn last_index(&self) -> Index {
+    self.0.last_index()
+  }
+
+  fn term(&self, index: Index) -> Result<Term, TermErr> {
+    if self.1 == Some(index) {
+      return Err(TermErr);
+    }
+    self.0.term(index).map_err(|e| match e {})
+  }
+
+  fn entries(
+    &self,
+    range: core::ops::Range<Index>,
+    max_bytes: u64,
+  ) -> Result<crate::EntriesRead<'_>, TermErr> {
+    self.0.entries(range, max_bytes).map_err(|e| match e {})
+  }
+
+  fn submit_append(&mut self, id: crate::OpId, entries: &[crate::Entry]) {
+    self.0.submit_append(id, entries)
+  }
+
+  fn compact(&mut self, up_to: Index) {
+    self.0.compact(up_to)
+  }
+
+  fn restore(&mut self, last_index: Index, last_term: Term) {
+    self.0.restore(last_index, last_term)
+  }
+
+  fn poll(&mut self) -> Option<Result<crate::LogDone, TermErr>> {
+    self.0.poll().map(|r| r.map_err(|e| match e {}))
+  }
+
+  fn has_pending(&self) -> bool {
+    self.0.has_pending()
+  }
+}
+
+struct FaultTermStores(std::collections::BTreeMap<u64, (FaultTermLog, AsyncStable)>);
+
+impl crate::GroupStores<u64, FaultTermLog, AsyncStable> for FaultTermStores {
+  fn stores(&mut self, group: &u64) -> Option<(&mut FaultTermLog, &mut AsyncStable)> {
+    self.0.get_mut(group).map(|(l, s)| (l, s))
+  }
+}
+
+impl crate::FloorStore<u64> for FaultTermStores {
+  fn floor(&self, _gid: &u64) -> u64 {
+    0
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
+/// The AdvanceSource identity read can POISON the source (a fatal term fault) while answering
+/// false — and the crank's earlier lifecycle drain has already run, so without the latch the
+/// fail-stop would sit invisible until unrelated traffic. It must reach `poll_poisoned` in the
+/// faulting crank itself.
+#[test]
+fn a_faulting_advance_source_identity_read_latches_in_the_same_crank() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  // The source: its log CONTAINS the freeze pair but commit lags behind it, the AdvanceSource
+  // shape. The term read at the boundary faults.
+  let mut log2 = FaultTermLog(VecLog::default(), Some(Index::new(2)));
+  let mut stable2 = AsyncStable::default();
+  {
+    let mut tb = Vec::new();
+    Data::encode(&1u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 1),
+      &mut fbuf,
+    );
+    log2.0.force_append(&[
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(1),
+        crate::EntryKind::Normal,
+        cmd.clone(),
+      ),
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(2),
+        crate::EntryKind::PrepareMerge,
+        Bytes::from(fbuf),
+      ),
+    ]);
+    stable2.force_state(Term::new(1), Some(1u64), Index::new(1));
+  }
+  m.restore_group(
+    2,
+    single_node_cfg(1),
+    now,
+    8,
+    SplitSm::default(),
+    1,
+    &mut log2,
+    &mut stable2,
+  )
+  .unwrap();
+  assert!(
+    !m.group(&2).unwrap().is_frozen(),
+    "the freeze is appended, not applied — commit lags"
+  );
+
+  let mut log1 = FaultTermLog(VecLog::default(), None);
+  let mut stable1 = AsyncStable::default();
+  log1.0.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(2, Index::new(2), 1, 1),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+  ]);
+  stable1.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log1,
+    &mut stable1,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+
+  let mut stores = FaultTermStores(std::collections::BTreeMap::new());
+  stores.0.insert(1, (log1, stable1));
+  stores.0.insert(2, (log2, stable2));
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let sep = m.group(&2).unwrap();
+  assert!(
+    sep.is_poisoned(),
+    "the identity read fail-stopped the source"
+  );
+  assert_eq!(sep.poison_reason(), Some(PoisonReason::LogTerm));
+  assert_eq!(
+    m.poll_poisoned(),
+    Some(2),
+    "latched in the faulting crank itself"
+  );
+}
+
+/// The held-merge signal is DELIVERED-BEFORE-CONSUMED at the container seam: `peek` exposes the
+/// head without consuming (however many times), and only `poll` retires it — what lets a driver
+/// facing a full lifecycle tail leave the signal queued instead of losing the one edge its
+/// dedupe will never re-arm.
+#[test]
+fn a_peeked_merge_blocked_signal_survives_until_polled() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = under_hosted_park_host();
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let head = m.peek_merge_blocked().expect("the hold signalled");
+  assert_eq!(
+    m.peek_merge_blocked().as_ref(),
+    Some(&head),
+    "peek consumes nothing"
+  );
+  assert_eq!(m.poll_merge_blocked(), Some(head), "poll retires the head");
+  assert_eq!(m.peek_merge_blocked(), None);
 }
 
 /// An under-hosted park on a single-node host, with the `k+1` coordinate committed so the abort
@@ -12566,6 +12756,42 @@ fn a_same_batch_freeze_clears_the_stale_cure_admission() {
   assert!(
     m.group(&1).unwrap().pending_merge().is_some(),
     "the stale hint was cleared at receipt: no adopt, the obligation survives"
+  );
+  // A genuinely NEWER blob in the same invalidated state is dropped WHOLE — with the hint
+  // gone it would otherwise fall through to the ordinary destructive install, whose
+  // completion supersedes the park and clears covered obligations, exactly what the sibling
+  // state proved unsafe.
+  let newer = crate::SnapshotMeta::new(
+    Index::new(6),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(2);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        newer,
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+    assert!(
+      stable.snapshot().is_none(),
+      "the invalidated receipt drops the whole message: nothing staged"
+    );
+  }
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_some(),
+    "no destructive completion can supersede the park the sibling state protects"
   );
   assert!(
     m.group(&1).unwrap().has_abandoned(),

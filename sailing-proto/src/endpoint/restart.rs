@@ -500,6 +500,7 @@ where
       snapshot: SnapshotState {
         snapshot_recv: None,
         pending_install: None,
+        debt_cure: None,
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
         unsendable_meta_frames: 0,

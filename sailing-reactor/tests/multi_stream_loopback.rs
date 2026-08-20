@@ -3919,6 +3919,160 @@ async fn parked_conflict_survives_a_full_lifecycle_tail() {
   }
 }
 
+/// THE HELD-MERGE BACKPRESSURE PIN, the conflict pin's merge twin: a debt window's fence
+/// signal survives a momentarily-full lifecycle tail. Node 2 runs a capacity-1 tail,
+/// pre-filled by split #1's own `SplitApplied` and deliberately not drained; split #2 parks on
+/// node 2's squatter, arming the parent's fork fence there. A committed merge into the parent
+/// then resolves on node 2 as the fence-deferred absorb — minting the capture debt whose
+/// fence-hold signal is published against the full tail. Pre-fix the drain popped the
+/// coordinator's once-per-transition signal and `try_send` dropped it, erasing the embedder's
+/// only cue for a window that needs placement action; post-fix it stays queued until the tail
+/// has room.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_debt_windows_fence_signal_survives_a_full_lifecycle_tail() {
+  const SLOW_ELECTION: Duration = Duration::from_millis(2500);
+  const SLOW_HEARTBEAT: Duration = Duration::from_millis(500);
+  let slow =
+    |id: u64, voters: Vec<u64>| Config::try_new(id, voters, SLOW_ELECTION, SLOW_HEARTBEAT).unwrap();
+
+  let addrs = addrs(45_420, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let cfg = if id == 2 {
+      DriverConfig {
+        events_cap: 1,
+        ..DriverConfig::default()
+      }
+    } else {
+      DriverConfig::default()
+    };
+    let (driver, handle) =
+      bind_node_with::<CountSm>(id, addrs[(id - 1) as usize], peers, cfg).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  for (i, h) in handles.iter().enumerate() {
+    let id = i as u64 + 1;
+    h.create_group(100, slow(id, vec![1, 2]), id, CountSm::default(), 0)
+      .await
+      .expect("parent admission");
+    h.create_group(200, config(id, vec![1, 2]), id + 4, CountSm::default(), 0)
+      .await
+      .expect("source admission");
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  for i in 0..7u64 {
+    assert_eq!(submit_anywhere(&g100, b"load").await, i + 1);
+  }
+  assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
+
+  // Split #1 (clean): node 2's `SplitApplied` fills its one-slot tail and stays undrained.
+  let _ = steer_split_to_node1(&g100, 310, b"\x02").await;
+  await_lifecycle(handles[0].lifecycle(), "node 1 (split #1)", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::SplitApplied {
+        parent: 100,
+        child: 310
+      }
+    )
+  })
+  .await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while handles[1].group(310).status().await.is_err() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "node 2 never materialized split #1"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+
+  // The squatter, then split #2: node 2's fork parks and the parent's capture fence arms there.
+  handles[1]
+    .create_group(320, slow(2, vec![1, 2]), 9, CountSm::default(), 0)
+    .await
+    .expect("the squatter admits: no split names this id yet");
+  let split2 = steer_split_to_node1(&g100, 320, b"\x03").await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let status = handles[1]
+      .group(100)
+      .status()
+      .await
+      .expect("node 2 hosts the parent");
+    if status.applied_index >= split2 {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "node 2 never applied split #2"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  for _ in 0..3 {
+    let _ = handles[1].group(100).status().await;
+  }
+
+  // The merge: node 1 (fence-free once its own fork resolves) absorbs cleanly; node 2 resolves
+  // the SAME committed absorb as the fence-deferred debt, publishing its fence hold against
+  // the still-full tail.
+  merge_verb_anywhere(
+    "the freeze",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.prepare_merge(200, 100).await }
+    },
+    handles.len(),
+  )
+  .await;
+  merge_verb_anywhere(
+    "the commit",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.commit_merge(100, 200).await }
+    },
+    handles.len(),
+  )
+  .await;
+  // Node 2 serves the union: its deferred absorb resolved (2 kept post-splits + 2 absorbed).
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "node 2 never resolved the deferred absorb"
+    );
+    if let Ok(c) = handles[1].group(100).query(|sm: &CountSm| sm.count()).await
+      && c == 4
+    {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+
+  // Free the slot: the deferred fence-hold signal must land — the lost-signal regression.
+  await_lifecycle(
+    handles[1].lifecycle(),
+    "node 2 (deferred fence hold)",
+    |ev| {
+      matches!(
+        ev,
+        LifecycleEvent::MergeBlocked {
+          target: 100,
+          source: 200,
+          ..
+        }
+      )
+    },
+  )
+  .await;
+}
+
 /// Retry a leader-routed merge verb across nodes until some leader accepts it (transient
 /// refusals — routing, the local source still catching up to frozen-applied — no-op and retry).
 async fn merge_verb_anywhere<Fut>(what: &str, mut verb: impl FnMut(usize) -> Fut, n: usize) -> usize
