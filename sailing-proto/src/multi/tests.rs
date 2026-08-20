@@ -10777,3 +10777,75 @@ fn an_ordinary_staged_capture_discharges_the_debt() {
   );
   assert!(m.group(&1).unwrap().capture_debt().is_none());
 }
+
+/// The debt window's naming holds at every container lifecycle surface: the consumed source can
+/// be neither tombstoned nor re-admitted (create OR restore — either would revive a husk beside
+/// the absorbed union), and the debt-holding target cannot be torn down (its discharge is the
+/// source's only exit to the terminal floor). Every refusal releases at the discharge.
+#[test]
+fn a_debt_names_its_source_at_every_lifecycle_surface() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  assert!(m.debt_names(&2));
+
+  assert!(
+    matches!(
+      m.remove_group(&2, &mut empty_stores()),
+      Err(RemoveError::SpokenFor)
+    ),
+    "tombstoning the consumed source strands the union's only restart derivation"
+  );
+  assert!(
+    matches!(
+      m.remove_group(&1, &mut empty_stores()),
+      Err(RemoveError::OwesCapture)
+    ),
+    "tearing down the debt holder strands the source's stores forever"
+  );
+  assert!(
+    matches!(
+      m.create_group(
+        2,
+        1,
+        single_node_cfg(1),
+        Instant::ORIGIN,
+        9,
+        SplitSm::default()
+      ),
+      Err(CreateGroupError::AbsorbPending)
+    ),
+    "a fresh incarnation at the debt-named id revives a husk beside the union"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      matches!(
+        m.restore_group(
+          2,
+          single_node_cfg(1),
+          Instant::ORIGIN,
+          9,
+          SplitSm::default(),
+          3,
+          l,
+          s
+        ),
+        Err(CreateGroupError::AbsorbPending)
+      ),
+      "a restore over the preserved stores re-hosts the husk mid-window"
+    );
+  }
+
+  // The discharge releases every surface.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the wait");
+  m.lift_fork_barrier(&1, fork.split_index);
+  assert_eq!(
+    m.service_merge_applies(d, &mut stores),
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }]
+  );
+  assert!(!m.debt_names(&2), "the naming dies with the discharge");
+}
