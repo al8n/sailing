@@ -52,6 +52,15 @@ reference — this section pins the SEMANTICS:
   promptness, never safety. The field landed IN PLACE under the current `LABEL_VERSION` (see §4, and
   the same precedent at the end of §6) — the crates are unpublished at 0.0.0, so no deployment can
   hold two builds claiming one version.
+- A `stuck_boundary`-bearing `HeartbeatResponse` may be **UNSOLICITED** — no `Heartbeat` preceded
+  it — because the leader it must reach may have quiesced its beats entirely. Such a response
+  carries an EMPTY `context` (it correlates no read round) and pins `lease_round = 0` /
+  `lease_support_nanos = 0`: echoing a round the respondent saw earlier would extend a `LeaseBased`
+  lease on support never promised at that time, and a zero `lease_support_nanos` fails the leader's
+  accounting conjunction whatever round it holds open. The **cure** it solicits is an ordinary
+  single-shot `InstallSnapshot` (`total_len == 0`, `offset == 0` — one whole blob in one frame),
+  unsolicited and addressed to a fully caught-up voter; a receiver treats it exactly as any other
+  install, and the sender leaves the peer's replication progress untouched.
 - `Entry.timestamp` is the leader's append-time clock (nanos since its monotonic ORIGIN), read
   ONLY by the LeaseGuard read mode to age an entry across a leader change. It is `0` (and absent
   on the wire) in every other mode, so a non-LeaseGuard `Entry` is byte-identical to before the
