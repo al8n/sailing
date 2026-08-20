@@ -1102,15 +1102,6 @@ where
   /// separate field, so a higher-term step-down's pending-action clears do NOT drop it (a boundary
   /// that is already quorum-committed stays valid across a pure term bump). `restart` resets it to `None`.
   pending_install: Option<(OpId, crate::SnapshotMeta<I>, F::Snapshot, I)>,
-  /// A covering install HELD VOLATILE through a capture-debt window (see the receipt's
-  /// debt-cure hold): submitting it would put a covering blob in the durable slot while the
-  /// debts' floors are still non-terminal — the restart shape that Restores past the
-  /// `CommitMerge` with the volatile debts lost. The debt pass submits this through the
-  /// ordinary deferral in the SAME crank it drains the chain, so the slot write and the
-  /// terminal floors ride one driver flush. Raw bytes kept beside the decoded snap so the
-  /// submit needs no re-encode. A crash loses only this hold; the sender's paced resend
-  /// re-drives.
-  debt_cure: Option<(crate::SnapshotMeta<I>, F::Snapshot, Bytes, I)>,
   /// In-flight snapshot write: `(opid, up_to)`. Compaction is deferred until the snapshot
   /// is durable (crash-safe: we never compact before the snapshot write completes).
   ///
@@ -1653,7 +1644,6 @@ where
       snapshot: SnapshotState {
         snapshot_recv: None,
         pending_install: None,
-        debt_cure: None,
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
         unsendable_meta_frames: 0,

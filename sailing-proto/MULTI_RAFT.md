@@ -478,15 +478,16 @@ window** — a completed install or capture already at-or-past the boundary — 
 fence has itself released (durability alone is not compaction: a completion-time redundant
 install raises the durable index while deliberately keeping the log, so a durable-covered
 debtor behind a standing fence still stages its capture). A DESTRUCTIVE install DURING the
-window is HELD at the pre-slot choke point rather than submitted: a covering blob in the
-durable slot beside the intact log is exactly the restart shape that `Restore`s past the
-`CommitMerge` with the volatile debts lost and the source floors still non-terminal. The debt
-pass submits the hold through the ordinary deferral in the SAME crank it drains the whole
-chain, so the slot write and the terminal floors ride one driver flush — either both durable
-or neither — and the completion then re-baselines as any deferred install. The hold is
-volatile: a crash loses only it (the unchanged log re-derives the debts, the paced resend
-re-drives the blob), which is what makes a partitioned debtor whose thaw witness was compacted
-away curable at all — that install is its only way back.
+window flows through the one ordinary install path and SUPERSEDES the chain, by the same rule
+that rebaselines covered abort obligations: everything below the blob's boundary was resolved
+globally by the transferring leader's own discharge barrier, so the completion clears the
+chain WITHOUT surfacing `Merged` — this host authorizes no teardown it did not run. The prior
+sources' terminal floors reach it by propagation, and until then their preserved stores and
+engine records stand exactly as a husk's — never re-admittable, torn down off the propagated
+floor. This is also what makes a partitioned debtor whose thaw witness was compacted away
+curable at all: that install is its only way back, and a crash on either side of it is
+consistent — before, the unchanged log re-derives the debts; after, the restored state is past
+the window with nothing left to authorize locally.
 
 A debt is HOST-LOCAL — the fences that deferred it are this replica's own — so a foreign-led
 freeze can legally commit the DEBTOR's own consumption as the next merge source while the debt
