@@ -594,6 +594,10 @@ where
   /// the top of the next [`service_merge_applies`](Self::service_merge_applies) once neither
   /// stands, and at removal), so a target that gets held again later signals afresh.
   merge_blocked_seen: BTreeMap<G, (MergeBlockedCause, G, Index)>,
+  /// Every `note_merge_blocked` ATTEMPT of the CURRENT service crank (the edge dedupe absorbs
+  /// repeats downstream) — the end-of-crank retirement's evidence that a cause was still
+  /// derived this crank. Drained there; meaningful only within one `service_merge_applies`.
+  merge_blocked_attempts: BTreeMap<G, (MergeBlockedCause, G, Index)>,
   /// Pending structural-hold observations, drained by
   /// [`poll_merge_blocked`](Self::poll_merge_blocked). Best-effort like the poison tail: the
   /// container's own re-derivation, not this queue, is what keeps the hold resolving, so a
@@ -646,6 +650,7 @@ where
       parked: BTreeSet::new(),
       conflicts: VecDeque::new(),
       merge_blocked_seen: BTreeMap::new(),
+      merge_blocked_attempts: BTreeMap::new(),
       merge_blocked: VecDeque::new(),
       poisoned_seen: BTreeSet::new(),
       poisoned_pending: VecDeque::new(),
@@ -1615,6 +1620,10 @@ where
     // cause alone: with hosted crossings A then B, removing A must let B's observation through,
     // or the placement layer holds a wedge with no actionable identity for it.
     let observation = (cause, source.cheap_clone(), boundary);
+    self.merge_blocked_attempts.insert(
+      target.cheap_clone(),
+      (cause, source.cheap_clone(), boundary),
+    );
     if self.merge_blocked_seen.get(target) == Some(&observation) {
       return;
     }
@@ -3364,35 +3373,6 @@ where
   {
     let now: Now = now.into();
     let mut resolutions = Vec::new();
-    // THE SIGNAL EDGE, retired before this crank re-derives it: a target holding neither a park
-    // nor a capture debt is not held by anything, so its remembered cause has served its purpose
-    // and a LATER hold on the same target must signal afresh. Taken and restored around the
-    // `self.groups` read (the scratch-borrow discipline).
-    let mut blocked_seen = core::mem::take(&mut self.merge_blocked_seen);
-    blocked_seen.retain(|gid, _| {
-      self
-        .groups
-        .get(gid)
-        .is_some_and(|ep| ep.pending_merge().is_some() || ep.capture_debt().is_some())
-    });
-    // The QUEUED observation retires with the edge: a full lifecycle tail can hold a signal
-    // undelivered across its hold's whole life, and publishing it after the resolution would
-    // prompt embedder action against a hold that no longer exists (re-hosting an absorbed
-    // source beside the cured union). Purge by the same predicate the edge uses.
-    let retained: std::collections::BTreeSet<Bytes> = blocked_seen
-      .keys()
-      .map(|g| {
-        let mut b = Vec::new();
-        g.encode(&mut b);
-        Bytes::from(b)
-      })
-      .collect();
-    self.merge_blocked.retain(|b| {
-      let mut k = Vec::new();
-      b.target.encode(&mut k);
-      retained.contains(&Bytes::from(k))
-    });
-    self.merge_blocked_seen = blocked_seen;
     let parked: Vec<G> = self
       .groups
       .iter()
@@ -4339,6 +4319,22 @@ where
       }
       self.mark_dirty(&gid);
     }
+    // THE OBSERVATION RETIREMENT, at the END of the crank so a hold resolved by ANY pass above
+    // never outlives it: the seen edge and the QUEUE both retain only what THIS crank still
+    // derived. Every pass re-attempts a standing cause each crank (the edge dedupe absorbs the
+    // repeats), so absence here IS resolution or cause drift — and a queued undelivered signal
+    // for either would prompt embedder action against a hold that no longer exists (re-hosting
+    // an absorbed source beside the cured union, chasing a crossing that moved on). The drivers
+    // drain immediately after this returns, so nothing later re-checks.
+    let attempts = core::mem::take(&mut self.merge_blocked_attempts);
+    self
+      .merge_blocked_seen
+      .retain(|g, obs| attempts.get(g) == Some(obs));
+    self.merge_blocked.retain(|b| {
+      attempts
+        .get(&b.target)
+        .is_some_and(|(c, s, i)| *c == b.cause && *s == b.source && *i == b.boundary)
+    });
     resolutions
   }
 

@@ -11860,6 +11860,72 @@ fn a_resolved_holds_queued_signal_is_purged() {
   );
 }
 
+/// The SAME-CRANK twin: the hold resolves inside the very service call whose end the drivers
+/// drain after — an entry-time retirement would still see the park standing and deliver the
+/// stale signal. The retirement runs at the END of the crank, keyed on what the crank still
+/// derived.
+#[test]
+fn a_same_crank_park_resolution_purges_the_queued_signal() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = under_hosted_park_host();
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert!(
+    m.peek_merge_blocked().is_some(),
+    "the hold signalled and nobody drained it"
+  );
+
+  // The propagated terminal floor resolves the park INSIDE the next service call.
+  stores.1.insert(42);
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert!(
+    !resolutions.is_empty(),
+    "the terminal floor resolved the park this crank: {resolutions:?}"
+  );
+  assert!(m.group(&1).unwrap().pending_merge().is_none());
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the queued signal retired with the same-crank resolution"
+  );
+}
+
+/// The debt flavor of the same-crank twin: the fence signal sits queued undelivered, the fence
+/// lifts, and the discharge lands inside one service call — nothing stale may survive to the
+/// drivers' immediate post-service drain.
+#[test]
+fn a_same_crank_debt_discharge_purges_the_queued_signal() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  assert!(
+    m.service_merge_applies(d, &mut stores).is_empty(),
+    "the debt waits for the fence"
+  );
+  assert!(
+    m.peek_merge_blocked().is_some(),
+    "the fence hold signalled and nobody drained it"
+  );
+
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived");
+  m.lift_fork_barrier(&1, fork.split_index);
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert!(
+    resolutions.iter().any(|r| matches!(
+      r,
+      MergeResolution::Merged {
+        source: 2,
+        target: 1
+      }
+    )),
+    "the discharge landed this crank: {resolutions:?}"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the queued fence signal retired with the same-crank discharge"
+  );
+}
+
 /// An under-hosted park on a single-node host, with the `k+1` coordinate committed so the abort
 /// window is closed and the resolver reaches the source lookup. The source (42) is unhosted at a
 /// non-terminal floor — the locally-unresolvable shape.
