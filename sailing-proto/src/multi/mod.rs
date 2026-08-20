@@ -536,10 +536,12 @@ where
   // preserved stores are the union's only restart derivation, and any admission here — an
   // embedder create, a restore over those very stores, a fork materialization, a solicited
   // factory build (whose driver gate consults this same refusal transitively) — would revive a
-  // husk beside the already-absorbed union. Self-releasing at the debt's discharge.
+  // husk beside the already-absorbed union. Self-releasing at the debt's discharge. The WHOLE
+  // chain: an inherited debt names a source absorbed transitively, whose stores are pinned
+  // exactly the same way.
   if groups.values().any(|ep| {
-    ep.capture_debt()
-      .is_some_and(|m| m.source().as_ref() == encoded.as_slice())
+    ep.capture_debt_chain()
+      .any(|m| m.source().as_ref() == encoded.as_slice())
   }) {
     return Err(CreateGroupError::AbsorbPending);
   }

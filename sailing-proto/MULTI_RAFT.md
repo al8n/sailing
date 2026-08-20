@@ -473,13 +473,17 @@ merge.
 Three producers discharge a debt, each surfacing the held `Merged` with its ordinary
 floor-and-teardown contract: the **fence-lift forced capture** (per crank, once the fence's own
 legs clear at the boundary); **any ordinary capture** staged at-or-past the boundary (it shares
-the same fence set, so neither races the other); and **any COMPLETED install** at-or-past it
-whose membership fence has itself released — durability alone is not compaction (a
-completion-time redundant install raises the durable index while deliberately keeping the log),
-so a durable-covered debtor behind a standing fence still stages its capture. The install leg is
-mandatory, not an optimization — an install past the boundary discards the `CommitMerge` a
-restart would re-park on, so without it a crash in the window would strand the source's stores
-un-floored and unreachable forever.
+the same fence set, so neither races the other); and **durable coverage that predates the
+window** — a completed install or capture already at-or-past the boundary — once the membership
+fence has itself released (durability alone is not compaction: a completion-time redundant
+install raises the durable index while deliberately keeping the log, so a durable-covered
+debtor behind a standing fence still stages its capture). A DESTRUCTIVE install DURING the
+window is refused at receipt: staging one would put a covering blob in the durable slot whose
+restart `Restore` arm re-baselines past the `CommitMerge` with the volatile debts lost and the
+source floors still non-terminal — restorable husks beside the absorbed union. The debtor's
+applied already covers every debt boundary, so the refused blob was pure catch-up; the sender's
+heartbeat-paced resend re-drives, and the retry admits once the chain discharges through the
+debtor's own forced capture.
 
 A debt is HOST-LOCAL — the fences that deferred it are this replica's own — so a foreign-led
 freeze can legally commit the DEBTOR's own consumption as the next merge source while the debt

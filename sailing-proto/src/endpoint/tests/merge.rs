@@ -2048,13 +2048,15 @@ fn a_live_freeze_blocks_the_forced_absorb_capture() {
   assert!(ep2.capture_absorb_snapshot(&log2, &mut stable2));
 }
 
-/// The freeze leg's APPEND-OBSERVED half: an uncommitted `PrepareMerge` accepted above the park
-/// arms `freeze_pending`, and the absorb capture must already refuse — the capture's compaction
-/// would race the freeze commit it cannot yet see the outcome of. A §5.3 conflict truncation
-/// that removes the entry releases the kill and the park resolves on the next crank — the
-/// endpoint-local release for a freeze that never committed.
+/// The freeze leg's APPEND-OBSERVED half is BOUNDARY-aware: an uncommitted `PrepareMerge`
+/// accepted ABOVE the park does NOT fence the absorb — the fold compacts only at-or-below its
+/// boundary, so the freeze entry survives replay untouched, and holding the earlier fold on it
+/// is a restart-replay circular wait (the park below is exactly what keeps that freeze from
+/// applying). A capture AT-OR-PAST the pending freeze's own index still refuses — its
+/// compaction would erase the entry whose replay is the freeze's only restart derivation — and
+/// a §5.3 conflict truncation that removes the entry releases that refusal too.
 #[test]
-fn a_pending_freeze_blocks_the_absorb_until_truncated() {
+fn a_pending_freeze_fences_only_at_or_past_its_own_index() {
   let (mut ep, mut log, mut stable) = make_follower();
   ep.handle_message(
     Instant::ORIGIN,
@@ -2110,12 +2112,16 @@ fn a_pending_freeze_blocks_the_absorb_until_truncated() {
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   assert_eq!(ep.merge.freeze_pending, Some(Index::new(3)));
   assert!(
-    ep.absorb_capture_blocked(),
-    "a pending freeze fences the absorb capture exactly as an applied one does"
+    !ep.absorb_capture_blocked(),
+    "a pending freeze ABOVE the park boundary leaves the earlier fold free"
+  );
+  assert!(
+    ep.capture_blocked_at(Index::new(3)),
+    "a capture at the freeze's own index would erase its replay — still refused"
   );
 
-  // A new leader's conflicting append truncates the freeze away: the kill releases and the
-  // resolve arm proceeds — no over-block once the freeze no longer exists in the log.
+  // A new leader's conflicting append truncates the freeze away: the kill releases and even a
+  // capture at that index is free — no over-block once the freeze no longer exists in the log.
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -2140,6 +2146,7 @@ fn a_pending_freeze_blocks_the_absorb_until_truncated() {
     ep.merge.freeze_pending, None,
     "the truncation released the kill"
   );
+  assert!(!ep.capture_blocked_at(Index::new(3)));
   assert!(!ep.absorb_capture_blocked());
   ep.resolve_pending_merge(CountSm::default());
   assert!(
@@ -3092,6 +3099,120 @@ fn make_capturing_leader() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
   (ep, log, stable)
+}
+
+/// A stable store whose paged snapshot read FAULTS — the cure sender's fatal-read seam.
+struct ChunkErrStable(AsyncStable);
+
+#[derive(Debug)]
+struct ChunkErr;
+
+impl core::fmt::Display for ChunkErr {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("chunk read fault")
+  }
+}
+
+impl core::error::Error for ChunkErr {}
+
+impl crate::StableStore for ChunkErrStable {
+  type NodeId = u64;
+  type Error = ChunkErr;
+
+  fn hard_state(&self) -> crate::HardState<u64> {
+    self.0.hard_state()
+  }
+
+  fn submit_write(&mut self, id: crate::OpId, hs: crate::HardState<u64>) {
+    self.0.submit_write(id, hs)
+  }
+
+  fn submit_snapshot(&mut self, id: crate::OpId, meta: crate::SnapshotMeta<u64>, data: Bytes) {
+    self.0.submit_snapshot(id, meta, data)
+  }
+
+  fn snapshot(&self) -> Option<(crate::SnapshotMeta<u64>, Bytes)> {
+    self.0.snapshot()
+  }
+
+  fn durable_snapshot(&self) -> Option<crate::SnapshotMeta<u64>> {
+    self.0.durable_snapshot()
+  }
+
+  fn snapshot_chunk(
+    &self,
+    _offset: u64,
+    _len: u64,
+  ) -> Option<Result<(crate::SnapshotMeta<u64>, u64, crate::SnapshotChunkRead), ChunkErr>> {
+    Some(Err(ChunkErr))
+  }
+
+  fn accept_snapshot_chunk(
+    &mut self,
+    meta: &crate::SnapshotMeta<u64>,
+    total_len: u64,
+    offset: u64,
+    data: &Bytes,
+  ) -> Result<u64, ChunkErr> {
+    self
+      .0
+      .accept_snapshot_chunk(meta, total_len, offset, data)
+      .map_err(|e| match e {})
+  }
+
+  fn take_staged_snapshot(&mut self, meta: &crate::SnapshotMeta<u64>) -> Option<Bytes> {
+    self.0.take_staged_snapshot(meta)
+  }
+
+  fn discard_snapshot_staging(&mut self) {
+    self.0.discard_snapshot_staging()
+  }
+
+  fn poll(&mut self) -> Option<Result<crate::StableDone, ChunkErr>> {
+    self.0.poll().map(|r| r.map_err(|e| match e {}))
+  }
+
+  fn has_pending(&self) -> bool {
+    self.0.has_pending()
+  }
+}
+
+/// A FAULTING cure read fail-stops the leader instead of retrying silently forever: the
+/// advertised follower is match-caught-up and deliberately stays in `Replicate`, so ordinary
+/// replication never exercises this read — a swallowed fault would park that follower
+/// indefinitely with no observable cause. The store contract makes the error fatal
+/// (`SnapshotRead`), exactly as the ordinary send path treats it.
+#[test]
+fn a_faulting_cure_read_fail_stops_the_leader() {
+  use crate::HeartbeatResponse;
+  let (mut ep, mut log, stable) = make_capturing_leader();
+  let mut stable = ChunkErrStable(stable);
+  let d = Instant::ORIGIN;
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+        .with_stuck_boundary(Index::new(3)),
+    ),
+  );
+  assert!(ep.has_cure_debts(), "the advertisement is the mint");
+  while ep.poll_message().is_some() {}
+  ep.handle_timeout(
+    d + core::time::Duration::from_millis(150),
+    &mut log,
+    &mut stable,
+  );
+  assert!(ep.is_poisoned(), "the fatal read fail-stops");
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::SnapshotRead));
+  while let Some(out) = ep.poll_message() {
+    assert!(
+      !matches!(out.message(), Message::InstallSnapshot(_)),
+      "no cure blob rides a faulting read"
+    );
+  }
 }
 
 /// The cure-send arc on the leader: an advertised boundary from a TRACKED peer mints the debt

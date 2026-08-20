@@ -711,13 +711,15 @@ where
   /// - THE ABORT REPLAY FENCE: an outstanding `abandoned` obligation is re-derivable solely by
   ///   replaying its abort entry — a capture at-or-past it erases the obligation's only restart
   ///   source with the owed source possibly still frozen (see `abort_relay_fences`);
-  /// - THE MERGE REPLAY FENCE: while a freeze is pending or applied this endpoint captures
-  ///   NOTHING — a capture at-or-past the `PrepareMerge` compacts the entry whose replay is the
-  ///   freeze's only restart derivation, so a crash restarts this replica UNFROZEN while a
-  ///   claiming target still holds a parked absorb of it at the freeze boundary: the two then
-  ///   disagree on what state the claim pinned. The freeze leg HOLDS its caller (it lifts with
-  ///   the thaw or with this group's own dissolution by the claimant); it is never grounds to
-  ///   fold-and-defer, because the fold itself would advance state the claim already pinned.
+  /// - THE MERGE REPLAY FENCE: an APPLIED freeze holds unconditionally — the fold itself would
+  ///   advance state a claiming target pinned at its freeze boundary, and the freeze lifts by
+  ///   protocol (the thaw, or this group's own dissolution by the claimant). A PENDING
+  ///   `PrepareMerge` fences by BOUNDARY: a capture at-or-past its index compacts the entry
+  ///   whose replay is the freeze's only restart derivation, so a crash restarts this replica
+  ///   UNFROZEN while the claimant still holds a parked absorb at the freeze boundary — but a
+  ///   pending freeze ABOVE the boundary survives the compaction untouched, and holding an
+  ///   earlier fold on it is a restart-replay circular wait (the park below is exactly what
+  ///   keeps that freeze from ever applying).
   pub(crate) fn capture_blocked_at(&self, boundary: Index) -> bool {
     self.snapshot.pending_compact.is_some()
       || self.snapshot.pending_install.is_some()
@@ -727,7 +729,8 @@ where
         .first()
         .is_some_and(|cap| *cap <= boundary)
       || self.abort_relay_fences(boundary)
-      || self.merge_freeze_active()
+      || self.merge.frozen
+      || self.merge.freeze_pending.is_some_and(|f| f <= boundary)
   }
 
   /// Which STRUCTURAL leg of [`capture_blocked_at`](Self::capture_blocked_at) stands at
@@ -738,7 +741,7 @@ where
   /// neither. Precedence mirrors [`absorb_capture_block`](Self::absorb_capture_block): the freeze
   /// is a HOLD leg and outranks the two replay fences it can stand alongside.
   pub(crate) fn capture_fence_at(&self, boundary: Index) -> Option<CaptureFence> {
-    if self.merge_freeze_active() {
+    if self.merge.frozen || self.merge.freeze_pending.is_some_and(|f| f <= boundary) {
       Some(CaptureFence::Frozen)
     } else if self
       .split
@@ -789,7 +792,8 @@ where
     }
     let verdict = if self.snapshot.pending_compact.is_some()
       || self.snapshot.pending_install.is_some()
-      || self.merge_freeze_active()
+      || self.merge.frozen
+      || self.merge.freeze_pending.is_some_and(|f| f <= pending.at())
     {
       AbsorbCaptureBlock::Hold
     } else if self
