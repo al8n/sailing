@@ -232,13 +232,15 @@ where
     let SnapshotChunkRead::Ready(blob) = chunk else {
       return; // cold: the next advertisement or sweep re-drives
     };
-    if blob.len() as u64 != total {
-      return;
-    }
     let (term, me) = (self.term, self.config.id());
-    let encoded =
-      crate::wire::install_snapshot_encoded_len(term, &me, &meta, 0, 0, blob.len() as u64);
-    if encoded.saturating_add(crate::wire::GROUP_HEADER_RESERVE) > crate::wire::MAX_FRAME_BYTES {
+    let encoded = crate::wire::install_snapshot_encoded_len(term, &me, &meta, 0, 0, total);
+    if blob.len() as u64 != total
+      || encoded.saturating_add(crate::wire::GROUP_HEADER_RESERVE) > crate::wire::MAX_FRAME_BYTES
+    {
+      // BOTH undeliverable shapes signal — a blob the store cannot hand back in one bounded
+      // call is exactly as unshippable as one that overflows the frame, and a silent return
+      // here would retry forever while the voter stays parked, which is the disease. The
+      // courtesy sender's silent skip is the safe direction only for a REMOVED peer.
       self
         .outputs
         .events
@@ -993,14 +995,14 @@ where
       if is.total_len() == 0
         && let Some(park) = self.merge_park_unresolvable()
         && meta.last_index() >= park
-        // Adopt only within the LOCALLY PROVEN committed range — the crossing walk's own cap. A
-        // blob beyond it may cover durable, Log-Matching entries the walk never examined (the
-        // async-follower coverage arm admits exactly that shape), and one of them could be a
-        // crossing naming a hosted source. Bailing here is not a refusal: the raise branch
+        // Adopt only what the crossing walk has EXAMINED — its own watermark, never the commit
+        // index: a delivery can raise commit between resolver cranks, and a duplicate arriving
+        // before the next crank would pass a commit-keyed gate while the walk still stops at
+        // the older frontier, adopting across an interval never examined (where a crossing
+        // naming a hosted source could hide). Bailing here is not a refusal: the raise branch
         // below advances commit off this very blob's evidence, the walk catches up next crank,
-        // the hint re-evaluates, and the NEXT delivery adopts — one extra round-trip, with the
-        // walk always ahead of the adopt.
-        && meta.last_index() <= self.commit
+        // the hint re-gates, and the NEXT delivery adopts — the walk always ahead of the adopt.
+        && self.crossing_walk_covers(meta.last_index())
         && !self.adopt_parked_union(log, meta, is.data().clone())
       {
         return;

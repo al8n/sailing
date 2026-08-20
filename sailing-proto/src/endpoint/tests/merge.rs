@@ -2776,8 +2776,9 @@ fn the_adopt_thaws_a_frozen_and_parked_target() {
   assert!(ep.is_frozen(), "the freeze applied below the park");
   assert!(ep.pending_merge().is_some(), "parked above its own freeze");
 
-  // The container's resolver would classify this park unresolvable (source unhosted); the
-  // endpoint test records the classification directly.
+  // The container's resolver would classify this park unresolvable (source unhosted) after
+  // advancing the crossing walk; the endpoint test mirrors both steps directly.
+  ep.advance_crossing_scan(&log);
   ep.note_merge_park_unresolvable(true);
   let meta = SnapshotMeta::new(
     Index::new(4),

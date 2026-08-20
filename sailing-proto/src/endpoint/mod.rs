@@ -3341,15 +3341,36 @@ where
       return;
     }
     let me = self.config.id();
-    let Some(to) = self
-      .tracker
-      .progress_map()
-      .iter()
-      .filter(|(id, _)| *id != me && self.tracker.is_voter(id) && !self.cure_owed.contains_key(id))
-      .max_by_key(|(_, pr)| pr.match_index())
-      .map(|(id, _)| id.cheap_clone())
-    else {
-      return;
+    // A forced handoff already authorized this term BINDS the choice: only the same target can
+    // re-arm (a second forced campaigner would split the term), so after a lost TimeoutNow the
+    // retry goes to the authorized target even if it has since advertised its own park —
+    // excluding it here would pick a peer the transfer machinery must refuse, and the leader
+    // would strand wedged behind a discarded refusal for the rest of a healthy term. A parked
+    // target that wins simply runs this same leg next term: the token walks either way.
+    let to = if self.transfer.forced_handoff_this_term {
+      let Some(t) = self
+        .transfer
+        .forced_handoff_target
+        .as_ref()
+        .map(CheapClone::cheap_clone)
+      else {
+        return;
+      };
+      t
+    } else {
+      let Some(to) = self
+        .tracker
+        .progress_map()
+        .iter()
+        .filter(|(id, _)| {
+          *id != me && self.tracker.is_voter(id) && !self.cure_owed.contains_key(id)
+        })
+        .max_by_key(|(_, pr)| pr.match_index())
+        .map(|(id, _)| id.cheap_clone())
+      else {
+        return;
+      };
+      to
     };
     // Every refusal is a no-op by construction — `HandoffPending` past the term's one forced
     // handoff, `Frozen` on a group whose leadership is dissolving anyway, `Poisoned` on a node

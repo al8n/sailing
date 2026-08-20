@@ -11581,6 +11581,38 @@ fn a_blob_beyond_local_commit_defers_until_the_walk_catches_up() {
     "the hosted crossing's source is untouched"
   );
 
+  // THE BACK-TO-BACK DUPLICATE: commit is raised to the boundary now, but the walk still stops
+  // at the old frontier — a commit-keyed gate would admit this duplicate and adopt across the
+  // unexamined crossing. The watermark bind refuses until the walk itself has moved.
+  let dup = crate::SnapshotMeta::new(
+    Index::new(4),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(2);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        dup,
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+  }
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_some(),
+    "a duplicate between cranks must not outrun the walk"
+  );
+  assert!(m.contains_group(&42));
+
   // The walk catches up on the next crank and the hint re-gates on the now-visible crossing.
   assert!(m.service_merge_applies(now, &mut stores).is_empty());
   assert_eq!(
