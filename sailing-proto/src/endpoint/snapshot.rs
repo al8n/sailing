@@ -1440,6 +1440,15 @@ where
     // observe it advance to discharge it) — a permanent capture wedge. An obligation above the
     // boundary is retained (see the helper).
     self.note_abort_rebaselined(meta.last_index());
+    // The fourth per-host reshape obligation the install supersedes: a QUEUED fork's durability
+    // barrier at-or-below the boundary. The justification is the restore itself, not any claim
+    // about the sender: `log.restore` above already discarded the split entry — the replay
+    // source the barrier protects is GONE, so past this point the fence protects nothing and
+    // could only wedge every later capture. (A sender-side durability argument would be
+    // unsound: a non-voter host clears its barrier with no durability at all and can later
+    // lead and send a blob past the coordinate.) The queue is kept and popped forks keep their
+    // barriers — see the helper.
+    self.note_fork_barrier_rebaselined(meta.last_index());
     // `restore` DISCARDS the prior tail, so the durable boundary IS exactly the snapshot's last index — a
     // hard RESET. `durable_index` and the re-baseline advance together, after the blob is durable, so the
     // boundary is recoverable (no stale-HIGH watermark, no orphan).

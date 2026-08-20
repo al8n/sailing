@@ -149,6 +149,24 @@ where
     self.split.outstanding.remove(&index);
   }
 
+  /// A snapshot install re-baselined the log to `boundary`, discarding every split entry
+  /// at-or-below it — the replay derivation the barrier protects. For a fork still QUEUED at
+  /// such an index the fence now protects nothing and can only wedge (the capture fence would
+  /// stand forever against a coordinate no replay can ever need), so its barrier clears; the
+  /// queue entry itself is KEPT — self-contained, it keeps the child materializable from the
+  /// in-memory blob for the process lifetime, strictly better than dropping it, and a later
+  /// examination still resolves it redundant against a transferred twin's token. A fork already
+  /// POPPED (the driver's pop→flush→lift window) keeps its barrier: `resolve_fork` lifts it when
+  /// the flush (or the container's drop) completes, and freeing it early would release the fence
+  /// under an in-flight materialization whose baseline is not yet durable.
+  pub(crate) fn note_fork_barrier_rebaselined(&mut self, boundary: Index) {
+    let queued: BTreeSet<Index> = self.split.pending_forks.iter().map(|f| f.index).collect();
+    self
+      .split
+      .outstanding
+      .retain(|i| *i > boundary || !queued.contains(i));
+  }
+
   /// The group's lineage counter (incarnation ⊔ shape), LIVE: one unified monotone per-id value,
   /// bumped by every applied split and merge entry. Public so an embedder (and the absorbing
   /// side of a merge) can read the counter the merge choreography's `*_gen_after` fields compare
