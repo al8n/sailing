@@ -261,6 +261,13 @@ pub(crate) struct MergeState {
   /// Never cleared: the check compares against the live `first_index`, so it self-releases
   /// permanently once the capture's compaction lands.
   pub(crate) absorb_index: Option<Index>,
+  /// Debts INHERITED from consumed sources that themselves still owed a capture (the chained
+  /// shape a foreign-led merge can deliver): they discharge WITH [`MergeState::capture_debt`]
+  /// on the same covering capture — the consumed state machine has carried each prior union
+  /// since its absorb applied, so one snapshot at-or-past the newest boundary covers them all.
+  /// Non-empty only while `capture_debt` is `Some` (inheritance happens only inside a `Defer`,
+  /// which always mints).
+  pub(crate) inherited_debts: std::vec::Vec<crate::Merged>,
   /// The abandoned merges this TARGET must thaw its sources out of, keyed by source id — one entry
   /// per aborted source, inserted when a target-role abort (`RollbackMerge` at its live mint)
   /// APPLIES here, removed once that source is observed thawed past the abandoned generation (or
@@ -830,6 +837,46 @@ where
   /// reshape verbs refuse this group both roles and a leader is never quiesce-eligible.
   pub fn capture_debt(&self) -> Option<&crate::Merged> {
     self.merge.capture_debt.as_ref()
+  }
+
+  /// Every debt this endpoint holds — its own, then the inherited chain. The consuming
+  /// teardowns validate and surface the WHOLE chain, and the naming scans pin every listed
+  /// source's preserved stores.
+  pub(crate) fn capture_debt_chain(&self) -> impl Iterator<Item = &crate::Merged> {
+    self
+      .merge
+      .capture_debt
+      .iter()
+      .chain(self.merge.inherited_debts.iter())
+  }
+
+  /// Whether any held debt (own or inherited) names `key` as its absorbed source.
+  pub(crate) fn debt_names_source(&self, key: &Bytes) -> bool {
+    self.capture_debt_chain().any(|m| m.source() == *key)
+  }
+
+  /// Drain the WHOLE chain (own debt first) — the consuming teardowns' take: the caller
+  /// surfaces every entry or hands them to the absorbing target.
+  pub(crate) fn take_capture_debts(&mut self) -> std::vec::Vec<crate::Merged> {
+    let mut chain = std::vec::Vec::with_capacity(1 + self.merge.inherited_debts.len());
+    chain.extend(self.merge.capture_debt.take());
+    chain.append(&mut self.merge.inherited_debts);
+    chain
+  }
+
+  /// Adopt a consumed source's drained chain as inherited debts (the `Defer` arm, after its own
+  /// mint): they discharge with this endpoint's own debt on the same covering capture.
+  pub(crate) fn adopt_inherited_debts(&mut self, debts: std::vec::Vec<crate::Merged>) {
+    debug_assert!(
+      self.merge.capture_debt.is_some() || debts.is_empty(),
+      "inherited debts ride an own debt's discharge"
+    );
+    self.merge.inherited_debts.extend(debts);
+  }
+
+  /// Drain the inherited chain at the own debt's discharge.
+  pub(crate) fn take_inherited_debts(&mut self) -> std::vec::Vec<crate::Merged> {
+    core::mem::take(&mut self.merge.inherited_debts)
   }
 
   /// The staged (submitted, not yet durability-completed) capture's boundary, if one is in

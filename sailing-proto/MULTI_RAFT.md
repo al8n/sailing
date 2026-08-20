@@ -484,14 +484,17 @@ un-floored and unreachable forever.
 A debt is HOST-LOCAL — the fences that deferred it are this replica's own — so a foreign-led
 freeze can legally commit the DEBTOR's own consumption as the next merge source while the debt
 still stands here: the propose-time refusal ran on a debt-less replica. The two resolver
-teardowns INHERIT the debt rather than drop it. The Resolve arm holds the park until its fence
-classification is `Clear`, then discharges the debt into the same one-crank capture barrier —
-the snapshot covers the debtor's state machine, which has carried the prior union since that
-absorb applied. The husk dissolve surfaces it alongside `Retired` on the propagated-floor
-evidence (a claimant that itself deferred writes no terminal floor until its own debt
-discharges, so the floor gate serializes chained debts by construction). Both surface the
-ordinary `Merged` resolution for the prior source with no endpoint event — the holder that would
-have carried it is consumed, the `Retired` asymmetry.
+teardowns INHERIT the debt chain rather than drop it. A `Clear`-classified absorb discharges the
+whole chain into its own one-crank capture barrier — the snapshot covers the debtor's state
+machine, which has carried every prior union since its absorb applied. A `Defer`-classified
+absorb chains the consumed source's debts onto the target's own minted debt instead of holding
+the park — an abort fence's clearing witness can ride ABOVE the park, so holding would be a
+circular wait — and one later covering capture discharges the entire chain. The husk dissolve
+surfaces the chain alongside `Retired` on the propagated-floor evidence (a claimant that itself
+deferred writes no terminal floor until its own debts discharge, so the floor gate serializes
+chains by construction). All of these surface the ordinary `Merged` resolution per prior source
+with no endpoint event — the holder that would have carried it is consumed, the `Retired`
+asymmetry.
 
 While a debt stands, the DEBT — not the park's naming, which died at the defer — fences every
 surface that can revive or destroy either group, and every refusal self-releases at the discharge:

@@ -921,8 +921,9 @@ where
         && (ep.pending_merge().is_some_and(|p| p.source_bytes() == key)
           // The debt window: the park was consumed by a fence-deferred absorb, but the named
           // source's stores remain the union's only restart derivation until the discharge —
-          // the naming outlives the park exactly that long.
-          || ep.capture_debt().is_some_and(|m| m.source() == key))
+          // the naming outlives the park exactly that long. Inherited debts name sources whose
+          // stores are pinned the same way.
+          || ep.debt_names_source(&key))
     })
   }
 
@@ -988,10 +989,7 @@ where
     let mut key = Vec::new();
     gid.encode(&mut key);
     let key = Bytes::from(key);
-    self
-      .groups
-      .values()
-      .any(|ep| ep.capture_debt().is_some_and(|m| m.source() == key))
+    self.groups.values().any(|ep| ep.debt_names_source(&key))
   }
 
   /// Whether `source` owes a LOCALLY-DRIVABLE target-role thaw — the shared residual belt of the
@@ -3643,46 +3641,48 @@ where
           // deferred the capture while siblings captured cleanly — so a foreign-led freeze can
           // legally commit this source's consumption while its debt still stands HERE: the
           // propose-time `AlreadyPending` refusal ran on a debt-less replica. Consuming the
-          // holder would drop the held `Merged`, the ONLY permission that terminally floors the
-          // earlier absorbed source, stranding those preserved stores restorable beside state
-          // already transitively absorbed. Nor can the debt discharge in place: a merge source
-          // is FROZEN, and a frozen endpoint never captures. It discharges INTO THIS ABSORB's
-          // own barrier instead — the forced capture covers the source's state machine, which
-          // has carried the earlier union since that absorb applied — and that demands the
-          // one-crank arm: hold the park unless the fence classification is `Clear` (a `Defer`
-          // would preserve the source's stores yet surface nothing for the inherited debt; its
-          // fences lift within cranks). A committed-corrupt debt source id fail-stops the
-          // holder — the resolver's uniform decode rule.
-          let inherited_debt_source = match self
-            .groups
-            .get(&source)
-            .and_then(|sep| sep.capture_debt().map(|m| m.source()))
+          // holder must not drop the held `Merged`s — the ONLY permission that terminally
+          // floors each earlier absorbed source — and the debts cannot discharge in place: a
+          // merge source is FROZEN, and a frozen endpoint never captures. So the whole chain
+          // discharges INTO THIS ABSORB's own barrier — the forced capture covers the source's
+          // state machine, which has carried every prior union since its absorb applied — and
+          // a `Defer` INHERITS the chain onto this target's own minted debt instead of holding
+          // the park: an abort fence's clearing witness can ride ABOVE the park, so holding
+          // here would be a circular wait (the fence lifts only once the park resolves). A
+          // committed-corrupt debt source id fail-stops the holder — the resolver's uniform
+          // decode rule — validated for the WHOLE chain before anything is consumed.
+          let mut inherited_sources: std::vec::Vec<G> = std::vec::Vec::new();
           {
-            Some(bytes) => match G::decode_exact(bytes) {
-              Ok(prior) => Some(prior),
-              Err(_) => {
-                if let Some(sep) = self.groups.get_mut(&source) {
-                  sep.poison(PoisonReason::MergeDecode);
+            let mut corrupt = false;
+            if let Some(sep) = self.groups.get(&source) {
+              for m in sep.capture_debt_chain() {
+                match G::decode_exact(m.source()) {
+                  Ok(prior) => inherited_sources.push(prior),
+                  Err(_) => {
+                    corrupt = true;
+                    break;
+                  }
                 }
-                self.note_if_poisoned(&source);
-                self.mark_dirty(&source);
-                continue;
               }
-            },
-            None => None,
-          };
-          if inherited_debt_source.is_some() && block != crate::endpoint::AbsorbCaptureBlock::Clear
-          {
-            continue;
+            }
+            if corrupt {
+              if let Some(sep) = self.groups.get_mut(&source) {
+                sep.poison(PoisonReason::MergeDecode);
+              }
+              self.note_if_poisoned(&source);
+              self.mark_dirty(&source);
+              continue;
+            }
           }
           // The β hold above proved the source owes no thaw; this absorb IS the merge resolving, so
           // it dissolves the source through the UNGATED inner teardown. The public gate's participant
           // refusals — the source is `Frozen`, and this target's own park names it (`SpokenFor`) —
           // all describe THIS in-flight merge and would wedge the absorb they exist to protect.
           // `None` (a source already gone) holds the park exactly as a busy target does.
-          let Some(sep) = self.remove_group_inner(&source) else {
+          let Some(mut sep) = self.remove_group_inner(&source) else {
             continue;
           };
+          let inherited_debts = sep.take_capture_debts();
           let fsm = sep.into_state_machine();
           let Some(tep) = self.groups.get_mut(&tgid) else {
             // Unreachable: `tgid` was iterated from `self.groups` and only `source` (a DISTINCT id)
@@ -3715,10 +3715,6 @@ where
             continue;
           }
           if block == crate::endpoint::AbsorbCaptureBlock::Defer {
-            debug_assert!(
-              inherited_debt_source.is_none(),
-              "a deferred absorb never consumes a debt-holding source"
-            );
             // A replay fence deferred the capture: the union lives in memory and the CONSUMED
             // source's intact stores remain its only restart derivation, so surface `Absorbed`
             // — the driver fails the source's stranded routing but PRESERVES its stores and
@@ -3732,6 +3728,9 @@ where
               && let Some(tep) = self.groups.get_mut(&tgid)
             {
               tep.mint_capture_debt(m);
+              // The consumed source's own chain rides the minted debt: one covering capture
+              // discharges them all (the fold just absorbed carries every prior union).
+              tep.adopt_inherited_debts(inherited_debts);
               self.mark_dirty(&tgid);
               // The resolution rides ONLY the minted debt: an `Absorbed` with no debt behind it
               // would be a permanent orphan carrying none of the lifecycle fences.
@@ -3775,14 +3774,14 @@ where
               source,
               target: tgid.cheap_clone(),
             });
-            if let Some(prior) = inherited_debt_source {
-              // The consumed source's inherited debt discharges into the SAME staged barrier:
-              // the capture covers the source's state machine, which has carried the prior
-              // union since that absorb applied. Resolution only — the holder that would have
-              // carried the app-visible event is consumed (the `Retired` asymmetry).
+            // The consumed source's debt chain discharges into the SAME staged barrier: the
+            // capture covers the source's state machine, which has carried every prior union
+            // since its absorb applied. Resolutions only — the holder that would have carried
+            // the app-visible events is consumed (the `Retired` asymmetry).
+            for prior in inherited_sources {
               resolutions.push(MergeResolution::Merged {
                 source: prior,
-                target: tgid,
+                target: tgid.cheap_clone(),
               });
             }
           } else {
@@ -3790,9 +3789,9 @@ where
             // teardown is safe. The source endpoint is already CONSUMED, so its parked routing is
             // stranded — emit `CaptureFailed` so the driver fails those callers typed while
             // PRESERVING the source's stores and floor, and a restart re-parks against the restored
-            // source rather than losing the union behind a floored, torn-down source. An
-            // inherited debt record dies un-surfaced here, and soundly: the preserved source
-            // stores replay their own CommitMerge on restart and re-derive it.
+            // source rather than losing the union behind a floored, torn-down source. Inherited
+            // debt records die un-surfaced here, and soundly: the preserved source stores
+            // replay their own CommitMerge entries on restart and re-derive them.
             self.note_if_poisoned(&tgid);
             resolutions.push(MergeResolution::CaptureFailed {
               source,
@@ -3978,26 +3977,35 @@ where
       // applied. (A claimant that itself deferred writes no terminal floor until its own debt
       // discharges, so the floor gate serializes the chain by construction.) A committed-corrupt
       // debt source id fail-stops the husk instead of retiring it.
-      let inherited_debt_source = match self.groups.get(&gid).and_then(|ep| ep.capture_debt()) {
-        Some(m) => match G::decode_exact(m.source()) {
-          Ok(prior) => Some(prior),
-          Err(_) => {
-            if let Some(ep) = self.groups.get_mut(&gid) {
-              ep.poison(PoisonReason::MergeDecode);
+      let mut inherited_sources: std::vec::Vec<G> = std::vec::Vec::new();
+      {
+        let mut corrupt = false;
+        if let Some(ep) = self.groups.get(&gid) {
+          for m in ep.capture_debt_chain() {
+            match G::decode_exact(m.source()) {
+              Ok(prior) => inherited_sources.push(prior),
+              Err(_) => {
+                corrupt = true;
+                break;
+              }
             }
-            self.note_if_poisoned(&gid);
-            self.mark_dirty(&gid);
-            continue;
           }
-        },
-        None => None,
-      };
+        }
+        if corrupt {
+          if let Some(ep) = self.groups.get_mut(&gid) {
+            ep.poison(PoisonReason::MergeDecode);
+          }
+          self.note_if_poisoned(&gid);
+          self.mark_dirty(&gid);
+          continue;
+        }
+      }
       // Dissolve through the UNGATED inner teardown (the public gate's `Frozen`/`Claimed` refusals all
       // describe this very dead lineage). The driver folds the SAME source half as `Merged` MINUS the
       // capture — the co-barriered terminal-floor re-write keeps a crash from re-admitting the id.
       if self.remove_group_inner(&gid).is_some() {
         self.mark_dirty(&gid);
-        if let Some(prior) = inherited_debt_source {
+        for prior in inherited_sources {
           resolutions.push(MergeResolution::Merged {
             source: prior,
             target: gid.cheap_clone(),
@@ -4180,16 +4188,38 @@ where
           continue;
         }
       }
+      let mut inherited: std::vec::Vec<crate::Merged> = std::vec::Vec::new();
       if let Some(tep) = self.groups.get_mut(&tgid)
         && let Some(m) = tep.discharge_capture_debt()
       {
         tep.emit_merged(m);
+        inherited = tep.take_inherited_debts();
       }
       self.mark_dirty(&tgid);
       resolutions.push(MergeResolution::Merged {
         source,
-        target: tgid,
+        target: tgid.cheap_clone(),
       });
+      // Inherited debts discharge WITH the own debt — the same covering capture proves every
+      // prior union durable (the fold has carried each since its absorb applied). Resolutions
+      // only: their app-visible events fired where the original holders captured cleanly. The
+      // ids decoded when the chain was validated at inheritance; a failure here is the same
+      // committed-corrupt fail-stop.
+      for m in inherited {
+        match G::decode_exact(m.source()) {
+          Ok(prior) => resolutions.push(MergeResolution::Merged {
+            source: prior,
+            target: tgid.cheap_clone(),
+          }),
+          Err(_) => {
+            if let Some(tep) = self.groups.get_mut(&tgid) {
+              tep.poison(PoisonReason::MergeDecode);
+            }
+            self.note_if_poisoned(&tgid);
+            break;
+          }
+        }
+      }
     }
     // THE ADOPT-CAPTURE PASS: an adopt owes one forced capture, threshold-independent (the
     // adopt persisted no blob — see the obligation's doc). Same fence discipline as every
