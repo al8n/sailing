@@ -2854,6 +2854,7 @@ where
         // farewell's own timing argument: one heartbeat interval is well inside the removed peer's
         // [T, 2T) election deadline, so the offer lands before its next campaign.
         self.drive_courtesy_offers(now, stable);
+        self.drive_cure_sweep(now, stable);
         // ...and, on the same beat, hand leadership away if THIS replica is the one holding a
         // park no local crank can resolve. The two cure legs are complements: a follower
         // advertises upward for a blob, a leader has nobody above it and must become a follower
@@ -2865,6 +2866,10 @@ where
         // clears `leader`, and the boundary is worth telling the leader this tick still knows
         // about, whether or not the tick goes on to depose it.
         self.drive_stuck_advertisement(now);
+        // The cure sweep's EXPIRY half runs here too: an ex-leader's leaked cure ledger would
+        // otherwise pin quiesce forever, with no further responses arriving to discharge it (the
+        // send half stays leader-gated inside).
+        self.drive_cure_sweep(now, stable);
         if self.election_deadline.is_some_and(|d| d <= now.mono()) {
           // A learner or removed node must never start an election.
           // Clear the deadline so `poll_timeout` returns `None` for this node and
@@ -3215,13 +3220,25 @@ where
     for peer in due {
       self.maybe_send_courtesy_snapshot(now, &peer, stable);
     }
-    // The merge-cure sweep, the same cadence: expire entries whose peer stopped advertising (the
-    // park resolved some other way — a ghost debt would ship whole blobs at nobody), then re-try
-    // the due remainder.
+  }
+
+  /// The merge-cure sweep, its OWN tick step — never nested behind the courtesy path's gates:
+  /// the EXPIRY half must run on every role with or without courtesy debts, because a standing
+  /// cure debt holds quiesce eligibility on both sides of the pump, and a peer that stopped
+  /// advertising (its park resolved, its replica died) would otherwise pin the group awake
+  /// forever — an ex-leader with a leaked entry receives no further response to discharge it.
+  /// Only the SEND half is leader-gated (the offer method's own bail).
+  fn drive_cure_sweep<S: StableStore<NodeId = I>>(&mut self, now: Now, stable: &S) {
+    if self.cure_owed.is_empty() {
+      return;
+    }
     let expiry = self.config.election_timeout() * CURE_EXPIRY_TIMEOUTS;
     self
       .cure_owed
       .retain(|_, d| now.mono().duration_since(d.refreshed_at) <= expiry);
+    if !self.role.is_leader() {
+      return;
+    }
     let cure_due: std::vec::Vec<I> = self
       .cure_owed
       .iter()

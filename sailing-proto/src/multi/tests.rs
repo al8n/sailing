@@ -11265,3 +11265,120 @@ fn a_resolved_park_retires_its_blocked_edge() {
     "the edge is retired with the hold that justified it"
   );
 }
+
+/// One debt at a time is a HOST-LOCAL invariant: a debt-free foreign leader's propose gates
+/// cannot see this host's standing fences, so a second committed absorb can legally park here
+/// mid-window — and it must HOLD, never defer, or the second mint would overwrite the first
+/// debt's held `Merged` and strand that source's stores forever. The hold releases on the first
+/// debt's own discharge.
+#[test]
+fn a_second_committed_absorb_holds_behind_a_standing_debt() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  assert!(m.group(&1).unwrap().capture_debt().is_some());
+
+  // A debt-free foreign leader committed a second absorb into this target; model its arrival by
+  // proposing at the ENDPOINT seam (the container's own gates would refuse — that is exactly the
+  // point: they run on the proposer, not on this host).
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let ep = m.group_mut(&1).unwrap();
+    ep.propose_merge_entry(
+      d,
+      l,
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(3, Index::new(9), 1, 3),
+    )
+    .unwrap();
+    m.flush_appends(&1, d, l, s).unwrap();
+    while matches!(
+      m.handle_storage(&1, d, l, s),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_some(),
+    "the second absorb parked"
+  );
+  let first_debt_source = m.group(&1).unwrap().capture_debt().unwrap().source();
+  // The resolver HOLDS: no second Absorbed, no overwritten debt.
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert!(
+    !resolutions
+      .iter()
+      .any(|r| matches!(r, MergeResolution::Absorbed { .. })),
+    "a standing debt holds the next park — deferring would overwrite the held Merged"
+  );
+  assert!(m.group(&1).unwrap().pending_merge().is_some());
+  assert_eq!(
+    m.group(&1).unwrap().capture_debt().unwrap().source(),
+    first_debt_source,
+    "the first debt survives byte-identical"
+  );
+
+  // The first debt's discharge releases the hold; the second park then takes its own course.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived");
+  m.lift_fork_barrier(&1, fork.split_index);
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert!(
+    resolutions.iter().any(|r| matches!(
+      r,
+      MergeResolution::Merged {
+        source: 2,
+        target: 1
+      }
+    )),
+    "the first union floors and tears down"
+  );
+  assert!(m.group(&1).unwrap().capture_debt().is_none());
+}
+
+/// The discharge fence is keyed at the CAPTURE POINT, never the absorb boundary: a Split
+/// applied INSIDE the debt window sits above the boundary — invisible to a boundary-keyed leg —
+/// while the forced capture's compaction at `applied` would erase exactly the entry that is the
+/// staged fork's only recovery source. The discharge waits for that fork too.
+#[test]
+fn a_split_inside_the_debt_window_fences_the_discharge() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+
+  // A second split lands INSIDE the window (above the absorb boundary).
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.propose_split(&1, d, l, s, &300, 0, Bytes::from_static(b"\x03"))
+      .unwrap()
+      .unwrap();
+    m.flush_appends(&1, d, l, s).unwrap();
+    while matches!(
+      m.handle_storage(&1, d, l, s),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  // The ORIGINAL fence lifts; the in-window fork's barrier must keep fencing the discharge.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the original fork");
+  m.lift_fork_barrier(&1, fork.split_index);
+  assert!(
+    m.service_merge_applies(d, &mut stores).is_empty(),
+    "the in-window fork's replay entry sits above the boundary; a boundary-keyed fence would \
+     miss it and the compaction would erase the staged fork's recovery source"
+  );
+  assert!(m.group(&1).unwrap().capture_debt().is_some());
+
+  // The in-window fork resolves; the discharge follows.
+  let fork2 = m.poll_pending_fork().expect("the in-window fork");
+  m.lift_fork_barrier(&1, fork2.split_index);
+  assert!(
+    m.service_merge_applies(d, &mut stores)
+      .iter()
+      .any(|r| matches!(
+        r,
+        MergeResolution::Merged {
+          source: 2,
+          target: 1
+        }
+      )),
+    "both replay entries safe, the union floors"
+  );
+}

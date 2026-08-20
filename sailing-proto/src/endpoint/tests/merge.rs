@@ -3171,14 +3171,23 @@ fn an_advertised_park_mints_a_cure_debt_and_offers_the_covering_blob() {
   assert!(!ep.has_cure_debts(), "evidence discharges");
 }
 
-/// Eligibility defers, never drops: a leader whose durable blob does not yet cover the
-/// advertised boundary sends nothing and keeps the debt armed — the leader's own later capture
-/// makes it eligible, and the sweep re-drives it then.
+/// Eligibility defers, never drops: a PLAUSIBLE advertised boundary (at-or-below this leader's
+/// commit) whose blob coverage has not caught up yet mints the debt and sends nothing — the
+/// leader's own later capture makes it eligible and the sweep re-drives it. An IMPLAUSIBLE
+/// boundary (above the leader's commit — a committed park cannot sit there) never mints at all:
+/// its debt could never become eligible and would only pin the group awake until expiry.
 #[test]
 fn an_uncovered_cure_debt_defers_without_spending() {
   use crate::HeartbeatResponse;
-  let (mut ep, mut log, mut stable) = make_capturing_leader();
+  // A leader that has never captured (default threshold): every boundary is uncovered.
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
   let d = Instant::ORIGIN;
+  for i in 0..2u8 {
+    let cmd = bytes::Bytes::copy_from_slice(&[i]);
+    let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+  }
+  ack_through(&mut ep, &mut log, &mut stable, Index::new(3));
+  while ep.poll_message().is_some() {}
   ep.handle_message(
     d,
     &mut log,
@@ -3186,12 +3195,12 @@ fn an_uncovered_cure_debt_defers_without_spending() {
     2u64,
     Message::HeartbeatResponse(
       HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
-        .with_stuck_boundary(Index::new(400)),
+        .with_stuck_boundary(Index::new(2)),
     ),
   );
   assert!(
     ep.has_cure_debts(),
-    "the debt mints regardless of eligibility"
+    "a plausible boundary mints regardless of blob coverage"
   );
   let mut offers = 0;
   while let Some(out) = ep.poll_message() {
@@ -3201,7 +3210,24 @@ fn an_uncovered_cure_debt_defers_without_spending() {
   }
   assert_eq!(
     offers, 0,
-    "a blob below the boundary cannot carry the union — defer"
+    "no blob covers the boundary yet — the offer defers, the debt stands"
+  );
+
+  // The implausible twin: a boundary above this leader's commit is refused at the mint.
+  let (mut ep2, mut log2, mut stable2) = make_capturing_leader();
+  ep2.handle_message(
+    d,
+    &mut log2,
+    &mut stable2,
+    2u64,
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+        .with_stuck_boundary(Index::new(400)),
+    ),
+  );
+  assert!(
+    !ep2.has_cure_debts(),
+    "a committed park cannot sit above the leader's commit — nothing mints"
   );
 }
 
@@ -3355,4 +3381,109 @@ fn an_unhinted_leader_arms_no_handoff() {
   ep.handle_timeout(Instant::ORIGIN, &mut log, &mut stable);
   assert!(drain_timeout_now_targets(&mut ep).is_empty());
   assert_eq!(ep.transfer.lead_transferee, None);
+}
+
+/// A CHUNK at a covered boundary must never enter the adopt: every install class reaches the
+/// redundancy arm, and a chunk's payload is a fragment whose decode would poison a live voter
+/// on a message class that was inert there before the adopt existed. The chunk falls through
+/// to the plain redundant handling and the park stands untouched.
+#[test]
+fn a_chunked_install_never_adopts_a_hinted_park() {
+  use crate::{InstallSnapshot, SnapshotMeta, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(1),
+          Index::new(1),
+          EntryKind::Normal,
+          encode_cmd(b"a")
+        ),
+        Entry::new(
+          Term::new(1),
+          Index::new(2),
+          EntryKind::CommitMerge,
+          commit_payload(b"\x2a", Index::new(7), 1, 1),
+        ),
+        Entry::new(
+          Term::new(1),
+          Index::new(3),
+          EntryKind::Normal,
+          encode_cmd(b"b")
+        ),
+      ],
+      Index::new(3),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(ep.pending_merge().is_some(), "parked");
+  ep.note_merge_park_unresolvable(true);
+
+  let meta = SnapshotMeta::new(
+    Index::new(3),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2]),
+  );
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(1),
+      1u64,
+      meta,
+      bytes::Bytes::from_static(&[0xDE, 0xAD]),
+      0,
+      1_000_000,
+    )),
+  );
+  assert!(
+    !ep.is_poisoned(),
+    "a fragment must never reach the adopt's decode"
+  );
+  assert!(
+    ep.pending_merge().is_some(),
+    "the chunk took the plain redundant path; the park stands for the whole-blob cure"
+  );
+}
+
+/// The cure ledger expires on advertisement silence REGARDLESS of role or of the courtesy
+/// ledger's state: a standing debt holds quiesce eligibility on both sides of the pump, and a
+/// peer that resolved its park some other way must not pin the group awake forever.
+#[test]
+fn a_silent_advertiser_expires_its_cure_debt() {
+  use crate::HeartbeatResponse;
+  use core::time::Duration;
+  let (mut ep, mut log, mut stable) = make_capturing_leader();
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+        .with_stuck_boundary(Index::new(3)),
+    ),
+  );
+  assert!(ep.has_cure_debts());
+  while ep.poll_message().is_some() {}
+  // Four election timeouts of silence: the sweep's expiry half runs on the tick, no courtesy
+  // debt anywhere, and the ledger drains.
+  let later = Instant::ORIGIN + Duration::from_millis(4_000);
+  let _ = ep.poll_timeout();
+  ep.handle_timeout(later, &mut log, &mut stable);
+  assert!(
+    !ep.has_cure_debts(),
+    "silence is resolution: the expiry half is gated by neither role nor the courtesy ledger"
+  );
 }

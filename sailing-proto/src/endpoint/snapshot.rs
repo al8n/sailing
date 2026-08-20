@@ -964,7 +964,13 @@ where
       // narrowing recorded: at a park the persisted commit certifies commit-durability while
       // STATE-derivability rides the advertisement loop (a crash re-parks, re-advertises, and
       // is re-cured; nothing is acked before the persist lands).
-      if let Some(park) = self.merge_park_unresolvable()
+      // Only a complete single-shot blob may adopt: every install class reaches this arm, and a
+      // CHUNK's payload is a fragment whose decode would fail — poisoning a live voter on a
+      // message class that was inert here before the adopt existed. A chunk at a covered
+      // boundary falls through to the plain redundant ack exactly as it always has; the cure
+      // sender ships whole blobs by construction, so the gate costs the cure nothing.
+      if is.total_len() == 0
+        && let Some(park) = self.merge_park_unresolvable()
         && meta.last_index() >= park
         && !self.adopt_parked_union(log, meta, is.data().clone())
       {
@@ -1322,6 +1328,13 @@ where
   where
     F::Snapshot: Data,
   {
+    // The destructive install paths validate the ConfState before adopting a configuration; a
+    // malformed one landing in the tracker would poison ConfChangeApply only later, far from its
+    // cause. Refuse BEFORE the park is taken, so the endpoint is byte-unchanged on the bail.
+    if !meta.conf().is_valid() {
+      self.poison(PoisonReason::InvalidConfState);
+      return false;
+    }
     let Some(pending) = self.merge.pending_apply.take() else {
       debug_assert!(false, "the adopt is keyed on a standing park");
       return false;
@@ -1373,7 +1386,12 @@ where
         }
       };
     }
-    self.merge.absorb_index = Some(absorb_high);
+    self.merge.absorb_index = Some(
+      self
+        .merge
+        .absorb_index
+        .map_or(absorb_high, |prior| prior.max(absorb_high)),
+    );
     self.applied = boundary;
     // The freeze quartet clears UNCONDITIONALLY, the totality argument in the correct
     // direction: a same-group sender is capture-fenced for its freeze's whole life, so a blob
