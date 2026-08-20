@@ -438,3 +438,213 @@ fn a_pending_farewell_blocks_quiescence() {
     "idle-eligible once the farewell budget drains"
   );
 }
+
+/// The factory's PRE-BUILD gate refuses a debt-named gid, and the debt leg is the only conjunct
+/// that does. Post-defer the consumed source id looks entirely admissible — no tombstone, no
+/// terminal floor (both arrive only at the discharge), no split reservation — so without this leg
+/// a solicitation for it would materialize a fresh husk beside the union its preserved stores
+/// still back. Driven through the real container + engine on the public API: a parked fork's
+/// standing barrier defers the absorb's capture into a debt, then each gate conjunct is evaluated
+/// at the seam the driver reads it from. The async pump itself is out of scope here; what is
+/// pinned is that the conjunction refuses, and refuses ONLY because of the debt.
+#[test]
+fn the_factory_gate_refuses_a_debt_named_source_and_releases_at_the_discharge() {
+  use sailing_proto::{
+    FloorStore, GroupEngine, Index, Instant, MergeResolution, MultiRaft, StateMachine,
+    StorageProgress, floor_admits,
+  };
+
+  #[derive(Default)]
+  struct Sm(u64);
+  impl StateMachine for Sm {
+    type Command = bytes::Bytes;
+    type Response = u64;
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+    fn apply(&mut self, _: Index, _: bytes::Bytes) -> Result<u64, Self::Error> {
+      self.0 += 1;
+      Ok(self.0)
+    }
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.0)
+    }
+    fn restore(&mut self, s: u64) -> Result<(), Self::Error> {
+      self.0 = s;
+      Ok(())
+    }
+    fn split(&mut self, instruction: &[u8]) -> Option<Self> {
+      let give = u64::from(*instruction.first()?).min(self.0);
+      self.0 -= give;
+      Some(Self(give))
+    }
+    fn absorb(&mut self, source: Self) -> bool {
+      self.0 += source.0;
+      true
+    }
+    fn supports_split(&self) -> bool {
+      true
+    }
+    fn supports_absorb(&self) -> bool {
+      true
+    }
+  }
+
+  let cfg = || Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+  let now = Instant::ORIGIN;
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut multi: MultiRaft<u64, u64, Sm> = MultiRaft::new();
+
+  // `drain` settles one group's storage; `elect` drives a single voter to leadership.
+  macro_rules! drain {
+    ($gid:expr, $at:expr) => {
+      for _ in 0..8 {
+        engine.flush();
+        let (log, stable) = engine.stores(&$gid).unwrap();
+        if !matches!(
+          multi.handle_storage(&$gid, $at, log, stable),
+          Some(StorageProgress::MorePending)
+        ) {
+          break;
+        }
+      }
+      engine.flush();
+      {
+        let (log, stable) = engine.stores(&$gid).unwrap();
+        let _ = multi.handle_storage(&$gid, $at, log, stable);
+      }
+    };
+  }
+  let boot = |multi: &mut MultiRaft<u64, u64, Sm>, engine: &mut GroupEngine<u64, u64>, gid| {
+    assert!(engine.add_group(gid));
+    multi
+      .create_group(gid, 0, cfg(), now, 7, Sm::default())
+      .unwrap();
+    let d = multi.group(&gid).unwrap().poll_timeout().unwrap();
+    {
+      let (log, stable) = engine.stores(&gid).unwrap();
+      multi.handle_timeout(&gid, d, log, stable).unwrap();
+    }
+    for _ in 0..4 {
+      engine.flush();
+      let (log, stable) = engine.stores(&gid).unwrap();
+      let _ = multi.handle_storage(&gid, d, log, stable).unwrap();
+    }
+    assert!(multi.group(&gid).unwrap().role().is_leader());
+    d
+  };
+
+  // Group 1 leads and takes on load, then splits out child 300 — whose id is ALREADY hosted by
+  // the time the committed split applies (the reachable conflict shape: an admission the
+  // propose-time gate could not see). The fork parks and its durability barrier stands.
+  let d = boot(&mut multi, &mut engine, 1u64);
+  for _ in 0..3 {
+    {
+      let (log, stable) = engine.stores(&1).unwrap();
+      multi
+        .propose(&1, d, log, stable, &bytes::Bytes::from_static(b"c"))
+        .unwrap()
+        .unwrap();
+    }
+    drain!(1u64, d);
+  }
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    multi
+      .propose_split(
+        &1,
+        d,
+        log,
+        stable,
+        &300,
+        0,
+        bytes::Bytes::from_static(b"\x02"),
+      )
+      .unwrap()
+      .unwrap();
+  }
+  assert!(engine.add_group(300));
+  multi
+    .create_group(300, 0, cfg(), d, 43, Sm::default())
+    .unwrap();
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    multi.flush_appends(&1, d, log, stable).unwrap();
+  }
+  drain!(1u64, d);
+  assert!(
+    multi.poll_pending_fork().is_none(),
+    "the fork parks on the hosted child, leaving its barrier standing"
+  );
+
+  // Group 2 freezes into group 1. The standing fork barrier turns the absorb into a DEFER: the
+  // union applies and serves, and its capture becomes a debt naming the consumed source.
+  let ds = boot(&mut multi, &mut engine, 2u64);
+  {
+    let (log, stable) = engine.stores(&2).unwrap();
+    multi
+      .propose(&2, ds, log, stable, &bytes::Bytes::from_static(b"c"))
+      .unwrap()
+      .unwrap();
+  }
+  drain!(2u64, ds);
+  multi
+    .prepare_merge(&2, ds, &mut engine, &1)
+    .unwrap()
+    .unwrap();
+  drain!(2u64, ds);
+  assert!(multi.group(&2).unwrap().is_frozen());
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    multi.commit_merge(&1, d, log, stable, &2).unwrap().unwrap();
+  }
+  drain!(1u64, d);
+  assert!(multi.group(&1).unwrap().pending_merge().is_some(), "parked");
+  assert!(multi.service_merge_applies(d, &mut engine).is_empty());
+  drain!(1u64, d);
+  assert_eq!(
+    multi.service_merge_applies(d, &mut engine),
+    vec![MergeResolution::Absorbed {
+      source: 2,
+      target: 1
+    }]
+  );
+
+  // The gate's conjuncts, at the seams the driver reads them from. A gen-0 blueprint naming the
+  // solicitor is the ordinary factory answer for a solicited id.
+  let blueprint = GroupBlueprint::new(
+    Config::try_new(1u64, vec![1, 2], ELECTION, HEARTBEAT).unwrap(),
+    0,
+  );
+  assert!(blueprint_names(&blueprint, &2), "the solicitor is named");
+  assert!(
+    floor_admits(engine.floor(&2), blueprint.generation()),
+    "no terminal floor yet — it arrives only with the discharge"
+  );
+  assert!(
+    !multi.split_reserved(&2),
+    "no split reserves the absorbed source's id"
+  );
+  assert!(
+    multi.debt_names(&2),
+    "the debt leg is the ONLY conjunct refusing — without it the factory builds a husk"
+  );
+
+  // The discharge releases the gate: the conflict resolves, the fence lifts, the capture stages,
+  // and the id then falls to the ordinary terminal-floor refusal instead.
+  multi.remove_group(&300, &mut engine).unwrap();
+  let fork = multi
+    .poll_pending_fork()
+    .expect("the fork survived the wait");
+  multi.lift_fork_barrier(&1, fork.split_index);
+  assert_eq!(
+    multi.service_merge_applies(d, &mut engine),
+    vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }]
+  );
+  assert!(
+    !multi.debt_names(&2),
+    "the debt window's refusal is self-releasing"
+  );
+}

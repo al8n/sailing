@@ -2167,7 +2167,16 @@ impl crate::StateMachine for SplitSm {
     Some(Self { units: give })
   }
 
+  fn absorb(&mut self, source: Self) -> bool {
+    self.units += source.units;
+    true
+  }
+
   fn supports_split(&self) -> bool {
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
     true
   }
 }
@@ -3101,4 +3110,222 @@ fn the_fence_covers_every_class_and_spares_the_frames_live_entries() {
     "the live group's entry in the fenced frame still dispatched"
   );
   assert_eq!(w.b.poll_conn_closed(), None, "the connection survives");
+}
+
+/// Drive a single-voter group on `c` to leadership, then settle its storage.
+fn lead_split_group(c: &mut SplitCoord, g: u64, st: &mut Stores, now: Instant) -> Instant {
+  let d = c.group(&g).unwrap().poll_timeout().unwrap().max(now);
+  {
+    let (l, s) = st.stores(&g).unwrap();
+    c.handle_timeout(&g, d, l, s).unwrap();
+  }
+  settle_group(c, g, st, d);
+  assert!(c.group(&g).unwrap().role().is_leader());
+  d
+}
+
+/// Drain one group's storage completions until nothing is pending.
+fn settle_group(c: &mut SplitCoord, g: u64, st: &mut Stores, d: Instant) {
+  for _ in 0..40 {
+    let (l, s) = st.stores(&g).unwrap();
+    if !matches!(
+      c.handle_storage(&g, d, l, s),
+      Some(StorageProgress::MorePending)
+    ) {
+      break;
+    }
+  }
+  let (l, s) = st.stores(&g).unwrap();
+  let _ = c.handle_storage(&g, d, l, s);
+}
+
+/// Commit one command on a single-voter leader.
+fn commit_one_on(c: &mut SplitCoord, g: u64, st: &mut Stores, d: Instant) {
+  {
+    let (l, s) = st.stores(&g).unwrap();
+    c.submit_propose(&g, d, l, s, &Bytes::from_static(b"c"))
+      .unwrap()
+      .unwrap();
+  }
+  settle_group(c, g, st, d);
+}
+
+/// A coordinator (node 2) parked in the DEBT WINDOW: group 1 carries a fork whose child id 200 is
+/// already hosted — so its durability barrier stands — and group 2 then freezes into it, which
+/// makes the resolve arm ABSORB and defer the union's capture as a debt. Returns the coordinator,
+/// its stores, and the instant everything is driven at.
+fn debt_window_coord() -> (SplitCoord, Stores, Instant) {
+  let now = Instant::ORIGIN;
+  let mut c = SplitCoord::new();
+  let mut st = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  for g in [1u64, 2, 200] {
+    st.map
+      .insert(g, (VecLog::default(), AsyncStable::default()));
+  }
+  for g in [1u64, 2] {
+    c.create_group(g, single_voter(2), now, 7, SplitSm::default(), 0, &NoFloors)
+      .unwrap();
+  }
+  let d = lead_split_group(&mut c, 1, &mut st, now);
+  for _ in 0..3 {
+    commit_one_on(&mut c, 1, &mut st, d);
+  }
+  {
+    let (l, s) = st.stores(&1).unwrap();
+    c.propose_split(&1, d, l, s, &200, 0, Bytes::from_static(b"\x02"), &NoFloors)
+      .expect("the parent is hosted")
+      .expect("the leader appends the split");
+  }
+  // The squatter is admitted through the CONTAINER, past this coordinator's split reservation.
+  // The reservation only ever narrows the LOCAL window (its doc says so): the reachable
+  // production shape is a replica that already hosted the child id when the committed split
+  // ARRIVED, which no local reservation can see. Everything downstream — the apply, the fork's
+  // park, the barrier it leaves standing — is the ordinary path.
+  c.multi
+    .create_group(200, 0, single_voter(2), now, 43, SplitSm::default())
+    .unwrap();
+  settle_group(&mut c, 1, &mut st, d);
+  assert!(
+    c.poll_pending_fork().is_none(),
+    "the fork parks on the hosted child, leaving its barrier standing"
+  );
+  assert_eq!(c.poll_split_conflict(), Some((1, 200)));
+
+  let ds = lead_split_group(&mut c, 2, &mut st, now);
+  commit_one_on(&mut c, 2, &mut st, ds);
+  c.prepare_merge(&2, ds, &mut st, &1, &NoFloors)
+    .unwrap()
+    .unwrap();
+  settle_group(&mut c, 2, &mut st, ds);
+  assert!(c.group(&2).unwrap().is_frozen());
+  {
+    let (l, s) = st.stores(&1).unwrap();
+    c.commit_merge(&1, d, l, s, &2, &NoFloors).unwrap().unwrap();
+  }
+  settle_group(&mut c, 1, &mut st, d);
+  assert!(c.group(&1).unwrap().pending_merge().is_some(), "parked");
+
+  // The first pass seals the park's abort window; the drain commits the seal; the next resolves.
+  assert!(c.service_merge_applies(d, &mut st).is_empty());
+  settle_group(&mut c, 1, &mut st, d);
+  assert_eq!(
+    c.service_merge_applies(d, &mut st),
+    std::vec![crate::MergeResolution::Absorbed {
+      source: 2,
+      target: 1
+    }],
+    "the standing fork barrier defers the capture into a debt"
+  );
+  assert!(c.debt_names(&2), "the debt names its consumed source");
+  (c, st, d)
+}
+
+/// The demux fence covers the debt window exactly as it covers a tombstone, and — like the
+/// tombstone check — it sits BEFORE store resolution, so the outcome does not depend on the
+/// embedder's `GroupStores` seam. The consumed source's id is NOT retired (its floor moves only at
+/// the discharge), yet every frame addressed to it is equally moot: the endpoint is gone and the
+/// preserved stores are the union's restart derivation, not a group.
+///
+/// Both seam shapes are asserted because they fail differently without the fence. With the source
+/// still store-resolvable (the drivers' posture — `Absorbed` deliberately keeps the stores and the
+/// engine record), the frame already dies as an unhosted-group dispatch. With the source absent
+/// from the seam, the frame reaches the initial-shaped arm, and an `UnknownGroup` advisory there
+/// would prompt the embedder — or a factory — to revive a husk beside the absorbed union. The
+/// fence is what makes both shapes silent, and neither ever closes the shared connection or
+/// disturbs the absorbing target.
+#[test]
+fn the_demux_fence_drops_a_debt_named_sources_frames_without_signalling() {
+  let (mut b, mut sb, d) = debt_window_coord();
+  assert!(
+    !b.is_retired(&2),
+    "an absorbed-pending-capture source is NOT tombstoned — the fence is the debt itself"
+  );
+
+  // A peer that still believes group 2 lives: node 1 dials, node 2 accepts, and the label
+  // handshake completes so the frames below arrive authenticated.
+  let mut a = SplitCoord::new();
+  let mut sa = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  a.create_group(
+    2,
+    single_voter(1),
+    Instant::ORIGIN,
+    9,
+    SplitSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  sa.map
+    .insert(2, (VecLog::default(), AsyncStable::default()));
+  let ca = a.on_dial_open(2, label(1, true), Instant::ORIGIN);
+  let cb = b.on_accept_open(label(2, false), Instant::ORIGIN);
+  assert_eq!(ca, cb);
+  for _ in 0..20 {
+    let mut moved = false;
+    for (_, bytes) in a.poll_transmit() {
+      if !bytes.is_empty() {
+        b.handle_conn_data(ConnId(1), &bytes, false, d, &mut sb);
+        moved = true;
+      }
+    }
+    for (_, bytes) in b.poll_transmit() {
+      if !bytes.is_empty() {
+        a.handle_conn_data(ConnId(1), &bytes, false, d, &mut sa);
+        moved = true;
+      }
+    }
+    if !moved {
+      break;
+    }
+  }
+  assert_eq!(b.conn_of(&1), Some(ConnId(1)), "the peer is authenticated");
+  assert_eq!(
+    b.poll_unknown_group(),
+    None,
+    "the handshake alone signals nothing"
+  );
+
+  // Initial-shaped traffic for the debt-named id: the one shape that mints an advisory.
+  let mut tag = Vec::new();
+  sailing_encode_u64(2, &mut tag);
+  let rv = Message::RequestVote(crate::RequestVote::new(
+    Term::new(9),
+    1u64,
+    Index::ZERO,
+    Term::ZERO,
+    false,
+    false,
+  ));
+  let framed = crafted_frame(&tag, &rv);
+  let target_term = b.group(&1).unwrap().term();
+
+  // Seam A: the source's stores are still resolvable, as the drivers keep them.
+  assert!(sb.map.contains_key(&2));
+  b.handle_conn_data(ConnId(1), &framed, false, d, &mut sb);
+  b.handle_conn_data(ConnId(1), &framed, false, d, &mut sb);
+  assert_eq!(b.poll_unknown_group(), None, "debt-named: silent");
+  assert_eq!(b.poll_conn_closed(), None, "no close on the shared link");
+
+  // Seam B: the source has fallen out of the store seam — the arm that would otherwise advertise
+  // the id as unhosted-and-solicited, which is exactly the revival the fence exists to prevent.
+  sb.map.remove(&2);
+  b.handle_conn_data(ConnId(1), &framed, false, d, &mut sb);
+  assert_eq!(
+    b.poll_unknown_group(),
+    None,
+    "debt-named: silent, not unknown — an advisory here revives a husk"
+  );
+  assert_eq!(b.poll_conn_closed(), None, "still no close");
+  assert_eq!(
+    b.group(&1).unwrap().term(),
+    target_term,
+    "the absorbing target is untouched by its consumed source's stragglers"
+  );
+  assert!(b.group(&2).is_none(), "the source endpoint stays consumed");
 }
