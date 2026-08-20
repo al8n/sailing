@@ -175,6 +175,19 @@ pub(crate) struct MergeState {
   /// cleared the moment the hint clears, so a later park never inherits a stale deadline. Volatile
   /// pacing state, meaningless without `park_unresolvable`.
   pub(crate) stuck_advert_next_at: Option<Instant>,
+  /// Sources of `CommitMerge` entries an install crossed WITHOUT locally resolving them — the
+  /// adopt's skipped range, and the restore path's superseded park. Each is `(source_bytes,
+  /// source_gen_after)` from the crossed entry's own payload. The install's blob EMBEDS every
+  /// such fold (log determinism through its boundary), so a locally hosted replica of one of
+  /// these lineages at-or-below the recorded generation is a live-voting husk of an
+  /// absorbed-away group — exactly the electorate the husk-minority argument must keep empty,
+  /// and left alone it re-arms the dead-target self-thaw into resurrecting absorbed state once
+  /// the target itself later dissolves. The container's per-crank service drains this: hosted +
+  /// gen-eligible ⇒ `Retired` (floor + teardown on the install's own evidence — the sender's
+  /// durable blob is the cluster-level durability proof, so no local store copy is
+  /// load-bearing); unhosted entries need nothing (no husk, no vote). Volatile: a crash
+  /// re-parks and the re-cure re-records.
+  pub(crate) crossed_sources: Vec<(Bytes, u64)>,
   /// An absorbed-but-uncaptured union's outstanding durability obligation: the fold ran and the
   /// apply drain resumed, but a standing replay fence (a parked fork's barrier, an undischarged
   /// abort obligation) deferred the forced capture — so the consumed source's stores remain the
@@ -760,6 +773,17 @@ where
       "absorb_capture_block drifted from capture_blocked_at"
     );
     verdict
+  }
+
+  /// Drain the crossed-source records an install left (see [`MergeState::crossed_sources`]) —
+  /// the container's per-crank retire pass consumes them.
+  pub(crate) fn take_crossed_sources(&mut self) -> Vec<(Bytes, u64)> {
+    core::mem::take(&mut self.merge.crossed_sources)
+  }
+
+  /// Whether any install-crossed source records await the container's retire pass.
+  pub(crate) fn has_crossed_sources(&self) -> bool {
+    !self.merge.crossed_sources.is_empty()
   }
 
   /// Whether any merge-cure debt stands — the drivers' quiesce-eligibility leg: a wedged peer is

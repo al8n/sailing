@@ -632,6 +632,7 @@ where
       pending_farewells: BTreeMap::new(),
       courtesy_owed: BTreeMap::new(),
       cure_owed: BTreeMap::new(),
+      cure_send_gate: None,
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
