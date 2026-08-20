@@ -3648,8 +3648,9 @@ where
         Some(ep) => ep.take_crossed_sources(),
         None => continue,
       };
+      let mut retained: Vec<(Bytes, u64)> = Vec::new();
       for (source_bytes, gen_after) in records {
-        let Ok(source) = G::decode_exact(source_bytes) else {
+        let Ok(source) = G::decode_exact(source_bytes.clone()) else {
           // The entry decoded when it was recorded; a failure here is the committed-corrupt
           // class all the same.
           if let Some(ep) = self.groups.get_mut(&host_gid) {
@@ -3658,15 +3659,28 @@ where
           self.note_if_poisoned(&host_gid);
           continue;
         };
-        let eligible = self
-          .groups
-          .get(&source)
-          .is_some_and(|sep| sep.shape_gen() <= gen_after);
-        if !eligible
+        // TERMINAL dispositions consume the record: unhosted (no husk, no vote — the floor
+        // path owns any stores) and a hosted incarnation ABOVE the recorded generation (a
+        // recreation, not this lineage). Everything else that refuses is a TRANSIENT owner —
+        // the candidate's own park or debt, another park or debt naming it, a drivable thaw it
+        // still owes, a poison awaiting restart — and dropping the record there would leave the
+        // absorbed husk its vote the moment the owner resolves; those RETAIN for the next
+        // crank. (A crash loses the retained records with the rest of the volatile state — the
+        // propagated terminal floor remains that narrow residual's exit.)
+        let Some(sep) = self.groups.get(&source) else {
+          continue;
+        };
+        if sep.shape_gen() > gen_after {
+          continue;
+        }
+        let transiently_owned = sep.is_poisoned()
+          || sep.pending_merge().is_some()
+          || sep.capture_debt().is_some()
           || self.park_names_source(&source)
           || self.debt_names(&source)
-          || self.owes_a_drivable_thaw(&source)
-        {
+          || self.owes_a_drivable_thaw(&source);
+        if transiently_owned {
+          retained.push((source_bytes, gen_after));
           continue;
         }
         if self.remove_group_inner(&source).is_some() {
@@ -3675,6 +3689,11 @@ where
             source: source.cheap_clone(),
           });
         }
+      }
+      if !retained.is_empty()
+        && let Some(ep) = self.groups.get_mut(&host_gid)
+      {
+        ep.requeue_crossed_sources(retained);
       }
     }
     // THE MERGE-ABORT THAW PASS: drive every hosted target's durable `abandoned` obligations to

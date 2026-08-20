@@ -11564,3 +11564,187 @@ fn an_install_crossing_an_absorb_retires_its_hosted_husk() {
   );
   assert!(m2.contains_group(&42));
 }
+
+/// The crossed-absorb evidence is committed-scoped and outcome-checked: a stale leader's
+/// UNCOMMITTED divergent CommitMerge above the proven bound records nothing (its merge never
+/// happened), and a crossing whose abort-window coordinate committed THIS merge's abort records
+/// nothing either (an aborted merge's source is live, never a husk). Both hosted sources
+/// survive the install untouched.
+#[test]
+fn unproven_and_aborted_crossings_never_retire_their_sources() {
+  let now = Instant::ORIGIN;
+  // Shape A: the crossing sits in the UNCOMMITTED divergent tail.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m.create_group(42, 0, single_node_cfg(1), now, 8, SplitSm::default())
+    .unwrap();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(41, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(3),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    // The DIVERGENT tail: a stale leader's CommitMerge beyond the committed bound.
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(6), 1, 2),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some());
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+  let meta = crate::SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(2);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(4),
+        9u64,
+        meta,
+        fork_blob(7),
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(m.group(&1).unwrap().pending_merge().is_none(), "superseded");
+  let _ = m.service_merge_applies(now, &mut stores);
+  assert!(
+    m.contains_group(&42),
+    "an uncommitted divergent crossing is no evidence: the live source survives"
+  );
+
+  // Shape B: the crossing COMMITTED but its abort-window coordinate committed the ABORT.
+  let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m2.create_group(42, 0, single_node_cfg(1), now, 8, SplitSm::default())
+    .unwrap();
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(
+      {
+        let mut b = Vec::new();
+        42u64.encode(&mut b);
+        Bytes::from(b)
+      },
+      1,
+      2,
+    );
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let cmd2 = cmd.clone();
+  let mut log2 = VecLog::default();
+  let mut stable2 = AsyncStable::default();
+  log2.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd2.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(3),
+      crate::EntryKind::RollbackMerge,
+      abort,
+    ),
+  ]);
+  stable2.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m2.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log2,
+    &mut stable2,
+  )
+  .unwrap();
+  let mut stores2 = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores2.0.insert(1, (log2, stable2));
+  let meta2 = crate::SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(2);
+  {
+    let (log2, stable2) = stores2.0.get_mut(&1).unwrap();
+    m2.handle_message(
+      &1,
+      now,
+      log2,
+      stable2,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(4),
+        9u64,
+        meta2,
+        fork_blob(7),
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m2.handle_storage(&1, now, log2, stable2),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  let _ = m2.service_merge_applies(now, &mut stores2);
+  assert!(
+    m2.contains_group(&42),
+    "an aborted crossing's source is live, never a husk"
+  );
+}
