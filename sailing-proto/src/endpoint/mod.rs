@@ -2854,6 +2854,11 @@ where
         // farewell's own timing argument: one heartbeat interval is well inside the removed peer's
         // [T, 2T) election deadline, so the offer lands before its next campaign.
         self.drive_courtesy_offers(now, stable);
+        // ...and, on the same beat, hand leadership away if THIS replica is the one holding a
+        // park no local crank can resolve. The two cure legs are complements: a follower
+        // advertises upward for a blob, a leader has nobody above it and must become a follower
+        // to be curable at all.
+        self.drive_parked_leader_handoff(now, log, stable);
       }
       _ => {
         // Re-drive the wedged-park advertisement BEFORE the campaign branch below: a campaign
@@ -3226,6 +3231,60 @@ where
     for peer in cure_due {
       self.maybe_send_cure_snapshot(now, &peer, stable);
     }
+  }
+
+  /// Hand leadership away while THIS replica holds a locally-unresolvable park. The cure arrives
+  /// as an `InstallSnapshot` from a leader, and a leader is the one replica nobody installs to —
+  /// so a parked leader has no exit of its own, and its exit is another leader. The advertisement
+  /// belt is deliberately silent here for the same reason (`drive_stuck_advertisement` returns on
+  /// a leader): there is nobody above to tell.
+  ///
+  /// ONE forced handoff per term, which the transfer machine already enforces:
+  /// `forced_handoff_this_term` latches when the `TimeoutNow` goes out and clears only at
+  /// `become_leader`, so a later arm at a DIFFERENT target refuses with `HandoffPending` and sends
+  /// nothing (re-arming the SAME target stays admissible — it re-delivers one order to one
+  /// campaigner, never a second one). That single shot is what bounds the cost, which is real:
+  /// every attempt freezes proposals at the five sites that gate on `lead_transferee` and revokes
+  /// a `LeaseBased` lease for up to an election timeout. An in-flight attempt is left alone rather
+  /// than retargeted at a peer that just edged ahead — the abort deadline is the retry cadence.
+  ///
+  /// Candidate: the highest-matched voter that is not itself advertising a stuck boundary. A
+  /// debt-named peer is wedged the same way this leader is, so seating it moves the wedge instead
+  /// of curing it. No candidate ⇒ nothing is armed: an all-wedged group stays degraded-alive under
+  /// the container's blocked-park signal rather than churning leadership between wedged hosts,
+  /// which is the placement operator's call to make, not this leg's.
+  ///
+  /// `TimeoutNow` bypasses PreVote and the campaign bar is conditional, so a mis-timed pick can
+  /// still seat a replica that is itself parked. That is bounded, not unbounded: a
+  /// locally-RESOLVABLE park cures itself on its own crank, and an unresolvable one advertises
+  /// and runs this same leg next term — the leadership token walks until it lands on a host the
+  /// cure can reach, if one exists.
+  fn drive_parked_leader_handoff<L, S>(&mut self, now: Now, log: &L, stable: &S)
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.role.is_leader()
+      || self.merge_park_unresolvable().is_none()
+      || self.transfer.lead_transferee.is_some()
+    {
+      return;
+    }
+    let me = self.config.id();
+    let Some(to) = self
+      .tracker
+      .progress_map()
+      .iter()
+      .filter(|(id, _)| *id != me && self.tracker.is_voter(id) && !self.cure_owed.contains_key(id))
+      .max_by_key(|(_, pr)| pr.match_index())
+      .map(|(id, _)| id.cheap_clone())
+    else {
+      return;
+    };
+    // Every refusal is a no-op by construction — `HandoffPending` past the term's one forced
+    // handoff, `Frozen` on a group whose leadership is dissolving anyway, `Poisoned` on a node
+    // the next dispatch halts. None of them leaves state this leg must undo.
+    let _ = self.transfer_leader(now, log, stable, to);
   }
 
   /// Apply all entries that have been committed but not yet applied.
