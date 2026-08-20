@@ -201,6 +201,12 @@ pub(crate) struct MergeState {
   /// Whether the walk reached this crank's committed frontier — the hint demands it: an
   /// advertisement off a partial walk would authorize an adopt across entries never examined.
   pub(crate) crossing_scan_current: bool,
+  /// A successful ADOPT owes one forced capture, serviced by the container independently of
+  /// the snapshot threshold: the adopt deliberately persists no blob, so under idle load an
+  /// adopter that later leads would have nothing durable covering the boundary — unable to cure
+  /// the next parked voter, its absorb membership fence never releasing without compaction.
+  /// Volatile: a crash re-parks and the re-cure re-owes.
+  pub(crate) adopt_capture_owed: bool,
   /// An absorbed-but-uncaptured union's outstanding durability obligation: the fold ran and the
   /// apply drain resumed, but a standing replay fence (a parked fork's barrier, an undischarged
   /// abort obligation) deferred the forced capture — so the consumed source's stores remain the
@@ -798,6 +804,16 @@ where
       "absorb_capture_block drifted from capture_blocked_at"
     );
     verdict
+  }
+
+  /// Whether an adopt still owes its forced capture (see [`MergeState::adopt_capture_owed`]).
+  pub(crate) fn adopt_capture_owed(&self) -> bool {
+    self.merge.adopt_capture_owed
+  }
+
+  /// The owed capture staged (or the park died another way) — clear the obligation.
+  pub(crate) fn clear_adopt_capture_owed(&mut self) {
+    self.merge.adopt_capture_owed = false;
   }
 
   /// Whether any merge-cure debt stands — the drivers' quiesce-eligibility leg: a wedged peer is

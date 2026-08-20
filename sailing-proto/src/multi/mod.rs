@@ -4007,6 +4007,44 @@ where
     // capture and surface the held `Merged` — the driver's floor + teardown permission. A
     // capture fault poisons and surfaces `CaptureFailed` exactly as the one-crank arm: stores
     // preserved, restart re-parks.
+    // THE ADOPT-CAPTURE PASS: an adopt owes one forced capture, threshold-independent (the
+    // adopt persisted no blob — see the obligation's doc). Same fence discipline as every
+    // capture producer; a fenced crank just retries.
+    let adopt_owers: Vec<G> = self
+      .groups
+      .iter()
+      .filter(|(_, ep)| ep.adopt_capture_owed() && !ep.is_poisoned())
+      .map(|(gid, _)| gid.cheap_clone())
+      .collect();
+    for gid in adopt_owers {
+      let Some(ep) = self.groups.get(&gid) else {
+        continue;
+      };
+      if ep
+        .pending_compact_boundary()
+        .is_some_and(|b| b >= ep.applied_index())
+        || ep.durable_snapshot_covers(ep.applied_index())
+      {
+        if let Some(ep) = self.groups.get_mut(&gid) {
+          ep.clear_adopt_capture_owed();
+        }
+        continue;
+      }
+      if ep.capture_blocked_at(ep.applied_index()) {
+        continue;
+      }
+      let staged = match stores.stores(&gid) {
+        Some((log, stable)) => self
+          .groups
+          .get_mut(&gid)
+          .is_some_and(|ep| ep.capture_absorb_snapshot(log, stable)),
+        None => false,
+      };
+      if staged && let Some(ep) = self.groups.get_mut(&gid) {
+        ep.clear_adopt_capture_owed();
+        self.mark_dirty(&gid);
+      }
+    }
     let debtors: Vec<G> = self
       .groups
       .iter()
