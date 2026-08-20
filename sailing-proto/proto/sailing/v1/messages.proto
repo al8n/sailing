@@ -280,6 +280,11 @@ message HeartbeatResponse {
   // truncates by spec, which would make the bound unenforceable at the envelope).
   uint64 lease_support_secs = 5;
   uint64 lease_support_nanos = 6;
+  // The boundary of a merge park the respondent cannot resolve locally: the parked
+  // CommitMerge's index, i.e. the coordinate a cure must cover. Zero (the proto3 default)
+  // means no such park stands, so an ordinary response is byte-identical to before the
+  // field existed.
+  uint64 stuck_boundary = 7;
 }
 
 // Leader -> follower: install a snapshot (the follower is too far behind).

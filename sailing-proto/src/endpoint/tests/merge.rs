@@ -2817,3 +2817,237 @@ fn the_adopt_thaws_a_frozen_and_parked_target() {
     "the log is KEPT — the adopt discards nothing"
   );
 }
+
+/// A parked OBSERVER (non-voter) of `{1,2,3}`: `Normal@1` + `CommitMerge@2`, both committed, so the
+/// apply drain stops at 1 and the park stands at 2. Non-voter by construction, so its election
+/// timer never campaigns — every `handle_timeout` in the advertisement tests is pure cadence.
+/// Returns `(ep, log, stable, boundary)`.
+fn make_parked_observer() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable, Index) {
+  use core::time::Duration;
+  let cfg = Config::try_new_observer(
+    4u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      encode_cmd(b"a"),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(5), 1, 1),
+    ),
+  ]);
+  stable.force_state(Term::new(1), None, Index::new(2));
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep.is_poisoned());
+  assert_eq!(ep.applied_index(), Index::new(1), "the drain parked at k-1");
+  assert_eq!(
+    ep.pending_merge().map(PendingMergeApply::at),
+    Some(Index::new(2)),
+    "the park stands at the CommitMerge"
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  (ep, log, stable, Index::new(2))
+}
+
+/// Deliver a bare heartbeat from leader 2 and return the boundary its response advertised.
+fn beat_and_read_boundary(
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  at: Instant,
+) -> Index {
+  ep.handle_message(
+    at,
+    log,
+    stable,
+    2u64,
+    Message::Heartbeat(crate::Heartbeat::new(
+      Term::new(1),
+      2u64,
+      Index::new(2),
+      bytes::Bytes::new(),
+    )),
+  );
+  let mut boundary = None;
+  while let Some(out) = ep.poll_message() {
+    if let Message::HeartbeatResponse(hbr) = out.message() {
+      assert_eq!(out.to(), 2u64, "the response goes to the leader that beat");
+      boundary = Some(hbr.stuck_boundary());
+    }
+  }
+  boundary.expect("the heartbeat drew a response")
+}
+
+/// A replica whose park the container classified locally unresolvable STAMPS the boundary on the
+/// heartbeat response it already owed — the leader's only view of a wedge it is structurally blind
+/// to, since the park sits above a fully replicated log and stalls nothing but the local apply
+/// drain. The stamp ceases the moment the classification clears.
+#[test]
+fn an_unresolvable_park_stamps_its_boundary_on_the_heartbeat_response() {
+  let (mut ep, mut log, mut stable, boundary) = make_parked_observer();
+
+  assert_eq!(
+    beat_and_read_boundary(&mut ep, &mut log, &mut stable, Instant::ORIGIN),
+    Index::ZERO,
+    "a park nobody has classified advertises nothing"
+  );
+
+  ep.note_merge_park_unresolvable(true);
+  assert_eq!(
+    beat_and_read_boundary(&mut ep, &mut log, &mut stable, Instant::ORIGIN),
+    boundary,
+    "the classified park advertises its own boundary"
+  );
+
+  ep.note_merge_park_unresolvable(false);
+  assert_eq!(
+    beat_and_read_boundary(&mut ep, &mut log, &mut stable, Instant::ORIGIN),
+    Index::ZERO,
+    "the advertisement ceases with the classification"
+  );
+}
+
+/// The unsolicited belt: a hinted replica whose leader has stopped beating altogether — a quiesced
+/// leader emits nothing, so the stamped carrier above never fires — still puts the boundary in
+/// front of that leader, once per election timeout and no faster. Every emission pins `lease_round`
+/// to 0 and `lease_support` to ZERO: the leader's lease accounting credits a round-matching
+/// response as a FRESH support promise, and a leader that has stopped beating holds one round open
+/// arbitrarily long, so echoing a remembered round would float a `LeaseBased` lease on support this
+/// replica never promised at that time.
+#[test]
+fn a_hinted_replica_advertises_on_a_slow_tick_without_inbound_heartbeats() {
+  use core::time::Duration;
+  let period = Duration::from_millis(1000);
+  let (mut ep, mut log, mut stable, boundary) = make_parked_observer();
+
+  // One beat seats the leader and charges the first period; then the leader goes silent.
+  ep.note_merge_park_unresolvable(true);
+  assert_eq!(
+    beat_and_read_boundary(&mut ep, &mut log, &mut stable, Instant::ORIGIN),
+    boundary
+  );
+
+  // Collect this tick's unsolicited advertisements (there is no other traffic to confuse them).
+  fn tick(
+    ep: &mut Endpoint<u64, CountSm>,
+    log: &mut VecLog,
+    stable: &mut AsyncStable,
+    at: Instant,
+  ) -> Vec<(u64, crate::HeartbeatResponse<u64>)> {
+    ep.handle_timeout(at, log, stable);
+    let mut out = Vec::new();
+    while let Some(m) = ep.poll_message() {
+      let to = m.to();
+      if let Message::HeartbeatResponse(hbr) = m.message() {
+        out.push((to, hbr.clone()));
+      }
+    }
+    out
+  }
+
+  assert!(
+    tick(&mut ep, &mut log, &mut stable, Instant::ORIGIN + period / 2).is_empty(),
+    "the belt does not fire inside a period the beat already charged"
+  );
+
+  let due = tick(&mut ep, &mut log, &mut stable, Instant::ORIGIN + period);
+  assert_eq!(due.len(), 1, "exactly one advertisement per period");
+  let (to, hbr) = &due[0];
+  assert_eq!(*to, 2u64, "addressed to the known leader");
+  assert_eq!(hbr.stuck_boundary(), boundary);
+  assert_eq!(hbr.lease_round(), 0, "never echo a remembered round");
+  assert_eq!(
+    hbr.lease_support(),
+    Duration::ZERO,
+    "promise no support the leader could bank"
+  );
+  assert!(
+    hbr.context().is_empty(),
+    "a non-empty context is a ReadIndex token; this answers no read"
+  );
+
+  assert!(
+    tick(
+      &mut ep,
+      &mut log,
+      &mut stable,
+      Instant::ORIGIN + period + period / 2
+    )
+    .is_empty(),
+    "the emission charged its own period"
+  );
+  assert_eq!(
+    tick(
+      &mut ep,
+      &mut log,
+      &mut stable,
+      Instant::ORIGIN + period + period
+    )
+    .len(),
+    1,
+    "and the next period fires again"
+  );
+
+  ep.note_merge_park_unresolvable(false);
+  assert!(
+    tick(
+      &mut ep,
+      &mut log,
+      &mut stable,
+      Instant::ORIGIN + period + period + period
+    )
+    .is_empty(),
+    "the belt ceases with the hint"
+  );
+}
+
+/// A parked LEADER never advertises: it is the party the cure is addressed to, so telling itself
+/// is noise. And a replica with no known leader has nobody to tell — it stays silent until contact
+/// (or its own campaign's outcome) seats one.
+#[test]
+fn the_advertisement_needs_a_leader_that_is_not_this_replica() {
+  let (mut ep, mut log, mut stable, _) = make_parked_observer();
+  ep.note_merge_park_unresolvable(true);
+  assert_eq!(ep.leader(), None, "a fresh restart knows no leader");
+  ep.handle_timeout(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    ep.poll_message().is_none(),
+    "a leaderless replica advertises to nobody"
+  );
+
+  let (mut ep, mut log, mut stable, k) = make_parked_target(2);
+  assert!(ep.role().is_leader());
+  ep.note_merge_park_unresolvable(true);
+  assert_eq!(
+    ep.merge_park_unresolvable(),
+    Some(k),
+    "the leader's own park is classified too"
+  );
+  ep.handle_timeout(Instant::ORIGIN, &mut log, &mut stable);
+  while let Some(m) = ep.poll_message() {
+    assert!(
+      !matches!(m.message(), Message::HeartbeatResponse(_)),
+      "a leader advertises nothing to itself"
+    );
+  }
+}

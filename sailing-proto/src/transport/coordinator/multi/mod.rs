@@ -35,8 +35,9 @@ pub enum GroupControl {
   /// to wake everything.
   Quiesce,
   /// WAKE-class inbound traffic was dispatched to the group. The absorbed (non-waking) complement
-  /// is exactly one message kind — `HeartbeatResponse` — because a quiescing group's FINAL
-  /// flagged round exchanges precisely `Heartbeat` + `HeartbeatResponse` and nothing else, and
+  /// is one message kind in one shape — a `HeartbeatResponse` advertising no wedged merge park —
+  /// because a quiescing group's FINAL flagged round
+  /// exchanges precisely `Heartbeat` + `HeartbeatResponse` and nothing else, and
   /// waking on that response would re-arm the leader's timers and keep the round-trip alive
   /// forever. That the final round is exactly the pair rests on two gates: quiesce eligibility
   /// (every tracked peer — learners included — caught up and replicating, commit applied) means
@@ -45,7 +46,11 @@ pub enum GroupControl {
   /// empty-append tail to absorb. Absorbing the
   /// response is safe: it can only echo a beat the quiesced side itself sent pre-quiesce (a
   /// quiesced leader emits no new beats), and eligibility ensured no straggler ack carries new
-  /// progress. Everything else wakes — a `Heartbeat` tells a quiesced follower its leader is
+  /// progress. The one exception is a response carrying a nonzero `stuck_boundary`: that is a peer
+  /// reporting a merge park it cannot cure alone, state the eligibility sweep is structurally blind
+  /// to (a parked replica's log is fully caught up; only its apply drain is stalled), so it wakes —
+  /// see `is_wake_class`.
+  /// Everything else wakes — a `Heartbeat` tells a quiesced follower its leader is
   /// active again (restoring the silent-wedge detection its swept election timer provides), a
   /// non-empty `AppendEntries` is live replication, votes/transfers/reads/snapshots are live
   /// consensus, and an empty `AppendEntries` or `AppendResponse` no longer belongs to an idle
@@ -1339,7 +1344,7 @@ where
   }
 
   /// Queue the dispatch-driven [`GroupControl`]s for one delivered message: a `Wake` for every
-  /// wake-class kind (see [`GroupControl::Wake`] — the heartbeat response is absorbed), then a
+  /// wake-class kind (see [`GroupControl::Wake`] — an idle heartbeat response is absorbed), then a
   /// `Quiesce` if the entry carried the flag — flag AFTER wake, so a flagged
   /// beat nets quiesced. Same-group controls collapse to the latest (a burst of appends is one `Wake`).
   fn push_dispatch_controls(&mut self, group: &G, wake: bool, flags: u8) {
@@ -1351,14 +1356,27 @@ where
     }
   }
 
-  /// Whether a delivered message is WAKE-class for its group. The absorbed complement is exactly
-  /// `HeartbeatResponse` — with the heartbeat-response append pump gated and quiesce eligibility
-  /// excluding lagging peers, a quiescing group's FINAL flagged round is precisely
-  /// `Heartbeat` + `HeartbeatResponse`, so absorbing that one response is all it takes for the
-  /// round to die out instead of re-waking either side (see [`GroupControl::Wake`] for the
+  /// Whether a delivered message is WAKE-class for its group. The absorbed complement is a
+  /// `HeartbeatResponse` carrying NO wedged-park boundary — with the heartbeat-response append pump
+  /// gated and quiesce eligibility excluding lagging peers, a quiescing group's FINAL flagged round
+  /// is precisely `Heartbeat` + `HeartbeatResponse`, so absorbing that one response is all it takes
+  /// for the round to die out instead of re-waking either side (see [`GroupControl::Wake`] for the
   /// safety argument).
+  ///
+  /// A response whose `stuck_boundary` is nonzero is NOT that response. What the absorbed class
+  /// admits is the zero-information idle ack — a peer reporting that nothing has changed and that
+  /// nothing is owed. A boundary is the opposite: actionable non-idle state that the leader cannot
+  /// see by any other means, since a parked replica is not log-lagging (its park sits above a
+  /// fully-replicated log, so the pump predicate reads it as caught up) and its stalled apply drain
+  /// is purely local. Absorbing it would recreate exactly the blind spot the field exists to
+  /// pierce: the group would settle with a replica wedged forever and the only party able to cure
+  /// it asleep. The cost is bounded by the advertiser's slow-tick cadence — one response per
+  /// election timeout — and by the park's own lifetime, since the advertisement dies with it.
   fn is_wake_class(msg: &Message<I>) -> bool {
-    !msg.is_heartbeat_response()
+    match msg {
+      Message::HeartbeatResponse(hbr) => hbr.stuck_boundary() != Index::ZERO,
+      _ => true,
+    }
   }
 
   fn push_control(&mut self, group: &G, ctrl: GroupControl) {

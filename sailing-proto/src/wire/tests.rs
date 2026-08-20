@@ -86,6 +86,10 @@ fn round_trips_every_variant() {
       .with_lease_round(9)
       .with_lease_support(core::time::Duration::from_millis(150)),
   ));
+  // A wedged-park advertisement: the boundary rides the same response.
+  rt(Message::HeartbeatResponse(
+    HeartbeatResponse::new(Term::new(3), 2, Bytes::new()).with_stuck_boundary(Index::new(41)),
+  ));
   let meta = SnapshotMeta::new(
     Index::new(10),
     Term::new(3),
@@ -658,6 +662,85 @@ fn golden_byte_vectors() {
     ],
     "SnapshotResponse golden encoding (reject=false is absent on the wire)"
   );
+
+  let idle_response =
+    Message::HeartbeatResponse(HeartbeatResponse::new(Term::new(3), 2, Bytes::new()));
+  assert_eq!(
+    enc(&idle_response),
+    std::vec![
+      0x32, 0x0C, // Message.heartbeat_response (field 6, length-delimited, 12 bytes)
+      0x08, 0x03, // term = 3
+      0x12, 0x08, 0x02, 0, 0, 0, 0, 0, 0, 0, // from_id = the u64 id's 8-byte LE encoding
+    ],
+    "an idle HeartbeatResponse carries no stuck_boundary field at all"
+  );
+
+  let advertising = Message::HeartbeatResponse(
+    HeartbeatResponse::new(Term::new(3), 2, Bytes::new()).with_stuck_boundary(Index::new(41)),
+  );
+  assert_eq!(
+    enc(&advertising),
+    std::vec![
+      0x32, 0x0E, // Message.heartbeat_response (field 6, length-delimited, 14 bytes)
+      0x08, 0x03, // term = 3
+      0x12, 0x08, 0x02, 0, 0, 0, 0, 0, 0, 0, // from_id = the u64 id's 8-byte LE encoding
+      0x38, 0x29, // stuck_boundary = 41 (field 7)
+    ],
+    "a wedged park adds exactly the field-7 varint"
+  );
+}
+
+/// `stuck_boundary` is ABSENT-WHEN-ZERO, so every message that carries no wedged park encodes
+/// byte-for-byte as it did before the field existed: the two encodings differ by exactly the
+/// field-7 varint and nothing else. This is what lets the field land in place under the current
+/// `LABEL_VERSION` rather than behind a bump.
+#[test]
+fn a_zero_stuck_boundary_costs_no_bytes() {
+  fn enc(m: &Message<u64>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    encode_message(m, &mut buf);
+    buf
+  }
+
+  let base = HeartbeatResponse::new(Term::new(7), 3, Bytes::from_static(b"ctx"))
+    .with_lease_round(11)
+    .with_lease_support(core::time::Duration::from_millis(250));
+  let idle = enc(&Message::HeartbeatResponse(base.clone()));
+  let explicit_zero = enc(&Message::HeartbeatResponse(
+    base.clone().with_stuck_boundary(Index::ZERO),
+  ));
+  assert_eq!(
+    idle, explicit_zero,
+    "an explicit ZERO boundary is indistinguishable from never setting one"
+  );
+
+  let advertising = enc(&Message::HeartbeatResponse(
+    base.with_stuck_boundary(Index::new(300)),
+  ));
+  assert_eq!(
+    advertising.len(),
+    idle.len() + 3,
+    "the advertisement costs exactly tag + a two-byte varint"
+  );
+  // Byte 0 is the oneof tag and byte 1 the body length (which necessarily grew); everything the
+  // idle body holds is an unchanged PREFIX of the advertising body, with the new field appended.
+  assert_eq!(
+    advertising[2..idle.len()],
+    idle[2..],
+    "every pre-existing field is byte-identical"
+  );
+  assert_eq!(
+    &advertising[idle.len()..],
+    &[0x38, 0xAC, 0x02],
+    "the appended bytes are exactly field 7 = 300"
+  );
+
+  // ...and it survives the round trip with its value.
+  let back = decode_message::<u64>(Bytes::from(advertising)).expect("decode");
+  let Message::HeartbeatResponse(hbr) = back else {
+    panic!("variant");
+  };
+  assert_eq!(hbr.stuck_boundary(), Index::new(300));
 }
 
 /// The decoded message's Bytes fields alias the frame allocation (zero-copy): the

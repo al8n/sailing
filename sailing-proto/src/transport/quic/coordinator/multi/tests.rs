@@ -504,6 +504,17 @@ fn only_the_heartbeat_response_is_absorbed() {
     !MCoord::is_wake_class(&hbr),
     "the heartbeat response is absorbed"
   );
+  // ...unless it advertises a wedged merge park: a parked replica is not log-lagging, so no other
+  // leader-side signal can see it, and absorbing the boundary would settle the group with that
+  // replica wedged and its only possible curer asleep.
+  let advertising = Message::HeartbeatResponse(
+    crate::HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+      .with_stuck_boundary(Index::new(9)),
+  );
+  assert!(
+    MCoord::is_wake_class(&advertising),
+    "a wedged-park advertisement wakes"
+  );
 }
 
 /// A coalesced entry for a group the receiver no longer hosts is dropped ENTRY by entry over

@@ -2818,6 +2818,10 @@ where
         self.drive_courtesy_offers(now, stable);
       }
       _ => {
+        // Re-drive the wedged-park advertisement BEFORE the campaign branch below: a campaign
+        // clears `leader`, and the boundary is worth telling the leader this tick still knows
+        // about, whether or not the tick goes on to depose it.
+        self.drive_stuck_advertisement(now);
         if self.election_deadline.is_some_and(|d| d <= now.mono()) {
           // A learner or removed node must never start an election.
           // Clear the deadline so `poll_timeout` returns `None` for this node and
