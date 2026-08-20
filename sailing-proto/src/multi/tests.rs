@@ -11788,3 +11788,83 @@ fn a_same_batch_freeze_clears_the_stale_cure_admission() {
     "the live thaw obligation is intact"
   );
 }
+
+/// A committed crossing whose source id does not decode as the configured GroupId is
+/// committed-corrupt — the resolver's own park-decode fail-stop class. Fail-stopping is the
+/// only consistent read: advertising would loop the park through advertise-then-refuse forever
+/// (the receipt edge blocks the same bytes fail-closed), shipping whole blobs at a wedge no
+/// cure can fix.
+#[test]
+fn an_undecodable_crossing_id_fail_stops_the_target() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let corrupt_commit = {
+    // A structurally valid payload whose source bytes are an INCOMPLETE varint — length-valid,
+    // never decodable as u64.
+    let p = crate::CommitMergePayload::new(
+      Bytes::from_static(&[0x80]),
+      Index::new(6),
+      Term::new(1),
+      1,
+      2,
+    );
+    let mut buf = Vec::new();
+    crate::wire::encode_commit_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(41, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(3),
+      crate::EntryKind::CommitMerge,
+      corrupt_commit,
+    ),
+    crate::Entry::new(Term::new(1), Index::new(4), crate::EntryKind::Normal, cmd),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(4));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+
+  let _ = m.service_merge_applies(now, &mut stores);
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.is_poisoned(),
+    "committed-corrupt fails stop, never loops"
+  );
+  assert_eq!(
+    tep.merge_park_unresolvable(),
+    None,
+    "a poisoned park never advertises"
+  );
+}

@@ -3505,22 +3505,34 @@ where
       // re-derivation no scan can soundly make — so ANY hosted crossing withholds the hint and
       // the park waits (its exit is the hosted replica's own lifecycle, or the propagated
       // terminal floor). A decode failure withholds too: fail-closed.
+      let mut crossing_decode_corrupt = false;
       let hosted_crossing: Option<G> = if w1_unresolvable {
         self.groups.get(&tgid).and_then(|t| {
-          t.crossing_sources().iter().find_map(|b| {
-            match G::decode_exact(b.clone()) {
-              Ok(g) if self.groups.contains_key(&g) => Some(Some(g)),
-              // Undecodable = fail-closed, but there is no identity to name; the sticky
-              // decode flag already withholds the hint, so signal nothing extra here.
-              Err(_) => Some(None),
+          t.crossing_sources()
+            .iter()
+            .find_map(|b| match G::decode_exact(b.clone()) {
+              Ok(g) if self.groups.contains_key(&g) => Some(g),
+              // A committed source id that does not decode as G is committed-corrupt — the
+              // resolver's own park-decode fail-stop class. Anything short of poisoning here
+              // disagrees with the receipt edge's fail-closed read and loops the park through
+              // advertise-then-refuse forever, shipping whole blobs at a wedge no cure can fix.
+              Err(_) => {
+                crossing_decode_corrupt = true;
+                None
+              }
               Ok(_) => None,
-            }
-          })
+            })
         })
       } else {
         None
+      };
+      if crossing_decode_corrupt {
+        if let Some(tep) = self.groups.get_mut(&tgid) {
+          tep.poison(PoisonReason::MergeDecode);
+        }
+        self.note_if_poisoned(&tgid);
+        continue;
       }
-      .flatten();
       let crossing_blocks = w1_unresolvable
         && self
           .groups
