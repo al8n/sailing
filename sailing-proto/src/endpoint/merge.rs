@@ -709,6 +709,13 @@ where
     AbsorbCaptureBlock::Clear
   }
 
+  /// Whether any merge-cure debt stands — the drivers' quiesce-eligibility leg: a wedged peer is
+  /// invisible to the pump predicate (it is not log-lagging), so the debt is what keeps the group
+  /// awake until the cure lands.
+  pub fn has_cure_debts(&self) -> bool {
+    !self.cure_owed.is_empty()
+  }
+
   /// The outstanding absorbed-but-uncaptured union obligation, if any: a replay fence deferred
   /// the absorb's forced durability capture, so the consumed source's preserved stores remain
   /// the union's only restart derivation until a capture (or superseding install) at-or-past

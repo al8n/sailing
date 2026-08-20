@@ -273,6 +273,34 @@ impl MergeRolledBack {
   }
 }
 
+/// The payload of [`Event::MergeCureUndeliverable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeCureUndeliverable<I> {
+  peer: I,
+  boundary: Index,
+}
+
+impl<I> MergeCureUndeliverable<I> {
+  /// Construct.
+  pub const fn new(peer: I, boundary: Index) -> Self {
+    Self { peer, boundary }
+  }
+
+  /// The advertised boundary the oversize blob covers.
+  #[inline(always)]
+  pub const fn boundary(&self) -> Index {
+    self.boundary
+  }
+}
+
+impl<I: CheapClone> MergeCureUndeliverable<I> {
+  /// The wedged peer that advertised the park.
+  #[inline(always)]
+  pub fn peer(&self) -> I {
+    self.peer.cheap_clone()
+  }
+}
+
 /// A `CommitMerge` entry RESOLVED: the frozen source group's state machine was absorbed into
 /// this group at the parked entry, and this group now serves the union. G-FREE like
 /// [`SplitApplied`] — `source` is the absorbed group id's canonical `Data` encoding; the typed id
@@ -379,6 +407,12 @@ pub enum Event<I, R> {
   /// A snapshot was successfully installed on this node (follower receive path).
   /// The payload is the metadata of the installed snapshot.
   SnapshotInstalled(SnapshotMeta<I>),
+  /// A merge-cure debt's covering snapshot exceeds the one-frame whole-blob bound and cannot be
+  /// offered: the advertised park stays wedged until chunked cure transfer exists or placement
+  /// changes. Loud by design — the courtesy sender's silent size skip leaves a REMOVED peer
+  /// ignorant-but-alive (the safe direction), but this residual leaves a live VOTER wedged, and
+  /// silence would read as coverage.
+  MergeCureUndeliverable(MergeCureUndeliverable<I>),
   /// A `ConfChange` entry was committed and applied; the cluster membership changed.
   ConfChanged(ConfChanged<I>),
   /// A `SetReadMode` entry was committed and applied; the active read mode changed.

@@ -3051,3 +3051,156 @@ fn the_advertisement_needs_a_leader_that_is_not_this_replica() {
     );
   }
 }
+
+/// A leader with a snapshot-threshold-1 config, three committed commands, and a durable capture
+/// covering them — the eligible cure sender.
+fn make_capturing_leader() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(1);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  for i in 0..3u8 {
+    let cmd = bytes::Bytes::copy_from_slice(&[i]);
+    let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+  }
+  ack_through(&mut ep, &mut log, &mut stable, Index::new(4));
+  // Two cranks: capture submitted, then completed durable + compacted.
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(stable.snapshot().is_some(), "the covering blob is durable");
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  (ep, log, stable)
+}
+
+/// The cure-send arc on the leader: an advertised boundary from a TRACKED peer mints the debt
+/// and the covering blob goes out immediately — `Progress` untouched, so the peer keeps
+/// replicating throughout — the cooldown suppresses a duplicate, and completed evidence at-or-
+/// past the boundary discharges. Nothing weaker discharges: the advertisement re-mints, and
+/// evidence is the only exit.
+#[test]
+fn an_advertised_park_mints_a_cure_debt_and_offers_the_covering_blob() {
+  use crate::{HeartbeatResponse, SnapshotResponse};
+  let (mut ep, mut log, mut stable) = make_capturing_leader();
+  let d = Instant::ORIGIN;
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+        .with_stuck_boundary(Index::new(3)),
+    ),
+  );
+  assert!(ep.has_cure_debts(), "the advertisement is the mint");
+  let mut offers = 0;
+  let mut boundary = Index::ZERO;
+  while let Some(out) = ep.poll_message() {
+    if let Message::InstallSnapshot(is) = out.message() {
+      offers += 1;
+      boundary = is.snapshot().last_index();
+    }
+  }
+  assert_eq!(offers, 1, "the receipt answers immediately when eligible");
+  assert!(
+    boundary >= Index::new(3),
+    "the blob covers the advertised park"
+  );
+  assert!(
+    ep.peer_progress(&2u64).is_some(),
+    "Progress untouched: the peer stays tracked and replicating through the transfer"
+  );
+
+  // The cooldown: a re-advertisement inside the window re-mints but does not re-send.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+        .with_stuck_boundary(Index::new(3)),
+    ),
+  );
+  let mut resent = 0;
+  while let Some(out) = ep.poll_message() {
+    if matches!(out.message(), Message::InstallSnapshot(_)) {
+      resent += 1;
+    }
+  }
+  assert_eq!(
+    resent, 0,
+    "one blob per cooldown, however often the peer advertises"
+  );
+  assert!(ep.has_cure_debts());
+
+  // Completed evidence at-or-past the boundary discharges; the debt is gone and stays gone.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::SnapshotResponse(SnapshotResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::new(4),
+    )),
+  );
+  assert!(!ep.has_cure_debts(), "evidence discharges");
+}
+
+/// Eligibility defers, never drops: a leader whose durable blob does not yet cover the
+/// advertised boundary sends nothing and keeps the debt armed — the leader's own later capture
+/// makes it eligible, and the sweep re-drives it then.
+#[test]
+fn an_uncovered_cure_debt_defers_without_spending() {
+  use crate::HeartbeatResponse;
+  let (mut ep, mut log, mut stable) = make_capturing_leader();
+  let d = Instant::ORIGIN;
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+        .with_stuck_boundary(Index::new(400)),
+    ),
+  );
+  assert!(
+    ep.has_cure_debts(),
+    "the debt mints regardless of eligibility"
+  );
+  let mut offers = 0;
+  while let Some(out) = ep.poll_message() {
+    if matches!(out.message(), Message::InstallSnapshot(_)) {
+      offers += 1;
+    }
+  }
+  assert_eq!(
+    offers, 0,
+    "a blob below the boundary cannot carry the union — defer"
+  );
+}

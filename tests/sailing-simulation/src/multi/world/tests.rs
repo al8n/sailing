@@ -3399,17 +3399,17 @@ fn crash_after_full_absorb_does_not_restore_the_source() {
 
 /// The absent-source park discrimination on a GENUINE replayed park: a follower's target
 /// stable gets a real fsync window, so its absorb capture dies in a crash and the restored
-/// replica replays the commit and re-parks. The floor gate must hold BOTH ways: the durable
-/// hosts' floors are already recorded (the sweep landed their barriers at resolution), while
-/// the follower's floor stays honestly ABSENT — its barrier never landed — so the replayed
-/// park WAITS for the snapshot route instead of skipping the union it does not have. The
-/// floor-present half of the discrimination lives at the service seam
-/// ([`recorded_floors_reach_the_service_as_the_terminal_sentinel`] plus the product's own
-/// absent-arm test): in the world's one-barrier model a durable floor implies a durable
-/// capture, which restores PAST the commit — floor-with-replay cannot conformingly coexist,
-/// and the agreement oracle convicts the divergent union-skip within a tick if it is forced.
+/// replica replays the commit and re-parks — under-hosted, since the consumed source never
+/// re-hosts. The floor gate must hold BOTH ways: the durable hosts' floors are already
+/// recorded, while the follower's stays honestly ABSENT — its barrier never landed. The park
+/// itself no longer waits for the ordinary snapshot route: the resolver classifies it locally
+/// unresolvable, the follower ADVERTISES its boundary, and the leader's covering blob adopts
+/// in place of the impossible fold — the full cure pipeline, exercised through a real crash.
+/// What stays pinned is the barrier's honesty across the cure: no floor may land ahead of a
+/// durable capture covering the boundary, the retained source stores outlive the adopt until
+/// that capture completes, and the agreement oracle convicts any divergent union within a tick.
 #[test]
-fn replayed_park_holds_while_the_capture_barrier_is_open() {
+fn a_replayed_under_hosted_park_is_cured_while_the_floor_waits_for_durability() {
   let mut w = MultiWorld::new(19);
   for n in 0..3 {
     w.add_node(n);
@@ -3462,7 +3462,13 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
   );
 
   // The crash collapses the window: the capture is lost, the durable log still holds the
-  // commit — the restored target replays it and re-parks.
+  // commit — the restored target replays it and re-parks, under-hosted. The re-wired replica
+  // carries a low threshold so post-cure load reaches an ordinary capture in test time (the
+  // crash restores off the STORED per-replica config).
+  {
+    let c = w.configs.get_mut(&(follower, 10)).expect("stored config");
+    *c = c.clone().with_snapshot_threshold(8);
+  }
   w.crash(follower);
   assert!(
     w.run_until(4_000, |w| {
@@ -3472,18 +3478,7 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
     }),
     "the restored target replays the commit and re-parks"
   );
-  for _ in 0..50 {
-    w.tick();
-  }
-  assert!(
-    w.hosts[&follower]
-      .group(&10)
-      .is_some_and(|ep| ep.pending_merge().is_some()),
-    "without the floor the replayed park holds for the snapshot route"
-  );
-  assert_eq!(w.merges_aborted(), 0);
-  // The open barrier keeps the whole batch honest: no floor, the extracted source's stores
-  // retained for the pending teardown, and the entry itself still staged.
+  // At the re-park instant the barrier is honest: no floor, the retained source stores intact.
   assert!(
     !w.merge_floors.contains(&(follower, 11)),
     "the floor may not land while the capture is unrecoverable"
@@ -3492,11 +3487,39 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
     w.logs.contains_key(&(follower, 11)),
     "the pending teardown retains the source stores until the barrier lands"
   );
+  // The cure pipeline: the resolver classifies the park locally unresolvable, the follower
+  // advertises, and the leader's covering blob adopts in place of the impossible fold.
   assert!(
-    w.pending_merge_teardowns
-      .iter()
-      .any(|(n, s, _, _)| *n == follower && *s == 11),
-    "the follower's teardown entry stays staged"
+    w.run_until(8_000, |w| {
+      w.hosts[&follower]
+        .group(&10)
+        .is_some_and(|ep| ep.pending_merge().is_none())
+    }),
+    "the advertised park is cured by the leader's covering snapshot"
+  );
+  assert_eq!(w.merges_aborted(), 0);
+  // The barrier stays honest THROUGH the cure: the adopt persisted no blob, so the floor may
+  // not land until an ordinary capture covers the boundary locally — under idle the retained
+  // stores simply wait, the conservative direction. Post-cure load drives the threshold
+  // capture, the pending teardown's gate releases, and the floor lands.
+  assert!(
+    !w.merge_floors.contains(&(follower, 11)),
+    "no floor lands off the adopt alone: durability, not adoption, releases the teardown"
+  );
+  // The fsync window served its purpose (it killed the original capture); a stable that never
+  // flushes would hold the teardown forever by construction, so restore sync completions for
+  // the post-cure half.
+  w.stables
+    .get_mut(&(follower, 10))
+    .expect("target stable")
+    .set_mode(crate::StoreMode::Sync);
+  for i in 0..200u32 {
+    w.propose(10, &i.to_be_bytes());
+    w.tick();
+  }
+  assert!(
+    w.run_until(8_000, |w| w.merge_floors.contains(&(follower, 11))),
+    "an ordinary capture covers the boundary and the deferred teardown completes"
   );
 }
 
