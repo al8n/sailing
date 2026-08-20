@@ -374,6 +374,25 @@ pub enum MergeResolution<G> {
     /// The absorbing target group.
     target: G,
   },
+  /// The target ABSORBED the source but a standing replay fence (a parked fork's durability
+  /// barrier, an undischarged abort obligation) DEFERRED the forced capture: the union is applied
+  /// and serving, the source endpoint is gone from this container, and the consumed source's
+  /// stores remain the union's ONLY restart derivation until the debt discharges. The driver
+  /// folds the `CaptureFailed` routing half WITHOUT the poison or the restart demand: fail the
+  /// source's parked routing typed (its callers would hang forever on the removed endpoint's
+  /// completions), drain the routing's completion-panic latch, clear the source's volatile
+  /// per-group maps — and PRESERVE the source's stores and floor untouched: no floor write, no
+  /// store teardown, no tombstone. `Merged { source, target }` follows from a later crank once
+  /// the fence lifts and the capture stages, with its exact contract; `CaptureFailed` follows a
+  /// capture fault instead. A crash in the window re-parks against the restored source (the
+  /// boundary's `CommitMerge` cannot compact away first — compaction past it requires exactly
+  /// the capture still owed).
+  Absorbed {
+    /// The absorbed source group, whose stores and floor the driver MUST keep until `Merged`.
+    source: G,
+    /// The absorbing target group, now unparked and carrying the capture debt.
+    target: G,
+  },
   /// The parked commit resolved as a deterministic NO-OP (the source's log settled the race, or
   /// the commit was a replayed duplicate). Both groups remain exactly as they were.
   Aborted {
@@ -724,6 +743,18 @@ where
   /// public gate's participant refusals (a frozen source, a park naming it) all describe the very
   /// in-flight merge and would wedge the absorb they exist to protect.
   fn remove_group_inner(&mut self, gid: &G) -> Option<Endpoint<I, F, R>> {
+    // No caller may consume a target still owing its absorb capture: the debt's `Merged` is the
+    // only path that floors and tears down the prior source, so dropping the holder here strands
+    // that source's stores as an unreachable orphan. Today this holds by the call graph (the
+    // resolve arm removes SOURCES, the husk dissolve removes FROZEN sources, and the reshape
+    // gates refuse a debt-holder both roles) — the assert turns the accident into a contract.
+    debug_assert!(
+      self
+        .groups
+        .get(gid)
+        .is_none_or(|ep| ep.capture_debt().is_none()),
+      "an inner teardown consumed a target with an outstanding capture debt"
+    );
     // A parked PARENT's staged forks die with its endpoint (removal is the embedder's explicit
     // destruction of this replica), so the park bookkeeping — a still-queued conflict signal
     // included — dies too. Removing a parked fork's CHILD needs nothing here: the next relay
@@ -2258,7 +2289,11 @@ where
     // A source that is itself mid-ABSORB (a CommitMerge in flight or parked as a target)
     // must finish that first: freezing it would mint a source generation the pending absorb
     // is about to move, and the two verbs' entries would race on one counter.
-    if sep.commit_merge_in_flight() || sep.pending_merge().is_some() {
+    if sep.commit_merge_in_flight() || sep.pending_merge().is_some() || sep.capture_debt().is_some()
+    {
+      // The debt leg: an absorbed-but-uncaptured union still owes its durability capture, and
+      // freezing the holder would let a claimant absorb and tear it down with the debt live —
+      // the consumed prior source's stores would strand as an unreachable orphan.
       return Some(Err(MergeError::AlreadyPending));
     }
     // A source still owing a target-role thaw must discharge it before dissolving. It applied an
@@ -2393,7 +2428,11 @@ where
         leader: tep.leader(),
       }));
     }
-    if tep.commit_merge_in_flight() || tep.pending_merge().is_some() {
+    if tep.commit_merge_in_flight() || tep.pending_merge().is_some() || tep.capture_debt().is_some()
+    {
+      // The debt leg keeps the one-absorb-at-a-time posture across a fence-deferred capture:
+      // the prior union's durability is still owed, and a second absorb would chain debts the
+      // discharge pass and the restart re-park are not shaped for.
       return Some(Err(MergeError::AlreadyPending));
     }
     // A frozen (or freezing) target must not absorb: the CommitMerge would land above its own
@@ -3211,14 +3250,19 @@ where
           });
         }
         Verdict::Resolve => {
-          // The absorb capture must be stageable NOW: absorb + capture + (driver-side) floor
-          // and teardown ride one crank, one barrier. A busy target (a capture or install
-          // already staged, a fork barrier at the absorb point) stays parked this crank.
-          if self
-            .groups
-            .get(&tgid)
-            .is_some_and(Endpoint::absorb_capture_blocked)
-          {
+          // The fence classification decides the arm's shape. `Hold` (a staged capture/install
+          // draining within cranks, or a live freeze whose pinned claim the fold itself would
+          // advance) keeps the park. `Defer` — only a REPLAY fence stands (a parked fork's
+          // barrier, an undischarged abort obligation) — absorbs NOW and records the capture as
+          // a debt: the fold is safe, only its compaction must wait for the fence, and holding
+          // instead would wedge the park for the fence's whole embedder-timescale life (the
+          // abort fence's clearing witness can even ride an entry the park itself keeps from
+          // applying). `Clear` is the one-crank absorb + capture + floor + teardown barrier.
+          let block = match self.groups.get(&tgid) {
+            Some(tep) => tep.absorb_capture_block(),
+            None => continue,
+          };
+          if block == crate::endpoint::AbsorbCaptureBlock::Hold {
             continue;
           }
           // THE RESIDUAL BELT, gated to LOCAL DRIVABILITY (see `owes_a_drivable_thaw`). HOLD the park
@@ -3261,6 +3305,28 @@ where
           if tep.is_poisoned() {
             self.mark_dirty(&tgid);
             resolutions.push(MergeResolution::CaptureFailed {
+              source,
+              target: tgid,
+            });
+            continue;
+          }
+          if block == crate::endpoint::AbsorbCaptureBlock::Defer {
+            // A replay fence deferred the capture: the union lives in memory and the CONSUMED
+            // source's intact stores remain its only restart derivation, so surface `Absorbed`
+            // — the driver fails the source's stranded routing but PRESERVES its stores and
+            // floor (the `CaptureFailed` half, minus the poison) — and hold the `Merged` as the
+            // target's capture debt. The per-crank debt pass stages the capture once the fence
+            // lifts (or adopts any other capture/install at-or-past the boundary) and only THEN
+            // surfaces `Merged`, the floor + teardown permission. A crash meanwhile re-parks
+            // against the restored source: the boundary's `CommitMerge` cannot have compacted
+            // away, since compaction past it requires exactly the capture the debt still owes.
+            if let Some(m) = merged
+              && let Some(tep) = self.groups.get_mut(&tgid)
+            {
+              tep.mint_capture_debt(m);
+            }
+            self.mark_dirty(&tgid);
+            resolutions.push(MergeResolution::Absorbed {
               source,
               target: tgid,
             });
@@ -3550,6 +3616,76 @@ where
       if let Some((slog, sstable)) = stores.stores(&sgid) {
         let _ = self.propose_dead_target_thaw(&sgid, now, slog, sstable, &target);
       }
+    }
+    // THE CAPTURE-DEBT PASS: discharge fence-deferred absorb captures. A debt's union is applied
+    // and serving, but its durability capture waited on a replay fence — the consumed source's
+    // intact stores are still the union's only restart derivation. Once the fence lifts (this
+    // pass runs LAST in the crank, so a fence any earlier pass lifted feeds it immediately), or
+    // a capture at-or-past the boundary is already staged (the threshold capture shares the same
+    // fence set, so either producer is co-barriered with this crank's flush), stage the forced
+    // capture and surface the held `Merged` — the driver's floor + teardown permission. A
+    // capture fault poisons and surfaces `CaptureFailed` exactly as the one-crank arm: stores
+    // preserved, restart re-parks.
+    let debtors: Vec<G> = self
+      .groups
+      .iter()
+      .filter(|(_, ep)| ep.capture_debt().is_some())
+      .map(|(gid, _)| gid.cheap_clone())
+      .collect();
+    for tgid in debtors {
+      let Some(tep) = self.groups.get(&tgid) else {
+        continue;
+      };
+      let Some(debt) = tep.capture_debt() else {
+        continue;
+      };
+      let boundary = debt.index();
+      let Ok(source) = G::decode_exact(debt.source()) else {
+        // The same bytes decoded at the defer; a failure here is the committed-corrupt class.
+        if let Some(tep) = self.groups.get_mut(&tgid) {
+          tep.poison(PoisonReason::MergeDecode);
+        }
+        self.note_if_poisoned(&tgid);
+        continue;
+      };
+      let already_staged = tep
+        .pending_compact_boundary()
+        .is_some_and(|b| b >= boundary);
+      if !already_staged {
+        if tep.capture_blocked_at(boundary) {
+          continue;
+        }
+        let staged = match stores.stores(&tgid) {
+          Some((log, stable)) => self
+            .groups
+            .get_mut(&tgid)
+            .is_some_and(|tep| tep.capture_absorb_snapshot(log, stable)),
+          None => {
+            if let Some(tep) = self.groups.get_mut(&tgid) {
+              tep.poison(PoisonReason::SnapshotCapture);
+            }
+            false
+          }
+        };
+        if !staged {
+          self.mark_dirty(&tgid);
+          resolutions.push(MergeResolution::CaptureFailed {
+            source,
+            target: tgid,
+          });
+          continue;
+        }
+      }
+      if let Some(tep) = self.groups.get_mut(&tgid)
+        && let Some(m) = tep.discharge_capture_debt()
+      {
+        tep.emit_merged(m);
+      }
+      self.mark_dirty(&tgid);
+      resolutions.push(MergeResolution::Merged {
+        source,
+        target: tgid,
+      });
     }
     resolutions
   }

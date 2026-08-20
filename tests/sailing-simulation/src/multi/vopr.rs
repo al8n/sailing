@@ -555,6 +555,8 @@ pub struct MultiVoprReport {
   /// Per-host capture-failed resolutions across the run — a consumed source whose union could not be
   /// made durable. Expected zero under the sim FSM; a non-zero value is a wedge to report.
   pub merges_capture_failed: u64,
+  /// Fence-deferred absorbs surfaced as `Absorbed` (the union applied, its capture deferred).
+  pub merges_absorbed: u64,
   /// Groups (live OR retired frozen husk) the run-end quiesce EXEMPTED from the convergence/
   /// freeze-wedge verdict as the tracked under-hosted parked-absorb class (#106): the merge
   /// component transitively blocked by an under-hosted merge conf
@@ -885,6 +887,7 @@ fn run_multi_vopr_inner(
   report.merges_resolved = w.merges_resolved();
   report.merges_aborted = w.merges_aborted();
   report.merges_capture_failed = w.merges_capture_failed();
+  report.merges_absorbed = w.merges_absorbed();
   report.membership_oracle_comparisons = w.membership_oracle_comparisons();
   report.skipped_unwitnessed_installs = w.skipped_unwitnessed_installs();
   report.kind_unobservable_installs = w.kind_unobservable_installs();

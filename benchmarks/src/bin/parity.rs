@@ -1173,7 +1173,11 @@ impl ReshapeHost {
             self.stores.remove(&s);
             self.floored.insert(s);
           }
-          MergeResolution::Aborted { .. } | MergeResolution::CaptureFailed { .. } => {
+          // The bench's single-group reshape never stands a fork/abort fence at the absorb, so
+          // a fence-deferred `Absorbed` is as unexpected here as an abort.
+          MergeResolution::Aborted { .. }
+          | MergeResolution::CaptureFailed { .. }
+          | MergeResolution::Absorbed { .. } => {
             panic!("reshape merge {source}->{target} resolved unexpectedly: {r:?}");
           }
         }

@@ -187,7 +187,14 @@ impl MultiWorld {
               .get(&node)
               .and_then(|h| h.group(&target))
               .map_or(sailing_proto::Index::ZERO, |ep| ep.applied_index());
-            self.register_or_check_merge(node, source, target, boundary);
+            // A debt discharge already CHECKED the union at its fold (the `Absorbed` arm below,
+            // where applied sits exactly at the boundary); by now the unparked target has
+            // legitimately applied past it, so re-sampling here would compare post-absorb load
+            // against the fold-point records of one-crank resolvers — a false divergence. The
+            // teardown registration below still rides this discharge.
+            if !self.absorbed_pending.remove(&(node, source, target)) {
+              self.register_or_check_merge(node, source, target, boundary);
+            }
             // The driver's teardown half — DEFERRED behind the capture's durability, modeling
             // the engine's one-barrier batch: floor, teardown, and the absorb capture land
             // together or not at all. Dropping the source stores at resolution time would make
@@ -204,6 +211,23 @@ impl MultiWorld {
           }
           sailing_proto::MergeResolution::Aborted { .. } => {
             self.merges_aborted += 1;
+          }
+          sailing_proto::MergeResolution::Absorbed { source, target } => {
+            // The fence-deferred absorb: the union is applied in the target while the source's
+            // stores stay preserved as its only restart derivation. NOTHING tears down here —
+            // the later `Merged` the debt discharges into registers the ordinary deferred
+            // teardown above. The absorbed-state determinism CHECK runs HERE, at the fold,
+            // where applied sits exactly at the boundary on every resolution path — the
+            // discharge-`Merged` skips its re-check (the target applies on past the boundary
+            // in the window, legitimately).
+            self.merges_absorbed += 1;
+            let boundary = self
+              .hosts
+              .get(&node)
+              .and_then(|h| h.group(&target))
+              .map_or(sailing_proto::Index::ZERO, |ep| ep.applied_index());
+            self.register_or_check_merge(node, source, target, boundary);
+            self.absorbed_pending.insert((node, source, target));
           }
           sailing_proto::MergeResolution::CaptureFailed { .. } => {
             // The absorb consumed the source endpoint but the union could not be made durable (the
@@ -443,6 +467,11 @@ impl MultiWorld {
   /// Per-host `CaptureFailed` resolutions across the run (expected zero under the sim FSM).
   pub fn merges_capture_failed(&self) -> u64 {
     self.merges_capture_failed
+  }
+
+  /// Fence-deferred absorbs surfaced as `Absorbed` this run (the union applied, capture owed).
+  pub fn merges_absorbed(&self) -> u64 {
+    self.merges_absorbed
   }
 
   /// Whether `gid` has ever ABSORBED another group — the agreement oracle's mode switch (see
@@ -704,12 +733,30 @@ impl MultiWorld {
     let participant =
       |g: u64| self.group_frozen(g) || self.group_freeze_seen(g) || self.group_merge_parked(g);
     // Base: merge participants with no live host quorum (the under-hosted husk roots).
-    let base: BTreeSet<u64> = self
+    let mut base: BTreeSet<u64> = self
       .groups
       .keys()
       .copied()
       .filter(|&g| participant(g) && !self.has_live_host_quorum(g))
       .collect();
+    // A parked target whose NAMED source has no live host quorum is the same under-hosted root
+    // even when the source's surviving husk predates its own freeze: a pre-freeze replica is not
+    // a merge participant (nothing frozen, nothing seen), yet the park is exactly as
+    // unresolvable — the source can never elect, never replicate, and never reach its boundary,
+    // and the identity leg has no freeze entry to find. The participant-gated base only reached
+    // this shape transitively when the husk itself had frozen first.
+    let parked_on_quorumless: Vec<u64> = self
+      .groups
+      .keys()
+      .copied()
+      .filter(|&g| {
+        self.group_merge_parked(g)
+          && self
+            .parked_source_of(g)
+            .is_some_and(|s| !self.has_live_host_quorum(s))
+      })
+      .collect();
+    base.extend(parked_on_quorumless);
     self.propagate_merge_block(base)
   }
 

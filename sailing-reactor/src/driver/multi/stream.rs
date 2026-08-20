@@ -761,6 +761,31 @@ where
         sailing_proto::MergeResolution::Merged { source, .. } => source,
         sailing_proto::MergeResolution::Retired { source } => source,
         sailing_proto::MergeResolution::Aborted { .. } => continue,
+        sailing_proto::MergeResolution::Absorbed { source, target } => {
+          // The fence-deferred absorb: the union is applied and serving in the target, the source
+          // endpoint is gone, and the source's stores and floor stay DELIBERATELY untouched — they
+          // remain the union's only restart derivation until the capture debt discharges into the
+          // later `Merged` (whose arm then floors and tears down as usual). Fail the source's
+          // stranded routing typed — its callers would hang forever on the vanished endpoint's
+          // oneshots — and drain the completion latch exactly as the other consuming arms do.
+          self.was_leader.remove(&source);
+          self.quiesced.remove(&source);
+          self.quiesce_pending.remove(&source);
+          self.activity.remove(&source);
+          self.election.remove(&source);
+          if let Some(mut routing) = self.routing.remove(&source) {
+            routing.fail_all(&DriverError::SourceAbsorbed);
+            // The source's DYING latch fires PLANE-FATAL, as on every consuming arm: the swept
+            // completion's dropped guard could have torn ANY hosted group's FSM.
+            if routing.take_completion_panicked() {
+              self.coord.fail_stop_plane_unattributable_panic();
+            }
+          }
+          let _ = self
+            .lifecycle_tx
+            .try_send(LifecycleEvent::MergeAbsorbed { source, target });
+          continue;
+        }
         sailing_proto::MergeResolution::CaptureFailed { source, target } => {
           self.was_leader.remove(&source);
           self.quiesced.remove(&source);
