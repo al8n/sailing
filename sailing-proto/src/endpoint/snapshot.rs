@@ -993,6 +993,14 @@ where
       if is.total_len() == 0
         && let Some(park) = self.merge_park_unresolvable()
         && meta.last_index() >= park
+        // Adopt only within the LOCALLY PROVEN committed range — the crossing walk's own cap. A
+        // blob beyond it may cover durable, Log-Matching entries the walk never examined (the
+        // async-follower coverage arm admits exactly that shape), and one of them could be a
+        // crossing naming a hosted source. Bailing here is not a refusal: the raise branch
+        // below advances commit off this very blob's evidence, the walk catches up next crank,
+        // the hint re-evaluates, and the NEXT delivery adopts — one extra round-trip, with the
+        // walk always ahead of the adopt.
+        && meta.last_index() <= self.commit
         && !self.adopt_parked_union(log, meta, is.data().clone())
       {
         return;
@@ -1383,16 +1391,14 @@ where
         None => return false,
       };
     }
-    let freeze_pending = match Self::scan_freeze_pending(log, boundary) {
+    let freeze_pending = match Self::scan_freeze_pending_read(log, boundary) {
       Ok(fp) => fp,
-      Err(PoisonReason::LogRead) => {
-        // `scan_freeze_pending` folds Pending/empty and Err into one reason; at THIS seam the
-        // benign shapes must defer, and a genuine fault will recur on the retry until the
-        // ordinary apply drain (which owns the distinction) poisons it.
-        return false;
-      }
-      Err(reason) => {
-        self.poison(reason);
+      // Benign transient unreadiness: defer byte-unchanged, the cure re-sends on cooldown.
+      Err(crate::endpoint::merge::ScanInterrupt::Retry) => return false,
+      // A genuine store fault in the kept suffix: the parked drain can never reach it to raise
+      // it, so poisoning HERE is the only surfacing this replica gets.
+      Err(crate::endpoint::merge::ScanInterrupt::Fault) => {
+        self.poison(PoisonReason::LogRead);
         return false;
       }
     };
@@ -1415,6 +1421,8 @@ where
     self.merge.park_unresolvable = false;
     self.merge.crossing_sources.clear();
     self.merge.crossing_scan_upto = Index::ZERO;
+    self.merge.crossing_scan_current = false;
+    self.merge.crossing_decode_failed = false;
     if self.fsm.restore(snap).is_err() {
       self.poison(PoisonReason::SnapshotRestore);
       return false;
@@ -1725,6 +1733,8 @@ where
     self.merge.park_unresolvable = false;
     self.merge.crossing_sources.clear();
     self.merge.crossing_scan_upto = Index::ZERO;
+    self.merge.crossing_scan_current = false;
+    self.merge.crossing_decode_failed = false;
     // The re-baseline discarded every abort entry at-or-below the boundary — the ONLY restart
     // re-derivation of the `abandoned` obligation. The install sits past the committed+applied abort,
     // proving the source thawed past the abandoned freeze (the capturing leader's own service drove
