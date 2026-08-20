@@ -4063,3 +4063,161 @@ fn the_delivery_seam_fences_a_retired_incarnations_frames() {
     "the at-floor campaign reached the endpoint"
   );
 }
+
+/// THE HUSK-MINORITY PROTECTION with a QUORUM of adopt-superseded replicas. A single follower
+/// adopting the leader's covering blob is a straggler; a MAJORITY adopting is the case the adopt's
+/// soundness argument actually has to survive, since a divergent blob would then carry the quorum
+/// rather than be outvoted by it. Two of the target's three replicas are driven into the
+/// under-hosted park at once — their absorb captures die in a crash, their durable logs replay the
+/// commit, and neither can fold a source whose endpoint resolution already removed — so both
+/// ADVERTISE their boundary and both are superseded in place by the one blob the leader sends.
+///
+/// The world's agreement, cross-talk and lineage oracles run at the end of EVERY tick over every
+/// hosted replica, so the convergence assertions below are only half the verdict: the other half is
+/// that no tick between the two adopts convicted the union.
+///
+/// SHAPE DELTA. The natural statement of this — a source hosted on exactly one node, with the other
+/// two target replicas absorbing a group they never held — is not constructible: a merge demands
+/// identical voter sets (`MergeError::VoterSetsDiffer`), so the source cannot be given a solo voter
+/// set, and under-hosting it after the fact is refused too (the container will not tear down an
+/// unresolved merge participant, and a source that lost its quorum before the freeze can never
+/// commit one). The crash-replay park is the constructible route to the same endpoint — source
+/// endpoint gone, floor honestly absent, no local fold possible — and this widens it from the single
+/// follower [`a_replayed_under_hosted_park_is_cured_while_the_floor_waits_for_durability`] drives to
+/// a quorum of them.
+#[test]
+fn a_quorum_of_adopt_superseded_replicas_converges_under_the_oracles() {
+  let mut w = MultiWorld::new(59);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(11, &all);
+  w.create_group(10, &all);
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(11).is_some() && w.leader_of(10).is_some()
+  }));
+  propose_until_accepted(&mut w, 11, b"s0");
+  propose_until_accepted(&mut w, 10, b"t0");
+  w.run_until(200, |_| false);
+
+  // Colocate first: with both leaderships on one host, the OTHER TWO nodes are non-leaders of both
+  // groups — the pair whose target captures are free to lag, and the pair this test parks together.
+  colocate_source_onto_target(&mut w, 11, 10);
+  let leader = w.leader_of(10).expect("target leader");
+  let followers: Vec<u64> = (0..3u64).filter(|&n| n != leader).collect();
+  assert_eq!(followers.len(), 2, "three nodes, one colocated leader");
+  // A real fsync window on each follower's TARGET stable: the absorb capture will sit in flight
+  // there while the (sync) log keeps the parked commit itself durable.
+  for &f in &followers {
+    w.stables
+      .get_mut(&(f, 10))
+      .expect("target stable")
+      .set_mode(crate::StoreMode::Async);
+  }
+
+  merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(11, 10)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
+    w.propose_commit_merge(10, 11)
+  });
+  assert!(
+    w.run_until(8_000, |w| w.merges_resolved() >= 3),
+    "every host resolves the absorb before the crashes"
+  );
+  for &f in &followers {
+    assert!(
+      w.stables[&(f, 10)].has_inflight(),
+      "node {f}: the absorb capture must sit in the fsync window"
+    );
+    assert!(
+      !w.merge_floors.contains(&(f, 11)),
+      "node {f}: no floor may be recorded ahead of the capture's durability"
+    );
+  }
+
+  // Collapse BOTH windows in the same instant: each restored target replays its durable commit and
+  // re-parks under-hosted (the source endpoint resolution removed, its floor never landed), leaving
+  // the target's apply pinned on a MAJORITY of its replicas at once.
+  for &f in &followers {
+    w.crash(f);
+  }
+  assert!(
+    w.run_until(6_000, |w| followers.iter().all(|&f| w.hosts[&f]
+      .group(&10)
+      .is_some_and(|ep| ep.pending_merge().is_some()))),
+    "both restored followers replay the commit and re-park TOGETHER"
+  );
+  // Both park UNRESOLVABLE — the advertisement, not an ordinary wait on a fold that is merely late.
+  assert!(
+    followers.iter().all(|&f| w.hosts[&f]
+      .group(&10)
+      .is_some_and(|ep| ep.merge_park_unresolvable().is_some())),
+    "both parked followers must ADVERTISE a boundary: no local fold can ever land on either"
+  );
+  assert!(
+    followers.iter().all(|&f| !w.hosts_group(f, 11)),
+    "the parks are under-hosted BY CONSTRUCTION: no source endpoint survives on either follower to \
+     fold, only the stores the pending teardown retains (hosting {:?})",
+    w.hosting_nodes(11)
+  );
+  assert!(
+    w.hosts[&leader]
+      .group(&10)
+      .is_some_and(|ep| ep.pending_merge().is_none()),
+    "the folding leader is NOT parked — the parked set is exactly the two-replica MAJORITY, which \
+     is what makes this the husk-minority argument's hard case"
+  );
+
+  // The cure: ONE covering blob from the leader supersedes BOTH parks. Nothing else can clear them
+  // — neither follower can fold a source it no longer hosts, and an abort would skip a committed
+  // union on a quorum of replicas.
+  assert!(
+    w.run_until(12_000, |w| followers.iter().all(|&f| w.hosts[&f]
+      .group(&10)
+      .is_some_and(|ep| ep.pending_merge().is_none()))),
+    "both advertised parks are cured by the leader's covering snapshot"
+  );
+  assert_eq!(
+    w.merges_aborted(),
+    0,
+    "an adopt is not an abort: the union is never skipped on a replica"
+  );
+  assert!(
+    w.agreement_holds(10),
+    "the union agrees across the adopting quorum and the leader that folded it"
+  );
+
+  // The adopt is observable as CONVERGENCE: the superseded majority holds the leader's applied
+  // record at equal watermarks, source content folded in.
+  assert!(
+    w.run_until(8_000, |w| {
+      let lens: Vec<usize> = (0..3u64).map(|n| w.applied_of(n, 10).len()).collect();
+      lens.iter().min() == lens.iter().max()
+    }),
+    "the adopting quorum converges to the leader's applied record"
+  );
+
+  // Post-cure load drains everywhere: the adopted replicas are ordinary followers again, not
+  // replicas pinned at a boundary they can only leave by installing. Sync completions are restored
+  // first — a stable that never flushes would hold their teardowns forever by construction.
+  for &f in &followers {
+    w.stables
+      .get_mut(&(f, 10))
+      .expect("target stable")
+      .set_mode(crate::StoreMode::Sync);
+  }
+  for i in 0..40u32 {
+    propose_until_accepted(&mut w, 10, &i.to_be_bytes());
+  }
+  assert!(
+    w.run_until(8_000, |w| (0..3u64).all(|n| {
+      w.hosts[&n]
+        .group(&10)
+        .is_some_and(|ep| ep.applied_index() == ep.commit_index())
+    })),
+    "every live member drains the post-cure load to applied == commit"
+  );
+  w.check_now();
+}
