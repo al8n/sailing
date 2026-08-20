@@ -478,12 +478,15 @@ window** — a completed install or capture already at-or-past the boundary — 
 fence has itself released (durability alone is not compaction: a completion-time redundant
 install raises the durable index while deliberately keeping the log, so a durable-covered
 debtor behind a standing fence still stages its capture). A DESTRUCTIVE install DURING the
-window is refused at receipt: staging one would put a covering blob in the durable slot whose
-restart `Restore` arm re-baselines past the `CommitMerge` with the volatile debts lost and the
-source floors still non-terminal — restorable husks beside the absorbed union. The debtor's
-applied already covers every debt boundary, so the refused blob was pure catch-up; the sender's
-heartbeat-paced resend re-drives, and the retry admits once the chain discharges through the
-debtor's own forced capture.
+window is HELD at the pre-slot choke point rather than submitted: a covering blob in the
+durable slot beside the intact log is exactly the restart shape that `Restore`s past the
+`CommitMerge` with the volatile debts lost and the source floors still non-terminal. The debt
+pass submits the hold through the ordinary deferral in the SAME crank it drains the whole
+chain, so the slot write and the terminal floors ride one driver flush — either both durable
+or neither — and the completion then re-baselines as any deferred install. The hold is
+volatile: a crash loses only it (the unchanged log re-derives the debts, the paced resend
+re-drives the blob), which is what makes a partitioned debtor whose thaw witness was compacted
+away curable at all — that install is its only way back.
 
 A debt is HOST-LOCAL — the fences that deferred it are this replica's own — so a foreign-led
 freeze can legally commit the DEBTOR's own consumption as the next merge source while the debt

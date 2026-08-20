@@ -1089,19 +1089,6 @@ where
       return;
     }
 
-    // THE DEBT WINDOW REFUSES DESTRUCTIVE INSTALLS. While a capture debt (own or inherited)
-    // stands, the consumed sources' preserved stores are the union's only restart derivation —
-    // and this replica's applied already covers every debt boundary (a debt exists only past
-    // its absorb's fold), so this genuinely-newer blob is pure catch-up, never the cure.
-    // Staging it would put a covering snapshot in the durable slot whose restart `Restore` arm
-    // re-baselines past the `CommitMerge` with the volatile debts lost and the source floors
-    // still non-terminal — restorable husks beside the absorbed union. The debts discharge
-    // through this endpoint's OWN forced capture on the fence timescale they already ride;
-    // silent, no ack, exactly as the slot guard below: the sender's heartbeat-paced resend
-    // re-drives, and once the chain discharges the retry admits.
-    if self.merge.capture_debt.is_some() || !self.merge.inherited_debts.is_empty() {
-      return;
-    }
     // SLOT MONOTONICITY: the store keeps ONE latest snapshot, so a submit is destructive — it
     // REPLACES whatever the slot holds. An inbound snapshot strictly below the slot's boundary must
     // therefore never reach `submit_snapshot`: the slot may be the only baseline for a prefix the
@@ -1171,10 +1158,23 @@ where
           return;
         }
       };
+      let leader = is.leader();
+      // THE DEBT-CURE HOLD. While a capture debt (own or inherited) stands, the deferral must
+      // not reach the durable slot yet: a covering slot beside this intact log is exactly the
+      // restart shape that Restores past the `CommitMerge` with the volatile debts lost and
+      // the source floors still non-terminal. Hold the validated install VOLATILE instead —
+      // the per-crank debt pass drains the whole chain and submits this hold in the SAME
+      // crank, so the slot write and the terminal floors ride one driver flush (either both
+      // durable or neither). A crash loses only the hold: the unchanged log re-derives the
+      // debts and the sender's paced resend re-drives the blob.
+      if self.merge.capture_debt.is_some() || !self.merge.inherited_debts.is_empty() {
+        self.snapshot.debt_cure = Some((meta.clone(), snap, is.data().clone(), leader));
+        return;
+      }
+      self.snapshot.debt_cure = None;
       self.ensure_term_durable(stable);
       let opid = self.mint_op_id();
       self.submit_snapshot(stable, opid, meta.clone(), is.data().clone());
-      let leader = is.leader();
       self.snapshot.pending_install = Some((opid, meta.clone(), snap, leader));
       return;
     }
@@ -1321,10 +1321,18 @@ where
         return;
       }
     };
+    let leader = is.leader();
+    // THE DEBT-CURE HOLD, the chunked completion's copy of the whole-blob arm above — the
+    // reassembled blob is at the identical pre-slot choke point.
+    if self.merge.capture_debt.is_some() || !self.merge.inherited_debts.is_empty() {
+      self.snapshot.debt_cure = Some((meta.clone(), snap, blob, leader));
+      self.snapshot.snapshot_recv = None;
+      return;
+    }
+    self.snapshot.debt_cure = None;
     self.ensure_term_durable(stable);
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta.clone(), blob);
-    let leader = is.leader();
     self.snapshot.pending_install = Some((opid, meta.clone(), snap, leader));
     self.snapshot.snapshot_recv = None;
   }
@@ -1531,6 +1539,26 @@ where
       self.note_courtesy_debt_at_boundary(&peer, boundary);
     }
     true
+  }
+
+  /// Whether a covering install is HELD through this endpoint's capture-debt window (see
+  /// `SnapshotState::debt_cure`).
+  pub(crate) fn debt_cure_held(&self) -> bool {
+    self.snapshot.debt_cure.is_some()
+  }
+
+  /// Submit the held debt-cure install through the ORDINARY deferral. Called by the debt pass
+  /// in the same crank that drains the chain, so the blob's slot write and the discharge's
+  /// terminal floors ride one driver flush; the completion then re-baselines exactly as any
+  /// deferred install.
+  pub(crate) fn submit_debt_cure_install<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
+    let Some((meta, snap, blob, leader)) = self.snapshot.debt_cure.take() else {
+      return;
+    };
+    self.ensure_term_durable(stable);
+    let opid = self.mint_op_id();
+    self.submit_snapshot(stable, opid, meta.clone(), blob);
+    self.snapshot.pending_install = Some((opid, meta, snap, leader));
   }
 
   pub(crate) fn install_snapshot_now<L: LogStore, S: StableStore<NodeId = I>>(
