@@ -10969,14 +10969,15 @@ fn a_replayed_chain_resolves_the_inner_park_beneath_a_pending_freeze() {
   assert_eq!(tep.state_machine().units, 2, "the union folded first");
 }
 
-/// A covering install at a debt holder is HELD, then becomes the discharge itself: submitting
-/// it straight to the slot would hand a restart a covering blob beside the intact log — the
-/// shape that Restores past the `CommitMerge` with the volatile debts lost and the source
-/// floors still non-terminal. The debt pass submits the hold in the SAME crank it drains the
-/// chain, so slot and floors ride one flush — and the fence NEVER lifts here: a partitioned
-/// debtor whose witness was compacted away has exactly this install as its only cure.
+/// A covering install SUPERSEDES the debt chain by the rebaseline rule: per-entry obligations
+/// below the blob's boundary were resolved globally by the transferring leader's own discharge
+/// barrier, so the chain clears at the completion WITHOUT surfacing `Merged` — this host
+/// authorizes no teardown it did not run; the prior source's terminal floor reaches it by
+/// propagation, and until then the preserved stores stand exactly as a husk's. The fence never
+/// lifts here: a partitioned debtor whose witness was compacted away has exactly this install
+/// as its only way back, and it flows through the ONE ordinary install path.
 #[test]
-fn a_covering_install_at_a_debt_holder_becomes_the_discharge() {
+fn a_covering_install_supersedes_the_debt_chain() {
   let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
   defer_to_absorbed(&mut m, &mut stores, d);
   let units_before = m.group(&1).unwrap().state_machine().units;
@@ -10988,7 +10989,6 @@ fn a_covering_install_at_a_debt_holder_becomes_the_discharge() {
   .with_shape_gen(1);
   {
     let (l, s) = stores.0.get_mut(&1).unwrap();
-    let slot_before = s.snapshot().map(|(sm, _)| sm.last_index());
     m.handle_message(
       &1,
       d,
@@ -11003,34 +11003,17 @@ fn a_covering_install_at_a_debt_holder_becomes_the_discharge() {
       )),
     )
     .unwrap();
-    drain_storage(&mut m, 1, d, l, s);
-    assert_eq!(
-      s.snapshot().map(|(sm, _)| sm.last_index()),
-      slot_before,
-      "the hold is VOLATILE: nothing reached the durable slot"
-    );
   }
   let tep = m.group(&1).unwrap();
   assert_eq!(
     tep.state_machine().units,
     units_before,
-    "held, not installed: nothing restored yet"
+    "the deferral holds the destructive body until the blob is durable"
   );
-  assert!(tep.capture_debt().is_some(), "the debt stands untouched");
-  while m.poll_message().is_some() {}
-
-  // The next crank: the hold submits and the WHOLE chain discharges — with the fork fence
-  // still standing (it never lifts in this test; the install is the only cure).
-  let resolutions = m.service_merge_applies(d, &mut stores);
-  assert_eq!(
-    resolutions,
-    std::vec![MergeResolution::Merged {
-      source: 2,
-      target: 1
-    }],
-    "the held install IS the discharge"
+  assert!(
+    tep.capture_debt().is_some(),
+    "the chain stands until the completion actually re-baselines"
   );
-  assert!(m.group(&1).unwrap().capture_debt().is_none());
   {
     let (l, s) = stores.0.get_mut(&1).unwrap();
     drain_storage(&mut m, 1, d, l, s);
@@ -11039,11 +11022,18 @@ fn a_covering_install_at_a_debt_holder_becomes_the_discharge() {
       "the completion re-baselined past the window"
     );
   }
-  assert_eq!(
-    m.group(&1).unwrap().state_machine().units,
-    9,
-    "the blob's state is the new baseline"
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.capture_debt().is_none(),
+    "the chain is superseded with the log it rode on"
   );
+  assert_eq!(tep.state_machine().units, 9, "the blob IS the new baseline");
+  assert!(
+    m.service_merge_applies(d, &mut stores).is_empty(),
+    "nothing surfaces: the teardown authority was the transferring leader's"
+  );
+  // The prior source's stores stay preserved for the propagated-floor teardown, husk-style.
+  assert!(stores.0.contains_key(&2));
 }
 
 /// A parked fork's standing capture fence no longer wedges a later merge into the same parent:
@@ -11821,6 +11811,53 @@ fn a_peeked_merge_blocked_signal_survives_until_polled() {
   );
   assert_eq!(m.poll_merge_blocked(), Some(head), "poll retires the head");
   assert_eq!(m.peek_merge_blocked(), None);
+}
+
+/// A signal still QUEUED when its hold resolves is PURGED, never delivered late: a full
+/// lifecycle tail can hold the observation undelivered across the hold's whole life, and
+/// publishing it after the cure would prompt the placement layer to act on a hold that no
+/// longer exists — re-hosting an absorbed source beside the cured union.
+#[test]
+fn a_resolved_holds_queued_signal_is_purged() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = under_hosted_park_host();
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert!(
+    m.peek_merge_blocked().is_some(),
+    "the hold signalled and nobody drained it"
+  );
+
+  // The cure adopts in place of the impossible fold; the hold is gone.
+  let meta = crate::SnapshotMeta::new(
+    Index::new(3),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta,
+        fork_blob(5),
+      )),
+    )
+    .unwrap();
+  }
+  assert!(m.group(&1).unwrap().pending_merge().is_none(), "adopted");
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the undelivered observation retired with its hold"
+  );
 }
 
 /// An under-hosted park on a single-node host, with the `k+1` coordinate committed so the abort
@@ -12602,7 +12639,7 @@ fn a_blob_beyond_local_commit_defers_until_the_walk_catches_up() {
 /// container's dispatch edge clears it, so the adopt never erases the live thaw obligation the
 /// freeze-active predicate protects.
 #[test]
-fn a_same_batch_freeze_clears_the_stale_cure_admission() {
+fn a_hosted_unadvanced_counterparty_withholds_the_cure() {
   let now = Instant::ORIGIN;
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   // The obligation's counterparty, hosted and (initially) unfrozen.
@@ -12670,11 +12707,15 @@ fn a_same_batch_freeze_clears_the_stale_cure_admission() {
   let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
   stores.0.insert(1, (log, stable));
 
-  // With 42 unfrozen, the hint stands after the crank.
+  // 42 is hosted at a generation NOT past the owed one: the cure admission is withheld from
+  // the very first crank — an unfrozen counterparty at-or-below the owed generation is one
+  // delayed PrepareMerge away from freezing at it, and the adopt's boundary clear would erase
+  // that freeze's only local thaw driver.
   assert!(m.service_merge_applies(now, &mut stores).is_empty());
   assert_eq!(
     m.group(&1).unwrap().merge_park_unresolvable(),
-    Some(Index::new(3))
+    None,
+    "hosted-unadvanced withholds the hint outright"
   );
 
   // SAME BATCH, no crank: 42's freeze arms at append-observation…

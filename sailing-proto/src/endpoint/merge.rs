@@ -883,6 +883,15 @@ where
     core::mem::take(&mut self.merge.inherited_debts)
   }
 
+  /// A covering install re-baselined this endpoint: the debt chain is SUPERSEDED, not
+  /// discharged — the blob's producer already ran the teardown barrier the held `Merged`s
+  /// would have authorized, and the prior sources' terminal floors reach this host by
+  /// propagation. Cleared without surfacing anything.
+  pub(crate) fn note_debts_rebaselined(&mut self) {
+    self.merge.capture_debt = None;
+    self.merge.inherited_debts.clear();
+  }
+
   /// The staged (submitted, not yet durability-completed) capture's boundary, if one is in
   /// flight — the debt pass adopts a staged capture at-or-past the absorb boundary as the
   /// debt's own discharge (boundary coverage is monotone in `applied`).

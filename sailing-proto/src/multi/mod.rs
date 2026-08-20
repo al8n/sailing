@@ -935,20 +935,26 @@ where
   /// the only drive for its thaw (a host-local proof of nothing — the source strands frozen).
   /// Unhosted or hosted-but-unfrozen counterparties have no local strand to protect, and the
   /// boundary-proof clear is exactly right for them.
-  fn obligation_names_hosted_frozen(&self, tgid: &G) -> bool {
+  fn obligation_names_hosted_unadvanced(&self, tgid: &G) -> bool {
     let Some(tep) = self.groups.get(tgid) else {
       return false;
     };
-    tep.abandoned_obligations().into_iter().any(|(sb, _, _)| {
-      G::decode_exact(sb)
-        .ok()
-        .and_then(|source| self.groups.get(&source))
-        // The full freeze-active predicate, PENDING included: the thaw path deliberately
-        // preserves an obligation while its hosted source is still freeze-pending, and an
-        // adopt's boundary clear would erase that live obligation exactly as it would a
-        // frozen one's.
-        .is_some_and(Endpoint::merge_freeze_active)
-    })
+    tep
+      .abandoned_obligations()
+      .into_iter()
+      .any(|(sb, expected, _)| {
+        G::decode_exact(sb)
+          .ok()
+          .and_then(|source| self.groups.get(&source))
+          // Withhold unless the hosted counterparty has provably advanced PAST the owed
+          // generation. Freeze-active includes PENDING (the thaw path deliberately preserves
+          // an obligation while its hosted source is still freeze-pending), and a hosted
+          // source merely AT-OR-BELOW the owed generation is one delayed PrepareMerge away
+          // from freezing at it — an adopt's boundary clear would then erase the freeze's
+          // only local thaw driver in the same inbound batch. Only `shape_gen > expected` —
+          // the same past-proof the thaw pass discharges on — makes the clear safe.
+          .is_some_and(|sep| sep.merge_freeze_active() || sep.shape_gen() <= expected)
+      })
   }
 
   /// A gid was just admitted (create / restore / fork): any hosted target whose park names it
@@ -1615,6 +1621,10 @@ where
     self
       .merge_blocked_seen
       .insert(target.cheap_clone(), observation);
+    // A superseded observation still QUEUED (a full lifecycle tail held it undelivered) is
+    // replaced, not delivered first: the embedder would act on the stale identity — the old
+    // crossing, the old cause — before ever seeing the current one.
+    self.merge_blocked.retain(|b| &b.target != target);
     self.merge_blocked.push_back(MergeBlocked {
       target: target.cheap_clone(),
       source: source.cheap_clone(),
@@ -2124,7 +2134,7 @@ where
             .unwrap_or(true)
         })
       });
-      if (hosted_crossing || self.obligation_names_hosted_frozen(gid))
+      if (hosted_crossing || self.obligation_names_hosted_unadvanced(gid))
         && let Some(ep) = self.groups.get_mut(gid)
       {
         ep.note_merge_park_unresolvable(false);
@@ -3365,6 +3375,23 @@ where
         .get(gid)
         .is_some_and(|ep| ep.pending_merge().is_some() || ep.capture_debt().is_some())
     });
+    // The QUEUED observation retires with the edge: a full lifecycle tail can hold a signal
+    // undelivered across its hold's whole life, and publishing it after the resolution would
+    // prompt embedder action against a hold that no longer exists (re-hosting an absorbed
+    // source beside the cured union). Purge by the same predicate the edge uses.
+    let retained: std::collections::BTreeSet<Bytes> = blocked_seen
+      .keys()
+      .map(|g| {
+        let mut b = Vec::new();
+        g.encode(&mut b);
+        Bytes::from(b)
+      })
+      .collect();
+    self.merge_blocked.retain(|b| {
+      let mut k = Vec::new();
+      b.target.encode(&mut k);
+      retained.contains(&Bytes::from(k))
+    });
     self.merge_blocked_seen = blocked_seen;
     let parked: Vec<G> = self
       .groups
@@ -3566,7 +3593,7 @@ where
           // across entries never examined — fail-closed.
           t.crossing_scan_current() && !t.fork_barrier_standing()
         })
-        && !self.obligation_names_hosted_frozen(&tgid);
+        && !self.obligation_names_hosted_unadvanced(&tgid);
       // ONE composed cause per crank: a hosted crossing outranks and SUPPRESSES the generic
       // unhosted-source signal (the actionable identity is the crossing's — its lifecycle is
       // what releases this wedge — carried with the PARK coordinate; the edge-dedup then holds
@@ -4146,39 +4173,9 @@ where
         self.note_if_poisoned(&tgid);
         continue;
       };
-      // A HELD DEBT-CURE INSTALL discharges the chain THIS crank: submit it through the
-      // ordinary deferral here, so its slot write and the discharge's terminal floors below
-      // ride one driver flush (either both durable or neither — a crash before it loses only
-      // the volatile hold and the unchanged log re-derives the debts). Its meta covers every
-      // debt boundary by construction (a genuinely-newer blob exceeds commit, which the
-      // absorb's fold already carried past each boundary), and installs are exempt from the
-      // capture fences — the completion's re-baseline retires covered replay obligations
-      // itself, exactly as any install does.
-      let cure_submitted = tep.debt_cure_held();
-      if cure_submitted {
-        match stores.stores(&tgid) {
-          Some((_, stable)) => {
-            if let Some(tep) = self.groups.get_mut(&tgid) {
-              tep.submit_debt_cure_install(stable);
-            }
-          }
-          None => {
-            if let Some(tep) = self.groups.get_mut(&tgid) {
-              tep.poison(PoisonReason::SnapshotCapture);
-            }
-            self.note_if_poisoned(&tgid);
-            self.mark_dirty(&tgid);
-            continue;
-          }
-        }
-      }
-      let Some(tep) = self.groups.get(&tgid) else {
-        continue;
-      };
-      let already_staged = cure_submitted
-        || tep
-          .pending_compact_boundary()
-          .is_some_and(|b| b >= boundary)
+      let already_staged = tep
+        .pending_compact_boundary()
+        .is_some_and(|b| b >= boundary)
         // A COMPLETED install (or capture) at-or-past the boundary is the after-durable form of
         // the same evidence — the soundest producer of the three; without this leg an install
         // into a debt-holder would orphan the debt (the restore discards the boundary's
