@@ -149,6 +149,13 @@ where
     self.split.outstanding.remove(&index);
   }
 
+  /// Whether any fork durability barrier stands — the cure-advertisement gate's fork leg: an
+  /// adopting install's restart takes the `Compact` arm at its boundary, which would destroy a
+  /// staged fork's only replay derivation, so a fork-fenced host never advertises.
+  pub(crate) fn fork_barrier_standing(&self) -> bool {
+    !self.split.outstanding.is_empty()
+  }
+
   /// A snapshot install re-baselined the log to `boundary`, discarding every split entry
   /// at-or-below it — the replay derivation the barrier protects. For a fork still QUEUED at
   /// such an index the fence now protects nothing and can only wedge (the capture fence would

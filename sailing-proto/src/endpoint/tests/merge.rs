@@ -2715,3 +2715,105 @@ fn a_park_over_plain_entries_still_campaigns() {
     "votes requested from both peers"
   );
 }
+
+/// The chained shape's adopt: a target frozen as ANOTHER merge's source (its own `PrepareMerge`
+/// applied below the park) whose thaw sits committed-but-unapplied in the skipped range. The
+/// adopt clears the quartet unconditionally — the totality argument in the correct direction: a
+/// same-group sender is capture-fenced for its freeze's whole life, so a blob at this boundary
+/// PROVES the freeze was thawed at-or-before it — and re-derives `freeze_pending` against the
+/// KEPT tail rather than blanket-clearing off a discard that did not happen. Exiting the adopt
+/// still frozen would strand the replica forever: captures fenced, proposals refused if
+/// elected, its stale claim blocking the claimant's teardown.
+#[test]
+fn the_adopt_thaws_a_frozen_and_parked_target() {
+  use crate::{InstallSnapshot, SnapshotMeta, conf::ConfState};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(5), 1, 2),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(3),
+      EntryKind::RollbackMerge,
+      rollback_payload(2),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(4),
+      EntryKind::Normal,
+      encode_cmd(b"a"),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(4));
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(ep.is_frozen(), "the freeze applied below the park");
+  assert!(ep.pending_merge().is_some(), "parked above its own freeze");
+
+  // The container's resolver would classify this park unresolvable (source unhosted); the
+  // endpoint test records the classification directly.
+  ep.note_merge_park_unresolvable(true);
+  let meta = SnapshotMeta::new(
+    Index::new(4),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  )
+  .with_shape_gen(2);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      2u64,
+      meta,
+      encode_snapshot(9),
+    )),
+  );
+  assert!(!ep.is_poisoned());
+  assert!(ep.pending_merge().is_none(), "the adopt cleared the park");
+  assert!(
+    !ep.is_frozen(),
+    "the boundary proves the freeze thawed — exiting frozen would strand this replica forever"
+  );
+  assert_eq!(
+    ep.merge.freeze_pending, None,
+    "re-derived against the kept tail: no freeze above"
+  );
+  assert_eq!(ep.applied_index(), Index::new(4));
+  assert!(
+    !ep.has_abandoned(),
+    "boundary-covered obligations cleared, restart-agreed"
+  );
+  assert!(
+    log.first_index() <= Index::new(1),
+    "the log is KEPT — the adopt discards nothing"
+  );
+}

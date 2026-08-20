@@ -853,6 +853,24 @@ where
     })
   }
 
+  /// Whether any of `tgid`'s standing abort obligations names a source hosted-and-frozen on
+  /// this container — the cure-advertisement gate's abort leg: an adopt clears obligations at
+  /// the boundary, and clearing one whose live frozen counterparty sits RIGHT HERE would erase
+  /// the only drive for its thaw (a host-local proof of nothing — the source strands frozen).
+  /// Unhosted or hosted-but-unfrozen counterparties have no local strand to protect, and the
+  /// boundary-proof clear is exactly right for them.
+  fn obligation_names_hosted_frozen(&self, tgid: &G) -> bool {
+    let Some(tep) = self.groups.get(tgid) else {
+      return false;
+    };
+    tep.abandoned_obligations().into_iter().any(|(sb, _, _)| {
+      G::decode_exact(sb)
+        .ok()
+        .and_then(|source| self.groups.get(&source))
+        .is_some_and(Endpoint::is_frozen)
+    })
+  }
+
   /// Whether any hosted target's outstanding capture debt names `gid` as its absorbed source —
   /// the debt-window naming the lifecycle surfaces consult: the id's preserved stores are the
   /// absorbed union's only restart derivation until the discharge, so nothing may re-host,
@@ -3162,6 +3180,7 @@ where
         self.note_if_poisoned(&tgid);
         continue;
       };
+      let mut w1_unresolvable = false;
       enum Verdict {
         Resolve,
         Abort,
@@ -3256,11 +3275,30 @@ where
             if stores.floor(&source) == crate::MERGED_FLOOR {
               Verdict::Abort
             } else {
+              w1_unresolvable = true;
               Verdict::Wait
             }
           }
         },
       };
+      // THE CURE-ADVERTISEMENT HINT, re-derived every crank this park is examined: only the
+      // locally-unresolvable Wait above (source unhosted, floor non-terminal — no local fold can
+      // ever land) may set it, and only with both gate legs clear: no fork durability barrier
+      // stands (an adopting install's restart takes the Compact arm at its boundary, destroying
+      // a staged fork's only replay derivation), and no abort obligation names a hosted-and-
+      // frozen source (the adopt's boundary clear would erase the only drive for that thaw —
+      // exactly the host-local-proof clear the witness rules forbid). Every other verdict, and a
+      // standing gate leg, clears it — the hint never outlives the shape that justified it, and
+      // a parked replica applies nothing, so a clear gate leg cannot re-arm within the episode.
+      let advertise = w1_unresolvable
+        && self
+          .groups
+          .get(&tgid)
+          .is_some_and(|t| !t.fork_barrier_standing())
+        && !self.obligation_names_hosted_frozen(&tgid);
+      if let Some(tep) = self.groups.get_mut(&tgid) {
+        tep.note_merge_park_unresolvable(advertise);
+      }
       match verdict {
         Verdict::Wait => {}
         Verdict::AdvanceSource => {
