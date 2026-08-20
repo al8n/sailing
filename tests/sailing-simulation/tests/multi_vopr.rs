@@ -574,11 +574,19 @@ fn merge_profile_same_seed_same_report() {
 /// budgets compaction-driven install comparisons are structurally near-zero — install×freeze
 /// coverage physically needs the soak twin's tick budget.
 ///
-/// Ignored by default: apply progress stalls under compaction pressure during a merge — a liveness
-/// gap where agreement holds while follower apply lags, so the compacting install×merge
-/// interleaving is not yet driven to convergence; run explicitly with `--ignored`.
+/// THE STALL IS GONE. This band was ignored because apply progress stalled under compaction
+/// pressure during a merge — agreement held while follower apply lagged, so the compacting
+/// install×merge interleaving never drove to convergence. The merge-liveness cure closed it: the
+/// band passes clean across its seeds, quiesce and all, with nothing certified past (it runs on the
+/// plain [`run_multi_vopr`], so any wedge panics). What keeps it opt-in is RUNTIME alone — ~45s for
+/// the eight compacting seeds, several times the everyday battery's per-band budget — so it stays
+/// `#[ignore]`d and is run explicitly, exactly like the soaks:
+///
+/// ```text
+/// cargo test --release -p sailing-simulation --test multi_vopr -- --ignored merge_compacting_band_smoke
+/// ```
 #[test]
-#[ignore = "apply progress stalls under compaction pressure during a merge (liveness: agreement holds, follower apply lags); the compacting install×merge interleaving is not yet driven to convergence — run explicitly with --ignored"]
+#[ignore = "the merge×compaction band — opt-in for RUNTIME only (~45s); the apply stall it was filed for no longer reproduces. Run explicitly, --release."]
 fn merge_compacting_band_smoke() {
   let mut total_registered = 0u64;
   let mut total_rollbacks = 0u64;
@@ -610,6 +618,10 @@ fn merge_compacting_band_smoke() {
       "seed {seed}: the runner did not apply the compacting threshold to a replica \
        (witness {applied}, outside the 256..=511 band): {r:?}"
     );
+    // Structurally zero on the plain runner, and stated for the same reason the merge band states
+    // it: the compacting interleaving certifies past nothing, so a swap back to the certifying
+    // runner cannot quietly reintroduce a tolerated wedge here.
+    assert_no_tracked_exemption("merge-compacting band", seed, &r);
     total_registered += r.merges_registered;
     total_rollbacks += r.merges_rolled_back;
     total_aborted += r.merges_aborted;
