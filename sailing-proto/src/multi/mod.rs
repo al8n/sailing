@@ -3639,13 +3639,19 @@ where
     //
     // THE HUSK-MINORITY LEMMA (why this can never race a live commit into divergence). A committed
     // `CommitMerge(S→T)` at coordinate k lives durably on a target QUORUM; every k-holding T replica
-    // PARKS at k−1 and resolves the absorb locally (a restart re-parks; a leader never installs over a
-    // peer whose match ≥ k). So the only T replicas that ever SKIP k are those an install SUPERSEDED —
-    // the "success-husk" shape where floor(T) is already terminal yet S's merge genuinely SUCCEEDED —
-    // and being install-superseded they are always SUB-QUORUM. S's voter set is FROZEN-TIME-FIXED (a
-    // frozen source refuses conf changes) and dissolved T replicas are tombstoned NON-voters; this
-    // mint is LEADER-only. Therefore in the success world an S leader can never even APPEND this thaw
-    // (a sub-quorum husk cannot lead), let alone commit it — the divergence is unconstructible. In the
+    // PARKS at k−1, and a restart re-parks. A T replica SKIPS k only when an install supersedes its
+    // park, and every superseding shape leaves S's post-success electorate exactly as consumed as a
+    // local absorb would have: a log-behind straggler's install (the pre-cure population) is
+    // sub-quorum by its own trigger, and the parked-union ADOPT — which deliberately reaches
+    // log-matched, even quorum-many, T replicas — fires ONLY where the resolver classified the park
+    // locally unresolvable, whose defining condition is that NO S replica is hosted there at all. So
+    // no skip, of either shape, ever adds a surviving S husk (a vote) to the success world's S
+    // electorate; the hosts whose S replicas survive un-consumed are exactly those that resolved
+    // locally, and their husks dissolve off the propagated terminal floor (`Retired`). S's voter set
+    // is FROZEN-TIME-FIXED (a frozen source refuses conf changes), dissolved T replicas are
+    // tombstoned NON-voters, and this mint is LEADER-only. Therefore in the success world an S
+    // leader can never even APPEND this thaw (the surviving-husk electorate cannot elect), let
+    // alone commit it — the divergence is unconstructible. In the
     // commit-ABORTED world the source's drivable-thaw belt (the absorb Resolve arm / husk belt) thaws
     // S off the target's `abandoned` obligation before T could ever dissolve. In the
     // commit-NEVER-EXISTED world (the genuine chain strand) this thaw is exactly correct: no commit is
