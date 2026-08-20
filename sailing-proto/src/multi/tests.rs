@@ -10673,6 +10673,154 @@ fn a_husked_debtor_retires_with_its_inherited_debt_discharged() {
   assert!(stores.0.contains_key(&1) && stores.0.contains_key(&2));
 }
 
+/// The Defer twin: the consuming target's own capture is fenced by an ABORT obligation whose
+/// clearing rides its embedder timescale, so holding the park for a Clear classification would
+/// be a circular wait — the fence stands exactly as long as the park does. A deferred absorb of
+/// a debt-carrying source therefore proceeds, CHAINING the consumed debtor's debts onto the
+/// target's own minted debt, and one later covering capture discharges the entire chain: the
+/// fold just absorbed has carried every prior union since its absorb applied.
+#[test]
+fn a_deferred_absorb_chains_the_consumed_debtors_debts() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  assert!(m.group(&1).unwrap().capture_debt().is_some());
+
+  // The consuming target 3, its capture fenced by an undischarged abort obligation for the
+  // unhosted 8 (its clearing waits on 8's floor — the embedder's timescale, not this park's).
+  let (mut log3, mut stable3) = (VecLog::default(), AsyncStable::default());
+  m.create_group(3, 0, single_node_cfg(1), d, 45, SplitSm::default())
+    .unwrap();
+  let d3 = lead_single_split(&mut m, 3, &mut log3, &mut stable3);
+  stores.0.insert(3, (log3, stable3));
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    let mut sb = Vec::new();
+    Data::encode(&8u64, &mut sb);
+    let abort = crate::RollbackMergePayload::abort(Bytes::from(sb), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
+    m.group_mut(&3)
+      .unwrap()
+      .propose_merge_entry(d3, l, crate::EntryKind::RollbackMerge, Bytes::from(buf))
+      .unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  assert!(
+    m.group(&3).unwrap().has_abandoned(),
+    "the abort fence stands"
+  );
+
+  // The foreign-led freeze on the debtor, then its committed absorb into 3.
+  let freeze_idx = {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let mut tb = Vec::new();
+    Data::encode(&3u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 2),
+      &mut fbuf,
+    );
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(d, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    let idx = l.last_index();
+    drain_storage(&mut m, 1, d, l, s);
+    idx
+  };
+  assert!(m.group(&1).unwrap().is_frozen());
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    m.group_mut(&3)
+      .unwrap()
+      .propose_merge_entry(
+        d3,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(1, freeze_idx, 2, 2),
+      )
+      .unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  let park = m.group(&3).unwrap().pending_merge().expect("parked").at();
+
+  assert!(
+    m.service_merge_applies(d3, &mut stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  let resolutions = m.service_merge_applies(d3, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Absorbed {
+      source: 1,
+      target: 3
+    }],
+    "the deferred absorb proceeds — holding here would wait circularly on its own park"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  let tep = m.group(&3).unwrap();
+  assert!(tep.pending_merge().is_none(), "unparked: the drain resumed");
+  assert!(tep.applied_index() >= park, "applies moved past the park");
+  assert_eq!(tep.state_machine().units, 2, "the transitive union folded");
+  assert_eq!(
+    tep.capture_debt().expect("the own debt minted").source(),
+    {
+      let mut b = Vec::new();
+      Data::encode(&1u64, &mut b);
+      Bytes::from(b)
+    },
+    "the own debt names the consumed debtor"
+  );
+  assert!(!m.contains_group(&1), "the debtor was consumed");
+  assert!(
+    m.service_merge_applies(d3, &mut stores).is_empty(),
+    "the chain waits: the abort fence still stands"
+  );
+
+  // The obligation clears on the embedder's floor, THROUGH the committed thaw witness: the
+  // leader appends it, and the apply — possible at all only because the deferred absorb
+  // unparked the drain — clears the map. ONE covering capture then discharges the ENTIRE
+  // chain, the own debt and the inherited one.
+  stores.1.insert(8);
+  assert!(
+    m.service_merge_applies(d3, &mut stores).is_empty(),
+    "the witness appends first"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    m.flush_appends(&3, d3, l, s).unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  assert!(
+    !m.group(&3).unwrap().has_abandoned(),
+    "the applied witness cleared the obligation"
+  );
+  let resolutions = m.service_merge_applies(d3, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![
+      MergeResolution::Merged {
+        source: 1,
+        target: 3
+      },
+      MergeResolution::Merged {
+        source: 2,
+        target: 3
+      },
+    ],
+    "one covering capture discharges the whole chain"
+  );
+  assert!(m.group(&3).unwrap().capture_debt().is_none());
+  assert!(stores.0.contains_key(&1) && stores.0.contains_key(&2));
+}
+
 /// A parked fork's standing capture fence no longer wedges a later merge into the same parent:
 /// the absorb resolves as `Absorbed` — the union applies and serves, the source endpoint is
 /// consumed with its stores preserved, and the forced capture becomes a debt the per-crank
