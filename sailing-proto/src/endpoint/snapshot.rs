@@ -484,46 +484,15 @@ where
     if self.poison.poisoned {
       return;
     }
-    if self.snapshot.pending_compact.is_some() || self.snapshot.pending_install.is_some() {
-      // A snapshot is already being persisted (our own compaction) OR a follower install is deferred
-      // and about to re-baseline the log; don't start a leader-side snapshot over it.
-      return;
-    }
-    // THE FORK DURABILITY BARRIER: a staged fork's only recovery source is re-applying its Split
-    // entry, which dies the moment this endpoint snapshots at-or-past that index (the capture
-    // below is taken at `applied`, and its compaction discards the entry). Refuse until every
-    // such fork is RESOLVED (`resolve_fork`: flush-durable behind the driver's engine barrier,
-    // or dropped by the container's replay guard) — so a correlated crash can never lose the
-    // child's state outright. The window is ≈ one crank.
-    if self
-      .split
-      .outstanding
-      .first()
-      .is_some_and(|cap| self.applied >= *cap)
-    {
-      return;
-    }
-    // THE MERGE REPLAY FENCE: while a freeze is pending or applied, this endpoint captures no
-    // snapshot. A capture at applied >= the freeze would compact the PrepareMerge entry, and a
-    // crash then restarts this replica UNFROZEN (frozen is derived by replaying that entry) —
-    // it could serve reads and accept writes while a target still holds a parked absorb of it.
-    // The fence guarantees every restart re-derives the freeze from the (snapshot ⊔ log) replay
-    // range for as long as the merge is live; the window is bounded by the merge's own explicit
-    // resolution (absorb removes the group; rollback lifts the fence).
-    if self.merge_freeze_active() {
-      return;
-    }
-    // THE ABORT REPLAY FENCE: a TARGET-side abort applied here records its `abandoned` obligation
-    // durable-derived from that entry, re-derivable solely by replaying it. A capture at-or-past
-    // the entry's index would compact it, and a restart from the snapshot would then re-derive no
-    // obligation with the source possibly still frozen — no trigger left to thaw it, a permanent
-    // frozen-source wedge across compaction. Refuse the capture while the abort entry sits
-    // at-or-below `applied` (the capture boundary here). The forced absorb capture shares this
-    // exact predicate (`absorb_capture_blocked`), so no target-capture site can drift; see
-    // `abort_relay_fences` for how the deferred compact and restart floor-advances are covered
-    // transitively, how a snapshot install instead CLEARS a covered obligation
-    // (`note_abort_rebaselined`), and when the fence lifts (the service discharges `abandoned`).
-    if self.abort_relay_fences(self.applied) {
+    // The shared capture busy/fence set, keyed at this capture's boundary (`applied`): a staged
+    // capture/install, the fork durability barrier, the abort replay fence, and the merge replay
+    // fence. The per-leg arguments live on `capture_blocked_at` — ONE predicate for every capture
+    // producer (this threshold capture, the forced absorb capture, and any future site), so no
+    // site can drift by carrying a partial set. A snapshot INSTALL is the one floor-advance that
+    // legitimately crosses these fences — it re-baselines to a LEADER's boundary and CLEARS what
+    // that boundary covers (`note_freeze_rebaselined`, `note_abort_rebaselined`) instead of
+    // leaning on them.
+    if self.capture_blocked_at(self.applied) {
       return;
     }
     if self.applied == Index::ZERO {

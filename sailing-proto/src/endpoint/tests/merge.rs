@@ -1942,6 +1942,212 @@ fn outstanding_abort_relay_blocks_the_forced_absorb_capture() {
   );
 }
 
+/// THE MERGE REPLAY FENCE, absorb-capture edition: a target that FROZE as another merge's source
+/// (its own `PrepareMerge` applied) and then parked a `CommitMerge` above the freeze reaches the
+/// resolve arm frozen-and-parked. The forced absorb capture at the park would compact the
+/// `PrepareMerge` — the freeze's only restart re-derivation — so a crash would restart this
+/// replica UNFROZEN while the claiming target still holds a parked absorb of it at the freeze
+/// boundary; the fold itself would also advance state that claim already pinned. The shared
+/// fence set refuses, holding the park until the freeze dies by protocol (the claimant absorbs
+/// this whole group, or a thaw arrives wholesale via a superseding install).
+#[test]
+fn a_live_freeze_blocks_the_forced_absorb_capture() {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(5), 1, 2),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(2));
+  let mut ep = Endpoint::restart(
+    cfg.clone(),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep.is_poisoned());
+  assert!(ep.is_frozen(), "the freeze applied below the park");
+  let pending = ep.pending_merge().expect("parked above its own freeze");
+  let k = pending.at();
+  assert_eq!(k, Index::new(2));
+
+  // Model the container's resolve arm EXACTLY: it resolves + forces the capture ONLY when the
+  // capture is not blocked. The freeze leg must hold the park.
+  if !ep.absorb_capture_blocked() {
+    ep.resolve_pending_merge(CountSm::default());
+    assert!(ep.capture_absorb_snapshot(&log, &mut stable));
+  }
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    ep.pending_merge().is_some(),
+    "the park holds: an absorb into a frozen target would fold and compact across the claim"
+  );
+  assert!(ep.is_frozen(), "the freeze survives the held park");
+  assert!(
+    log.first_index() <= Index::new(1),
+    "the PrepareMerge stays replayable: it is the freeze's only restart re-derivation"
+  );
+
+  // Leg isolation: the identical shape minus the freeze resolves freely — the hold above is the
+  // freeze leg alone, not the park or the payload shape.
+  let mut log2 = VecLog::default();
+  let mut stable2 = AsyncStable::default();
+  log2.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      encode_cmd(b"a"),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::CommitMerge,
+      // target_gen_after = 1: no freeze bumped this control's lineage, and the park's guard is
+      // exact-increment — the ep1 payload's 2 would no-op here instead of parking.
+      commit_payload(b"\x2a", Index::new(5), 1, 1),
+    ),
+  ]);
+  stable2.force_state(Term::new(1), Some(1u64), Index::new(2));
+  let mut ep2 = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log2,
+    &mut stable2,
+  );
+  assert!(ep2.pending_merge().is_some());
+  assert!(
+    !ep2.absorb_capture_blocked(),
+    "no freeze, no hold: the fence is the freeze leg, not the park"
+  );
+  ep2.resolve_pending_merge(CountSm::default());
+  assert!(ep2.capture_absorb_snapshot(&log2, &mut stable2));
+}
+
+/// The freeze leg's APPEND-OBSERVED half: an uncommitted `PrepareMerge` accepted above the park
+/// arms `freeze_pending`, and the absorb capture must already refuse — the capture's compaction
+/// would race the freeze commit it cannot yet see the outcome of. A §5.3 conflict truncation
+/// that removes the entry releases the kill and the park resolves on the next crank — the
+/// endpoint-local release for a freeze that never committed.
+#[test]
+fn a_pending_freeze_blocks_the_absorb_until_truncated() {
+  let (mut ep, mut log, mut stable) = make_follower();
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(1),
+          Index::new(1),
+          EntryKind::Normal,
+          encode_cmd(b"a")
+        ),
+        Entry::new(
+          Term::new(1),
+          Index::new(2),
+          EntryKind::CommitMerge,
+          commit_payload(b"\x2a", Index::new(7), 1, 1),
+        ),
+      ],
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(ep.pending_merge().is_some(), "parked at k-1");
+  assert!(!ep.absorb_capture_blocked(), "nothing fences yet");
+
+  // An UNCOMMITTED PrepareMerge lands above the park: the append-observed kill arms.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::new(2),
+      Term::new(1),
+      std::vec![Entry::new(
+        Term::new(1),
+        Index::new(3),
+        EntryKind::PrepareMerge,
+        prepare_payload(b"\x2c", 1),
+      )],
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(ep.merge.freeze_pending, Some(Index::new(3)));
+  assert!(
+    ep.absorb_capture_blocked(),
+    "a pending freeze fences the absorb capture exactly as an applied one does"
+  );
+
+  // A new leader's conflicting append truncates the freeze away: the kill releases and the
+  // resolve arm proceeds — no over-block once the freeze no longer exists in the log.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      3u64,
+      Index::new(2),
+      Term::new(1),
+      std::vec![Entry::new(
+        Term::new(2),
+        Index::new(3),
+        EntryKind::Normal,
+        encode_cmd(b"b"),
+      )],
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(
+    ep.merge.freeze_pending, None,
+    "the truncation released the kill"
+  );
+  assert!(!ep.absorb_capture_blocked());
+  ep.resolve_pending_merge(CountSm::default());
+  assert!(
+    ep.capture_absorb_snapshot(&log, &mut stable),
+    "the capture stages once no freeze is live"
+  );
+}
+
 /// A snapshot install at-or-past the parked entry SUPERSEDES the park: the union state arrives
 /// wholesale in the blob (the target leader's forced absorb capture guarantees one exists past
 /// every resolution), so a log-behind straggler that parked is caught up without ever touching

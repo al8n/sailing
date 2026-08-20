@@ -597,24 +597,47 @@ where
       .any(|(_, abort_index)| *abort_index <= boundary)
   }
 
-  /// Whether the absorb's forced snapshot capture would be REFUSED right now — the capture
-  /// shares `maybe_snapshot`'s busy/fence set (a capture or install already staged, a fork barrier
-  /// at-or-below the absorb point, or an abort relay whose entry the capture would compact). The
-  /// capture compacts at `pending.at()`, so the abort-relay leg fences on that boundary. The
-  /// container's resolve arm holds the park while this is true, so the absorb and its durability
-  /// capture always land in the SAME crank.
-  pub(crate) fn absorb_capture_blocked(&self) -> bool {
-    let Some(pending) = self.merge.pending_apply.as_ref() else {
-      return false;
-    };
+  /// Whether a TARGET capture/compaction at `boundary` is REFUSED right now — the ONE busy/fence
+  /// set every capture producer shares (`maybe_snapshot` at `applied`, the forced absorb capture
+  /// at the absorb boundary via [`absorb_capture_blocked`](Self::absorb_capture_blocked)), so no
+  /// site can drift from the others. The legs:
+  ///
+  /// - a capture or install is already STAGED (`pending_compact`/`pending_install`) — firing
+  ///   another would overwrite the staged operation's identity mid-flight;
+  /// - THE FORK DURABILITY BARRIER: a staged fork's only recovery source is re-applying its
+  ///   `Split` entry, which dies the moment this endpoint snapshots at-or-past that index (the
+  ///   compaction discards the entry) — refuse until every such fork is RESOLVED;
+  /// - THE ABORT REPLAY FENCE: an outstanding `abandoned` obligation is re-derivable solely by
+  ///   replaying its abort entry — a capture at-or-past it erases the obligation's only restart
+  ///   source with the owed source possibly still frozen (see `abort_relay_fences`);
+  /// - THE MERGE REPLAY FENCE: while a freeze is pending or applied this endpoint captures
+  ///   NOTHING — a capture at-or-past the `PrepareMerge` compacts the entry whose replay is the
+  ///   freeze's only restart derivation, so a crash restarts this replica UNFROZEN while a
+  ///   claiming target still holds a parked absorb of it at the freeze boundary: the two then
+  ///   disagree on what state the claim pinned. The freeze leg HOLDS its caller (it lifts with
+  ///   the thaw or with this group's own dissolution by the claimant); it is never grounds to
+  ///   fold-and-defer, because the fold itself would advance state the claim already pinned.
+  pub(crate) fn capture_blocked_at(&self, boundary: Index) -> bool {
     self.snapshot.pending_compact.is_some()
       || self.snapshot.pending_install.is_some()
       || self
         .split
         .outstanding
         .first()
-        .is_some_and(|cap| *cap <= pending.at())
-      || self.abort_relay_fences(pending.at())
+        .is_some_and(|cap| *cap <= boundary)
+      || self.abort_relay_fences(boundary)
+      || self.merge_freeze_active()
+  }
+
+  /// Whether the absorb's forced snapshot capture would be REFUSED right now — the shared
+  /// [`capture_blocked_at`](Self::capture_blocked_at) set keyed at the absorb boundary
+  /// `pending.at()` (the capture compacts there). The container's resolve arm holds the park
+  /// while this is true, so the absorb and its durability capture always land in the SAME crank.
+  pub(crate) fn absorb_capture_blocked(&self) -> bool {
+    let Some(pending) = self.merge.pending_apply.as_ref() else {
+      return false;
+    };
+    self.capture_blocked_at(pending.at())
   }
 
   /// Resolve the parked `CommitMerge` by ABSORBING the extracted source state machine: fold it
