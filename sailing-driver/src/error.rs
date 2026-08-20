@@ -41,6 +41,14 @@ pub enum DriverError<I> {
   /// The driver is shutting down (or already gone); no further operations will commit.
   #[error("driver is shutting down")]
   ShuttingDown,
+  /// The group this operation named was ABSORBED into its merge target: the endpoint is gone and
+  /// the union now lives (and serves) in the target, so no operation will ever commit on the
+  /// source itself again — callers re-route to the target. Distinct from a completed merge's
+  /// [`ShuttingDown`](Self::ShuttingDown) teardown: the source's stores are still held pending
+  /// the union's durability capture, and distinct from [`Poisoned`](Self::Poisoned): nothing
+  /// fail-stopped.
+  #[error("the group was absorbed into its merge target")]
+  SourceAbsorbed,
   /// A [`restore_group`](crate::MultiHandle::restore_group) named a group the host holds NO stored
   /// state for: the in-memory engine never staged it (or it was torn down and its volatile state
   /// died with the engine). The host fails closed rather than fabricating a blank index-0

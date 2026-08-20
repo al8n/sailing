@@ -252,6 +252,12 @@ pub struct MultiWorld {
   /// made durable (absorb refused, or capture faulted). The absorb-capable/non-faulting sim FSM never
   /// produces one; a non-zero count is the wedge worth reporting, not chasing.
   merges_capture_failed: u64,
+  /// Fence-deferred absorbs surfaced as `Absorbed` (the union applied, the capture owed).
+  merges_absorbed: u64,
+  /// Fence-deferred absorbs whose fold-point determinism check ran at `Absorbed`; the later
+  /// discharge-`Merged` skips its re-check (the target legitimately applies past the boundary
+  /// inside the debt window).
+  absorbed_pending: std::collections::BTreeSet<(u64, u64, u64)>,
   /// Per-`(target, source)` MONOTONE count of `Event::MergeAborted` observations drained across
   /// the run — the abort clock the fuzzer's pending-merge book retires against: a pair booked at
   /// clock `c` is resolved-by-abort once the clock reads past `c` (the absorb side retires via
@@ -366,6 +372,8 @@ impl MultiWorld {
       merges_resolved: 0,
       merges_aborted: 0,
       merges_capture_failed: 0,
+      merges_absorbed: 0,
+      absorbed_pending: std::collections::BTreeSet::new(),
       merge_aborts_observed: BTreeMap::new(),
       teardown_tie_streak: BTreeMap::new(),
       store_mode: StoreMode::Sync,

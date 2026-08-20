@@ -10426,3 +10426,354 @@ fn a_backlogged_group_cannot_starve_its_co_hosted_neighbors() {
     "A fully drains to applied == commit"
   );
 }
+
+/// The fork-parked-then-merge composition: a squatter at the child id parks the fork on group 1
+/// (its capture fence stands at the split index), then source 2 freezes for the merge into 1 and
+/// the `CommitMerge` parks above the standing fence. Returns the container, the stores, the
+/// park index, and the two leaders' instants.
+fn fork_fenced_park_fixture() -> (
+  MultiRaft<u64, u64, SplitSm>,
+  MapStores,
+  Index,
+  Index,
+  Instant,
+  Instant,
+) {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  let (mut plog, mut pstable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(
+    1,
+    0,
+    single_node_cfg(1).with_snapshot_threshold(1),
+    now,
+    42,
+    SplitSm::default(),
+  )
+  .unwrap();
+  let d = lead_single_split(&mut m, 1, &mut plog, &mut pstable);
+  for _ in 0..3 {
+    commit_one_split(&mut m, 1, d, &mut plog, &mut pstable);
+  }
+  let split_idx = m
+    .propose_split(
+      &1,
+      d,
+      &mut plog,
+      &pstable,
+      &200,
+      0,
+      Bytes::from_static(b"\x02"),
+    )
+    .unwrap()
+    .unwrap();
+  m.create_group(200, 0, single_node_cfg(1), d, 43, SplitSm::default())
+    .unwrap();
+  m.flush_appends(&1, d, &plog, &pstable).unwrap();
+  while matches!(
+    m.handle_storage(&1, d, &mut plog, &mut pstable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert!(m.poll_pending_fork().is_none(), "parked on the squatter");
+  assert_eq!(m.poll_split_conflict(), Some((1, 200)));
+
+  let (mut slog, mut sstable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(2, 0, single_node_cfg(1), now, 44, SplitSm::default())
+    .unwrap();
+  let ds = lead_single_split(&mut m, 2, &mut slog, &mut sstable);
+  commit_one_split(&mut m, 2, ds, &mut slog, &mut sstable);
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (plog, pstable));
+  stores.0.insert(2, (slog, sstable));
+  m.prepare_merge(&2, ds, &mut stores, &1).unwrap().unwrap();
+  {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    while matches!(
+      m.handle_storage(&2, ds, l, s),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(m.group(&2).unwrap().is_frozen());
+
+  let k = {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let k = m.commit_merge(&1, d, l, s, &2).unwrap().unwrap();
+    while matches!(
+      m.handle_storage(&1, d, l, s),
+      Some(StorageProgress::MorePending)
+    ) {}
+    k
+  };
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  (m, stores, k, split_idx, d, ds)
+}
+
+/// Advance a fork-fenced park to the fence-deferred absorb: seal, drain, resolve. Returns the
+/// park index.
+fn defer_to_absorbed(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  stores: &mut MapStores,
+  d: Instant,
+) -> Index {
+  assert!(
+    m.service_merge_applies(d, stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    while matches!(
+      m.handle_storage(&1, d, l, s),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  let resolutions = m.service_merge_applies(d, stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Absorbed {
+      source: 2,
+      target: 1
+    }],
+    "a standing fork fence defers the capture instead of wedging the park"
+  );
+  m.group(&1)
+    .unwrap()
+    .capture_debt()
+    .expect("the union owes its capture")
+    .index()
+}
+
+/// A parked fork's standing capture fence no longer wedges a later merge into the same parent:
+/// the absorb resolves as `Absorbed` — the union applies and serves, the source endpoint is
+/// consumed with its stores preserved, and the forced capture becomes a debt the per-crank
+/// service discharges into `Merged` once the fence lifts.
+#[test]
+fn a_parked_fork_defers_the_absorb_capture_as_a_debt() {
+  let (mut m, mut stores, k, split_idx, d, _ds) = fork_fenced_park_fixture();
+  let boundary = defer_to_absorbed(&mut m, &mut stores, d);
+  assert_eq!(boundary, k);
+
+  assert!(!m.contains_group(&2), "the source endpoint was consumed");
+  let tep = m.group(&1).unwrap();
+  assert!(tep.pending_merge().is_none(), "unparked: the drain resumed");
+  assert!(tep.applied_index() >= k, "the union applied");
+  assert_eq!(tep.state_machine().units, 2, "one half kept + one absorbed");
+  {
+    let (l, _s) = stores.0.get_mut(&1).unwrap();
+    assert!(
+      l.first_index() <= split_idx,
+      "the split entry stays replayable under the debt"
+    );
+  }
+  // The fence still stands: further cranks hold the debt, never a premature `Merged`.
+  assert!(
+    m.service_merge_applies(d, &mut stores).is_empty(),
+    "the debt waits for the fence"
+  );
+
+  // The fence lifts: the squatter leaves, the fork yields, and the driver's flush report
+  // releases the barrier — the very next crank stages the capture and surfaces `Merged`.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the wait");
+  m.lift_fork_barrier(&1, fork.split_index);
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }],
+    "the lifted fence discharges the debt"
+  );
+  assert!(m.group(&1).unwrap().capture_debt().is_none());
+  let mut saw_merged = false;
+  while let Some((_gid, ev)) = m.poll_event() {
+    if matches!(ev, crate::Event::Merged(_)) {
+      saw_merged = true;
+    }
+  }
+  assert!(
+    saw_merged,
+    "the union event rides the discharge, not the defer"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    while matches!(
+      m.handle_storage(&1, d, l, s),
+      Some(StorageProgress::MorePending)
+    ) {}
+    assert!(
+      l.first_index() > k,
+      "the discharged capture compacted through the absorb"
+    );
+  }
+}
+
+/// A crash inside the debt window loses nothing: the target's log still holds the `CommitMerge`
+/// (compaction past it required exactly the capture still owed) and the source's stores were
+/// preserved, so a restart re-parks, re-folds deterministically, and re-forms the debt — and the
+/// fence's later lift discharges it exactly as in the uncrashed run.
+#[test]
+fn a_crash_inside_the_debt_window_re_parks_and_converges() {
+  let (mut m, mut stores, k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  assert_eq!(m.group(&1).unwrap().state_machine().units, 2);
+
+  // Crash: the container dies with the volatile fold and debt; the stores survive.
+  drop(m);
+  let now = Instant::ORIGIN;
+  let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  {
+    let (plog, pstable) = stores.0.get_mut(&1).unwrap();
+    m2.restore_group(
+      1,
+      single_node_cfg(1),
+      now,
+      42,
+      SplitSm::default(),
+      2,
+      plog,
+      pstable,
+    )
+    .unwrap();
+  }
+  {
+    let (slog, sstable) = stores.0.get_mut(&2).unwrap();
+    m2.restore_group(
+      2,
+      single_node_cfg(1),
+      now,
+      44,
+      SplitSm::default(),
+      2,
+      slog,
+      sstable,
+    )
+    .unwrap();
+  }
+  assert!(
+    m2.group(&1).unwrap().pending_merge().is_some(),
+    "the replayed CommitMerge re-parked"
+  );
+  assert!(
+    m2.group(&2).unwrap().is_frozen(),
+    "the restored source re-derived its freeze"
+  );
+
+  // The replayed split re-staged the fork (the squatter is gone in this incarnation, so it
+  // yields rather than parks), and its barrier re-derived with it — the re-resolve defers again,
+  // deterministically re-folding the same union.
+  let resolutions = m2.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Absorbed {
+      source: 2,
+      target: 1
+    }],
+    "the restart re-derives the debt, not a wedge and not a premature teardown"
+  );
+  assert_eq!(
+    m2.group(&1).unwrap().state_machine().units,
+    2,
+    "the re-fold is deterministic"
+  );
+
+  // The fork yields in this incarnation; the flush report lifts the barrier and the debt
+  // discharges — the crashed and uncrashed runs converge on the same end state.
+  let fork = m2.poll_pending_fork().expect("the replayed fork yields");
+  m2.lift_fork_barrier(&1, fork.split_index);
+  let resolutions = m2.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }]
+  );
+  assert!(!m2.contains_group(&2));
+  assert_eq!(m2.group(&1).unwrap().state_machine().units, 2);
+  let _ = k;
+}
+
+/// The one-absorb-at-a-time posture holds across the debt window: a second reshape verb into
+/// (or out of) a debt-holding target refuses until the debt discharges.
+#[test]
+fn a_debt_holding_target_refuses_further_reshape_verbs() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+
+  // Named counterparts for the refused verbs: 3 as a would-be source into 1, and 0 as a
+  // would-be target of 1 (merges run higher-id into lower-id, so the source-side probe needs
+  // the debt-holder on the high side).
+  m.create_group(
+    3,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    45,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.create_group(
+    0,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    46,
+    SplitSm::default(),
+  )
+  .unwrap();
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    assert!(
+      matches!(
+        m.commit_merge(&1, d, l, s, &3),
+        Some(Err(MergeError::AlreadyPending))
+      ),
+      "a debt-holding target absorbs nothing further"
+    );
+  }
+  assert!(
+    matches!(
+      m.prepare_merge(&1, d, &mut stores, &0),
+      Some(Err(MergeError::AlreadyPending))
+    ),
+    "a debt-holding group refuses to freeze as a source"
+  );
+}
+
+/// The staged-capture discharge: an ordinary threshold capture staged after the fence lifts is
+/// adopted as the debt's own discharge — same-crank `Merged` while the transient is still
+/// staged, where the forced-capture leg alone would have waited out the transient.
+#[test]
+fn an_ordinary_staged_capture_discharges_the_debt() {
+  let (mut m, mut stores, k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the wait");
+  m.lift_fork_barrier(&1, fork.split_index);
+
+  // One storage crank after the lift: the threshold capture stages (threshold 1, applied >= k)
+  // and its completion is still pending when the service runs.
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let _ = m.handle_storage(&1, d, l, s);
+  }
+  assert!(
+    m.group(&1)
+      .unwrap()
+      .pending_compact_boundary()
+      .is_some_and(|b| b >= k),
+    "an ordinary capture covering the boundary is staged"
+  );
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }],
+    "the staged capture is adopted as the discharge in the same crank"
+  );
+  assert!(m.group(&1).unwrap().capture_debt().is_none());
+}

@@ -417,6 +417,7 @@ fn merge_band_smoke() {
   // narrow, so a non-merge livelock (or any wedge outside the tracked sets) still trips; the band
   // must exercise the exemption at least once (proven nonzero below).
   let mut total_tracked_exempted = 0u64;
+  let mut total_absorbed = 0u64;
   for seed in 0..8u64 {
     let r = run_multi_vopr_certifying_tracked_wedges(seed, 4_000, MultiProfile::merge_reshape());
     std::eprintln!(
@@ -455,8 +456,11 @@ fn merge_band_smoke() {
     total_torn += r.torn_writes_fired;
     total_crashes_inflight += r.crashes_with_log_inflight + r.crashes_with_stable_inflight;
     total_tracked_exempted += r.tracked_merge_wedges_exempted + r.fork_fence_couplings_exempted;
+    total_absorbed += r.merges_absorbed;
   }
-  std::eprintln!("merge band: total_tracked_exempted={total_tracked_exempted}");
+  std::eprintln!(
+    "merge band: total_tracked_exempted={total_tracked_exempted} total_absorbed={total_absorbed}"
+  );
   assert!(
     total_registered > 0,
     "the merge band never resolved an absorb — the merge verbs are inert"
@@ -479,10 +483,15 @@ fn merge_band_smoke() {
     total_crashes_inflight > 0,
     "the merge band never crashed mid-fsync-window — the crash×durability interleaving is vacuous"
   );
+  // The fork-fence and abort-fence park classes now resolve through the fence-deferred absorb
+  // (`Absorbed` -> debt -> `Merged`), so the band's positive witness is the defer FIRING rather
+  // than the wedge being reached; the under-hosted class (no local source to fold) remains the
+  // tracked exemption until its install-based cure lands, and the certifying runner keeps every
+  // wedge outside the tracked sets a hard failure either way.
   assert!(
-    total_tracked_exempted > 0,
-    "the merge band never reached the filed #106/#110 wedge — the tracked-wedge certification is \
-     vacuous; if the retry's front-loaded delivery no longer raises the husk incidence, revisit it"
+    total_absorbed > 0,
+    "the merge band never deferred a fenced absorb — the debt path is inert on the very \
+     schedules that used to wedge"
   );
 }
 
@@ -496,10 +505,11 @@ fn merge_profile_same_seed_same_report() {
   let r = run_multi_vopr_certifying_tracked_wedges(43, 3_000, MultiProfile::merge_reshape());
   std::eprintln!(
     "merge profile seed 43: tracked_merge_wedges_exempted={} fork_fence_couplings_exempted={} \
-     exemption_overlap={}",
+     exemption_overlap={} merges_absorbed={}",
     r.tracked_merge_wedges_exempted,
     r.fork_fence_couplings_exempted,
     r.exemption_overlap,
+    r.merges_absorbed,
   );
   assert_eq!(
     r,
@@ -507,8 +517,9 @@ fn merge_profile_same_seed_same_report() {
     "run_multi_vopr must be a pure function of (seed, ticks, profile)"
   );
   assert!(
-    r.tracked_merge_wedges_exempted + r.fork_fence_couplings_exempted > 0,
-    "seed 43 must reach the filed wedge so the certification is a positive witness, not vacuous"
+    r.merges_absorbed > 0,
+    "seed 43 must exercise the fence-deferred absorb — this schedule reached the filed wedge \
+     before the cure, so a zero here means the defer path is inert exactly where it matters"
   );
 }
 

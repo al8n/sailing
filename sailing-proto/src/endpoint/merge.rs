@@ -91,6 +91,18 @@ impl PendingMergeApply {
   }
 }
 
+/// The resolve arm's fence classification at a parked absorb — see
+/// [`Endpoint::absorb_capture_block`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AbsorbCaptureBlock {
+  /// No fence: absorb + capture land this crank, one barrier.
+  Clear,
+  /// A transient (staged capture/install) or a live freeze: the park stays.
+  Hold,
+  /// Only a replay fence (fork barrier / abort obligation): absorb now, capture as a debt.
+  Defer,
+}
+
 /// The endpoint-resident merge state. One instance per endpoint, defaulted inert; every field is
 /// DERIVED from the log and re-derivable at restart (`freeze_pending` from the unapplied suffix,
 /// `frozen`/`freeze_index` from replaying the applied prefix, the park from re-encountering its
@@ -135,6 +147,16 @@ pub(crate) struct MergeState {
   /// The parked `CommitMerge` (target side), `Some` while the apply drain is stopped at
   /// `at - 1`. Written ONLY by the park arm and the two container resolutions.
   pub(crate) pending_apply: Option<PendingMergeApply>,
+  /// An absorbed-but-uncaptured union's outstanding durability obligation: the fold ran and the
+  /// apply drain resumed, but a standing replay fence (a parked fork's barrier, an undischarged
+  /// abort obligation) deferred the forced capture — so the consumed source's stores remain the
+  /// union's only restart derivation until a capture (or a superseding install) at-or-past the
+  /// absorb boundary is staged. Holds the `Merged` payload the discharge will surface; volatile,
+  /// re-derived by the restart re-park (the boundary's `CommitMerge` cannot compact away first —
+  /// compaction past it requires exactly the capture whose absence defines the debt). While set:
+  /// reshape verbs into this target refuse, the container refuses to re-host or tear down either
+  /// named group, and a debt-holding leader is never quiesce-eligible.
+  pub(crate) capture_debt: Option<crate::Merged>,
   /// Log index of the most recently appended (not-yet-applied) `CommitMerge` on THIS leader —
   /// the in-flight leg of the target's membership fence (`> applied` ⇒ a commit-merge is in
   /// flight), mirroring `pending_split_index` exactly: derived state, re-seated conservatively
@@ -631,13 +653,81 @@ where
 
   /// Whether the absorb's forced snapshot capture would be REFUSED right now — the shared
   /// [`capture_blocked_at`](Self::capture_blocked_at) set keyed at the absorb boundary
-  /// `pending.at()` (the capture compacts there). The container's resolve arm holds the park
-  /// while this is true, so the absorb and its durability capture always land in the SAME crank.
+  /// `pending.at()` (the capture compacts there). The tests' modeling seam for the resolve
+  /// arm's gate; production reads the three-way [`absorb_capture_block`](Self::absorb_capture_block).
+  #[cfg(test)]
   pub(crate) fn absorb_capture_blocked(&self) -> bool {
+    !matches!(self.absorb_capture_block(), AbsorbCaptureBlock::Clear)
+  }
+
+  /// The resolve arm's three-way classification of the absorb-capture fence at the park:
+  ///
+  /// - `Hold`: a staged capture/install (drains within cranks) or a live freeze (the fold itself
+  ///   would advance state a claiming target pinned at its freeze boundary, and the freeze lifts
+  ///   by protocol — the thaw, or this group's own dissolution by the claimant). The park stays.
+  /// - `Defer`: only a REPLAY fence stands — a fork's durability barrier or an undischarged
+  ///   abort obligation. The fold is safe NOW; only the capture's compaction must wait for the
+  ///   fence. The arm absorbs, unparks, and records the capture as a debt — deferring the park
+  ///   instead would wedge it for as long as the fence stands, and the abort fence can even be
+  ///   UNDISCHARGEABLE behind the park (its clearing witness rides an entry above the park that
+  ///   the park itself keeps from applying).
+  /// - `Clear`: absorb + capture land in this crank, as one barrier.
+  pub(crate) fn absorb_capture_block(&self) -> AbsorbCaptureBlock {
     let Some(pending) = self.merge.pending_apply.as_ref() else {
-      return false;
+      return AbsorbCaptureBlock::Clear;
     };
-    self.capture_blocked_at(pending.at())
+    if self.snapshot.pending_compact.is_some()
+      || self.snapshot.pending_install.is_some()
+      || self.merge_freeze_active()
+    {
+      return AbsorbCaptureBlock::Hold;
+    }
+    if self
+      .split
+      .outstanding
+      .first()
+      .is_some_and(|cap| *cap <= pending.at())
+      || self.abort_relay_fences(pending.at())
+    {
+      return AbsorbCaptureBlock::Defer;
+    }
+    AbsorbCaptureBlock::Clear
+  }
+
+  /// The outstanding absorbed-but-uncaptured union obligation, if any: a replay fence deferred
+  /// the absorb's forced durability capture, so the consumed source's preserved stores remain
+  /// the union's only restart derivation until a capture (or superseding install) at-or-past
+  /// the absorb boundary stages. Holds the `Merged` the discharge will surface. While set, the
+  /// reshape verbs refuse this group both roles and a leader is never quiesce-eligible.
+  pub fn capture_debt(&self) -> Option<&crate::Merged> {
+    self.merge.capture_debt.as_ref()
+  }
+
+  /// The staged (submitted, not yet durability-completed) capture's boundary, if one is in
+  /// flight — the debt pass adopts a staged capture at-or-past the absorb boundary as the
+  /// debt's own discharge (boundary coverage is monotone in `applied`).
+  pub(crate) fn pending_compact_boundary(&self) -> Option<Index> {
+    self
+      .snapshot
+      .pending_compact
+      .as_ref()
+      .map(|(_, meta)| meta.last_index())
+  }
+
+  /// Record the deferred capture's obligation after a fence-deferred absorb (the resolve arm's
+  /// `Defer` leg). The payload is the `Merged` the discharge will surface.
+  pub(crate) fn mint_capture_debt(&mut self, merged: crate::Merged) {
+    debug_assert!(
+      self.merge.capture_debt.is_none(),
+      "one absorb at a time: the reshape gates refuse while a debt stands"
+    );
+    self.merge.capture_debt = Some(merged);
+  }
+
+  /// Take the debt for discharge — the caller staged (or observed) a capture at-or-past the
+  /// absorb boundary and now surfaces the held `Merged`.
+  pub(crate) fn discharge_capture_debt(&mut self) -> Option<crate::Merged> {
+    self.merge.capture_debt.take()
   }
 
   /// Resolve the parked `CommitMerge` by ABSORBING the extracted source state machine: fold it

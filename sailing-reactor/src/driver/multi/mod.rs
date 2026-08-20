@@ -277,6 +277,9 @@ where
     // across a demotion and re-arms on re-election, so the shots can span MULTIPLE leaderships before it
     // drains (still bounded — at most the original budget per removal across all terms).
     || ep.has_pending_farewells()
+    // An outstanding capture debt is pending durability work only the per-crank service drives;
+    // a quiesced group would strand the union's capture until unrelated traffic woke the pump.
+    || ep.capture_debt().is_some()
   {
     return false;
   }

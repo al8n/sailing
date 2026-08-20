@@ -409,6 +409,21 @@ pub enum LifecycleEvent<G, I> {
     /// The poisoned absorbing target.
     target: G,
   },
+  /// A committed merge ABSORBED `source` into `target` on this host, but a standing replay fence
+  /// (a parked fork's durability barrier, an undischarged abort obligation) DEFERRED the union's
+  /// forced durability capture. The union is applied and serving in `target`; the `source`
+  /// endpoint is gone and its parked callers were failed with
+  /// [`DriverError::SourceAbsorbed`](crate::DriverError::SourceAbsorbed); the source's stores and
+  /// floor are DELIBERATELY preserved — they remain the union's only restart derivation until the
+  /// capture stages, and a crash meanwhile restores the source and re-parks the merge. NO action
+  /// is required: the fence's own resolution (the fork conflict resolving, the thaw discharging)
+  /// is the exit, and the debt then discharges into the ordinary merge teardown.
+  MergeAbsorbed {
+    /// The consumed source group, whose stores the driver keeps until the debt discharges.
+    source: G,
+    /// The absorbing target group, now serving the union and owing its capture.
+    target: G,
+  },
 }
 
 /// A cheaply-cloneable, `Send + Sync` handle to a MULTI-GROUP driver: group lifecycle, the

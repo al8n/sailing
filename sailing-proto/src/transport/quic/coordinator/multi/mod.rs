@@ -917,7 +917,12 @@ where
       let source = match r {
         crate::MergeResolution::Merged { source, .. }
         | crate::MergeResolution::Retired { source } => source,
-        crate::MergeResolution::Aborted { .. } | crate::MergeResolution::CaptureFailed { .. } => {
+        // `Absorbed` is the CaptureFailed posture wire-side: the source endpoint is gone but its
+        // stores and floor are preserved for the debt's discharge (or a crash re-park), so no
+        // tombstone — the demux fence covers the window through the debt itself, not `retired`.
+        crate::MergeResolution::Aborted { .. }
+        | crate::MergeResolution::CaptureFailed { .. }
+        | crate::MergeResolution::Absorbed { .. } => {
           continue;
         }
       };
