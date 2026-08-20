@@ -769,3 +769,74 @@ fn soak_merge_compacting_profile() {
      (crashes_with_log_inflight={crashes_log_inflight} crashes_with_stable_inflight={crashes_stable_inflight})"
   );
 }
+
+/// THE FILED #110 REPRO, converging without an exemption. Seeds 62 and 67 of the lifecycle-churn
+/// profile are the coordinates the fork-fence coupling was filed from — a merge park held behind a
+/// parked fork's standing capture fence on the same parent, two individually sound designs
+/// composing into a deadlock. The cure defers the fenced absorb (`Absorbed`, a capture debt
+/// discharged into `Merged`) instead of blocking on the fence, so both seeds must now reach run end
+/// with BOTH wedge classifiers empty, and the defer must be what carries them: `merges_absorbed`
+/// over the pair is the witness that the debt path fired exactly where the wedge used to form.
+///
+/// Minimized to 200 ticks — the shortest budget at which the merge machinery is non-vacuous on both
+/// seeds (62 registers 2 absorbs and defers 3; 67 registers 1). The certifying runner is deliberate:
+/// it keeps the classifiers computing so the assertion below is a measurement, not a tautology.
+#[test]
+fn lifecycle_seeds_62_and_67_converge() {
+  let mut absorbed = 0u64;
+  for seed in [62u64, 67] {
+    let r =
+      run_multi_vopr_certifying_tracked_wedges(seed, 200, MultiProfile::lifecycle_churn_reshape());
+    std::eprintln!(
+      "filed lifecycle seed {seed}: absorbed={} registered={} prepared={} groups_created={} \
+       committed={}",
+      r.merges_absorbed,
+      r.merges_registered,
+      r.merges_prepared,
+      r.groups_created,
+      r.committed,
+    );
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    assert!(
+      r.merges_registered > 0,
+      "seed {seed} never resolved an absorb — the filed coordinates must still exercise the merge \
+       machinery, or the repro has drifted off its shape: {r:?}"
+    );
+    assert_no_tracked_exemption("filed lifecycle", seed, &r);
+    absorbed += r.merges_absorbed;
+  }
+  assert!(
+    absorbed > 0,
+    "neither filed seed deferred a fenced absorb — the capture debt is inert on the very \
+     coordinates the fork-fence coupling was filed from (absorbed={absorbed})"
+  );
+}
+
+/// THE FILED #106/#110 MERGE SEED, converging without an exemption. Seed 43 of the merge profile is
+/// the schedule the fence-deferred absorb was proven on; its determinism twin
+/// ([`merge_profile_same_seed_same_report`]) pins the report's purity, and this pins the property
+/// that report carries — the run reaches quiesce with both classifiers empty, and the defer is what
+/// got it there.
+#[test]
+fn merge_reshape_seed_43_converges() {
+  let r = run_multi_vopr_certifying_tracked_wedges(43, 3_000, MultiProfile::merge_reshape());
+  std::eprintln!(
+    "filed merge seed 43: absorbed={} registered={} groups_created={} committed={}",
+    r.merges_absorbed,
+    r.merges_registered,
+    r.groups_created,
+    r.committed,
+  );
+  assert!(
+    r.groups_created >= 2 && r.committed > 0,
+    "seed 43 vacuous: {r:?}"
+  );
+  assert_no_tracked_exemption("filed merge", 43, &r);
+  assert!(
+    r.merges_absorbed > 0,
+    "seed 43 never deferred a fenced absorb — the debt path is inert on the filed schedule: {r:?}"
+  );
+}
