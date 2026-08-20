@@ -251,6 +251,20 @@ where
     if let Some(debt) = self.cure_owed.get_mut(peer) {
       debt.next_at = Some(now.mono() + interval);
     }
+    // The eviction-surviving service history (bounded like the ledger; oldest deadline yields).
+    if !self.cure_served.contains_key(peer)
+      && self.cure_served.len() >= COURTESY_DEBT_CAP
+      && let Some(oldest) = self
+        .cure_served
+        .iter()
+        .min_by_key(|(_, at)| **at)
+        .map(|(p, _)| p.cheap_clone())
+    {
+      self.cure_served.remove(&oldest);
+    }
+    self
+      .cure_served
+      .insert(peer.cheap_clone(), now.mono() + interval);
     self.cure_send_gate = Some(now.mono() + self.config.election_timeout() / 2);
     self.outputs.outgoing.push_back(crate::Outgoing::new(
       peer.cheap_clone(),
@@ -1321,75 +1335,6 @@ where
   /// the core, not the storage layer, owns the ordering. Called only from `handle_storage`, with
   /// the matching `pending_install` tuple already `take`n out (so a failure leaves no partial deferred
   /// install behind).
-  /// Record the sources of RESOLVED `CommitMerge` entries in `[from, tip]` off the still-intact
-  /// log — the install-crossed range the local replay will never run. An entry records only
-  /// when its abort-window coordinate (`k + 1`) is committed within `proven_commit` AND that
-  /// coordinate's content is not this merge's own abort: the window's pure log function, so
-  /// every replica records identically. Returns `false` on a benign unreadable page (the caller
-  /// defers the destructive step and retries); poisons and returns `false` on a fatal read.
-  fn record_crossed_absorbs<L: LogStore>(
-    &mut self,
-    log: &L,
-    from: Index,
-    proven_commit: Index,
-  ) -> bool {
-    let last = log.last_index().min(proven_commit);
-    let mut idx = from;
-    while idx <= last {
-      let read_end = last
-        .next()
-        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
-      let chunk = match log.entries(idx..read_end, 1 << 20) {
-        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
-        Ok(_) => return false,
-        Err(_) => {
-          self.poison(PoisonReason::LogRead);
-          return false;
-        }
-      };
-      for e in chunk.iter() {
-        if e.kind() != EntryKind::CommitMerge {
-          continue;
-        }
-        let Ok(p) = crate::wire::decode_commit_merge_payload(e.data_bytes()) else {
-          continue;
-        };
-        let coord = e.index().next();
-        if coord > proven_commit {
-          // The window was never locally proven decided: no evidence, no record — the
-          // propagated terminal floor remains that husk's exit.
-          continue;
-        }
-        let decider = match log.entries(coord..coord.next(), 1 << 20) {
-          Ok(EntriesRead::Ready(d)) if !d.is_empty() => d,
-          Ok(_) => return false,
-          Err(_) => {
-            self.poison(PoisonReason::LogRead);
-            return false;
-          }
-        };
-        let aborted = decider[0].kind() == EntryKind::RollbackMerge
-          && matches!(
-            crate::wire::decode_rollback_merge_payload(decider[0].data_bytes()),
-            Ok(r) if !r.is_unfreeze()
-              && r.source_bytes() == p.source_bytes()
-              && r.source_gen_after() == p.source_gen_after()
-          );
-        if !aborted {
-          self
-            .merge
-            .crossed_sources
-            .push((p.source_bytes(), p.source_gen_after()));
-        }
-      }
-      idx = match chunk.last() {
-        Some(e) => e.index().next(),
-        None => return false,
-      };
-    }
-    true
-  }
-
   /// Adopt a covering blob in place of a locally-impossible fold (see the receipt-time call
   /// site): the state moves wholesale to the blob's boundary while the LOG stays untouched —
   /// the exact inverse of the restore path's total discard, sound because Log Matching was
@@ -1404,62 +1349,26 @@ where
   where
     F::Snapshot: Data,
   {
-    // Record the crossed absorbs FIRST, while nothing is mutated: the blob embeds every fold in
-    // the skipped range, and a hosted replica of a resolved crossing's source is a live-voting
-    // husk of an absorbed-away lineage the container must retire (left alone, quorum-many of
-    // them re-arm the dead-target self-thaw into resurrecting absorbed state). The same
-    // evidence discipline as the restore path's scan: window-proven, abort-aware, and a benign
-    // unreadable page bails the whole adopt byte-unchanged — the cure re-sends on its cooldown.
-    {
-      let Some(park_at) = self.merge.pending_apply.as_ref().map(PendingMergeApply::at) else {
-        debug_assert!(false, "the adopt is keyed on a standing park");
-        return false;
-      };
-      if !self.record_crossed_absorbs(log, park_at.next(), self.commit) {
-        return false;
-      }
-    }
-    // The destructive install paths validate the ConfState before adopting a configuration; a
-    // malformed one landing in the tracker would poison ConfChangeApply only later, far from its
-    // cause. Refuse BEFORE the park is taken, so the endpoint is byte-unchanged on the bail.
-    if !meta.conf().is_valid() {
-      self.poison(PoisonReason::InvalidConfState);
-      return false;
-    }
-    let Some(pending) = self.merge.pending_apply.take() else {
+    // EVERY fallible read runs FIRST, into locals, so a benign cold page (Pending / briefly
+    // empty — both legal under the LogStore contract) bails BYTE-UNCHANGED: the park stands,
+    // the hint keeps advertising, and the cure re-sends on its cooldown. Only a genuine store
+    // Err poisons. Nothing below the reads can fail benignly, so the mutation suite that
+    // follows is all-or-poison.
+    let Some(park_at) = self.merge.pending_apply.as_ref().map(PendingMergeApply::at) else {
       debug_assert!(false, "the adopt is keyed on a standing park");
       return false;
     };
-    self.merge.park_unresolvable = false;
-    let snap = match <F::Snapshot as Data>::decode_exact(data) {
-      Ok(s) => s,
-      Err(_) => {
-        self.poison(PoisonReason::SnapshotDecode);
-        return false;
-      }
-    };
-    if self.fsm.restore(snap).is_err() {
-      self.poison(PoisonReason::SnapshotRestore);
-      return false;
-    }
-    // The skipped range (park, boundary] never executes locally — its group-level effects are
-    // embedded in the blob — but two entry kinds leave LOCAL obligations the meta cannot carry:
-    // a further CommitMerge's absorb point must engage the membership fence's compaction leg
-    // exactly as if it had applied (a joiner could still be log-walked across it while
-    // first_index sits at-or-below it), and the park's own entry is the first such point. A
-    // skipped Split stages nothing here — restore-path parity: the child reaches this host via
-    // ordinary transfer, and the token-redundant arm resolves any later twin. A skipped
-    // PrepareMerge/RollbackMerge pair is covered by the quartet clear + re-derivation below.
-    let mut absorb_high = pending.at();
     let boundary = meta.last_index();
-    let mut idx = pending.at().next();
+    let mut absorb_high = park_at;
+    let mut idx = park_at.next();
     while idx <= boundary {
       let read_end = boundary
         .next()
         .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
       let chunk = match log.entries(idx..read_end, 1 << 20) {
         Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
-        _ => {
+        Ok(_) => return false,
+        Err(_) => {
           self.poison(PoisonReason::LogRead);
           return false;
         }
@@ -1471,12 +1380,54 @@ where
       }
       idx = match chunk.last() {
         Some(e) => e.index().next(),
-        None => {
-          self.poison(PoisonReason::LogRead);
-          return false;
-        }
+        None => return false,
       };
     }
+    let freeze_pending = match Self::scan_freeze_pending(log, boundary) {
+      Ok(fp) => fp,
+      Err(PoisonReason::LogRead) => {
+        // `scan_freeze_pending` folds Pending/empty and Err into one reason; at THIS seam the
+        // benign shapes must defer, and a genuine fault will recur on the retry until the
+        // ordinary apply drain (which owns the distinction) poisons it.
+        return false;
+      }
+      Err(reason) => {
+        self.poison(reason);
+        return false;
+      }
+    };
+    let snap = match <F::Snapshot as Data>::decode_exact(data) {
+      Ok(s) => s,
+      Err(_) => {
+        self.poison(PoisonReason::SnapshotDecode);
+        return false;
+      }
+    };
+    if !meta.conf().is_valid() {
+      self.poison(PoisonReason::InvalidConfState);
+      return false;
+    }
+    // ── the mutation suite: nothing below fails benignly.
+    if self.merge.pending_apply.take().is_none() {
+      debug_assert!(false, "the park was checked above");
+      return false;
+    }
+    self.merge.park_unresolvable = false;
+    self.merge.crossing_sources.clear();
+    self.merge.crossing_scan_upto = Index::ZERO;
+    if self.fsm.restore(snap).is_err() {
+      self.poison(PoisonReason::SnapshotRestore);
+      return false;
+    }
+    // The skipped range (park, boundary] never executes locally — its group-level effects are
+    // embedded in the blob — but a further CommitMerge's absorb point must engage the
+    // membership fence's compaction leg exactly as if it had applied (a joiner could still be
+    // log-walked across it while first_index sits at-or-below it), and the park's own entry is
+    // the first such point. A skipped Split stages nothing here — restore-path parity: the
+    // child reaches this host via ordinary transfer, and the token-redundant arm resolves any
+    // later twin; a crossing that names a HOSTED source never reaches this arm at all (the
+    // advertisement gate withholds the hint). A skipped PrepareMerge/RollbackMerge pair is
+    // covered by the quartet clear + re-derivation below.
     self.merge.absorb_index = Some(
       self
         .merge
@@ -1496,13 +1447,7 @@ where
     self.merge.freeze_index = None;
     self.merge.freeze_term = None;
     self.merge.frozen_for = None;
-    match Self::scan_freeze_pending(log, boundary) {
-      Ok(fp) => self.merge.freeze_pending = fp,
-      Err(reason) => {
-        self.poison(reason);
-        return false;
-      }
-    }
+    self.merge.freeze_pending = freeze_pending;
     // Obligations at-or-below the boundary clear on the same boundary-proof the restore path
     // uses — and the restart agrees by construction (a crash before the commit persist lands
     // re-parks and re-derives them; nothing was acked). The retain clause is vacuous here:
@@ -1556,14 +1501,6 @@ where
     true
   }
 
-  /// `Err` hands the components back when a benign log read (Pending / briefly empty)
-  /// interrupted the crossed-absorb scan BEFORE anything durable was touched: the caller
-  /// re-stages them and the next crank retries — every step up to the re-baseline is idempotent
-  /// over volatile state, so the re-run converges. `Ok` means the body completed (or poisoned —
-  /// the caller checks poison separately).
-  // The Err carries the whole staged install BY DESIGN — it is the re-stage, not an error code;
-  // boxing it would allocate on a path whose whole point is handing back what was moved in.
-  #[allow(clippy::result_large_err)]
   pub(crate) fn install_snapshot_now<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     log: &mut L,
@@ -1571,12 +1508,11 @@ where
     meta: SnapshotMeta<I>,
     snap: F::Snapshot,
     leader: I,
-  ) -> Result<(), (SnapshotMeta<I>, F::Snapshot, I)>
-  where
+  ) where
     F::Snapshot: Data,
   {
     if self.poison.poisoned {
-      return Ok(());
+      return;
     }
     // Only a FOLLOWER installs a snapshot (etcd parity). A deferred install can complete after this node
     // became a candidate or leader — its blob fsync outliving an election it won on a longer, visible
@@ -1593,7 +1529,7 @@ where
     // that outvoted it). Skipping the `durable_snapshot_index` raise below is deliberate here: for a
     // leader it would claim local durability at a boundary the real log has not yet reached.
     if !self.role.is_follower() {
-      return Ok(());
+      return;
     }
     // A lineage-ADOPTING install (token-less self, token-bearing snapshot) lands only on the
     // content-emptiness the door gate demanded — re-checked HERE because admission was deferred
@@ -1616,7 +1552,7 @@ where
         .snapshot
         .refused_cross_lineage_installs
         .saturating_add(1);
-      return Ok(());
+      return;
     }
     // this runs ONLY once the blob is durable (the matching `SnapshotWritten` or `durable_snapshot()`
     // evidence), so the snapshot boundary is now a durable RECOVERABLE prefix — a crash would
@@ -1673,7 +1609,7 @@ where
     // and bails (treating it as "not redundant" would `log.restore` over unreadable state).
     let redundant = match self.covered_by_local_history(log, &meta, self.commit) {
       Some(r) => r,
-      None => return Ok(()),
+      None => return,
     };
     if redundant {
       // Release the leader from `ProgressState::Snapshot` NOW, without waiting for a heartbeat resend: a
@@ -1695,47 +1631,21 @@ where
           self.apply_committed(log);
         }
         if self.poison.poisoned {
-          return Ok(());
+          return;
         }
         self.persist_commit_floor(stable);
       }
       self.send_or_gate_shortcut_snapshot_ack(leader, meta.last_index());
-      return Ok(());
+      return;
     }
 
-    // The committed bound of the OLD log, read before this install advances `commit`: the
-    // crossed-absorb scan below may only trust entries whose abort-window coordinate this
-    // replica had PROVEN committed — a stale leader's uncommitted divergent tail above it can
-    // name merges that never happened.
-    let pre_commit = self.commit;
-    if let Some(park_at) = self.merge.pending_apply.as_ref().map(|p| p.at()) {
-      // Walk from the PARKED entry itself (inclusive — its own source may be hosted here, the
-      // ordinary resolvable-park-superseded shape): `applied` was already advanced to the
-      // boundary above, but the park pinned the replay at exactly `at - 1`, so the never-run
-      // range is `[at, tip]`. The scan is EVIDENCE-SCOPED and RECOVERABLE: only an entry whose
-      // abort-window coordinate was committed within the PRE-install bound may record, and only
-      // when that coordinate's committed content is not this merge's abort (an aborted merge's
-      // source is live, never a husk — the window's own pure log function, computed off
-      // identical bytes everywhere). A benign unreadable page defers the WHOLE destructive
-      // install — the caller re-stages and retries — because the restore below would otherwise
-      // destroy the only derivation; a fatal read poisons without restoring. Entries whose
-      // window the pre-install commit had not proven fall to the propagated-terminal-floor
-      // exit, the pre-existing residual (and a crash between the durable restore and the
-      // retire pass leaves the same narrow residual — the records are volatile by design).
-      if !self.record_crossed_absorbs(log, park_at, pre_commit) {
-        if self.poison.poisoned {
-          return Ok(());
-        }
-        return Err((meta, snap, leader));
-      }
-    }
     // The SM, commit/applied, durable_index and the log re-baseline are all advanced TOGETHER here, with
     // the blob already durable — so `durable_commit()`/`ack_watermark()` need no install-window fence.
     // Step 2: restore the state machine. On failure, poison (deterministic: the durable blob re-enters
     // the install on restart and re-poisons, consistent with `restart_inner`'s SnapshotRestore).
     if self.fsm.restore(snap).is_err() {
       self.poison(PoisonReason::SnapshotRestore);
-      return Ok(());
+      return;
     }
 
     // The re-baseline below discards the log tail; drop any pending log-append acks that referred to
@@ -1813,6 +1723,8 @@ where
     // A stale park kept here would wedge the drain forever below a boundary it cannot re-reach.
     self.merge.pending_apply = None;
     self.merge.park_unresolvable = false;
+    self.merge.crossing_sources.clear();
+    self.merge.crossing_scan_upto = Index::ZERO;
     // The re-baseline discarded every abort entry at-or-below the boundary — the ONLY restart
     // re-derivation of the `abandoned` obligation. The install sits past the committed+applied abort,
     // proving the source thawed past the abandoned freeze (the capturing leader's own service drove
@@ -1848,7 +1760,7 @@ where
     // commit a discarded entry), so poison rather than serve off it (a release check, not a debug assert).
     if !super::restore_rebaselined(log, meta.last_index(), meta.last_term()) {
       self.poison(PoisonReason::SnapshotRebaseline);
-      return Ok(());
+      return;
     }
 
     // The membership transition this install performs, computed while the tracker still holds the
@@ -1939,7 +1851,6 @@ where
     // receipt — keeps the leader correctly in Snapshot state while the install is in flight; a follower
     // that crashes mid-window is re-driven by the leader's heartbeat-resend after it restarts.)
     self.send_or_gate_snapshot_ack(leader, meta.last_index());
-    Ok(())
   }
 
   /// Receive a `SnapshotResponse` from a follower (leader path), or from a peer this replica owes

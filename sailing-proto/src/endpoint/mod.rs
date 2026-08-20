@@ -1579,6 +1579,12 @@ where
   /// rotates instead of key-ordering every global-gate token to the lowest due id. Survives
   /// ledger eviction (it is not an entry) and costs nothing when at most one debt stands.
   cure_cursor: Option<I>,
+  /// Service history that SURVIVES ledger eviction, capped like the ledger: peer → the cooldown
+  /// deadline its last cure send earned. A re-mint inherits it, so an evicted-then-readvertising
+  /// served peer re-enters as cooling-down rather than as a fresh waiter — without this, every
+  /// eviction erased the cooldown and re-serves competed true waiters out of the global gate's
+  /// one token per window.
+  cure_served: BTreeMap<I, Instant>,
 }
 
 // Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
@@ -1747,6 +1753,7 @@ where
       cure_owed: BTreeMap::new(),
       cure_send_gate: None,
       cure_cursor: None,
+      cure_served: BTreeMap::new(),
     };
     ep.arm_election_timer(now);
     ep
@@ -3072,34 +3079,35 @@ where
   /// the ones eviction must protect, or sustained wide wedging starves a rotating subset.
   fn note_cure_debt(&mut self, now: Now, peer: &I, boundary: Index) {
     if !self.cure_owed.contains_key(peer) && self.cure_owed.len() >= COURTESY_DEBT_CAP {
-      // Evict a NEVER-SENT entry first (the newest-refreshed one — the longest-waiting
-      // never-sent debts are the protected population), and only when every entry has been
-      // served, the most recently sent. The inverse order let churn erase a just-served peer's
-      // cooldown: its next advertisement re-minted immediately due and one lossy peer could
-      // monopolize the global gate forever while unserved wedges starved.
+      // Admission makes PROGRESS or it refuses — it never shuffles: evicting one never-sent
+      // waiter for another gains nothing, and under a fixed advertisement order it thrashes the
+      // same handful out of residency forever. When a SERVED resident exists, the most recently
+      // served one yields its slot (its cure landed, or its cooldown-paced retry re-mints
+      // later); when every resident is still waiting, the mint REFUSES — the refused peer keeps
+      // advertising, every sweep window serves one waiter, so a slot frees at least once per
+      // window and every advertiser is admitted, then served, within bounded windows.
       let victim = self
         .cure_owed
         .iter()
-        .filter(|(_, d)| d.next_at.is_none())
-        .max_by_key(|(_, d)| d.refreshed_at)
-        .map(|(p, _)| p.cheap_clone())
-        .or_else(|| {
-          self
-            .cure_owed
-            .iter()
-            .max_by_key(|(_, d)| d.next_at)
-            .map(|(p, _)| p.cheap_clone())
-        });
-      if let Some(victim) = victim {
-        self.cure_owed.remove(&victim);
-      }
+        .filter(|(_, d)| d.next_at.is_some())
+        .max_by_key(|(_, d)| d.next_at)
+        .map(|(p, _)| p.cheap_clone());
+      let Some(victim) = victim else {
+        return;
+      };
+      self.cure_owed.remove(&victim);
     }
+    let inherited = self
+      .cure_served
+      .get(peer)
+      .copied()
+      .filter(|at| now.mono() < *at);
     let entry = self
       .cure_owed
       .entry(peer.cheap_clone())
       .or_insert(CureDebt {
         boundary,
-        next_at: None,
+        next_at: inherited,
         refreshed_at: now.mono(),
       });
     entry.boundary = entry.boundary.max(boundary);
@@ -3264,15 +3272,25 @@ where
     if !self.role.is_leader() {
       return;
     }
-    // Serve due debts in ROTATION from a cursor that survives ledger churn: key-ordered
-    // service would hand every global-gate token to the lowest due id, starving the rest under
-    // sustained wide wedging. The cursor advances past whoever was offered first this sweep.
+    // Serve due debts in ROTATION from a cursor that survives ledger churn — and NEVER-SERVED
+    // debts strictly first: a cooldown-expired retry re-entering the due pool must not compete
+    // a standing waiter out of the global gate's one token per window, or an over-cap
+    // population converges at one NEW peer per full rotation instead of one per window. Within
+    // each class the cursor rotates, so neither key order nor advertisement order is a lever.
     let mut cure_due: std::vec::Vec<I> = self
       .cure_owed
       .iter()
-      .filter(|(_, d)| d.next_at.is_none_or(|at| at <= now.mono()))
+      .filter(|(_, d)| d.next_at.is_none())
       .map(|(peer, _)| peer.cheap_clone())
       .collect();
+    if cure_due.is_empty() {
+      cure_due = self
+        .cure_owed
+        .iter()
+        .filter(|(_, d)| d.next_at.is_some_and(|at| at <= now.mono()))
+        .map(|(peer, _)| peer.cheap_clone())
+        .collect();
+    }
     if let Some(cursor) = self.cure_cursor.as_ref() {
       let split = cure_due.partition_point(|p| p <= cursor);
       cure_due.rotate_left(split);

@@ -175,19 +175,19 @@ pub(crate) struct MergeState {
   /// cleared the moment the hint clears, so a later park never inherits a stale deadline. Volatile
   /// pacing state, meaningless without `park_unresolvable`.
   pub(crate) stuck_advert_next_at: Option<Instant>,
-  /// Sources of `CommitMerge` entries an install crossed WITHOUT locally resolving them — the
-  /// adopt's skipped range, and the restore path's superseded park. Each is `(source_bytes,
-  /// source_gen_after)` from the crossed entry's own payload. The install's blob EMBEDS every
-  /// such fold (log determinism through its boundary), so a locally hosted replica of one of
-  /// these lineages at-or-below the recorded generation is a live-voting husk of an
-  /// absorbed-away group — exactly the electorate the husk-minority argument must keep empty,
-  /// and left alone it re-arms the dead-target self-thaw into resurrecting absorbed state once
-  /// the target itself later dissolves. The container's per-crank service drains this: hosted +
-  /// gen-eligible ⇒ `Retired` (floor + teardown on the install's own evidence — the sender's
-  /// durable blob is the cluster-level durability proof, so no local store copy is
-  /// load-bearing); unhosted entries need nothing (no husk, no vote). Volatile: a crash
-  /// re-parks and the re-cure re-records.
-  pub(crate) crossed_sources: Vec<(Bytes, u64)>,
+  /// Committed `CommitMerge` entries ABOVE the standing park that an adopting install would
+  /// cross without locally resolving — their source id bytes, recorded by an incremental
+  /// kind-only walk the resolver advances each crank. The cure-advertisement gate withholds the
+  /// hint while ANY of them names a locally hosted group: an adopt would leave that replica a
+  /// live-voting husk of a lineage the blob absorbed (or a lineage whose stale no-op only the
+  /// full apply machinery can classify), and no scan-side re-derivation of the apply's lineage
+  /// guard is sound — so the refusal is deliberately outcome-blind and conservative. Patience
+  /// costs liveness only for the composed shape, whose exit stays the hosted replica's own
+  /// lifecycle (or the propagated terminal floor). Volatile with the park.
+  pub(crate) crossing_sources: Vec<Bytes>,
+  /// The crossing walk's high-water mark: entries at-or-below it were already examined, so each
+  /// crank scans only the committed delta — O(new entries) amortized for the park's life.
+  pub(crate) crossing_scan_upto: Index,
   /// An absorbed-but-uncaptured union's outstanding durability obligation: the fold ran and the
   /// apply drain resumed, but a standing replay fence (a parked fork's barrier, an undischarged
   /// abort obligation) deferred the forced capture — so the consumed source's stores remain the
@@ -775,23 +775,6 @@ where
     verdict
   }
 
-  /// Drain the crossed-source records an install left (see [`MergeState::crossed_sources`]) —
-  /// the container's per-crank retire pass consumes them.
-  pub(crate) fn take_crossed_sources(&mut self) -> Vec<(Bytes, u64)> {
-    core::mem::take(&mut self.merge.crossed_sources)
-  }
-
-  /// Whether any install-crossed source records await the container's retire pass.
-  pub(crate) fn has_crossed_sources(&self) -> bool {
-    !self.merge.crossed_sources.is_empty()
-  }
-
-  /// Re-queue records the retire pass could not consume this crank (a transient owner stands);
-  /// they retry until the owner reaches a terminal outcome.
-  pub(crate) fn requeue_crossed_sources(&mut self, records: Vec<(Bytes, u64)>) {
-    self.merge.crossed_sources.extend(records);
-  }
-
   /// Whether any merge-cure debt stands — the drivers' quiesce-eligibility leg: a wedged peer is
   /// invisible to the pump predicate (it is not log-lagging), so the debt is what keeps the group
   /// awake until the cure lands.
@@ -845,6 +828,45 @@ where
     self.merge.capture_debt.take()
   }
 
+  /// Advance the incremental crossing walk over the committed range above the park (see
+  /// [`MergeState::crossing_sources`]). Kind-only plus one payload decode per hit; an
+  /// unreadable page simply stops this crank's advance (the hint stays withheld — fail-closed).
+  pub(crate) fn advance_crossing_scan<L: LogStore>(&mut self, log: &L) {
+    let Some(park_at) = self.merge.pending_apply.as_ref().map(PendingMergeApply::at) else {
+      return;
+    };
+    let last = log.last_index().min(self.commit);
+    let mut idx = self.merge.crossing_scan_upto.max(park_at).next();
+    while idx <= last {
+      let read_end = last
+        .next()
+        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
+      let chunk = match log.entries(idx..read_end, 1 << 20) {
+        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
+        _ => return,
+      };
+      for e in chunk.iter() {
+        if e.kind() == EntryKind::CommitMerge
+          && let Ok(p) = crate::wire::decode_commit_merge_payload(e.data_bytes())
+        {
+          self.merge.crossing_sources.push(p.source_bytes());
+        }
+      }
+      match chunk.last() {
+        Some(e) => {
+          self.merge.crossing_scan_upto = e.index();
+          idx = e.index().next();
+        }
+        None => return,
+      }
+    }
+  }
+
+  /// The committed crossings recorded so far (see [`MergeState::crossing_sources`]).
+  pub(crate) fn crossing_sources(&self) -> &[Bytes] {
+    &self.merge.crossing_sources
+  }
+
   /// The standing park's boundary when the container's resolver classified it locally
   /// unresolvable — the source is unhosted here with a non-terminal floor, so no local fold can
   /// ever land, and the advertisement gate passed: the coordinate this follower advertises for
@@ -886,6 +908,8 @@ where
       debug_assert!(false, "resolve without a parked CommitMerge");
       return None;
     };
+    self.merge.crossing_sources.clear();
+    self.merge.crossing_scan_upto = Index::ZERO;
     if !self.fsm.absorb(source_fsm) {
       self.poison(PoisonReason::MergeUnsupported);
       return None;
@@ -919,6 +943,8 @@ where
       debug_assert!(false, "abort-resolve without a parked CommitMerge");
       return;
     };
+    self.merge.crossing_sources.clear();
+    self.merge.crossing_scan_upto = Index::ZERO;
     self.applied = pending.at();
     self
       .outputs
