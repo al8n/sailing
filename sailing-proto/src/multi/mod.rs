@@ -3673,6 +3673,9 @@ where
           // its stores and floor, and a restart re-parks against the restored source.
           if tep.is_poisoned() {
             self.mark_dirty(&tgid);
+            // Latch for `poll_poisoned` alongside the typed resolution, as at every other
+            // in-service fail-stop.
+            self.note_if_poisoned(&tgid);
             resolutions.push(MergeResolution::CaptureFailed {
               source,
               target: tgid,
@@ -3742,6 +3745,7 @@ where
             // stranded — emit `CaptureFailed` so the driver fails those callers typed while
             // PRESERVING the source's stores and floor, and a restart re-parks against the restored
             // source rather than losing the union behind a floored, torn-down source.
+            self.note_if_poisoned(&tgid);
             resolutions.push(MergeResolution::CaptureFailed {
               source,
               target: tgid,
@@ -4001,50 +4005,13 @@ where
     // THE CAPTURE-DEBT PASS: discharge fence-deferred absorb captures. A debt's union is applied
     // and serving, but its durability capture waited on a replay fence — the consumed source's
     // intact stores are still the union's only restart derivation. Once the fence lifts (this
-    // pass runs LAST in the crank, so a fence any earlier pass lifted feeds it immediately), or
+    // pass runs after every fence-lifting pass in the crank, so a lifted fence feeds it
+    // immediately), or
     // a capture at-or-past the boundary is already staged (the threshold capture shares the same
     // fence set, so either producer is co-barriered with this crank's flush), stage the forced
     // capture and surface the held `Merged` — the driver's floor + teardown permission. A
     // capture fault poisons and surfaces `CaptureFailed` exactly as the one-crank arm: stores
     // preserved, restart re-parks.
-    // THE ADOPT-CAPTURE PASS: an adopt owes one forced capture, threshold-independent (the
-    // adopt persisted no blob — see the obligation's doc). Same fence discipline as every
-    // capture producer; a fenced crank just retries.
-    let adopt_owers: Vec<G> = self
-      .groups
-      .iter()
-      .filter(|(_, ep)| ep.adopt_capture_owed() && !ep.is_poisoned())
-      .map(|(gid, _)| gid.cheap_clone())
-      .collect();
-    for gid in adopt_owers {
-      let Some(ep) = self.groups.get(&gid) else {
-        continue;
-      };
-      if ep
-        .pending_compact_boundary()
-        .is_some_and(|b| b >= ep.applied_index())
-        || ep.durable_snapshot_covers(ep.applied_index())
-      {
-        if let Some(ep) = self.groups.get_mut(&gid) {
-          ep.clear_adopt_capture_owed();
-        }
-        continue;
-      }
-      if ep.capture_blocked_at(ep.applied_index()) {
-        continue;
-      }
-      let staged = match stores.stores(&gid) {
-        Some((log, stable)) => self
-          .groups
-          .get_mut(&gid)
-          .is_some_and(|ep| ep.capture_absorb_snapshot(log, stable)),
-        None => false,
-      };
-      if staged && let Some(ep) = self.groups.get_mut(&gid) {
-        ep.clear_adopt_capture_owed();
-        self.mark_dirty(&gid);
-      }
-    }
     let debtors: Vec<G> = self
       .groups
       .iter()
@@ -4076,8 +4043,17 @@ where
         // A COMPLETED install (or capture) at-or-past the boundary is the after-durable form of
         // the same evidence — the soundest producer of the three; without this leg an install
         // into a debt-holder would orphan the debt (the restore discards the boundary's
-        // CommitMerge, so a crash then loses the volatile debt with no re-park left).
-        || tep.durable_snapshot_covers(boundary);
+        // CommitMerge, so a crash then loses the volatile debt with no re-park left). Durability
+        // ALONE is not it, though: a completion-time redundant install raises the durable index
+        // while deliberately keeping the log, and discharging on that evidence would strand the
+        // membership fence on a compaction no threshold will trigger — so the leg also requires
+        // the fence itself to have released (a real restore compacts past the absorb point and
+        // satisfies both).
+        || (tep.durable_snapshot_covers(boundary)
+          && match stores.stores(&tgid) {
+            Some((log, _)) => !tep.merge_conf_fence(&*log),
+            None => false,
+          });
       if !already_staged {
         // The fence is keyed at the CAPTURE POINT — current `applied`, where the forced capture
         // stamps and its compaction lands — never the absorb boundary: the debt window is
@@ -4115,6 +4091,10 @@ where
           }
         };
         if !staged {
+          // Latch for `poll_poisoned` alongside the typed resolution: the poisoned debtor is
+          // filtered from every later pass, so without the latch the fail-stop never surfaces
+          // once cure traffic stops.
+          self.note_if_poisoned(&tgid);
           self.mark_dirty(&tgid);
           resolutions.push(MergeResolution::CaptureFailed {
             source,
@@ -4133,6 +4113,73 @@ where
         source,
         target: tgid,
       });
+    }
+    // THE ADOPT-CAPTURE PASS: an adopt owes one forced capture, threshold-independent (the
+    // adopt persisted no blob — see the obligation's doc). Same fence discipline as every
+    // capture producer; a fenced crank just retries. Runs AFTER the debt pass so a coexisting
+    // debt services first under its own CaptureFailed contract — the debt's staged capture (at
+    // applied, at-or-past this obligation's boundary) then discharges this flag in the same
+    // crank, and a faulting shared capture surfaces the debt's typed resolution instead of
+    // vanishing behind the poison filter.
+    let adopt_owers: Vec<G> = self
+      .groups
+      .iter()
+      .filter(|(_, ep)| ep.adopt_capture_owed() && !ep.is_poisoned())
+      .map(|(gid, _)| gid.cheap_clone())
+      .collect();
+    for gid in adopt_owers {
+      let (discharged, blocked) = {
+        let Some(ep) = self.groups.get(&gid) else {
+          continue;
+        };
+        let applied = ep.applied_index();
+        // Discharged only when BOTH halves of the obligation hold, or a staged capture will
+        // produce them together. Durable coverage ALONE is neither: a completion-time
+        // redundant install raises the durable index while deliberately keeping the log, so
+        // it satisfies cure-serving while the membership fence still awaits a compaction no
+        // threshold will trigger — the exact wedge this obligation exists to cure. The
+        // durable leg therefore also requires the fence itself to have released.
+        let discharged = ep.pending_compact_boundary().is_some_and(|b| b >= applied)
+          || (ep.durable_snapshot_covers(applied)
+            && match stores.stores(&gid) {
+              Some((log, _)) => !ep.merge_conf_fence(&*log),
+              None => false,
+            });
+        (discharged, ep.capture_blocked_at(applied))
+      };
+      if discharged {
+        if let Some(ep) = self.groups.get_mut(&gid) {
+          ep.clear_adopt_capture_owed();
+        }
+        continue;
+      }
+      if blocked {
+        continue;
+      }
+      let staged = match stores.stores(&gid) {
+        Some((log, stable)) => self
+          .groups
+          .get_mut(&gid)
+          .is_some_and(|ep| ep.capture_absorb_snapshot(log, stable)),
+        None => {
+          if let Some(ep) = self.groups.get_mut(&gid) {
+            ep.poison(PoisonReason::SnapshotCapture);
+          }
+          false
+        }
+      };
+      if staged {
+        if let Some(ep) = self.groups.get_mut(&gid) {
+          ep.clear_adopt_capture_owed();
+        }
+      } else {
+        // The capture faulted: no consumed source stands behind this obligation, so no
+        // CaptureFailed routing contract applies — the poison surface is the whole signal,
+        // and it must latch here or an idle adopter's fail-stop stays invisible until
+        // unrelated traffic next touches the group.
+        self.note_if_poisoned(&gid);
+      }
+      self.mark_dirty(&gid);
     }
     resolutions
   }

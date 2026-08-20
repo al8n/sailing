@@ -835,9 +835,10 @@ where
   /// The staged (submitted, not yet durability-completed) capture's boundary, if one is in
   /// flight — the debt pass adopts a staged capture at-or-past the absorb boundary as the
   /// debt's own discharge (boundary coverage is monotone in `applied`).
-  /// Whether this endpoint's DURABLE snapshot already covers `boundary` — the debt pass's
-  /// third discharge producer: a completed install (or any completed capture) at-or-past the
-  /// absorb boundary IS the union's durability, with nothing left to stage.
+  /// Whether this endpoint's DURABLE snapshot already covers `boundary` — durability
+  /// evidence ONLY: a completion-time redundant install raises this index while deliberately
+  /// keeping the log, so a caller discharging a compaction-bearing obligation on it must pair
+  /// it with the membership fence's own release.
   pub(crate) fn durable_snapshot_covers(&self, boundary: Index) -> bool {
     self.durable.durable_snapshot_index >= boundary
   }

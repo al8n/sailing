@@ -11162,6 +11162,273 @@ fn under_hosted_park_host() -> (MultiRaft<u64, u64, SplitSm>, MapStores) {
   (m, stores)
 }
 
+/// A completion-time redundant install — staged while `commit` was behind its boundary, covered
+/// by the time its blob turned durable — raises the DURABLE snapshot index and deliberately
+/// keeps the log: durability without compaction. The owed adopt capture must NOT discharge on
+/// that evidence: the absorb membership fence waits on `first_index` passing the absorb point,
+/// so shedding the obligation there would wedge every voter change until unrelated threshold
+/// traffic. The service stages the forced capture anyway; its compaction releases the fence and
+/// a voter add is admitted again.
+#[test]
+fn a_redundant_install_does_not_shed_the_adopts_compaction_obligation() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = under_hosted_park_host();
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    Some(Index::new(2))
+  );
+
+  // The cure blob adopts, leaving the one owed forced capture.
+  let meta = crate::SnapshotMeta::new(
+    Index::new(3),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta,
+        fork_blob(5),
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  while m.poll_message().is_some() {}
+  assert!(m.group(&1).unwrap().adopt_capture_owed());
+
+  // Manufacture the redundant completion: stage an install one past commit (nothing local
+  // covers it, so it defers on blob durability), then let the leader's append carry that entry
+  // and the commit over it — the completion finds itself covered, records durability, and
+  // keeps the log.
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let meta4 = crate::SnapshotMeta::new(
+      Index::new(4),
+      Term::new(1),
+      crate::conf::ConfState::from_voters(std::vec![1u64]),
+    )
+    .with_shape_gen(1);
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta4,
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        Term::new(1),
+        9u64,
+        Index::new(3),
+        Term::new(1),
+        std::vec![crate::Entry::new(
+          Term::new(1),
+          Index::new(4),
+          crate::EntryKind::Normal,
+          cmd
+        )],
+        Index::new(4),
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+    assert_eq!(
+      m.group(&1).unwrap().state_machine().units,
+      6,
+      "the covered completion restored nothing — entry 4 applied on top of the union"
+    );
+    assert!(
+      sailing_proto_durable_covers(stable, Index::new(4)),
+      "durability was recorded"
+    );
+    assert_eq!(
+      log.first_index(),
+      Index::new(1),
+      "and the log was deliberately kept"
+    );
+  }
+  while m.poll_message().is_some() {}
+  assert!(
+    m.group(&1).unwrap().adopt_capture_owed(),
+    "durability without compaction does not discharge the obligation"
+  );
+
+  // The service still stages the forced capture; its compaction is what the fence awaits.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+    assert!(
+      log.first_index() > Index::new(2),
+      "the owed compaction released the fence"
+    );
+  }
+  assert!(!m.group(&1).unwrap().adopt_capture_owed());
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+
+  // The membership fence has genuinely released: a voter add is admitted.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    while matches!(
+      m.handle_storage(&1, d, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+    assert!(m.group(&1).unwrap().role().is_leader());
+    m.propose_conf_change(
+      &1,
+      d,
+      log,
+      stable,
+      crate::conf::ConfChange::new(crate::ConfChangeType::AddNode, 2u64, Bytes::new()),
+    )
+    .unwrap()
+    .unwrap();
+  }
+}
+
+/// The owed adopt capture FAULTS (`snapshot()` errors): the endpoint fail-stops, and the poison
+/// must LATCH for `poll_poisoned` in the same crank — the ower is filtered from every later
+/// pass and a poisoned endpoint arms no timer, so without the latch an idle adopter\'s fail-stop
+/// stays invisible until unrelated traffic touches the group. No `CaptureFailed` surfaces: that
+/// contract names a consumed source\'s stranded routing, and the adopt has none.
+#[test]
+fn an_adopts_faulting_capture_fail_stops_and_latches() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SnapFailSm> = MultiRaft::new();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  let fail = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SnapFailSm {
+      count: 0,
+      fail: fail.clone(),
+    },
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    Some(Index::new(2))
+  );
+  let meta = crate::SnapshotMeta::new(
+    Index::new(3),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta,
+        fork_blob(5),
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  while m.poll_message().is_some() {}
+  assert!(m.group(&1).unwrap().adopt_capture_owed());
+  assert_eq!(m.group(&1).unwrap().state_machine().count, 5);
+
+  fail.store(true, core::sync::atomic::Ordering::Relaxed);
+  assert!(
+    m.service_merge_applies(now, &mut stores).is_empty(),
+    "no CaptureFailed: no consumed source stands behind the obligation"
+  );
+  let ep = m.group(&1).unwrap();
+  assert!(ep.is_poisoned());
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::SnapshotCapture));
+  assert!(ep.adopt_capture_owed(), "nothing was discharged");
+  assert_eq!(
+    m.poll_poisoned(),
+    Some(1),
+    "the fail-stop latched in the faulting crank"
+  );
+  assert_eq!(m.poll_poisoned(), None);
+}
+
 /// The structural-hold signal is EDGE-triggered: an under-hosted park names its cause ONCE and
 /// then stays silent however many cranks re-derive it, and a genuine change of cause — the source
 /// arriving, still below its freeze generation — signals exactly once more.
