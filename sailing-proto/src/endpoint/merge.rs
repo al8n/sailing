@@ -786,6 +786,12 @@ where
     !self.merge.crossed_sources.is_empty()
   }
 
+  /// Re-queue records the retire pass could not consume this crank (a transient owner stands);
+  /// they retry until the owner reaches a terminal outcome.
+  pub(crate) fn requeue_crossed_sources(&mut self, records: Vec<(Bytes, u64)>) {
+    self.merge.crossed_sources.extend(records);
+  }
+
   /// Whether any merge-cure debt stands — the drivers' quiesce-eligibility leg: a wedged peer is
   /// invisible to the pump predicate (it is not log-lagging), so the debt is what keeps the group
   /// awake until the cure lands.

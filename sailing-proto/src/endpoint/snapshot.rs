@@ -1321,6 +1321,75 @@ where
   /// the core, not the storage layer, owns the ordering. Called only from `handle_storage`, with
   /// the matching `pending_install` tuple already `take`n out (so a failure leaves no partial deferred
   /// install behind).
+  /// Record the sources of RESOLVED `CommitMerge` entries in `[from, tip]` off the still-intact
+  /// log — the install-crossed range the local replay will never run. An entry records only
+  /// when its abort-window coordinate (`k + 1`) is committed within `proven_commit` AND that
+  /// coordinate's content is not this merge's own abort: the window's pure log function, so
+  /// every replica records identically. Returns `false` on a benign unreadable page (the caller
+  /// defers the destructive step and retries); poisons and returns `false` on a fatal read.
+  fn record_crossed_absorbs<L: LogStore>(
+    &mut self,
+    log: &L,
+    from: Index,
+    proven_commit: Index,
+  ) -> bool {
+    let last = log.last_index().min(proven_commit);
+    let mut idx = from;
+    while idx <= last {
+      let read_end = last
+        .next()
+        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
+      let chunk = match log.entries(idx..read_end, 1 << 20) {
+        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
+        Ok(_) => return false,
+        Err(_) => {
+          self.poison(PoisonReason::LogRead);
+          return false;
+        }
+      };
+      for e in chunk.iter() {
+        if e.kind() != EntryKind::CommitMerge {
+          continue;
+        }
+        let Ok(p) = crate::wire::decode_commit_merge_payload(e.data_bytes()) else {
+          continue;
+        };
+        let coord = e.index().next();
+        if coord > proven_commit {
+          // The window was never locally proven decided: no evidence, no record — the
+          // propagated terminal floor remains that husk's exit.
+          continue;
+        }
+        let decider = match log.entries(coord..coord.next(), 1 << 20) {
+          Ok(EntriesRead::Ready(d)) if !d.is_empty() => d,
+          Ok(_) => return false,
+          Err(_) => {
+            self.poison(PoisonReason::LogRead);
+            return false;
+          }
+        };
+        let aborted = decider[0].kind() == EntryKind::RollbackMerge
+          && matches!(
+            crate::wire::decode_rollback_merge_payload(decider[0].data_bytes()),
+            Ok(r) if !r.is_unfreeze()
+              && r.source_bytes() == p.source_bytes()
+              && r.source_gen_after() == p.source_gen_after()
+          );
+        if !aborted {
+          self
+            .merge
+            .crossed_sources
+            .push((p.source_bytes(), p.source_gen_after()));
+        }
+      }
+      idx = match chunk.last() {
+        Some(e) => e.index().next(),
+        None => return false,
+      };
+    }
+    true
+  }
+
   /// Adopt a covering blob in place of a locally-impossible fold (see the receipt-time call
   /// site): the state moves wholesale to the blob's boundary while the LOG stays untouched —
   /// the exact inverse of the restore path's total discard, sound because Log Matching was
@@ -1335,6 +1404,21 @@ where
   where
     F::Snapshot: Data,
   {
+    // Record the crossed absorbs FIRST, while nothing is mutated: the blob embeds every fold in
+    // the skipped range, and a hosted replica of a resolved crossing's source is a live-voting
+    // husk of an absorbed-away lineage the container must retire (left alone, quorum-many of
+    // them re-arm the dead-target self-thaw into resurrecting absorbed state). The same
+    // evidence discipline as the restore path's scan: window-proven, abort-aware, and a benign
+    // unreadable page bails the whole adopt byte-unchanged — the cure re-sends on its cooldown.
+    {
+      let Some(park_at) = self.merge.pending_apply.as_ref().map(PendingMergeApply::at) else {
+        debug_assert!(false, "the adopt is keyed on a standing park");
+        return false;
+      };
+      if !self.record_crossed_absorbs(log, park_at.next(), self.commit) {
+        return false;
+      }
+    }
     // The destructive install paths validate the ConfState before adopting a configuration; a
     // malformed one landing in the tracker would poison ConfChangeApply only later, far from its
     // cause. Refuse BEFORE the park is taken, so the endpoint is byte-unchanged on the bail.
@@ -1383,16 +1467,6 @@ where
       for e in chunk.iter() {
         if e.kind() == EntryKind::CommitMerge {
           absorb_high = absorb_high.max(e.index());
-          // Record the crossed absorb's SOURCE: the blob embeds its fold, so a locally hosted
-          // replica of that lineage is a live-voting husk of an absorbed-away group — the
-          // container retires it on this install's own evidence. Left alone, quorum-many such
-          // husks re-arm the dead-target self-thaw into resurrecting absorbed state.
-          if let Ok(p) = crate::wire::decode_commit_merge_payload(e.data_bytes()) {
-            self
-              .merge
-              .crossed_sources
-              .push((p.source_bytes(), p.source_gen_after()));
-          }
         }
       }
       idx = match chunk.last() {
@@ -1482,6 +1556,14 @@ where
     true
   }
 
+  /// `Err` hands the components back when a benign log read (Pending / briefly empty)
+  /// interrupted the crossed-absorb scan BEFORE anything durable was touched: the caller
+  /// re-stages them and the next crank retries — every step up to the re-baseline is idempotent
+  /// over volatile state, so the re-run converges. `Ok` means the body completed (or poisoned —
+  /// the caller checks poison separately).
+  // The Err carries the whole staged install BY DESIGN — it is the re-stage, not an error code;
+  // boxing it would allocate on a path whose whole point is handing back what was moved in.
+  #[allow(clippy::result_large_err)]
   pub(crate) fn install_snapshot_now<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     log: &mut L,
@@ -1489,11 +1571,12 @@ where
     meta: SnapshotMeta<I>,
     snap: F::Snapshot,
     leader: I,
-  ) where
+  ) -> Result<(), (SnapshotMeta<I>, F::Snapshot, I)>
+  where
     F::Snapshot: Data,
   {
     if self.poison.poisoned {
-      return;
+      return Ok(());
     }
     // Only a FOLLOWER installs a snapshot (etcd parity). A deferred install can complete after this node
     // became a candidate or leader — its blob fsync outliving an election it won on a longer, visible
@@ -1510,7 +1593,7 @@ where
     // that outvoted it). Skipping the `durable_snapshot_index` raise below is deliberate here: for a
     // leader it would claim local durability at a boundary the real log has not yet reached.
     if !self.role.is_follower() {
-      return;
+      return Ok(());
     }
     // A lineage-ADOPTING install (token-less self, token-bearing snapshot) lands only on the
     // content-emptiness the door gate demanded — re-checked HERE because admission was deferred
@@ -1533,7 +1616,7 @@ where
         .snapshot
         .refused_cross_lineage_installs
         .saturating_add(1);
-      return;
+      return Ok(());
     }
     // this runs ONLY once the blob is durable (the matching `SnapshotWritten` or `durable_snapshot()`
     // evidence), so the snapshot boundary is now a durable RECOVERABLE prefix — a crash would
@@ -1590,7 +1673,7 @@ where
     // and bails (treating it as "not redundant" would `log.restore` over unreadable state).
     let redundant = match self.covered_by_local_history(log, &meta, self.commit) {
       Some(r) => r,
-      None => return,
+      None => return Ok(()),
     };
     if redundant {
       // Release the leader from `ProgressState::Snapshot` NOW, without waiting for a heartbeat resend: a
@@ -1612,21 +1695,47 @@ where
           self.apply_committed(log);
         }
         if self.poison.poisoned {
-          return;
+          return Ok(());
         }
         self.persist_commit_floor(stable);
       }
       self.send_or_gate_shortcut_snapshot_ack(leader, meta.last_index());
-      return;
+      return Ok(());
     }
 
+    // The committed bound of the OLD log, read before this install advances `commit`: the
+    // crossed-absorb scan below may only trust entries whose abort-window coordinate this
+    // replica had PROVEN committed — a stale leader's uncommitted divergent tail above it can
+    // name merges that never happened.
+    let pre_commit = self.commit;
+    if let Some(park_at) = self.merge.pending_apply.as_ref().map(|p| p.at()) {
+      // Walk from the PARKED entry itself (inclusive — its own source may be hosted here, the
+      // ordinary resolvable-park-superseded shape): `applied` was already advanced to the
+      // boundary above, but the park pinned the replay at exactly `at - 1`, so the never-run
+      // range is `[at, tip]`. The scan is EVIDENCE-SCOPED and RECOVERABLE: only an entry whose
+      // abort-window coordinate was committed within the PRE-install bound may record, and only
+      // when that coordinate's committed content is not this merge's abort (an aborted merge's
+      // source is live, never a husk — the window's own pure log function, computed off
+      // identical bytes everywhere). A benign unreadable page defers the WHOLE destructive
+      // install — the caller re-stages and retries — because the restore below would otherwise
+      // destroy the only derivation; a fatal read poisons without restoring. Entries whose
+      // window the pre-install commit had not proven fall to the propagated-terminal-floor
+      // exit, the pre-existing residual (and a crash between the durable restore and the
+      // retire pass leaves the same narrow residual — the records are volatile by design).
+      if !self.record_crossed_absorbs(log, park_at, pre_commit) {
+        if self.poison.poisoned {
+          return Ok(());
+        }
+        return Err((meta, snap, leader));
+      }
+    }
     // The SM, commit/applied, durable_index and the log re-baseline are all advanced TOGETHER here, with
     // the blob already durable — so `durable_commit()`/`ack_watermark()` need no install-window fence.
     // Step 2: restore the state machine. On failure, poison (deterministic: the durable blob re-enters
     // the install on restart and re-poisons, consistent with `restart_inner`'s SnapshotRestore).
     if self.fsm.restore(snap).is_err() {
       self.poison(PoisonReason::SnapshotRestore);
-      return;
+      return Ok(());
     }
 
     // The re-baseline below discards the log tail; drop any pending log-append acks that referred to
@@ -1678,39 +1787,6 @@ where
     // husk-minority argument's obligation, now that installs reach quorum-many parked hosts).
     // A read fault only forfeits the eager retire — the propagated terminal floor remains the
     // fallback exit — so it is not poisoned here.
-    if let Some(park_at) = self.merge.pending_apply.as_ref().map(|p| p.at()) {
-      // Walk from the PARKED entry itself (inclusive — its own source may be hosted here, the
-      // ordinary resolvable-park-superseded shape): `applied` was already advanced to the
-      // boundary above, but the park pinned the replay at exactly `at - 1`, so the never-run
-      // range is `[at, tip]`.
-      let last = log.last_index();
-      let mut idx = park_at;
-      'scan: while idx <= last {
-        let read_end = last
-          .next()
-          .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
-        let Ok(EntriesRead::Ready(chunk)) = log.entries(idx..read_end, 1 << 20) else {
-          break 'scan;
-        };
-        if chunk.is_empty() {
-          break 'scan;
-        }
-        for e in chunk.iter() {
-          if e.kind() == EntryKind::CommitMerge
-            && let Ok(p) = crate::wire::decode_commit_merge_payload(e.data_bytes())
-          {
-            self
-              .merge
-              .crossed_sources
-              .push((p.source_bytes(), p.source_gen_after()));
-          }
-        }
-        idx = match chunk.last() {
-          Some(e) => e.index().next(),
-          None => break 'scan,
-        };
-      }
-    }
     log.restore(meta.last_index(), meta.last_term());
     // The re-baseline discarded every entry above the boundary — a pending merge freeze among
     // them no longer exists in this log, so the append-observed kill releases (re-armed at
@@ -1772,7 +1848,7 @@ where
     // commit a discarded entry), so poison rather than serve off it (a release check, not a debug assert).
     if !super::restore_rebaselined(log, meta.last_index(), meta.last_term()) {
       self.poison(PoisonReason::SnapshotRebaseline);
-      return;
+      return Ok(());
     }
 
     // The membership transition this install performs, computed while the tracker still holds the
@@ -1863,6 +1939,7 @@ where
     // receipt — keeps the leader correctly in Snapshot state while the install is in flight; a follower
     // that crashes mid-window is re-driven by the leader's heartbeat-resend after it restarts.)
     self.send_or_gate_snapshot_ack(leader, meta.last_index());
+    Ok(())
   }
 
   /// Receive a `SnapshotResponse` from a follower (leader path), or from a peer this replica owes

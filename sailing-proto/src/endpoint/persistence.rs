@@ -670,12 +670,19 @@ where
           // durable log; running it here makes the re-baseline strictly AFTER the blob is durable,
           // closing the orphan window by construction.
           if matches!(&self.snapshot.pending_install, Some((pid, ..)) if *pid == opid) {
-            let (_pid, meta, snap, leader) = self
+            let (pid, meta, snap, leader) = self
               .snapshot
               .pending_install
               .take()
               .expect("checked Some above");
-            self.install_snapshot_now(log, stable, meta, snap, leader);
+            if let Err((meta, snap, leader)) =
+              self.install_snapshot_now(log, stable, meta, snap, leader)
+            {
+              // A benign unreadable page interrupted the crossed-absorb scan before anything
+              // durable was touched: re-stage and let the missed-completion fallback re-drive
+              // off the already-durable blob next crank.
+              self.snapshot.pending_install = Some((pid, meta, snap, leader));
+            }
             // Completion-time install can poison (log_term, SnapshotRestore, the log re-baseline) →
             // fail-stop the storage handler before any further drain / compaction / reclaim on a dead node.
             if self.poison.poisoned {
@@ -730,12 +737,17 @@ where
       // non-durable blob, and a crash recovers the superseded identity). Require the durable slot to be
       // THIS pending install's own snapshot.
       if matches!(stable.durable_snapshot(), Some(m) if m.identity_eq(meta)) {
-        let (_pid, meta, snap, leader) = self
+        let (pid, meta, snap, leader) = self
           .snapshot
           .pending_install
           .take()
           .expect("checked Some above");
-        self.install_snapshot_now(log, stable, meta, snap, leader);
+        if let Err((meta, snap, leader)) =
+          self.install_snapshot_now(log, stable, meta, snap, leader)
+        {
+          // Benign scan interruption: re-stage; this same fallback re-drives next crank.
+          self.snapshot.pending_install = Some((pid, meta, snap, leader));
+        }
         // The deferred (missed-completion) install can poison the same ways → fail-stop before reclaim.
         if self.poison.poisoned {
           return StorageProgress::Drained;

@@ -5193,7 +5193,7 @@ fn deferred_install_off_follower_preserves_log_and_campaign() {
     Term::new(1),
     ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
   );
-  ep.install_snapshot_now(&mut log, &mut stable, meta, 7u64, 1u64);
+  let _ = ep.install_snapshot_now(&mut log, &mut stable, meta, 7u64, 1u64);
 
   assert!(!ep.poison.poisoned, "the guarded drop must not poison");
   assert_eq!(

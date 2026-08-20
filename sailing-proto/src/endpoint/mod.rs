@@ -1575,6 +1575,10 @@ where
   /// would arrive immediately due — this token is what keeps the aggregate bounded (one
   /// near-frame blob per half-timeout) instead of one per advertisement.
   cure_send_gate: Option<Instant>,
+  /// The round-robin cursor of the cure sweep — the last peer offered first — so service order
+  /// rotates instead of key-ordering every global-gate token to the lowest due id. Survives
+  /// ledger eviction (it is not an entry) and costs nothing when at most one debt stands.
+  cure_cursor: Option<I>,
 }
 
 // Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
@@ -1742,6 +1746,7 @@ where
       courtesy_owed: BTreeMap::new(),
       cure_owed: BTreeMap::new(),
       cure_send_gate: None,
+      cure_cursor: None,
     };
     ep.arm_election_timer(now);
     ep
@@ -3066,15 +3071,28 @@ where
   /// deadline — the most recently SENT — is evicted: the least-recently-served debts are exactly
   /// the ones eviction must protect, or sustained wide wedging starves a rotating subset.
   fn note_cure_debt(&mut self, now: Now, peer: &I, boundary: Index) {
-    if !self.cure_owed.contains_key(peer)
-      && self.cure_owed.len() >= COURTESY_DEBT_CAP
-      && let Some(victim) = self
+    if !self.cure_owed.contains_key(peer) && self.cure_owed.len() >= COURTESY_DEBT_CAP {
+      // Evict a NEVER-SENT entry first (the newest-refreshed one — the longest-waiting
+      // never-sent debts are the protected population), and only when every entry has been
+      // served, the most recently sent. The inverse order let churn erase a just-served peer's
+      // cooldown: its next advertisement re-minted immediately due and one lossy peer could
+      // monopolize the global gate forever while unserved wedges starved.
+      let victim = self
         .cure_owed
         .iter()
-        .max_by_key(|(_, d)| d.next_at)
+        .filter(|(_, d)| d.next_at.is_none())
+        .max_by_key(|(_, d)| d.refreshed_at)
         .map(|(p, _)| p.cheap_clone())
-    {
-      self.cure_owed.remove(&victim);
+        .or_else(|| {
+          self
+            .cure_owed
+            .iter()
+            .max_by_key(|(_, d)| d.next_at)
+            .map(|(p, _)| p.cheap_clone())
+        });
+      if let Some(victim) = victim {
+        self.cure_owed.remove(&victim);
+      }
     }
     let entry = self
       .cure_owed
@@ -3246,12 +3264,22 @@ where
     if !self.role.is_leader() {
       return;
     }
-    let cure_due: std::vec::Vec<I> = self
+    // Serve due debts in ROTATION from a cursor that survives ledger churn: key-ordered
+    // service would hand every global-gate token to the lowest due id, starving the rest under
+    // sustained wide wedging. The cursor advances past whoever was offered first this sweep.
+    let mut cure_due: std::vec::Vec<I> = self
       .cure_owed
       .iter()
       .filter(|(_, d)| d.next_at.is_none_or(|at| at <= now.mono()))
       .map(|(peer, _)| peer.cheap_clone())
       .collect();
+    if let Some(cursor) = self.cure_cursor.as_ref() {
+      let split = cure_due.partition_point(|p| p <= cursor);
+      cure_due.rotate_left(split);
+    }
+    if let Some(first) = cure_due.first() {
+      self.cure_cursor = Some(first.cheap_clone());
+    }
     for peer in cure_due {
       self.maybe_send_cure_snapshot(now, &peer, stable);
     }
