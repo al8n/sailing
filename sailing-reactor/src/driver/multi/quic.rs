@@ -746,6 +746,24 @@ where
         }
       }
     }
+    // `service_merge_applies` can latch a fail-stop with NO resolution and NO staged storage
+    // work — an owed adopt capture faulting, a committed-corrupt decode in the resolver — and
+    // this crank's earlier drain already ran, so without a second drain an otherwise idle
+    // plane would sit on the queued poison until an unrelated wake. Same best-effort tail
+    // semantics as the pre-storage drain; the hold signal drains here too for the same reason.
+    while let Some(group) = self.coord.poll_poisoned() {
+      let _ = self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::Poisoned { group });
+    }
+    while let Some(blocked) = self.coord.poll_merge_blocked() {
+      let _ = self.lifecycle_tx.try_send(LifecycleEvent::MergeBlocked {
+        target: blocked.target,
+        source: blocked.source,
+        boundary: blocked.boundary,
+        cause: blocked.cause,
+      });
+    }
     self.flush_pending = self.engine.has_staged() || more;
     self
       .metrics

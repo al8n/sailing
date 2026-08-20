@@ -1091,6 +1091,56 @@ async fn a_capture_failed_merge_fails_the_source_routing_instead_of_hanging() {
   );
 }
 
+/// A fail-stop latched DURING `service_merge_applies` must surface on the lifecycle tail in the
+/// SAME storage crank. The crank's pre-storage drain has already run by then, so without the
+/// post-service drain the queued `Poisoned` waits for an unrelated wake — invisible exactly when
+/// the plane is otherwise idle. The faulting absorb is the constructible member of the class
+/// here; the resolution-less member (an owed adopt capture faulting on an idle adopter) is
+/// pinned at the container by the proto regression and rides this same drain.
+#[tokio::test]
+async fn a_service_latched_poison_surfaces_in_the_same_crank() {
+  let _fail_absorb = FailAbsorbGuard::arm();
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+  }
+  drive(&mut driver, handle.prepare_merge(2, 1))
+    .await
+    .expect("freeze proposed");
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while !driver.coord.group(&2).is_some_and(|ep| ep.is_frozen()) {
+    assert!(std::time::Instant::now() < deadline, "no freeze in time");
+    crank(&mut driver).await;
+  }
+  drive(&mut driver, handle.commit_merge(1, 2))
+    .await
+    .expect("commit proposed");
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while driver.coord.group(&2).is_some() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the parked merge never resolved"
+    );
+    crank(&mut driver).await;
+  }
+  // The crank that resolved (and poisoned the target) is the LAST one executed: the poison must
+  // already be on the tail, with no further crank granted.
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
+    "the faulting absorb fail-stopped the target"
+  );
+  let lifecycle: Vec<LifecycleEvent<u64, u64>> = handle.lifecycle().try_iter().collect();
+  assert!(
+    lifecycle
+      .iter()
+      .any(|ev| matches!(ev, LifecycleEvent::Poisoned { group: 1 })),
+    "the poison latched in service surfaces in the resolving crank itself: {lifecycle:?}"
+  );
+}
+
 /// The ID-ORDER red-proof for the plane-wide pre-serve phase.
 ///
 /// `a_pre_serve_completion_panic_skips_the_serve_and_fail_stops_the_plane` parks the panicking decline on

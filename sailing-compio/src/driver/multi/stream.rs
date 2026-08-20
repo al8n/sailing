@@ -742,6 +742,24 @@ where
         }
       }
     }
+    // `service_merge_applies` can latch a fail-stop with NO resolution and NO staged storage
+    // work — an owed adopt capture faulting, a committed-corrupt decode in the resolver — and
+    // this crank's earlier drain already ran, so without a second drain an otherwise idle
+    // plane would sit on the queued poison until an unrelated wake. Same best-effort tail
+    // semantics as the pre-storage drain; the hold signal drains here too for the same reason.
+    while let Some(group) = self.coord.poll_poisoned() {
+      let _ = self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::Poisoned { group });
+    }
+    while let Some(blocked) = self.coord.poll_merge_blocked() {
+      let _ = self.lifecycle_tx.try_send(LifecycleEvent::MergeBlocked {
+        target: blocked.target,
+        source: blocked.source,
+        boundary: blocked.boundary,
+        cause: blocked.cause,
+      });
+    }
     // Completions drained above can STAGE follow-up writes (a commit's HardState write submitted
     // by the core's storage tail) that stay invisible to has_pending until the next barrier — so
     // the re-arm predicate is the engine's own staged-work signal, measured AFTER the drains: it
