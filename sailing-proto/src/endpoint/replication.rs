@@ -1322,8 +1322,10 @@ where
     // forged coordinate whose debt could never become eligible and would only pin the group
     // awake until expiry.
     if stuck != Index::ZERO && stuck <= self.commit && self.tracker.progress(&from).is_some() {
+      // Mint only: EVERY send goes through the sweep's rotating scheduler, so receipt order
+      // cannot jump the queue — a lossy peer re-advertising each beat would otherwise take the
+      // global gate's token ahead of every waiting debt. First-offer latency is one tick.
       self.note_cure_debt(now, &from, stuck);
-      self.maybe_send_cure_snapshot(now, &from, stable);
     }
     if let Some(pr) = self.tracker.progress_mut(&from) {
       pr.clear_probe_pause();

@@ -451,6 +451,12 @@ pub enum MergeBlockedCause {
   /// Ordinarily transient — the source's own replication closes it — but a source left
   /// leaderless and under-hosted stays here.
   SourceBehind,
+  /// The park itself is locally unresolvable, but a committed `CommitMerge` ABOVE it names a
+  /// source hosted on this host: an adopting install would cross that entry without resolving
+  /// it, leaving the hosted replica a live-voting husk of an absorbed-away (or stale-no-op)
+  /// lineage — so the cure advertisement is withheld, outcome-blind and fail-closed, and the
+  /// park waits on the hosted replica's own lifecycle or the propagated terminal floor.
+  CrossedHostedSource,
   /// The union is absorbed and serving; its durability capture waits on a staged fork's
   /// durability barrier. The fork conflict's resolution is the exit.
   ForkFence,
@@ -3437,12 +3443,41 @@ where
       // exactly the host-local-proof clear the witness rules forbid). Every other verdict, and a
       // standing gate leg, clears it — the hint never outlives the shape that justified it, and
       // a parked replica applies nothing, so a clear gate leg cannot re-arm within the episode.
+      if w1_unresolvable
+        && let Some((tlog, _)) = stores.stores(&tgid)
+        && let Some(tep) = self.groups.get_mut(&tgid)
+      {
+        tep.advance_crossing_scan(&*tlog);
+      }
+      // The crossing leg is OUTCOME-BLIND by design: an adopt over a crossing whose source is
+      // hosted here would leave that replica a live-voting husk of a lineage the blob absorbed
+      // — or a stale no-op only the full apply machinery's lineage guard can classify, a
+      // re-derivation no scan can soundly make — so ANY hosted crossing withholds the hint and
+      // the park waits (its exit is the hosted replica's own lifecycle, or the propagated
+      // terminal floor). A decode failure withholds too: fail-closed.
+      let hosted_crossing = w1_unresolvable
+        && self.groups.get(&tgid).is_some_and(|t| {
+          t.crossing_sources().iter().any(|b| {
+            G::decode_exact(b.clone())
+              .map(|g| self.groups.contains_key(&g))
+              .unwrap_or(true)
+          })
+        });
       let advertise = w1_unresolvable
+        && !hosted_crossing
         && self
           .groups
           .get(&tgid)
           .is_some_and(|t| !t.fork_barrier_standing())
         && !self.obligation_names_hosted_frozen(&tgid);
+      if hosted_crossing {
+        self.note_merge_blocked(
+          &tgid,
+          &source,
+          boundary,
+          MergeBlockedCause::CrossedHostedSource,
+        );
+      }
       if let Some(tep) = self.groups.get_mut(&tgid) {
         tep.note_merge_park_unresolvable(advertise);
       }
@@ -3624,76 +3659,6 @@ where
             });
           }
         }
-      }
-    }
-    // THE CROSSED-SOURCE RETIRE PASS: an install that superseded (or adopted over) parked and
-    // skipped CommitMerge entries recorded their sources; the blob embedded every such fold, so
-    // a hosted replica of one of those lineages at-or-below its recorded generation is a
-    // live-voting husk of an absorbed-away group. Retire it on the install's own evidence — the
-    // sender's durable blob is the cluster-level durability proof, so no local store copy is
-    // load-bearing — exactly the `Retired` contract ("its target caught up via a snapshot
-    // install and never parked here"), which until now had only the propagated-floor trigger.
-    // Left standing, quorum-many such husks re-elect and the dead-target self-thaw resurrects
-    // absorbed state once the target itself later dissolves. A recreation ABOVE the recorded
-    // generation is a different incarnation and is untouched; a husk still named by another
-    // live park, or owing a drivable thaw, holds for the machinery that owns it.
-    let crossed_hosts: Vec<G> = self
-      .groups
-      .iter()
-      .filter(|(_, ep)| ep.has_crossed_sources())
-      .map(|(gid, _)| gid.cheap_clone())
-      .collect();
-    for host_gid in crossed_hosts {
-      let records = match self.groups.get_mut(&host_gid) {
-        Some(ep) => ep.take_crossed_sources(),
-        None => continue,
-      };
-      let mut retained: Vec<(Bytes, u64)> = Vec::new();
-      for (source_bytes, gen_after) in records {
-        let Ok(source) = G::decode_exact(source_bytes.clone()) else {
-          // The entry decoded when it was recorded; a failure here is the committed-corrupt
-          // class all the same.
-          if let Some(ep) = self.groups.get_mut(&host_gid) {
-            ep.poison(PoisonReason::MergeDecode);
-          }
-          self.note_if_poisoned(&host_gid);
-          continue;
-        };
-        // TERMINAL dispositions consume the record: unhosted (no husk, no vote — the floor
-        // path owns any stores) and a hosted incarnation ABOVE the recorded generation (a
-        // recreation, not this lineage). Everything else that refuses is a TRANSIENT owner —
-        // the candidate's own park or debt, another park or debt naming it, a drivable thaw it
-        // still owes, a poison awaiting restart — and dropping the record there would leave the
-        // absorbed husk its vote the moment the owner resolves; those RETAIN for the next
-        // crank. (A crash loses the retained records with the rest of the volatile state — the
-        // propagated terminal floor remains that narrow residual's exit.)
-        let Some(sep) = self.groups.get(&source) else {
-          continue;
-        };
-        if sep.shape_gen() > gen_after {
-          continue;
-        }
-        let transiently_owned = sep.is_poisoned()
-          || sep.pending_merge().is_some()
-          || sep.capture_debt().is_some()
-          || self.park_names_source(&source)
-          || self.debt_names(&source)
-          || self.owes_a_drivable_thaw(&source);
-        if transiently_owned {
-          retained.push((source_bytes, gen_after));
-          continue;
-        }
-        if self.remove_group_inner(&source).is_some() {
-          self.mark_dirty(&source);
-          resolutions.push(MergeResolution::Retired {
-            source: source.cheap_clone(),
-          });
-        }
-      }
-      if !retained.is_empty()
-        && let Some(ep) = self.groups.get_mut(&host_gid)
-      {
-        ep.requeue_crossed_sources(retained);
       }
     }
     // THE MERGE-ABORT THAW PASS: drive every hosted target's durable `abandoned` obligations to

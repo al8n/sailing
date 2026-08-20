@@ -3114,6 +3114,13 @@ fn an_advertised_park_mints_a_cure_debt_and_offers_the_covering_blob() {
     ),
   );
   assert!(ep.has_cure_debts(), "the advertisement is the mint");
+  // Every send rides the sweep's scheduler; the first offer lands on the next leader tick.
+  while ep.poll_message().is_some() {}
+  ep.handle_timeout(
+    d + core::time::Duration::from_millis(150),
+    &mut log,
+    &mut stable,
+  );
   let mut offers = 0;
   let mut boundary = Index::ZERO;
   while let Some(out) = ep.poll_message() {
@@ -3122,7 +3129,10 @@ fn an_advertised_park_mints_a_cure_debt_and_offers_the_covering_blob() {
       boundary = is.snapshot().last_index();
     }
   }
-  assert_eq!(offers, 1, "the receipt answers immediately when eligible");
+  assert_eq!(
+    offers, 1,
+    "the sweep offers once eligible, one tick after the mint"
+  );
   assert!(
     boundary >= Index::new(3),
     "the blob covers the advertised park"
@@ -3142,6 +3152,11 @@ fn an_advertised_park_mints_a_cure_debt_and_offers_the_covering_blob() {
       HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
         .with_stuck_boundary(Index::new(3)),
     ),
+  );
+  ep.handle_timeout(
+    d + core::time::Duration::from_millis(300),
+    &mut log,
+    &mut stable,
   );
   let mut resent = 0;
   while let Some(out) = ep.poll_message() {
@@ -3564,6 +3579,11 @@ fn a_rotating_advertiser_population_is_globally_rate_bounded() {
       ),
     );
   }
+  ep.handle_timeout(
+    d + core::time::Duration::from_millis(150),
+    &mut log,
+    &mut stable,
+  );
   let mut blobs = 0;
   while let Some(out) = ep.poll_message() {
     if matches!(out.message(), Message::InstallSnapshot(_)) {
@@ -3573,5 +3593,39 @@ fn a_rotating_advertiser_population_is_globally_rate_bounded() {
   assert_eq!(
     blobs, 1,
     "one blob per half election timeout, whatever the advertiser population does"
+  );
+
+  // Sustained churn is starvation-free: every continuously advertising peer is EVENTUALLY
+  // offered a cure — the immutable admission order keys eviction, the cursor rotates service,
+  // and every send goes through the scheduler, so no advertisement pattern can monopolize the
+  // global gate.
+  let mut served: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+  let mut now_ms: u64 = 1000;
+  for _ in 0..600u32 {
+    now_ms += 500;
+    let t = Instant::ORIGIN + core::time::Duration::from_millis(now_ms);
+    for peer in 2..=70u64 {
+      ep.handle_message(
+        t,
+        &mut log,
+        &mut stable,
+        peer,
+        Message::HeartbeatResponse(
+          HeartbeatResponse::new(Term::new(1), peer, bytes::Bytes::new())
+            .with_stuck_boundary(Index::new(2)),
+        ),
+      );
+    }
+    ep.handle_timeout(t, &mut log, &mut stable);
+    while let Some(out) = ep.poll_message() {
+      if matches!(out.message(), Message::InstallSnapshot(_)) {
+        served.insert(out.to());
+      }
+    }
+  }
+  assert_eq!(
+    served.len(),
+    69,
+    "every advertiser is served under sustained over-cap churn: {served:?}"
   );
 }
