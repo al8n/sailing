@@ -939,6 +939,25 @@ where
     })
   }
 
+  /// A gid was just admitted (create / restore / fork): any hosted target whose park names it
+  /// as the absorbed source is no longer locally unresolvable — the fold the hint declared
+  /// impossible is now merely pending catch-up — so the advertisement must stop BEFORE the next
+  /// resolver crank re-derives it. The gap this closes is admission-to-receipt: a cure blob
+  /// dispatched in the same iteration would otherwise adopt against the previous crank's hint
+  /// and clear a park over the freshly admitted source, stranding it as an orphan husk at a
+  /// non-terminal floor. The placement recovery the blocked-park signal invites stays safe
+  /// exactly because of this clear.
+  fn clear_unresolvable_hints_naming(&mut self, gid: &G) {
+    let mut key = Vec::new();
+    gid.encode(&mut key);
+    let key = Bytes::from(key);
+    for ep in self.groups.values_mut() {
+      if ep.pending_merge().is_some_and(|p| p.source_bytes() == key) {
+        ep.note_merge_park_unresolvable(false);
+      }
+    }
+  }
+
   /// Whether any hosted target's outstanding capture debt names `gid` as its absorbed source —
   /// the debt-window naming the lifecycle surfaces consult: the id's preserved stores are the
   /// absorbed union's only restart derivation until the discharge, so nothing may re-host,
@@ -1644,6 +1663,7 @@ where
     // same-uptime incarnation must not shadow this admission) — at the ADMITTED generation,
     // exactly where the endpoint's own counter starts.
     self.lineage.insert(gid.cheap_clone(), generation);
+    self.clear_unresolvable_hints_naming(&gid);
     self.groups.insert(gid, ep);
     Ok(())
   }
@@ -1694,6 +1714,7 @@ where
     self
       .lineage
       .insert(gid.cheap_clone(), ep.restored_lineage());
+    self.clear_unresolvable_hints_naming(&gid);
     self.groups.insert(gid.cheap_clone(), ep);
     // The dirty marks cover the replayed forks (message/event replay is deliberately cleared by
     // `Endpoint::restart`, so those two queues mark empty).
@@ -1744,6 +1765,7 @@ where
     self
       .lineage
       .insert(gid.cheap_clone(), ep.restored_lineage());
+    self.clear_unresolvable_hints_naming(&gid);
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -1839,6 +1861,7 @@ where
     self
       .lineage
       .insert(gid.cheap_clone(), ep.restored_lineage());
+    self.clear_unresolvable_hints_naming(&gid);
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -1877,6 +1900,7 @@ where
     let mut ep = Endpoint::new_with_rng(config, now, rng, fsm);
     ep.seed_lineage(generation);
     self.lineage.insert(gid.cheap_clone(), generation);
+    self.clear_unresolvable_hints_naming(&gid);
     self.groups.insert(gid, ep);
     Ok(())
   }
@@ -1912,6 +1936,7 @@ where
     self
       .lineage
       .insert(gid.cheap_clone(), ep.restored_lineage());
+    self.clear_unresolvable_hints_naming(&gid);
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -1958,6 +1983,7 @@ where
     self
       .lineage
       .insert(gid.cheap_clone(), ep.restored_lineage());
+    self.clear_unresolvable_hints_naming(&gid);
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -2008,6 +2034,7 @@ where
     self
       .lineage
       .insert(gid.cheap_clone(), ep.restored_lineage());
+    self.clear_unresolvable_hints_naming(&gid);
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -3542,12 +3569,17 @@ where
               && let Some(tep) = self.groups.get_mut(&tgid)
             {
               tep.mint_capture_debt(m);
+              self.mark_dirty(&tgid);
+              // The resolution rides ONLY the minted debt: an `Absorbed` with no debt behind it
+              // would be a permanent orphan carrying none of the lifecycle fences.
+              resolutions.push(MergeResolution::Absorbed {
+                source,
+                target: tgid,
+              });
+            } else {
+              debug_assert!(false, "a defer without a foldable park");
+              self.mark_dirty(&tgid);
             }
-            self.mark_dirty(&tgid);
-            resolutions.push(MergeResolution::Absorbed {
-              source,
-              target: tgid,
-            });
             continue;
           }
           // The absorb happened in memory; the union is durable ONLY once the forced capture
@@ -3785,8 +3817,9 @@ where
     // log-matched, even quorum-many, T replicas — fires ONLY where the resolver classified the park
     // locally unresolvable, whose defining condition is that NO S replica is hosted there at all. So
     // no skip, of either shape, ever adds a surviving S husk (a vote) to the success world's S
-    // electorate; the hosts whose S replicas survive un-consumed are exactly those that resolved
-    // locally, and their husks dissolve off the propagated terminal floor (`Retired`). S's voter set
+    // electorate; the hosts whose S replicas survive un-consumed are exactly those where the
+    // absorb is still locally pending or locally impossible-by-hosting, and their husks retire
+    // off the propagated terminal floor once it arrives. S's voter set
     // is FROZEN-TIME-FIXED (a frozen source refuses conf changes), dissolved T replicas are
     // tombstoned NON-voters, and this mint is LEADER-only. Therefore in the success world an S
     // leader can never even APPEND this thaw (the surviving-husk electorate cannot elect), let
@@ -3853,7 +3886,10 @@ where
     let debtors: Vec<G> = self
       .groups
       .iter()
-      .filter(|(_, ep)| ep.capture_debt().is_some())
+      // A poisoned debtor already surfaced its CaptureFailed during the faulting attempt;
+      // re-entering every crank would re-emit it unboundedly and busy-spin the plane. The debt
+      // stays minted so its lifecycle fences keep holding.
+      .filter(|(_, ep)| ep.capture_debt().is_some() && !ep.is_poisoned())
       .map(|(gid, _)| gid.cheap_clone())
       .collect();
     for tgid in debtors {
@@ -3881,12 +3917,20 @@ where
         // CommitMerge, so a crash then loses the volatile debt with no re-park left).
         || tep.durable_snapshot_covers(boundary);
       if !already_staged {
-        if tep.capture_blocked_at(boundary) {
+        // The fence is keyed at the CAPTURE POINT — current `applied`, where the forced capture
+        // stamps and its compaction lands — never the absorb boundary: the debt window is
+        // embedder-timescale, and a Split or a target-role abort applied INSIDE it sits above
+        // the boundary, invisible to a boundary-keyed leg, while the compaction at `applied`
+        // would erase exactly the replay entry that fence exists to keep. The boundary stays
+        // the COVERAGE key (the staged/durable producers above) — coverage is monotone; the
+        // fence is not.
+        let capture_at = tep.applied_index();
+        if tep.capture_blocked_at(capture_at) {
           // The debt window's own signal: post-defer the group LOOKS healthy — unparked,
           // committing, serving the union — while its conf changes are fenced and the consumed
           // source's id stays un-reusable. Name the fence that is standing, or nothing at all
           // when only a transient is (it drains within cranks).
-          if let Some(fence) = tep.capture_fence_at(boundary) {
+          if let Some(fence) = tep.capture_fence_at(capture_at) {
             let cause = match fence {
               crate::endpoint::CaptureFence::Frozen => MergeBlockedCause::Frozen,
               crate::endpoint::CaptureFence::Fork => MergeBlockedCause::ForkFence,

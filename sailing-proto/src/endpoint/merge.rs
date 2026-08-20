@@ -649,7 +649,7 @@ where
 
   /// Whether a TARGET capture/compaction at `boundary` is REFUSED right now — the ONE busy/fence
   /// set every capture producer shares (`maybe_snapshot` at `applied`, the forced absorb capture
-  /// at the absorb boundary via [`absorb_capture_blocked`](Self::absorb_capture_blocked)), so no
+  /// at the absorb boundary via [`absorb_capture_block`](Self::absorb_capture_block) (the caller classified the fence and reached `Clear`)), so no
   /// site can drift from the others. The legs:
   ///
   /// - a capture or install is already STAGED (`pending_compact`/`pending_install`) — firing
@@ -728,22 +728,38 @@ where
     let Some(pending) = self.merge.pending_apply.as_ref() else {
       return AbsorbCaptureBlock::Clear;
     };
-    if self.snapshot.pending_compact.is_some()
+    // ONE debt at a time is a HOST-LOCAL invariant: the propose-time reshape gates run on the
+    // proposing leader, whose own fences may be clear while THIS host's still stand — so a
+    // second committed absorb can legally park here mid-window, and deferring it would
+    // overwrite the first debt's held `Merged`, stranding that source's stores forever. Hold
+    // the park instead: the discharge is independent of it and releases it on its own crank.
+    if self.merge.capture_debt.is_some() {
+      return AbsorbCaptureBlock::Hold;
+    }
+    let verdict = if self.snapshot.pending_compact.is_some()
       || self.snapshot.pending_install.is_some()
       || self.merge_freeze_active()
     {
-      return AbsorbCaptureBlock::Hold;
-    }
-    if self
+      AbsorbCaptureBlock::Hold
+    } else if self
       .split
       .outstanding
       .first()
       .is_some_and(|cap| *cap <= pending.at())
       || self.abort_relay_fences(pending.at())
     {
-      return AbsorbCaptureBlock::Defer;
-    }
-    AbsorbCaptureBlock::Clear
+      AbsorbCaptureBlock::Defer
+    } else {
+      AbsorbCaptureBlock::Clear
+    };
+    // The two predicates must never drift: Clear here has to mean exactly "the shared fence set
+    // is clear at the absorb boundary" — a leg added to one and not the other would fire a
+    // blocked capture.
+    debug_assert!(
+      (verdict == AbsorbCaptureBlock::Clear) == !self.capture_blocked_at(pending.at()),
+      "absorb_capture_block drifted from capture_blocked_at"
+    );
+    verdict
   }
 
   /// Whether any merge-cure debt stands — the drivers' quiesce-eligibility leg: a wedged peer is
@@ -772,6 +788,9 @@ where
     self.durable.durable_snapshot_index >= boundary
   }
 
+  /// The staged (submitted, not yet durability-completed) capture's boundary, if one is in
+  /// flight — the debt pass adopts a staged capture at-or-past the absorb boundary as the
+  /// debt's own discharge (boundary coverage is monotone in `applied`).
   pub(crate) fn pending_compact_boundary(&self) -> Option<Index> {
     self
       .snapshot

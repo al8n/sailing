@@ -1317,7 +1317,11 @@ where
     // Mint (or refresh) the debt and answer immediately when eligible; the sweep re-drives the
     // rest. Untracked senders fall to the courtesy machinery's turf.
     let stuck = response.stuck_boundary();
-    if stuck != Index::ZERO && self.tracker.progress(&from).is_some() {
+    // The plausibility leg is defence-in-depth, not trust: a committed park boundary is by
+    // definition at-or-below this leader's commit, so anything above it is a mis-encoded or
+    // forged coordinate whose debt could never become eligible and would only pin the group
+    // awake until expiry.
+    if stuck != Index::ZERO && stuck <= self.commit && self.tracker.progress(&from).is_some() {
       self.note_cure_debt(now, &from, stuck);
       self.maybe_send_cure_snapshot(now, &from, stable);
     }
