@@ -27,7 +27,7 @@ mod split;
 mod transfer;
 
 pub use merge::PendingMergeApply;
-pub(crate) use merge::{AbsorbCaptureBlock, MergeWindow};
+pub(crate) use merge::{AbsorbCaptureBlock, CaptureFence, MergeWindow};
 
 /// The max ENTRY COUNT a single committed-range read requests (apply, replication, the restart scans).
 /// The store's byte cap is PAYLOAD-only, so a backlog of zero-payload entries (no-ops, empty/conf) would

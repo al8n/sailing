@@ -680,6 +680,17 @@ where
         .lifecycle_tx
         .try_send(LifecycleEvent::Poisoned { group });
     }
+    // A structurally held merge surfaces on the same best-effort tail, once per transition of
+    // its cause. A full tail drops the observation and nothing stalls: the container re-derives
+    // the hold every crank and its resolution never depended on this being read.
+    while let Some(blocked) = self.coord.poll_merge_blocked() {
+      let _ = self.lifecycle_tx.try_send(LifecycleEvent::MergeBlocked {
+        target: blocked.target,
+        source: blocked.source,
+        boundary: blocked.boundary,
+        cause: blocked.cause,
+      });
+    }
   }
 
   fn storage_crank(&mut self, now: Now) {
@@ -1886,8 +1897,10 @@ where
     while let Some((g, ctrl)) = self.coord.poll_group_control() {
       match ctrl {
         GroupControl::Quiesce => {
-          // A loss in this pass supersedes a Quiesce queued before it was known.
-          if !self.link_lost_in_pass {
+          // A loss in this pass supersedes a Quiesce queued before it was known — and so does
+          // standing merge-cure work, whose only carrier is the tick this entry would silence
+          // (see [`Self::owes_merge_cure_ticks`]).
+          if !self.link_lost_in_pass && !self.owes_merge_cure_ticks(&g) {
             self.quiesced.insert(g);
           }
         }
@@ -2119,6 +2132,25 @@ where
   /// dispatch-based activity clock would never expire; every consensus-visible advance (an
   /// election, an append, a commit, an apply) moves the tuple, and client commands reset the
   /// clock directly ([`Self::wake_group`]).
+  /// Whether `g` carries merge-cure work whose ONLY carrier is the slow tick.
+  ///
+  /// THE CARRIER ARGUMENT. A wedged park's boundary advertisement rides `handle_timeout`
+  /// (`drive_stuck_advertisement`, one unsolicited response per election timeout), the leader's
+  /// cure and capture-debt sweeps ride the same beat, and a quiesced group's deadlines are
+  /// EXCLUDED from the armed fold and skipped in the due sweep. So a group admitted to the
+  /// quiesced set while any of these stand loses the exact cadence that would end them, until
+  /// unrelated traffic happens to wake it — and the wedge is precisely the state in which no such
+  /// traffic is coming.
+  ///
+  /// [`group_idle`] already refuses the LEADER side of all three. This covers the FOLLOWER-side
+  /// entry, which is driven by the leader's flagged beat and gated by no eligibility check of
+  /// ours — and a follower is where the advertisement lives, the leader being its consumer.
+  fn owes_merge_cure_ticks(&self, g: &G) -> bool {
+    self.coord.group(g).is_some_and(|ep| {
+      ep.merge_park_unresolvable().is_some() || ep.capture_debt().is_some() || ep.has_cure_debts()
+    })
+  }
+
   fn quiesce_sweep(&mut self) {
     let now_std = std::time::Instant::now();
     let stamped: Vec<G> = self
@@ -2155,6 +2187,15 @@ where
         };
       }
       let idle_since = entry.at;
+      // EVICT, not merely refuse: the resolver's unresolvable classification is re-derived every
+      // crank and can first hold on a crank AFTER the group entered the quiesced set, so the
+      // entry gate alone would leave the group silent with the hint standing.
+      if self.owes_merge_cure_ticks(g) {
+        if self.quiesced.contains(g) || self.quiesce_pending.contains(g) {
+          self.wake_group(g);
+        }
+        continue;
+      }
       if self.quiesced.contains(g) || self.quiesce_pending.contains(g) {
         continue;
       }
