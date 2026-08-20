@@ -831,18 +831,14 @@ where
   /// public gate's participant refusals (a frozen source, a park naming it) all describe the very
   /// in-flight merge and would wedge the absorb they exist to protect.
   fn remove_group_inner(&mut self, gid: &G) -> Option<Endpoint<I, F, R>> {
-    // No caller may consume a target still owing its absorb capture: the debt's `Merged` is the
-    // only path that floors and tears down the prior source, so dropping the holder here strands
-    // that source's stores as an unreachable orphan. Today this holds by the call graph (the
-    // resolve arm removes SOURCES, the husk dissolve removes FROZEN sources, and the reshape
-    // gates refuse a debt-holder both roles) — the assert turns the accident into a contract.
-    debug_assert!(
-      self
-        .groups
-        .get(gid)
-        .is_none_or(|ep| ep.capture_debt().is_none()),
-      "an inner teardown consumed a target with an outstanding capture debt"
-    );
+    // A consumed endpoint's outstanding capture debt is the CALLER's to surface: the public
+    // remove refuses it (`OwesCapture`), and the two resolver teardowns — the Resolve arm and
+    // the husk dissolve — inherit it into their own resolutions, discharging it on the same
+    // barrier that covers the consumed state machine (which has carried the prior union since
+    // that absorb applied). The debt is HOST-LOCAL, so a foreign-led merge can legally deliver
+    // a debt-holder here for consumption; dropping the record instead would strand the prior
+    // source's preserved stores as a restorable orphan beside state already transitively
+    // absorbed.
     // A parked PARENT's staged forks die with its endpoint (removal is the embedder's explicit
     // destruction of this replica), so the park bookkeeping — a still-queued conflict signal
     // included — dies too. Removing a parked fork's CHILD needs nothing here: the next relay
@@ -3643,6 +3639,42 @@ where
           if self.owes_a_drivable_thaw(&source) {
             continue;
           }
+          // THE INHERITED-DEBT LEG. A capture debt is HOST-LOCAL — this replica's fences
+          // deferred the capture while siblings captured cleanly — so a foreign-led freeze can
+          // legally commit this source's consumption while its debt still stands HERE: the
+          // propose-time `AlreadyPending` refusal ran on a debt-less replica. Consuming the
+          // holder would drop the held `Merged`, the ONLY permission that terminally floors the
+          // earlier absorbed source, stranding those preserved stores restorable beside state
+          // already transitively absorbed. Nor can the debt discharge in place: a merge source
+          // is FROZEN, and a frozen endpoint never captures. It discharges INTO THIS ABSORB's
+          // own barrier instead — the forced capture covers the source's state machine, which
+          // has carried the earlier union since that absorb applied — and that demands the
+          // one-crank arm: hold the park unless the fence classification is `Clear` (a `Defer`
+          // would preserve the source's stores yet surface nothing for the inherited debt; its
+          // fences lift within cranks). A committed-corrupt debt source id fail-stops the
+          // holder — the resolver's uniform decode rule.
+          let inherited_debt_source = match self
+            .groups
+            .get(&source)
+            .and_then(|sep| sep.capture_debt().map(|m| m.source()))
+          {
+            Some(bytes) => match G::decode_exact(bytes) {
+              Ok(prior) => Some(prior),
+              Err(_) => {
+                if let Some(sep) = self.groups.get_mut(&source) {
+                  sep.poison(PoisonReason::MergeDecode);
+                }
+                self.note_if_poisoned(&source);
+                self.mark_dirty(&source);
+                continue;
+              }
+            },
+            None => None,
+          };
+          if inherited_debt_source.is_some() && block != crate::endpoint::AbsorbCaptureBlock::Clear
+          {
+            continue;
+          }
           // The β hold above proved the source owes no thaw; this absorb IS the merge resolving, so
           // it dissolves the source through the UNGATED inner teardown. The public gate's participant
           // refusals — the source is `Frozen`, and this target's own park names it (`SpokenFor`) —
@@ -3683,6 +3715,10 @@ where
             continue;
           }
           if block == crate::endpoint::AbsorbCaptureBlock::Defer {
+            debug_assert!(
+              inherited_debt_source.is_none(),
+              "a deferred absorb never consumes a debt-holding source"
+            );
             // A replay fence deferred the capture: the union lives in memory and the CONSUMED
             // source's intact stores remain its only restart derivation, so surface `Absorbed`
             // — the driver fails the source's stranded routing but PRESERVES its stores and
@@ -3737,14 +3773,26 @@ where
             }
             resolutions.push(MergeResolution::Merged {
               source,
-              target: tgid,
+              target: tgid.cheap_clone(),
             });
+            if let Some(prior) = inherited_debt_source {
+              // The consumed source's inherited debt discharges into the SAME staged barrier:
+              // the capture covers the source's state machine, which has carried the prior
+              // union since that absorb applied. Resolution only — the holder that would have
+              // carried the app-visible event is consumed (the `Retired` asymmetry).
+              resolutions.push(MergeResolution::Merged {
+                source: prior,
+                target: tgid,
+              });
+            }
           } else {
             // The capture faulted (or the stores vanished): the target is POISONED and no union
             // teardown is safe. The source endpoint is already CONSUMED, so its parked routing is
             // stranded — emit `CaptureFailed` so the driver fails those callers typed while
             // PRESERVING the source's stores and floor, and a restart re-parks against the restored
-            // source rather than losing the union behind a floored, torn-down source.
+            // source rather than losing the union behind a floored, torn-down source. An
+            // inherited debt record dies un-surfaced here, and soundly: the preserved source
+            // stores replay their own CommitMerge on restart and re-derive it.
             self.note_if_poisoned(&tgid);
             resolutions.push(MergeResolution::CaptureFailed {
               source,
@@ -3921,11 +3969,40 @@ where
       if self.owes_a_drivable_thaw(&gid) {
         continue;
       }
+      // THE INHERITED-DEBT LEG (the Resolve arm's, for the husk): the debt is HOST-LOCAL, so a
+      // foreign-led freeze can husk a debtor here while the replicas that captured cleanly never
+      // owed. Retiring would drop the held `Merged` — the earlier absorbed source's only
+      // terminal-floor permission — so it discharges into the SAME evidence this dissolve keys
+      // on: the propagated `MERGED_FLOOR` was co-barriered with the claimant's durable capture
+      // of this husk's state machine, which has carried the prior union since that absorb
+      // applied. (A claimant that itself deferred writes no terminal floor until its own debt
+      // discharges, so the floor gate serializes the chain by construction.) A committed-corrupt
+      // debt source id fail-stops the husk instead of retiring it.
+      let inherited_debt_source = match self.groups.get(&gid).and_then(|ep| ep.capture_debt()) {
+        Some(m) => match G::decode_exact(m.source()) {
+          Ok(prior) => Some(prior),
+          Err(_) => {
+            if let Some(ep) = self.groups.get_mut(&gid) {
+              ep.poison(PoisonReason::MergeDecode);
+            }
+            self.note_if_poisoned(&gid);
+            self.mark_dirty(&gid);
+            continue;
+          }
+        },
+        None => None,
+      };
       // Dissolve through the UNGATED inner teardown (the public gate's `Frozen`/`Claimed` refusals all
       // describe this very dead lineage). The driver folds the SAME source half as `Merged` MINUS the
       // capture — the co-barriered terminal-floor re-write keeps a crash from re-admitting the id.
       if self.remove_group_inner(&gid).is_some() {
         self.mark_dirty(&gid);
+        if let Some(prior) = inherited_debt_source {
+          resolutions.push(MergeResolution::Merged {
+            source: prior,
+            target: gid.cheap_clone(),
+          });
+        }
         resolutions.push(MergeResolution::Retired { source: gid });
       }
     }
