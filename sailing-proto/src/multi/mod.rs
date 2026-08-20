@@ -591,7 +591,7 @@ where
   /// crank. An entry lives exactly as long as the target's park or capture debt does (dropped at
   /// the top of the next [`service_merge_applies`](Self::service_merge_applies) once neither
   /// stands, and at removal), so a target that gets held again later signals afresh.
-  merge_blocked_seen: BTreeMap<G, MergeBlockedCause>,
+  merge_blocked_seen: BTreeMap<G, (MergeBlockedCause, G, Index)>,
   /// Pending structural-hold observations, drained by
   /// [`poll_merge_blocked`](Self::poll_merge_blocked). Best-effort like the poison tail: the
   /// container's own re-derivation, not this queue, is what keeps the hold resolving, so a
@@ -857,6 +857,9 @@ where
     // nothing, and a source that is gone is not the hold anyone can act on. Clearing the edge lets
     // a re-admitted id that gets held again signal afresh.
     self.merge_blocked_seen.remove(gid);
+    // A remembered observation NAMING the removed gid clears too, so the successor cause (the
+    // next hosted crossing, the underlying unhosted source) can signal afresh.
+    self.merge_blocked_seen.retain(|_, (_, src, _)| src != gid);
     self
       .merge_blocked
       .retain(|b| &b.target != gid && &b.source != gid);
@@ -941,7 +944,11 @@ where
       G::decode_exact(sb)
         .ok()
         .and_then(|source| self.groups.get(&source))
-        .is_some_and(Endpoint::is_frozen)
+        // The full freeze-active predicate, PENDING included: the thaw path deliberately
+        // preserves an obligation while its hosted source is still freeze-pending, and an
+        // adopt's boundary clear would erase that live obligation exactly as it would a
+        // frozen one's.
+        .is_some_and(Endpoint::merge_freeze_active)
     })
   }
 
@@ -958,11 +965,17 @@ where
     gid.encode(&mut key);
     let key = Bytes::from(key);
     for ep in self.groups.values_mut() {
-      // BOTH namings clear: a park whose own source just got a host is merely pending
-      // catch-up, and a park whose CROSSING set names the admitted gid must stop advertising
-      // before a same-iteration cure delivery adopts across a now-hosted crossing.
+      // EVERY naming clears: a park whose own source just got a host is merely pending
+      // catch-up; a park whose CROSSING set names the admitted gid must stop advertising
+      // before a same-iteration cure delivery adopts across a now-hosted crossing; and a park
+      // whose ABANDONED obligations name it must re-gate against the restored counterparty's
+      // freeze state before an adopt's boundary clear could erase a live obligation.
       if ep.pending_merge().is_some_and(|p| p.source_bytes() == key)
         || ep.crossing_sources().contains(&key)
+        || ep
+          .abandoned_obligations()
+          .into_iter()
+          .any(|(sb, _, _)| sb == key)
       {
         ep.note_merge_park_unresolvable(false);
       }
@@ -1587,10 +1600,16 @@ where
     boundary: Index,
     cause: MergeBlockedCause,
   ) {
-    if self.merge_blocked_seen.get(target) == Some(&cause) {
+    // The FULL observation identity dedups — cause, named source, and boundary — never the
+    // cause alone: with hosted crossings A then B, removing A must let B's observation through,
+    // or the placement layer holds a wedge with no actionable identity for it.
+    let observation = (cause, source.cheap_clone(), boundary);
+    if self.merge_blocked_seen.get(target) == Some(&observation) {
       return;
     }
-    self.merge_blocked_seen.insert(target.cheap_clone(), cause);
+    self
+      .merge_blocked_seen
+      .insert(target.cheap_clone(), observation);
     self.merge_blocked.push_back(MergeBlocked {
       target: target.cheap_clone(),
       source: source.cheap_clone(),

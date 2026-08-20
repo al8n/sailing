@@ -871,8 +871,16 @@ where
         .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
       let chunk = match log.entries(idx..read_end, 1 << 20) {
         Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
-        _ => {
+        // Benign transient unreadiness: the walk stays partial and retries next crank.
+        Ok(_) => {
           self.merge.crossing_scan_current = false;
+          return;
+        }
+        // A genuine store fault in committed content the parked drain can never reach to
+        // poison itself — surface it here or nowhere.
+        Err(_) => {
+          self.merge.crossing_scan_current = false;
+          self.poison(PoisonReason::LogRead);
           return;
         }
       };
@@ -903,6 +911,25 @@ where
   /// hint's completeness leg.
   pub(crate) fn crossing_scan_current(&self) -> bool {
     self.merge.crossing_scan_current && !self.merge.crossing_decode_failed
+  }
+
+  /// Whether the crossing walk has EXAMINED every entry through `boundary` — the adopt's
+  /// admission bind. The commit index is not the right key: a delivery can raise commit between
+  /// resolver cranks, and a duplicate arriving before the next crank would then pass a
+  /// commit-keyed gate while the walk still stops at the older frontier — adopting across an
+  /// interval never examined. The watermark moves only when the walk itself moves.
+  pub(crate) fn crossing_walk_covers(&self, boundary: Index) -> bool {
+    self.crossing_scan_current()
+      && boundary
+        <= self.merge.crossing_scan_upto.max(
+          // A pristine park (no entries above it yet examined because none exist below the
+          // frontier) covers exactly the park coordinate itself.
+          self
+            .merge
+            .pending_apply
+            .as_ref()
+            .map_or(Index::ZERO, PendingMergeApply::at),
+        )
   }
 
   /// The committed crossings recorded so far (see [`MergeState::crossing_sources`]).
