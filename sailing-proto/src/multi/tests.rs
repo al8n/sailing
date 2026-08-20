@@ -11115,3 +11115,153 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
     "converged to the same union"
   );
 }
+
+/// An under-hosted park on a single-node host, with the `k+1` coordinate committed so the abort
+/// window is closed and the resolver reaches the source lookup. The source (42) is unhosted at a
+/// non-terminal floor — the locally-unresolvable shape.
+fn under_hosted_park_host() -> (MultiRaft<u64, u64, SplitSm>, MapStores) {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+  (m, stores)
+}
+
+/// The structural-hold signal is EDGE-triggered: an under-hosted park names its cause ONCE and
+/// then stays silent however many cranks re-derive it, and a genuine change of cause — the source
+/// arriving, still below its freeze generation — signals exactly once more.
+#[test]
+fn a_structurally_held_park_signals_its_cause_once_per_transition() {
+  use crate::{MergeBlocked, MergeBlockedCause};
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = under_hosted_park_host();
+
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.poll_merge_blocked(),
+    Some(MergeBlocked {
+      target: 1,
+      source: 42,
+      boundary: Index::new(2),
+      cause: MergeBlockedCause::SourceUnhosted,
+    }),
+    "the hold names its cause and the park's own coordinate"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "one signal, not one per crank"
+  );
+
+  for _ in 0..5 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  }
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the edge holds for as long as the cause does"
+  );
+
+  // Hosting the source changes what is holding the park: the union is materializable here in
+  // principle now, just not yet folded. A different cause is a fresh transition.
+  m.create_group(42, 0, single_node_cfg(1), now, 9, SplitSm::default())
+    .unwrap();
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.poll_merge_blocked(),
+    Some(MergeBlocked {
+      target: 1,
+      source: 42,
+      boundary: Index::new(2),
+      cause: MergeBlockedCause::SourceBehind,
+    })
+  );
+  for _ in 0..3 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  }
+  assert_eq!(m.poll_merge_blocked(), None, "and then silence again");
+}
+
+/// Resolution RETIRES the edge rather than remembering it: the cure blob adopts in place of the
+/// fold, the next crank drops the target's remembered cause, and nothing stale is left queued —
+/// so a later hold on the same target signals afresh instead of being deduped forever.
+#[test]
+fn a_resolved_park_retires_its_blocked_edge() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = under_hosted_park_host();
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert!(m.poll_merge_blocked().is_some(), "held, and signalled");
+
+  let meta = crate::SnapshotMeta::new(
+    Index::new(3),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta,
+        fork_blob(5),
+      )),
+    )
+    .unwrap();
+  }
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_none(),
+    "the adopt cleared the park"
+  );
+  let _ = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "a resolved hold signals nothing further"
+  );
+  assert!(
+    m.merge_blocked_seen.is_empty(),
+    "the edge is retired with the hold that justified it"
+  );
+}

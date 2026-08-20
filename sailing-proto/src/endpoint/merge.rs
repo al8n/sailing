@@ -103,6 +103,19 @@ pub(crate) enum AbsorbCaptureBlock {
   Defer,
 }
 
+/// The STRUCTURAL leg holding a target's capture — see [`Endpoint::capture_fence_at`]. Only the
+/// legs that stand on an embedder or protocol timescale are named; a transient staged
+/// capture/install has no variant, because it resolves on its own within cranks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CaptureFence {
+  /// A live merge freeze: this endpoint is itself a source, pinned by a claiming target.
+  Frozen,
+  /// A staged fork's durability barrier sits at-or-below the boundary.
+  Fork,
+  /// An undischarged abort obligation's entry sits at-or-below the boundary.
+  Abort,
+}
+
 /// The endpoint-resident merge state. One instance per endpoint, defaulted inert; every field is
 /// DERIVED from the log and re-derivable at restart (`freeze_pending` from the unapplied suffix,
 /// `frozen`/`freeze_index` from replaying the applied prefix, the park from re-encountering its
@@ -664,6 +677,30 @@ where
         .is_some_and(|cap| *cap <= boundary)
       || self.abort_relay_fences(boundary)
       || self.merge_freeze_active()
+  }
+
+  /// Which STRUCTURAL leg of [`capture_blocked_at`](Self::capture_blocked_at) stands at
+  /// `boundary` — the observability signal's cause, classified from the same predicate the gate
+  /// itself reads so the two cannot drift. The TRANSIENT legs deliberately have no variant: a
+  /// staged capture or install drains within cranks and is this endpoint's own business, so
+  /// `None` covers both "nothing blocks" and "only a transient does" and the caller signals
+  /// neither. Precedence mirrors [`absorb_capture_block`](Self::absorb_capture_block): the freeze
+  /// is a HOLD leg and outranks the two replay fences it can stand alongside.
+  pub(crate) fn capture_fence_at(&self, boundary: Index) -> Option<CaptureFence> {
+    if self.merge_freeze_active() {
+      Some(CaptureFence::Frozen)
+    } else if self
+      .split
+      .outstanding
+      .first()
+      .is_some_and(|cap| *cap <= boundary)
+    {
+      Some(CaptureFence::Fork)
+    } else if self.abort_relay_fences(boundary) {
+      Some(CaptureFence::Abort)
+    } else {
+      None
+    }
   }
 
   /// Whether the absorb's forced snapshot capture would be REFUSED right now — the shared

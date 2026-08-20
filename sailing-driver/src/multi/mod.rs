@@ -27,7 +27,7 @@ use futures_channel::oneshot;
 use futures_util::{FutureExt, future::Shared};
 use sailing_proto::{
   ConfChange, ConfChangeV2, Config, Data, Entry, Event, FailoverReadWindow, GroupId, Index,
-  ReadOnlyOption,
+  MergeBlockedCause, ReadOnlyOption,
 };
 
 use crate::{
@@ -423,6 +423,30 @@ pub enum LifecycleEvent<G, I> {
     source: G,
     /// The absorbing target group, now serving the union and owing its capture.
     target: G,
+  },
+  /// A committed merge is STANDING STILL on this host for a structural reason — see
+  /// [`MergeBlockedCause`] for the causes and their exits. Fired ONCE PER TRANSITION of a
+  /// target's cause, not once per crank.
+  ///
+  /// A pure observation: nothing is torn down, no action is required, and the container keeps
+  /// re-deriving the hold every crank whether or not this is consumed (so a full tail costs a
+  /// notification and nothing else). It exists because the held shapes are otherwise invisible
+  /// from outside — a parked target is not log-lagging and its apply stall is purely local, and a
+  /// target owing a deferred capture looks entirely healthy while its conf changes are fenced and
+  /// the consumed source's id stays un-reusable. Two causes are the placement brain's to act on
+  /// ([`SourceUnhosted`](MergeBlockedCause::SourceUnhosted) — place the source, or let the
+  /// leader's cure blob arrive; [`ForkFence`](MergeBlockedCause::ForkFence) — resolve the split
+  /// conflict that stands behind it); the rest lift on their own protocol timescale.
+  MergeBlocked {
+    /// The absorbing target — the group whose apply drain or capture is held.
+    target: G,
+    /// The named source group.
+    source: G,
+    /// The held coordinate: the parked `CommitMerge`'s index while the park stands, the absorb
+    /// boundary the capture owes once the park has been deferred into a debt.
+    boundary: Index,
+    /// What is holding it.
+    cause: MergeBlockedCause,
   },
 }
 

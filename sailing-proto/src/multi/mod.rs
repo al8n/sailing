@@ -435,6 +435,54 @@ pub enum MergeResolution<G> {
   },
 }
 
+/// Why a merge is standing still on this host — see [`MergeBlocked`]. Every variant names a
+/// condition that outlives a crank; the transient waits a merge passes through on its way to
+/// resolving (a staged capture draining, the abort window still open) are deliberately unnamed
+/// and never signalled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MergeBlockedCause {
+  /// The source is NOT hosted here and its floor is non-terminal, so no local fold can ever land:
+  /// the union must arrive as a post-merge snapshot from the resolved quorum. This is the shape
+  /// the cure advertisement addresses, and the one a placement brain can also resolve directly by
+  /// giving the source a host.
+  SourceUnhosted,
+  /// The source is hosted but has not yet applied its freeze, so the absorb has nothing to fold.
+  /// Ordinarily transient — the source's own replication closes it — but a source left
+  /// leaderless and under-hosted stays here.
+  SourceBehind,
+  /// The union is absorbed and serving; its durability capture waits on a staged fork's
+  /// durability barrier. The fork conflict's resolution is the exit.
+  ForkFence,
+  /// The union is absorbed and serving; its durability capture waits on an undischarged abort
+  /// obligation. The named source's thaw is the exit.
+  AbortFence,
+  /// A live merge freeze holds the capture: this group is itself a source pinned by a claiming
+  /// target. The thaw — or this group's own dissolution into the claimant — is the exit.
+  Frozen,
+}
+
+/// A merge held on this host by a STRUCTURAL cause, surfaced once per transition — see
+/// [`MultiRaft::poll_merge_blocked`].
+///
+/// An OBSERVATION, never a command: nothing is torn down, nothing waits on consumption, and the
+/// container re-derives the same verdict every crank whether or not anyone reads this. It exists
+/// because both held shapes are otherwise INVISIBLE from outside — a parked target is not
+/// log-lagging and its apply stall is purely local, and a debt-holding target looks entirely
+/// healthy while its conf changes are fenced and the consumed source's id stays un-reusable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeBlocked<G> {
+  /// The absorbing target — the group whose apply drain (or capture) is held.
+  pub target: G,
+  /// The named source group.
+  pub source: G,
+  /// The held coordinate: the parked `CommitMerge`'s index while the park stands, the absorb
+  /// boundary the capture owes once the park has been deferred into a debt.
+  pub boundary: Index,
+  /// What is holding it.
+  pub cause: MergeBlockedCause,
+}
+
 /// The outcome of one head-fork examination (see `MultiRaft::poll_pending_fork`): the parent's
 /// queue was empty (or the parent gone / poisoned on a corrupt child id), the head fork was
 /// consumed by a resolution arm, it parked on a hosted-child conflict, or it yielded for
@@ -532,6 +580,17 @@ where
   /// still-queued signal ([`unpark`](Self::unpark)) — delivered after resolution it would be
   /// stale — so queued signals always name currently-parked parents.
   conflicts: VecDeque<(G, G)>,
+  /// The last [`MergeBlockedCause`] signalled per target — the EDGE that makes
+  /// [`poll_merge_blocked`](Self::poll_merge_blocked) fire once per transition instead of once per
+  /// crank. An entry lives exactly as long as the target's park or capture debt does (dropped at
+  /// the top of the next [`service_merge_applies`](Self::service_merge_applies) once neither
+  /// stands, and at removal), so a target that gets held again later signals afresh.
+  merge_blocked_seen: BTreeMap<G, MergeBlockedCause>,
+  /// Pending structural-hold observations, drained by
+  /// [`poll_merge_blocked`](Self::poll_merge_blocked). Best-effort like the poison tail: the
+  /// container's own re-derivation, not this queue, is what keeps the hold resolving, so a
+  /// dropped signal costs the embedder a notification and nothing else.
+  merge_blocked: VecDeque<MergeBlocked<G>>,
   /// Groups seen poisoned since their CURRENT hosting began — the dedupe that makes
   /// [`poll_poisoned`](Self::poll_poisoned) fire once per poisoning per hosted incarnation. An id's
   /// entry is cleared at removal, so a re-admitted id that poisons again re-signals as a fresh
@@ -578,6 +637,8 @@ where
       dirty_forks_set: BTreeSet::new(),
       parked: BTreeSet::new(),
       conflicts: VecDeque::new(),
+      merge_blocked_seen: BTreeMap::new(),
+      merge_blocked: VecDeque::new(),
       poisoned_seen: BTreeSet::new(),
       poisoned_pending: VecDeque::new(),
       lineage: BTreeMap::new(),
@@ -786,6 +847,13 @@ where
     // afresh as the new incarnation it is.
     self.poisoned_seen.remove(gid);
     self.poisoned_pending.retain(|g| g != gid);
+    // Same rule for the structural-hold observation, on both roles: a target that is gone holds
+    // nothing, and a source that is gone is not the hold anyone can act on. Clearing the edge lets
+    // a re-admitted id that gets held again signal afresh.
+    self.merge_blocked_seen.remove(gid);
+    self
+      .merge_blocked
+      .retain(|b| &b.target != gid && &b.source != gid);
     let removed = self.groups.remove(gid);
     // PURGE-ON-REMOVAL: a source leaving the container takes every target's outstanding thaw
     // obligation for it along with it, binding the obligation to the incarnation SYNCHRONOUSLY —
@@ -1463,6 +1531,42 @@ where
   /// currently poisoned, hosted group; a re-admitted id that poisons again signals afresh.
   pub fn poll_poisoned(&mut self) -> Option<G> {
     self.poisoned_pending.pop_front()
+  }
+
+  /// The next merge held by a STRUCTURAL cause on this host, reported ONCE PER TRANSITION of a
+  /// target's cause rather than once per crank — see [`MergeBlocked`].
+  ///
+  /// An OBSERVATION on a best-effort tail: the hold's resolution is driven by
+  /// [`service_merge_applies`](Self::service_merge_applies) re-deriving it every crank, never by
+  /// this queue, so a dropped signal costs a notification and nothing else. What the embedder does
+  /// with it is cause-specific and always OUT of the consensus path: give an unhosted source a
+  /// host, resolve a split conflict, remove a group whose thaw will never come. Doing nothing is
+  /// also a valid answer for the causes that lift on their own.
+  pub fn poll_merge_blocked(&mut self) -> Option<MergeBlocked<G>> {
+    self.merge_blocked.pop_front()
+  }
+
+  /// Queue one [`MergeBlocked`] iff `cause` DIFFERS from the last one signalled for `target`. The
+  /// container re-derives every hold on every crank, so without this edge the queue would grow by
+  /// one entry per crank for as long as the hold stands; with it, a stable hold costs exactly one
+  /// signal and a hold that changes shape costs one more.
+  fn note_merge_blocked(
+    &mut self,
+    target: &G,
+    source: &G,
+    boundary: Index,
+    cause: MergeBlockedCause,
+  ) {
+    if self.merge_blocked_seen.get(target) == Some(&cause) {
+      return;
+    }
+    self.merge_blocked_seen.insert(target.cheap_clone(), cause);
+    self.merge_blocked.push_back(MergeBlocked {
+      target: target.cheap_clone(),
+      source: source.cheap_clone(),
+      boundary,
+      cause,
+    });
   }
 
   /// Resolve the fork staged at exactly `split_index` on `parent`: the driver reports the
@@ -3154,6 +3258,18 @@ where
   {
     let now: Now = now.into();
     let mut resolutions = Vec::new();
+    // THE SIGNAL EDGE, retired before this crank re-derives it: a target holding neither a park
+    // nor a capture debt is not held by anything, so its remembered cause has served its purpose
+    // and a LATER hold on the same target must signal afresh. Taken and restored around the
+    // `self.groups` read (the scratch-borrow discipline).
+    let mut blocked_seen = core::mem::take(&mut self.merge_blocked_seen);
+    blocked_seen.retain(|gid, _| {
+      self
+        .groups
+        .get(gid)
+        .is_some_and(|ep| ep.pending_merge().is_some() || ep.capture_debt().is_some())
+    });
+    self.merge_blocked_seen = blocked_seen;
     let parked: Vec<G> = self
       .groups
       .iter()
@@ -3170,6 +3286,10 @@ where
       let expected = pending.source_gen_after();
       let boundary = pending.freeze_index();
       let freeze_term = pending.freeze_term();
+      // The park's OWN coordinate (the `CommitMerge`'s index), distinct from the SOURCE's freeze
+      // index above: it keys this target's capture fence and is the boundary a cure blob must
+      // cover, so it is what an observer of the hold needs.
+      let park_at = pending.at();
       let source_bytes = pending.source_bytes();
       let Ok(source) = G::decode_exact(source_bytes) else {
         // A committed source id that does not decode as G is committed-corrupt — the split
@@ -3300,8 +3420,16 @@ where
         tep.note_merge_park_unresolvable(advertise);
       }
       match verdict {
-        Verdict::Wait => {}
+        Verdict::Wait => {
+          // Only the STRUCTURAL wait is signalled. The other `Wait` — an abort window still
+          // undecided — is the merge's ordinary decision latency and closes with the next
+          // committed coordinate.
+          if w1_unresolvable {
+            self.note_merge_blocked(&tgid, &source, park_at, MergeBlockedCause::SourceUnhosted);
+          }
+        }
         Verdict::AdvanceSource => {
+          self.note_merge_blocked(&tgid, &source, park_at, MergeBlockedCause::SourceBehind);
           // The committed CommitMerge proves `(boundary, freeze_term)` committed in the source
           // — its proposer stamped the pair from a source observed frozen-applied AT the
           // boundary — and log matching carries that identity: a local source log CONTAINING
@@ -3342,6 +3470,17 @@ where
             None => continue,
           };
           if block == crate::endpoint::AbsorbCaptureBlock::Hold {
+            // A held park's cause is worth naming only when it is the FREEZE — a chained shape
+            // (this target is itself a claimed source) that lifts on another group's protocol
+            // timescale. The other `Hold` leg is a staged capture/install draining within cranks.
+            if self
+              .groups
+              .get(&tgid)
+              .and_then(|tep| tep.capture_fence_at(park_at))
+              == Some(crate::endpoint::CaptureFence::Frozen)
+            {
+              self.note_merge_blocked(&tgid, &source, park_at, MergeBlockedCause::Frozen);
+            }
             continue;
           }
           // THE RESIDUAL BELT, gated to LOCAL DRIVABILITY (see `owes_a_drivable_thaw`). HOLD the park
@@ -3743,6 +3882,18 @@ where
         || tep.durable_snapshot_covers(boundary);
       if !already_staged {
         if tep.capture_blocked_at(boundary) {
+          // The debt window's own signal: post-defer the group LOOKS healthy — unparked,
+          // committing, serving the union — while its conf changes are fenced and the consumed
+          // source's id stays un-reusable. Name the fence that is standing, or nothing at all
+          // when only a transient is (it drains within cranks).
+          if let Some(fence) = tep.capture_fence_at(boundary) {
+            let cause = match fence {
+              crate::endpoint::CaptureFence::Frozen => MergeBlockedCause::Frozen,
+              crate::endpoint::CaptureFence::Fork => MergeBlockedCause::ForkFence,
+              crate::endpoint::CaptureFence::Abort => MergeBlockedCause::AbortFence,
+            };
+            self.note_merge_blocked(&tgid, &source, boundary, cause);
+          }
           continue;
         }
         let staged = match stores.stores(&tgid) {
