@@ -719,12 +719,16 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
 }
 
 /// Like [`run_multi_vopr`], but forces the tracked #106/#110 wedge exemption ON for an UNPHASED
-/// profile. The filed classes are reachable from any merge-heavy schedule — the removed-replica
-/// farewell retry's front-loaded delivery dismantles merge sources into husks SOONER, raising the
-/// filed class's incidence — so a non-storm merge profile certifies past them exactly as the storm
-/// profiles do. The predicate stays deliberately narrow (a genuine hosting shortfall only), so a
+/// profile. The predicate stays deliberately narrow (a genuine hosting shortfall only), so a
 /// non-merge livelock — or any wedge outside the tracked sets — still trips, and safety is never
-/// gated. The merge-liveness cure that removes the wedge tracks separately under #106/#110.
+/// gated.
+///
+/// The merge-liveness cure RETIRED the exemption this opts into: the merge bands no longer need to
+/// certify past either class, and the ones that still call this ASSERT both counters at zero, so the
+/// classifiers keep computing on a merge-heavy schedule and a regression is named by its class. Note
+/// the exemption also lets the quiesce drive EXIT EARLY once every non-exempt group has converged —
+/// so a band wanting the cure driven to completion belongs on plain [`run_multi_vopr`], and this
+/// runner belongs where the classification itself is the subject.
 pub fn run_multi_vopr_certifying_tracked_wedges(
   seed: u64,
   ticks: usize,
