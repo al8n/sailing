@@ -214,6 +214,12 @@ where
     if next_at.is_some_and(|at| now.mono() < at) {
       return;
     }
+    // The GLOBAL gate, after the per-peer one: eviction churn on an over-cap ledger forgets
+    // per-peer cooldowns, so this token alone carries the aggregate bound — one blob per half
+    // election timeout from this leader, whatever the advertiser population does.
+    if self.cure_send_gate.is_some_and(|at| now.mono() < at) {
+      return;
+    }
     let Some(read) = stable.snapshot_chunk(0, crate::config::MAX_SNAPSHOT_CHUNK_BYTES) else {
       return; // nothing persisted yet — the eligibility deferral
     };
@@ -245,6 +251,7 @@ where
     if let Some(debt) = self.cure_owed.get_mut(peer) {
       debt.next_at = Some(now.mono() + interval);
     }
+    self.cure_send_gate = Some(now.mono() + self.config.election_timeout() / 2);
     self.outputs.outgoing.push_back(crate::Outgoing::new(
       peer.cheap_clone(),
       Message::InstallSnapshot(crate::InstallSnapshot::new(term, me, meta, blob)),
@@ -1376,6 +1383,16 @@ where
       for e in chunk.iter() {
         if e.kind() == EntryKind::CommitMerge {
           absorb_high = absorb_high.max(e.index());
+          // Record the crossed absorb's SOURCE: the blob embeds its fold, so a locally hosted
+          // replica of that lineage is a live-voting husk of an absorbed-away group — the
+          // container retires it on this install's own evidence. Left alone, quorum-many such
+          // husks re-arm the dead-target self-thaw into resurrecting absorbed state.
+          if let Ok(p) = crate::wire::decode_commit_merge_payload(e.data_bytes()) {
+            self
+              .merge
+              .crossed_sources
+              .push((p.source_bytes(), p.source_gen_after()));
+          }
         }
       }
       idx = match chunk.last() {
@@ -1653,6 +1670,47 @@ where
     // a crash immediately after this leaves {durable snapshot present, log re-baselined} OR {durable
     // snapshot present, log not-yet-re-baselined} — both of which `reconcile_restart_log` recovers
     // (None/Compact/Restore), NEVER the OrphanedLog poison.
+    // A superseded park means this install crosses CommitMerge entries the replay will never
+    // run — including the parked one itself, whose source may be hosted HERE (the ordinary
+    // log-behind resolvable-park shape). Record every crossed absorb's source off the still-
+    // intact log BEFORE the restore discards it: the container retires hosted gen-eligible
+    // husks on this install's own evidence, keeping the absorbed-lineage electorate empty (the
+    // husk-minority argument's obligation, now that installs reach quorum-many parked hosts).
+    // A read fault only forfeits the eager retire — the propagated terminal floor remains the
+    // fallback exit — so it is not poisoned here.
+    if let Some(park_at) = self.merge.pending_apply.as_ref().map(|p| p.at()) {
+      // Walk from the PARKED entry itself (inclusive — its own source may be hosted here, the
+      // ordinary resolvable-park-superseded shape): `applied` was already advanced to the
+      // boundary above, but the park pinned the replay at exactly `at - 1`, so the never-run
+      // range is `[at, tip]`.
+      let last = log.last_index();
+      let mut idx = park_at;
+      'scan: while idx <= last {
+        let read_end = last
+          .next()
+          .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
+        let Ok(EntriesRead::Ready(chunk)) = log.entries(idx..read_end, 1 << 20) else {
+          break 'scan;
+        };
+        if chunk.is_empty() {
+          break 'scan;
+        }
+        for e in chunk.iter() {
+          if e.kind() == EntryKind::CommitMerge
+            && let Ok(p) = crate::wire::decode_commit_merge_payload(e.data_bytes())
+          {
+            self
+              .merge
+              .crossed_sources
+              .push((p.source_bytes(), p.source_gen_after()));
+          }
+        }
+        idx = match chunk.last() {
+          Some(e) => e.index().next(),
+          None => break 'scan,
+        };
+      }
+    }
     log.restore(meta.last_index(), meta.last_term());
     // The re-baseline discarded every entry above the boundary — a pending merge freeze among
     // them no longer exists in this log, so the append-observed kill releases (re-armed at

@@ -1569,6 +1569,12 @@ where
   /// peer stops advertising (the park resolved some other way) and re-mint on every advertisement,
   /// so a crash-restarted peer re-enters through its own re-derived hint.
   cure_owed: BTreeMap<I, CureDebt>,
+  /// The GLOBAL cure-send gate: no two cure blobs leave this leader within half an election
+  /// timeout, whatever the ledger's churn. The per-peer cooldown lives in the ledger and dies
+  /// with an eviction, so under more than a cap's worth of rotating advertisers every re-mint
+  /// would arrive immediately due — this token is what keeps the aggregate bounded (one
+  /// near-frame blob per half-timeout) instead of one per advertisement.
+  cure_send_gate: Option<Instant>,
 }
 
 // Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
@@ -1735,6 +1741,7 @@ where
       pending_farewells: BTreeMap::new(),
       courtesy_owed: BTreeMap::new(),
       cure_owed: BTreeMap::new(),
+      cure_send_gate: None,
     };
     ep.arm_election_timer(now);
     ep

@@ -11382,3 +11382,185 @@ fn a_split_inside_the_debt_window_fences_the_discharge() {
     "both replay entries safe, the union floors"
   );
 }
+
+/// An install that crosses a CommitMerge it never locally resolved retires the crossed absorb's
+/// hosted husk on the install's own evidence: the blob embedded that fold, so the husk is a
+/// live-voting replica of an absorbed-away lineage — the electorate the husk-minority argument
+/// must keep empty, or quorum-many of them re-elect and the dead-target self-thaw resurrects
+/// absorbed state once the target itself later dissolves. A recreation ABOVE the recorded
+/// generation is a different incarnation and survives untouched.
+#[test]
+fn an_install_crossing_an_absorb_retires_its_hosted_husk() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  // The crossed absorb's source, hosted here as a stale pre-freeze husk (gen 0).
+  m.create_group(42, 0, single_node_cfg(1), now, 8, SplitSm::default())
+    .unwrap();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+
+  // The source IS hosted, so the park is locally resolvable — no hint. The ordinary log-behind
+  // install (boundary past the log tip) supersedes the park wholesale, crossing the absorb.
+  let meta = crate::SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(4),
+        9u64,
+        meta,
+        fork_blob(7),
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_none(),
+    "the install superseded the park"
+  );
+  assert!(
+    m.contains_group(&42),
+    "the husk survives until the retire pass"
+  );
+  assert!(
+    m.group(&1).unwrap().has_crossed_sources(),
+    "PROBE: the install recorded the crossed absorb"
+  );
+
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert!(
+    resolutions
+      .iter()
+      .any(|r| matches!(r, MergeResolution::Retired { source: 42 })),
+    "the crossed absorb's hosted husk retires on the install's own evidence"
+  );
+  assert!(
+    !m.contains_group(&42),
+    "no live-voting replica of an absorbed-away lineage remains"
+  );
+
+  // The recreation twin: a NEW incarnation above the recorded generation is untouched.
+  let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m2.create_group(42, 5, single_node_cfg(1), now, 8, SplitSm::default())
+    .unwrap();
+  let cmd2 = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log2 = VecLog::default();
+  let mut stable2 = AsyncStable::default();
+  log2.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd2.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd2),
+  ]);
+  stable2.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m2.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log2,
+    &mut stable2,
+  )
+  .unwrap();
+  let mut stores2 = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores2.0.insert(1, (log2, stable2));
+  let meta2 = crate::SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log2, stable2) = stores2.0.get_mut(&1).unwrap();
+    m2.handle_message(
+      &1,
+      now,
+      log2,
+      stable2,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(4),
+        9u64,
+        meta2,
+        fork_blob(7),
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m2.handle_storage(&1, now, log2, stable2),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  let resolutions = m2.service_merge_applies(now, &mut stores2);
+  assert!(
+    !resolutions
+      .iter()
+      .any(|r| matches!(r, MergeResolution::Retired { source: 42 })),
+    "a recreation above the recorded generation is a different incarnation"
+  );
+  assert!(m2.contains_group(&42));
+}

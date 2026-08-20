@@ -3487,3 +3487,91 @@ fn a_silent_advertiser_expires_its_cure_debt() {
     "silence is resolution: the expiry half is gated by neither role nor the courtesy ledger"
   );
 }
+
+/// The cure's aggregate traffic bound survives ledger churn: per-peer cooldowns die with an
+/// eviction, so past the cap every re-mint would arrive immediately due — the GLOBAL send gate
+/// is what keeps a rotating advertiser population at one blob per half election timeout from
+/// this leader, instead of one per advertisement.
+#[test]
+fn a_rotating_advertiser_population_is_globally_rate_bounded() {
+  use crate::HeartbeatResponse;
+  use core::time::Duration;
+  let voters: std::vec::Vec<u64> = (1..=70).collect();
+  let cfg = Config::try_new(
+    1u64,
+    voters,
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(1);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  for peer in 2..=36u64 {
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      peer,
+      Message::VoteResponse(VoteResponse::new(Term::new(1), peer, false, false)),
+    );
+  }
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  let cmd = bytes::Bytes::from_static(b"c");
+  let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+  // Quorum-ack the command so a covering capture exists.
+  {
+    use crate::AppendResponse;
+    ep.handle_storage(d, &mut log, &mut stable);
+    for peer in 2..=70u64 {
+      ep.handle_message(
+        d,
+        &mut log,
+        &mut stable,
+        peer,
+        Message::AppendResponse(AppendResponse::new(
+          Term::new(1),
+          peer,
+          false,
+          Index::ZERO,
+          Term::ZERO,
+          Index::new(2),
+        )),
+      );
+    }
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(stable.snapshot().is_some(), "a covering blob exists");
+  while ep.poll_message().is_some() {}
+
+  // Seventy distinct advertisers in one beat window: the ledger churns past its cap, every
+  // re-mint is immediately due per-peer — and exactly ONE blob leaves.
+  for peer in 2..=70u64 {
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      peer,
+      Message::HeartbeatResponse(
+        HeartbeatResponse::new(Term::new(1), peer, bytes::Bytes::new())
+          .with_stuck_boundary(Index::new(2)),
+      ),
+    );
+  }
+  let mut blobs = 0;
+  while let Some(out) = ep.poll_message() {
+    if matches!(out.message(), Message::InstallSnapshot(_)) {
+      blobs += 1;
+    }
+  }
+  assert_eq!(
+    blobs, 1,
+    "one blob per half election timeout, whatever the advertiser population does"
+  );
+}

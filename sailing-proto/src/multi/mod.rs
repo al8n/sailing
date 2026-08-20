@@ -3626,6 +3626,57 @@ where
         }
       }
     }
+    // THE CROSSED-SOURCE RETIRE PASS: an install that superseded (or adopted over) parked and
+    // skipped CommitMerge entries recorded their sources; the blob embedded every such fold, so
+    // a hosted replica of one of those lineages at-or-below its recorded generation is a
+    // live-voting husk of an absorbed-away group. Retire it on the install's own evidence — the
+    // sender's durable blob is the cluster-level durability proof, so no local store copy is
+    // load-bearing — exactly the `Retired` contract ("its target caught up via a snapshot
+    // install and never parked here"), which until now had only the propagated-floor trigger.
+    // Left standing, quorum-many such husks re-elect and the dead-target self-thaw resurrects
+    // absorbed state once the target itself later dissolves. A recreation ABOVE the recorded
+    // generation is a different incarnation and is untouched; a husk still named by another
+    // live park, or owing a drivable thaw, holds for the machinery that owns it.
+    let crossed_hosts: Vec<G> = self
+      .groups
+      .iter()
+      .filter(|(_, ep)| ep.has_crossed_sources())
+      .map(|(gid, _)| gid.cheap_clone())
+      .collect();
+    for host_gid in crossed_hosts {
+      let records = match self.groups.get_mut(&host_gid) {
+        Some(ep) => ep.take_crossed_sources(),
+        None => continue,
+      };
+      for (source_bytes, gen_after) in records {
+        let Ok(source) = G::decode_exact(source_bytes) else {
+          // The entry decoded when it was recorded; a failure here is the committed-corrupt
+          // class all the same.
+          if let Some(ep) = self.groups.get_mut(&host_gid) {
+            ep.poison(PoisonReason::MergeDecode);
+          }
+          self.note_if_poisoned(&host_gid);
+          continue;
+        };
+        let eligible = self
+          .groups
+          .get(&source)
+          .is_some_and(|sep| sep.shape_gen() <= gen_after);
+        if !eligible
+          || self.park_names_source(&source)
+          || self.debt_names(&source)
+          || self.owes_a_drivable_thaw(&source)
+        {
+          continue;
+        }
+        if self.remove_group_inner(&source).is_some() {
+          self.mark_dirty(&source);
+          resolutions.push(MergeResolution::Retired {
+            source: source.cheap_clone(),
+          });
+        }
+      }
+    }
     // THE MERGE-ABORT THAW PASS: drive every hosted target's durable `abandoned` obligations to
     // thaw their named sources — the durable-derived mirror of the commit side above (both re-derive
     // resolution from committed endpoint state each crank, no volatile relay). The source rollback
