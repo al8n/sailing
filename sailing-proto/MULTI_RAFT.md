@@ -473,10 +473,25 @@ merge.
 Three producers discharge a debt, each surfacing the held `Merged` with its ordinary
 floor-and-teardown contract: the **fence-lift forced capture** (per crank, once the fence's own
 legs clear at the boundary); **any ordinary capture** staged at-or-past the boundary (it shares
-the same fence set, so neither races the other); and **any COMPLETED install** at-or-past it. The
-third is mandatory, not an optimization — an install past the boundary discards the `CommitMerge`
-a restart would re-park on, so without this leg a crash in the window would strand the source's
-stores un-floored and unreachable forever.
+the same fence set, so neither races the other); and **any COMPLETED install** at-or-past it
+whose membership fence has itself released — durability alone is not compaction (a
+completion-time redundant install raises the durable index while deliberately keeping the log),
+so a durable-covered debtor behind a standing fence still stages its capture. The install leg is
+mandatory, not an optimization — an install past the boundary discards the `CommitMerge` a
+restart would re-park on, so without it a crash in the window would strand the source's stores
+un-floored and unreachable forever.
+
+A debt is HOST-LOCAL — the fences that deferred it are this replica's own — so a foreign-led
+freeze can legally commit the DEBTOR's own consumption as the next merge source while the debt
+still stands here: the propose-time refusal ran on a debt-less replica. The two resolver
+teardowns INHERIT the debt rather than drop it. The Resolve arm holds the park until its fence
+classification is `Clear`, then discharges the debt into the same one-crank capture barrier —
+the snapshot covers the debtor's state machine, which has carried the prior union since that
+absorb applied. The husk dissolve surfaces it alongside `Retired` on the propagated-floor
+evidence (a claimant that itself deferred writes no terminal floor until its own debt
+discharges, so the floor gate serializes chained debts by construction). Both surface the
+ordinary `Merged` resolution for the prior source with no endpoint event — the holder that would
+have carried it is consumed, the `Retired` asymmetry.
 
 While a debt stands, the DEBT — not the park's naming, which died at the defer — fences every
 surface that can revive or destroy either group, and every refusal self-releases at the discharge:

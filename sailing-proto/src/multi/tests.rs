@@ -10542,6 +10542,137 @@ fn defer_to_absorbed(
     .index()
 }
 
+/// The debt is HOST-LOCAL, so a foreign-led freeze can commit a debtor's consumption while the
+/// debt still stands here — the propose-time refusal ran on a debt-less replica. Reproduced past
+/// the door with a direct freeze append (the cross-host shape): the Resolve arm must consume the
+/// debtor WITHOUT dropping the held `Merged` — the earlier absorbed source's only terminal-floor
+/// permission — by discharging it into the same one-crank capture barrier, whose snapshot covers
+/// the debtor's state machine and therefore the prior union it has carried since that absorb.
+#[test]
+fn a_foreign_led_absorb_of_a_debtor_discharges_the_inherited_debt() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  assert!(m.group(&1).unwrap().capture_debt().is_some());
+
+  let (mut log3, mut stable3) = (VecLog::default(), AsyncStable::default());
+  m.create_group(3, 0, single_node_cfg(1), d, 45, SplitSm::default())
+    .unwrap();
+  let d3 = lead_single_split(&mut m, 3, &mut log3, &mut stable3);
+  stores.0.insert(3, (log3, stable3));
+
+  // The foreign-led freeze on the debtor, appended past the propose gate exactly as a
+  // cross-host commit arrives.
+  let freeze_idx = {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let mut tb = Vec::new();
+    Data::encode(&3u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 2),
+      &mut fbuf,
+    );
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(d, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    let idx = l.last_index();
+    drain_storage(&mut m, 1, d, l, s);
+    idx
+  };
+  assert!(m.group(&1).unwrap().is_frozen());
+
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    m.group_mut(&3)
+      .unwrap()
+      .propose_merge_entry(
+        d3,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(1, freeze_idx, 2, 1),
+      )
+      .unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  assert!(m.group(&3).unwrap().pending_merge().is_some(), "parked");
+
+  assert!(
+    m.service_merge_applies(d3, &mut stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  let resolutions = m.service_merge_applies(d3, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![
+      MergeResolution::Merged {
+        source: 1,
+        target: 3
+      },
+      MergeResolution::Merged {
+        source: 2,
+        target: 3
+      },
+    ],
+    "the inherited debt discharges into the consuming absorb's own barrier"
+  );
+  assert!(!m.contains_group(&1), "the debtor was consumed");
+  assert_eq!(
+    m.group(&3).unwrap().state_machine().units,
+    2,
+    "the transitive union: the debtor carried the prior absorb"
+  );
+  // The proto layer never touches stores; both teardowns are the driver's, off the resolutions.
+  assert!(stores.0.contains_key(&1) && stores.0.contains_key(&2));
+}
+
+/// The husk twin: a foreign-led freeze husks the debtor (target unhosted), the terminal floor
+/// propagates, and the retirement must surface the inherited debt alongside `Retired` — the
+/// propagated `MERGED_FLOOR` was co-barriered with the claimant's durable capture of this
+/// husk's state machine, which has carried the prior union since that absorb applied.
+#[test]
+fn a_husked_debtor_retires_with_its_inherited_debt_discharged() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  assert!(m.group(&1).unwrap().capture_debt().is_some());
+
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let mut tb = Vec::new();
+    Data::encode(&7u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 2),
+      &mut fbuf,
+    );
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(d, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+  }
+  assert!(m.group(&1).unwrap().is_frozen());
+
+  stores.1.insert(1);
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![
+      MergeResolution::Merged {
+        source: 2,
+        target: 1
+      },
+      MergeResolution::Retired { source: 1 },
+    ],
+    "the retirement surfaces the inherited debt on the propagated-floor evidence"
+  );
+  assert!(!m.contains_group(&1), "the husk dissolved");
+  assert!(stores.0.contains_key(&1) && stores.0.contains_key(&2));
+}
+
 /// A parked fork's standing capture fence no longer wedges a later merge into the same parent:
 /// the absorb resolves as `Absorbed` — the union applies and serves, the source endpoint is
 /// consumed with its stores preserved, and the forced capture becomes a debt the per-crank
