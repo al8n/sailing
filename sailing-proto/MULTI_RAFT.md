@@ -388,6 +388,165 @@ splits and refuses to be a merge target; a mid-absorb source refuses a fresh fre
 `pre_vote`/`check_quorum` recommendations are unaffected by the freeze — a frozen group elects
 normally.
 
+## Merge liveness
+
+Every park above resolves from committed state, but three shapes hold a park — or its durability
+— on a timescale no consensus event closes. Each has a cure, and none of the cures weakens a
+barrier.
+
+### W1 — the under-hosted park
+
+A replica that never hosted the source (lifecycle churn tore it down, or the replica joined after
+the source dissolved) cannot fold: the union is not materializable here, and aborting instead
+would skip it on this replica alone — silent, permanent divergence from every replica that
+absorbed. Its only exit is the resolved quorum's post-merge snapshot. That exit is unreachable
+for the population that needs it most: a parked replica is not log-lagging (the park sits ABOVE a
+fully replicated log) and its apply stall is purely local, so every leader-side signal reads it as
+healthy and no snapshot is ever sent.
+
+The cure is an advertisement, an out-of-band install, and — for the one replica nobody installs to
+— a handoff.
+
+- **The advertisement.** `service_merge_applies` re-derives the unresolvable classification every
+  crank and the follower stamps the boundary on its `HeartbeatResponse` (`stuck_boundary`, zero =
+  absent, WIRE.md §1). A leader that has quiesced solicits no acks at all, so a slow-tick belt
+  drives ONE unsolicited response per election timeout to the known leader, with the lease fields
+  pinned ZERO — echoing a remembered round would extend a `LeaseBased` lease on support that was
+  never promised at that time. A LEADER never advertises: it is the consumer. The classification
+  is GATED on no fork durability barrier standing and no abort obligation naming a
+  hosted-and-frozen source, because the adopt below clears both, and clearing them on host-local
+  proof would destroy a staged fork's only replay derivation, or the only drive for another
+  group's thaw.
+- **The cure send.** An advertised boundary from a TRACKED member mints a leader-side cure debt on
+  the courtesy-snapshot pattern: one whole blob per peer per cooldown, eligible only once this
+  leader's own DURABLE snapshot COVERS the boundary (a lower capture cannot carry the union;
+  deferral costs nothing, since the leader's own forced capture covers it promptly), discharged
+  only by completed evidence at-or-past the boundary. The peer's `Progress` is never touched — it
+  stays in `Replicate`, keeps taking appends, and keeps feeding the commit quorum throughout the
+  transfer. A debt whose peer stops advertising expires after a few election timeouts: the park
+  resolved some other way, and a ghost debt would ship whole blobs at nobody.
+- **The adopt.** The receipt-time arm installs a covering blob IN PLACE OF the fold: state moves
+  to the boundary, the park clears, and the LOG IS KEPT — the tail above the boundary replays, so
+  the adopt discards nothing and no acked entry is ever destroyed. The freeze quartet clears
+  unconditionally and `freeze_pending` is re-derived from the kept tail, so a chained
+  frozen-and-parked host exits unfrozen at exactly the state a restart's compaction at the
+  boundary would leave it. A replica genuinely log-behind the boundary takes the ordinary restore
+  path, as before.
+- **The wedged LEADER.** No one installs to a leader, so a leader holding a locally-unresolvable
+  park has no exit of its own and its exit is another leader: it hands leadership to the
+  highest-matched voter that is not itself advertising, ONE forced handoff per term (the transfer
+  machine's own latch is the single shot, which bounds the proposal freeze and lease revocation
+  each attempt costs). With no such candidate NOTHING is armed: churning leadership between hosts
+  that are all uncurable buys no progress and pays that cost every term, so the group stays
+  degraded-alive under the signal below. `TimeoutNow` bypasses pre-vote, so a mis-timed pick can seat another
+  parked replica — a locally-resolvable park cures itself, an unresolvable one advertises and runs
+  the same leg next term, and the token walks until it lands on a curable host.
+
+**The whole-blob bound and its loud residual.** A cure rides ONE frame. A blob that exceeds that
+bound cannot be sent, and the leader signals `Event::MergeCureUndeliverable` rather than deferring
+in silence — the deliberate asymmetry with the courtesy path, which SKIPS an oversized blob: that
+residual leaves a removed peer ignorant-but-alive, the safe direction, while this one leaves a
+VOTER wedged. Chunked cure transfer is the eventual exit; until it lands the signal is the whole
+contract, and recovery falls to the embedder's catalog like any dead group.
+
+### W2 — the fence-deferred capture
+
+A parked absorb whose forced capture a STRUCTURAL replay fence refuses — a staged fork's
+durability barrier, or an undischarged abort obligation — would otherwise hold the park for that
+fence's whole embedder-timescale life, and the abort fence can be UNDISCHARGEABLE behind the park
+(its clearing witness rides an entry the park itself keeps from applying). The arm therefore
+absorbs and defers only the capture: fold, unpark, and record the held `Merged` as the target's
+capture debt, surfacing `MergeResolution::Absorbed` (`LifecycleEvent::MergeAbsorbed`). Transient
+fences (a staged capture or install, draining within cranks) and a LIVE FREEZE still HOLD the
+park instead — folding into a frozen target would advance state a claiming target has pinned at
+its freeze boundary, and the freeze lifts by protocol anyway.
+
+The driver folds `Absorbed` as the `CaptureFailed` source half MINUS the poison and the restart
+demand: fail the source's parked routing with its own verdict (`DriverError::SourceAbsorbed` —
+neither shutting-down nor poisoned is truthful; its callers park on the vanished endpoint's
+completions and would otherwise hang forever), drain the routing's completion-panic
+latch, clear the source's volatile per-group maps — and PRESERVE its stores and floor untouched.
+No floor write, no storage teardown, no tombstone: they remain the union's only restart
+derivation until the capture stages, and a crash meanwhile restores the source and re-parks the
+merge.
+
+Three producers discharge a debt, each surfacing the held `Merged` with its ordinary
+floor-and-teardown contract: the **fence-lift forced capture** (per crank, once the fence's own
+legs clear at the boundary); **any ordinary capture** staged at-or-past the boundary (it shares
+the same fence set, so neither races the other); and **any COMPLETED install** at-or-past it. The
+third is mandatory, not an optimization — an install past the boundary discards the `CommitMerge`
+a restart would re-park on, so without this leg a crash in the window would strand the source's
+stores un-floored and unreachable forever.
+
+While a debt stands, the DEBT — not the park's naming, which died at the defer — fences every
+surface that can revive or destroy either group, and every refusal self-releases at the discharge:
+
+- `remove_group` refuses the debt-named source (`RemoveError::SpokenFor`) and the debt-holding
+  target (`RemoveError::OwesCapture`, whose discharge is the source's only exit to the terminal
+  floor).
+- `create_group`/`restore_group` refuse the debt-named id (`CreateGroupError::AbsorbPending`) —
+  either would run a fresh husk beside the union its preserved stores still back.
+- Both coordinators' demux fences drop the named source's frames silently, exactly as for a
+  tombstone: no close (the shared connection carries the live groups' traffic) and no
+  unknown-group advisory, which would prompt precisely that revival.
+- The drivers' factory pre-build gates refuse to materialize it: a defer-window source passes
+  every other gate (the blueprint names the solicitor, no terminal floor has landed, no split
+  reserves the id), so this leg is the only one that refuses.
+- The merge verbs refuse the debt holder BOTH roles (`MergeError::AlreadyPending`), preserving the
+  one-absorb-at-a-time posture the park used to carry; the conf-change fence engages continuously
+  across the handoff through the absorb index the fold recorded.
+
+An inner teardown that bypasses every public refusal leg must never consume a debt-holding target;
+that holds today by the call graph and is pinned as a debug assertion so it stays a contract.
+
+### W3 — the install-supersede completion
+
+A snapshot install past a fork coordinate runs its log restore FIRST, so the replay source the
+fork barrier protects is already gone by the time the barrier is consulted; left standing it could
+only wedge, refusing forever a capture no replay can ever need. The RESTORE path therefore clears
+the barrier of every fork still QUEUED at-or-below the installed boundary, while KEEPING the queue
+entry: a queued fork reads no log, so the child stays materializable from the in-memory blob for
+the process lifetime — strictly better than dropping it — and a later lift no-ops on an absent
+key. A fork already POPPED into the driver's flush window keeps its barrier, because the ordinary
+resolve lifts it moments later and freeing it early would release the fence under an in-flight
+materialization whose baseline is not yet durable. The ADOPT path keeps its barriers and their
+meaning — there the fences defer the adopt's persist instead of being cleared.
+
+### Observability
+
+A merge held by a structural cause surfaces as `MergeBlocked { target, source, boundary, cause }`
+with `cause` one of `SourceUnhosted`, `SourceBehind`, `ForkFence`, `AbortFence`, `Frozen`. It is
+EDGE-triggered: once per transition of a target's cause, retired when the park or debt resolves,
+never once per crank. The drivers forward it as `LifecycleEvent::MergeBlocked` on the best-effort
+lifecycle tail.
+
+It is an OBSERVATION, never a command. The container re-derives every hold on every crank whether
+or not anyone reads this, so a dropped signal costs a notification and nothing else. Two causes
+are the placement brain's to act on — `SourceUnhosted` (place the source, or let the leader's cure
+arrive) and `ForkFence` (resolve the split conflict standing behind it); the rest lift on their
+own protocol timescale. It exists because both held shapes are otherwise invisible from outside: a
+parked target is not log-lagging, and a debt-holding target looks entirely healthy while its conf
+changes are fenced and the consumed source's id is un-reusable.
+
+### Quiescence
+
+Every cure rides the slow tick, and a quiesced group's deadlines are excluded from the driver's
+armed fold and skipped in its due sweep — so quiescing a replica that carries cure work silences
+the exact cadence that would end it.
+
+- `group_idle` refuses the LEADER side: a parked merge, an outstanding capture debt, and a
+  standing cure debt each make the group ineligible. A wedged peer is invisible to the pump
+  predicate (it is not log-lagging), so the debt is what keeps the group awake until the cure
+  lands.
+- The drivers refuse the FOLLOWER-side entry — the one a leader's flagged beat drives, which no
+  eligibility check of theirs gates — while an unresolvable park hint, a capture debt, or a cure
+  debt stands, and EVICT a group that acquires one after entry (the classification is re-derived
+  every crank and can first hold on a crank after the group went quiet).
+- An ADVERTISING `HeartbeatResponse` is wake-class at the coordinator's demux where an ordinary
+  one is not, so a follower's advertisement re-arms the quiesced leader that has to answer it.
+- A fence lifting while a debt-holding group is quiesced is benign: the discharge runs on the next
+  wake, and the embedder action that resolves such a fence is itself wake-class.
+
 ## Ownership boundary
 
 Split and merge are an OPAQUE fork/fold: the LIBRARY owns fork/fold correctness and incarnation
