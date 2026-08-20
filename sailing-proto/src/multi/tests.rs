@@ -10850,6 +10850,11 @@ fn a_debt_names_its_source_at_every_lifecycle_surface() {
   assert!(!m.debt_names(&2), "the naming dies with the discharge");
 }
 
+/// Whether `stable` holds a durable snapshot at-or-past `boundary`.
+fn sailing_proto_durable_covers(stable: &AsyncStable, boundary: Index) -> bool {
+  crate::StableStore::durable_snapshot(stable).is_some_and(|m| m.last_index() >= boundary)
+}
+
 /// A raw `CommitMerge` entry payload naming a typed source id — the force-append form the
 /// restore fixtures use (the propose path derives the same bytes from live state).
 fn commit_merge_bytes(
@@ -10979,6 +10984,28 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
   }
   assert!(acked, "the completion ack rides the three-leg gate");
 
+  // The adopt owes one forced, threshold-independent capture: the service stages it, and its
+  // compaction releases the absorb membership fence — so an idle adopter that later leads has a
+  // durable blob covering the boundary and can cure the next parked voter.
+  assert!(m.group(&1).unwrap().adopt_capture_owed());
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+    assert!(
+      sailing_proto_durable_covers(stable, Index::new(3)),
+      "the owed capture is durable at the boundary"
+    );
+    assert!(
+      log.first_index() > Index::new(2),
+      "its compaction released the absorb membership fence"
+    );
+  }
+  assert!(!m.group(&1).unwrap().adopt_capture_owed());
+
   // The hosted twin: same log shape, but the source IS hosted — the resolvable arm keeps
   // today's behavior exactly (no hint, no adopt, the park held for the local resolution).
   let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
@@ -11055,10 +11082,12 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
   );
   assert_eq!(m2.group(&1).unwrap().applied_index(), Index::new(1));
 
-  // The crash story: no blob was ever persisted, so a restart is NOT adopt-equivalent — it
-  // re-parks off the durable log (the CommitMerge survived; compaction never ran) and the cure
-  // re-runs through the advertisement loop. Nothing was over-acked: the completion response
-  // certified the persisted commit, and that commit is exactly what the restart recovers.
+  // The crash story, both regimes. AFTER the owed capture lands, a restart is adopt-equivalent
+  // — the durable blob restores past the park, no re-cure needed. (BEFORE it lands — the
+  // one-crank window — nothing durable covers the boundary: the restart re-parks off the
+  // surviving CommitMerge and the advertisement loop re-cures; nothing was over-acked, since
+  // the completion response certified exactly the persisted commit the restart recovers. That
+  // regime is the crash-window residual the design records.)
   drop(m);
   let mut m3: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   {
@@ -11075,44 +11104,15 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
     )
     .unwrap();
   }
+  let restored = m3.group(&1).unwrap();
   assert!(
-    m3.group(&1).unwrap().pending_merge().is_some(),
-    "the restart re-parks: state-derivability rides the advertisement loop, not a durable blob"
+    restored.pending_merge().is_none(),
+    "post-capture, the restart restores past the park off the durable blob"
   );
-  assert!(m3.service_merge_applies(now, &mut stores).is_empty());
   assert_eq!(
-    m3.group(&1).unwrap().merge_park_unresolvable(),
-    Some(Index::new(2)),
-    "the hint re-derives and the loop re-cures"
-  );
-  let meta3 = crate::SnapshotMeta::new(
-    Index::new(3),
-    Term::new(1),
-    crate::conf::ConfState::from_voters(std::vec![1u64]),
-  )
-  .with_shape_gen(1);
-  {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m3.handle_message(
-      &1,
-      now,
-      log,
-      stable,
-      9u64,
-      Message::InstallSnapshot(crate::InstallSnapshot::new(
-        Term::new(1),
-        9u64,
-        meta3,
-        fork_blob(5),
-      )),
-    )
-    .unwrap();
-  }
-  assert!(m3.group(&1).unwrap().pending_merge().is_none());
-  assert_eq!(
-    m3.group(&1).unwrap().state_machine().units,
+    restored.state_machine().units,
     5,
-    "converged to the same union"
+    "adopt-equivalent: the same union, no re-cure"
   );
 }
 
