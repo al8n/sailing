@@ -147,6 +147,14 @@ pub(crate) struct MergeState {
   /// The parked `CommitMerge` (target side), `Some` while the apply drain is stopped at
   /// `at - 1`. Written ONLY by the park arm and the two container resolutions.
   pub(crate) pending_apply: Option<PendingMergeApply>,
+  /// Whether the container's per-crank resolver classified the standing park LOCALLY
+  /// UNRESOLVABLE — the source is unhosted here with a non-terminal floor, so no local fold can
+  /// ever land — AND the cure-advertisement gate passed (no fork barrier stands, and no abort
+  /// obligation names a hosted-and-frozen source whose thaw an adopt would erase). While set,
+  /// the follower advertises its park boundary and the receipt-time redundancy arm ADOPTS a
+  /// covering blob in place of the impossible fold. Volatile, re-derived every resolver crank;
+  /// meaningless without `pending_apply`.
+  pub(crate) park_unresolvable: bool,
   /// An absorbed-but-uncaptured union's outstanding durability obligation: the fold ran and the
   /// apply drain resumed, but a standing replay fence (a parked fork's barrier, an undischarged
   /// abort obligation) deferred the forced capture — so the consumed source's stores remain the
@@ -735,6 +743,24 @@ where
   /// absorb boundary and now surfaces the held `Merged`.
   pub(crate) fn discharge_capture_debt(&mut self) -> Option<crate::Merged> {
     self.merge.capture_debt.take()
+  }
+
+  /// The standing park's boundary when the container's resolver classified it locally
+  /// unresolvable — the source is unhosted here with a non-terminal floor, so no local fold can
+  /// ever land, and the advertisement gate passed: the coordinate this follower advertises for
+  /// the cure, and the receipt-time adopt's admission key. Volatile, re-derived every resolver
+  /// crank; `None` whenever no park stands.
+  pub fn merge_park_unresolvable(&self) -> Option<Index> {
+    if self.merge.park_unresolvable {
+      self.merge.pending_apply.as_ref().map(PendingMergeApply::at)
+    } else {
+      None
+    }
+  }
+
+  /// Record (or clear) the resolver's per-crank unresolvable classification.
+  pub(crate) fn note_merge_park_unresolvable(&mut self, unresolvable: bool) {
+    self.merge.park_unresolvable = unresolvable;
   }
 
   /// Resolve the parked `CommitMerge` by ABSORBING the extracted source state machine: fold it

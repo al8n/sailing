@@ -10849,3 +10849,269 @@ fn a_debt_names_its_source_at_every_lifecycle_surface() {
   );
   assert!(!m.debt_names(&2), "the naming dies with the discharge");
 }
+
+/// A raw `CommitMerge` entry payload naming a typed source id — the force-append form the
+/// restore fixtures use (the propose path derives the same bytes from live state).
+fn commit_merge_bytes(
+  source: u64,
+  freeze_index: Index,
+  source_gen_after: u64,
+  target_gen_after: u64,
+) -> Bytes {
+  let mut sb = Vec::new();
+  source.encode(&mut sb);
+  let p = crate::CommitMergePayload::new(
+    Bytes::from(sb),
+    freeze_index,
+    Term::new(1),
+    source_gen_after,
+    target_gen_after,
+  );
+  let mut buf = Vec::new();
+  crate::wire::encode_commit_merge_payload(&p, &mut buf);
+  Bytes::from(buf)
+}
+
+/// The under-hosted park's cure, end to end at the container: the resolver's unresolvable arm
+/// sets the advertisement hint (no local fold can ever land — the source is unhosted with a
+/// non-terminal floor), a covering blob then ADOPTS in place of the fold — state to the
+/// boundary, park cleared, the LOG kept — and the completion ack gates on the persisted commit
+/// exactly like every no-blob exit. The hosted twin of the same shape keeps today's behavior
+/// bit-for-bit: no hint, no adopt, the park held for the local resolution.
+#[test]
+fn an_under_hosted_park_advertises_and_adopts_the_cure() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 1),
+    ),
+    // The k+1 coordinate: committed content above the park closes the abort window, so the
+    // resolver reaches the source lookup instead of waiting on an unsealed window.
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    Some(Index::new(2)),
+    "the unresolvable arm advertises its boundary"
+  );
+
+  // The cure blob covers the park; the receipt-time redundancy arm adopts it.
+  let meta = crate::SnapshotMeta::new(
+    Index::new(3),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta,
+        fork_blob(5),
+      )),
+    )
+    .unwrap();
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(tep.pending_merge().is_none(), "the adopt cleared the park");
+  assert_eq!(tep.merge_park_unresolvable(), None);
+  assert_eq!(
+    tep.applied_index(),
+    Index::new(3),
+    "state moved to the boundary"
+  );
+  assert_eq!(tep.state_machine().units, 5, "the blob IS the union");
+  // Nothing acked before the commit persist lands; the gated ack releases on the crank.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  let mut acked = false;
+  while let Some((_gid, out)) = m.poll_message() {
+    if matches!(out.message(), Message::SnapshotResponse(r) if r.match_index() == Index::new(3) && !r.reject())
+    {
+      acked = true;
+    }
+  }
+  assert!(acked, "the completion ack rides the three-leg gate");
+
+  // The hosted twin: same log shape, but the source IS hosted — the resolvable arm keeps
+  // today's behavior exactly (no hint, no adopt, the park held for the local resolution).
+  let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let cmd2 = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log2 = VecLog::default();
+  let mut stable2 = AsyncStable::default();
+  log2.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd2.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd2),
+  ]);
+  stable2.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m2.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log2,
+    &mut stable2,
+  )
+  .unwrap();
+  m2.create_group(42, 0, single_node_cfg(1), now, 8, SplitSm::default())
+    .unwrap();
+  let mut stores2 = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores2.0.insert(1, (log2, stable2));
+  let _ = m2.service_merge_applies(now, &mut stores2);
+  assert_eq!(
+    m2.group(&1).unwrap().merge_park_unresolvable(),
+    None,
+    "a hosted source is resolvable — no advertisement"
+  );
+  let meta2 = crate::SnapshotMeta::new(
+    Index::new(3),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log2, stable2) = stores2.0.get_mut(&1).unwrap();
+    m2.handle_message(
+      &1,
+      now,
+      log2,
+      stable2,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta2,
+        fork_blob(5),
+      )),
+    )
+    .unwrap();
+  }
+  assert!(
+    m2.group(&1).unwrap().pending_merge().is_some(),
+    "no hint, no adopt: the covered blob is redundancy, exactly as before the cure"
+  );
+  assert_eq!(m2.group(&1).unwrap().applied_index(), Index::new(1));
+
+  // The crash story: no blob was ever persisted, so a restart is NOT adopt-equivalent — it
+  // re-parks off the durable log (the CommitMerge survived; compaction never ran) and the cure
+  // re-runs through the advertisement loop. Nothing was over-acked: the completion response
+  // certified the persisted commit, and that commit is exactly what the restart recovers.
+  drop(m);
+  let mut m3: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m3.restore_group(
+      1,
+      single_node_cfg(1),
+      now,
+      7,
+      SplitSm::default(),
+      2,
+      log,
+      stable,
+    )
+    .unwrap();
+  }
+  assert!(
+    m3.group(&1).unwrap().pending_merge().is_some(),
+    "the restart re-parks: state-derivability rides the advertisement loop, not a durable blob"
+  );
+  assert!(m3.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m3.group(&1).unwrap().merge_park_unresolvable(),
+    Some(Index::new(2)),
+    "the hint re-derives and the loop re-cures"
+  );
+  let meta3 = crate::SnapshotMeta::new(
+    Index::new(3),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m3.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(1),
+        9u64,
+        meta3,
+        fork_blob(5),
+      )),
+    )
+    .unwrap();
+  }
+  assert!(m3.group(&1).unwrap().pending_merge().is_none());
+  assert_eq!(
+    m3.group(&1).unwrap().state_machine().units,
+    5,
+    "converged to the same union"
+  );
+}

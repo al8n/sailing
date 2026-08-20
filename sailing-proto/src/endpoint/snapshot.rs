@@ -881,6 +881,24 @@ where
       self.snapshot.snapshot_recv = None;
       stable.discard_snapshot_staging();
       let leader = is.leader();
+      // THE PARKED-UNION ADOPT. A park the resolver classified locally unresolvable cannot use
+      // this arm's ordinary exit: `apply_committed` below pins at the park (the union at its
+      // boundary is not derivable from the local log — that is what the park IS), so the raise
+      // would gate the ack forever and cure nothing. The blob in hand IS the union — the
+      // deterministic fold of the log prefix this arm just proved matches entry-for-entry — so
+      // adopt it in place of the impossible fold: FSM from the blob, applied to its boundary,
+      // the park cleared, the log KEPT (nothing above the boundary is discarded; the tail
+      // resumes through the ordinary drain). The ack then rides the SAME three-leg gate as
+      // every no-blob exit, its evidence the persisted commit this arm stages — with one
+      // narrowing recorded: at a park the persisted commit certifies commit-durability while
+      // STATE-derivability rides the advertisement loop (a crash re-parks, re-advertises, and
+      // is re-cured; nothing is acked before the persist lands).
+      if let Some(park) = self.merge_park_unresolvable()
+        && meta.last_index() >= park
+        && !self.adopt_parked_union(log, meta, is.data().clone())
+      {
+        return;
+      }
       // THE WORK SPLITS ON `commit`; THE ACK DOES NOT. Only the above-commit case has anything to do
       // — raise, apply, persist — but BOTH cases leave through the one gate below, because
       // `self.commit` is a VOLATILE classifier and cannot decide whether an ack is truthful.
@@ -1219,6 +1237,145 @@ where
   /// the core, not the storage layer, owns the ordering. Called only from `handle_storage`, with
   /// the matching `pending_install` tuple already `take`n out (so a failure leaves no partial deferred
   /// install behind).
+  /// Adopt a covering blob in place of a locally-impossible fold (see the receipt-time call
+  /// site): the state moves wholesale to the blob's boundary while the LOG stays untouched —
+  /// the exact inverse of the restore path's total discard, sound because Log Matching was
+  /// already proven through the boundary and the blob is the deterministic fold of that prefix.
+  /// Returns false after poisoning (a decode/restore/log fault), exactly like the install body.
+  fn adopt_parked_union<L: LogStore>(
+    &mut self,
+    log: &L,
+    meta: &SnapshotMeta<I>,
+    data: Bytes,
+  ) -> bool
+  where
+    F::Snapshot: Data,
+  {
+    let Some(pending) = self.merge.pending_apply.take() else {
+      debug_assert!(false, "the adopt is keyed on a standing park");
+      return false;
+    };
+    self.merge.park_unresolvable = false;
+    let snap = match <F::Snapshot as Data>::decode_exact(data) {
+      Ok(s) => s,
+      Err(_) => {
+        self.poison(PoisonReason::SnapshotDecode);
+        return false;
+      }
+    };
+    if self.fsm.restore(snap).is_err() {
+      self.poison(PoisonReason::SnapshotRestore);
+      return false;
+    }
+    // The skipped range (park, boundary] never executes locally — its group-level effects are
+    // embedded in the blob — but two entry kinds leave LOCAL obligations the meta cannot carry:
+    // a further CommitMerge's absorb point must engage the membership fence's compaction leg
+    // exactly as if it had applied (a joiner could still be log-walked across it while
+    // first_index sits at-or-below it), and the park's own entry is the first such point. A
+    // skipped Split stages nothing here — restore-path parity: the child reaches this host via
+    // ordinary transfer, and the token-redundant arm resolves any later twin. A skipped
+    // PrepareMerge/RollbackMerge pair is covered by the quartet clear + re-derivation below.
+    let mut absorb_high = pending.at();
+    let boundary = meta.last_index();
+    let mut idx = pending.at().next();
+    while idx <= boundary {
+      let read_end = boundary
+        .next()
+        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
+      let chunk = match log.entries(idx..read_end, 1 << 20) {
+        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
+        _ => {
+          self.poison(PoisonReason::LogRead);
+          return false;
+        }
+      };
+      for e in chunk.iter() {
+        if e.kind() == EntryKind::CommitMerge {
+          absorb_high = absorb_high.max(e.index());
+        }
+      }
+      idx = match chunk.last() {
+        Some(e) => e.index().next(),
+        None => {
+          self.poison(PoisonReason::LogRead);
+          return false;
+        }
+      };
+    }
+    self.merge.absorb_index = Some(absorb_high);
+    self.applied = boundary;
+    // The freeze quartet clears UNCONDITIONALLY, the totality argument in the correct
+    // direction: a same-group sender is capture-fenced for its freeze's whole life, so a blob
+    // at this boundary PROVES the group was thawed at-or-before it — a quartet still set here
+    // reflects a thaw sitting unapplied in the skipped range. Leaving it set would strand this
+    // replica frozen forever with its captures fenced. `freeze_pending` then re-derives against
+    // the KEPT tail (the restore path's blanket clear rests on a discard that did not happen
+    // here — a PrepareMerge above the boundary still exists and its append-observed kill is
+    // legitimately armed).
+    self.merge.frozen = false;
+    self.merge.freeze_index = None;
+    self.merge.freeze_term = None;
+    self.merge.frozen_for = None;
+    match Self::scan_freeze_pending(log, boundary) {
+      Ok(fp) => self.merge.freeze_pending = fp,
+      Err(reason) => {
+        self.poison(reason);
+        return false;
+      }
+    }
+    // Obligations at-or-below the boundary clear on the same boundary-proof the restore path
+    // uses — and the restart agrees by construction (a crash before the commit persist lands
+    // re-parks and re-derives them; nothing was acked). The retain clause is vacuous here:
+    // every armed obligation sits below the park, hence below the boundary.
+    self.note_abort_rebaselined(boundary);
+    // Meta adoption, exactly as the install path: mode, lineage, provenance.
+    self.reads.active_read_mode = meta.read_only().unwrap_or(self.reads.active_read_mode);
+    self.reads.read_mode_migrated = meta.read_only().is_some() || self.reads.read_mode_migrated;
+    self.split.shape_gen = self.split.shape_gen.max(meta.shape_gen());
+    if let Some(fork_id) = meta.fork_id() {
+      self.split.fork_id = Some(fork_id.clone());
+    }
+    // The membership transition and its events, computed while the tracker still holds the
+    // prior applied configuration — the install path's step 5/6, log ops excluded.
+    let removed_members = self.install_removed_members(meta.conf());
+    self
+      .outputs
+      .events
+      .push_back(crate::Event::SnapshotInstalled(meta.clone()));
+    if removed_members.contains(&self.config.id()) {
+      self
+        .outputs
+        .events
+        .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
+          meta.last_index(),
+          meta.conf().clone(),
+        )));
+    }
+    self.tracker = crate::Tracker::from_conf_state(
+      meta.conf(),
+      meta.last_index(),
+      self.config.max_inflight_msgs(),
+      self.config.max_inflight_bytes(),
+    );
+    let tracker = &self.tracker;
+    self
+      .pending_farewells
+      .retain(|peer, _| tracker.progress(peer).is_none());
+    self
+      .courtesy_owed
+      .retain(|peer, _| tracker.progress(peer).is_none());
+    let me = self.config.id();
+    let newly_removed: std::vec::Vec<I> = removed_members
+      .iter()
+      .filter(|peer| **peer != me)
+      .map(CheapClone::cheap_clone)
+      .collect();
+    for peer in newly_removed {
+      self.note_courtesy_debt_at_boundary(&peer, boundary);
+    }
+    true
+  }
+
   pub(crate) fn install_snapshot_now<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     log: &mut L,
@@ -1432,6 +1589,7 @@ where
     // above the boundary, the replay re-encounters the entry and re-parks from log-fixed data.
     // A stale park kept here would wedge the drain forever below a boundary it cannot re-reach.
     self.merge.pending_apply = None;
+    self.merge.park_unresolvable = false;
     // The re-baseline discarded every abort entry at-or-below the boundary — the ONLY restart
     // re-derivation of the `abandoned` obligation. The install sits past the committed+applied abort,
     // proving the source thawed past the abandoned freeze (the capturing leader's own service drove
