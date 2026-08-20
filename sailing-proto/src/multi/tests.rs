@@ -10783,6 +10783,17 @@ fn a_deferred_absorb_chains_the_consumed_debtors_debts() {
     m.service_merge_applies(d3, &mut stores).is_empty(),
     "the chain waits: the abort fence still stands"
   );
+  // Every chained source is admission-fenced while the chain stands — create, restore, fork,
+  // and factory all route through the same shared refusal.
+  for pinned in [1u64, 2] {
+    assert!(
+      matches!(
+        m.create_group(pinned, 0, single_node_cfg(1), d3, 99, SplitSm::default()),
+        Err(crate::multi::CreateGroupError::AbsorbPending)
+      ),
+      "a chained debt pins {pinned}'s admission"
+    );
+  }
 
   // The obligation clears on the embedder's floor, THROUGH the committed thaw witness: the
   // leader appends it, and the apply — possible at all only because the deferred absorb
@@ -10819,6 +10830,233 @@ fn a_deferred_absorb_chains_the_consumed_debtors_debts() {
   );
   assert!(m.group(&3).unwrap().capture_debt().is_none());
   assert!(stores.0.contains_key(&1) && stores.0.contains_key(&2));
+  // The discharge self-releases the admission fence.
+  m.create_group(2, 0, single_node_cfg(1), d3, 99, SplitSm::default())
+    .unwrap();
+}
+
+/// A crash replays the chain: the inner `CommitMerge` re-parks while the LATER committed
+/// `PrepareMerge` re-arms only as PENDING — its apply sits above the park, which is exactly
+/// what the park keeps from draining. A pending freeze ABOVE the fold's boundary must not Hold
+/// the absorb (the entry survives the capture's compaction untouched); holding would be a
+/// permanent circular wait, with the downstream target parked against this very freeze.
+#[test]
+fn a_replayed_chain_resolves_the_inner_park_beneath_a_pending_freeze() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  // The consumed-source replica, replaying to its freeze.
+  let (mut log2, mut stable2) = (VecLog::default(), AsyncStable::default());
+  {
+    let mut tb = Vec::new();
+    Data::encode(&1u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 1),
+      &mut fbuf,
+    );
+    log2.force_append(&[
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(1),
+        crate::EntryKind::Normal,
+        cmd.clone(),
+      ),
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(2),
+        crate::EntryKind::PrepareMerge,
+        Bytes::from(fbuf),
+      ),
+    ]);
+    stable2.force_state(Term::new(1), Some(1u64), Index::new(2));
+  }
+  m.restore_group(
+    2,
+    single_node_cfg(1),
+    now,
+    8,
+    SplitSm::default(),
+    1,
+    &mut log2,
+    &mut stable2,
+  )
+  .unwrap();
+  assert!(
+    m.group(&2).unwrap().is_frozen(),
+    "the source replays frozen"
+  );
+
+  // The target replica: the inner absorb parks it, the later freeze re-arms pending above.
+  let (mut log1, mut stable1) = (VecLog::default(), AsyncStable::default());
+  {
+    let mut tb = Vec::new();
+    Data::encode(&0u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 2),
+      &mut fbuf,
+    );
+    log1.force_append(&[
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(1),
+        crate::EntryKind::Normal,
+        cmd.clone(),
+      ),
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(2),
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(2, Index::new(2), 1, 1),
+      ),
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(3),
+        crate::EntryKind::PrepareMerge,
+        Bytes::from(fbuf),
+      ),
+    ]);
+    stable1.force_state(Term::new(1), Some(1u64), Index::new(3));
+  }
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log1,
+    &mut stable1,
+  )
+  .unwrap();
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.pending_merge().is_some(),
+    "re-parked at the inner absorb"
+  );
+  assert!(
+    tep.merge_freeze_active(),
+    "the later freeze re-armed as pending"
+  );
+
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log1, stable1));
+  stores.0.insert(2, (log2, stable2));
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }],
+    "the pending freeze above the boundary leaves the inner fold free"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, l, s);
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(tep.pending_merge().is_none(), "the park resolved");
+  assert!(
+    tep.is_frozen(),
+    "the drain resumed and the later freeze applied — no circular wait"
+  );
+  assert_eq!(tep.state_machine().units, 2, "the union folded first");
+}
+
+/// A destructive install is refused while a capture debt stands: the debtor's applied already
+/// covers every debt boundary, so a genuinely-newer blob is pure catch-up — and staging it
+/// would put a covering snapshot in the durable slot whose restart re-baselines past the
+/// `CommitMerge` with the volatile debts lost and the source floors still non-terminal. The
+/// refusal is silent (the sender's paced resend re-drives), and the same install admits once
+/// the chain discharges through the debtor's own forced capture.
+#[test]
+fn a_debt_holder_refuses_a_destructive_install_until_the_discharge() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  let units_before = m.group(&1).unwrap().state_machine().units;
+  let meta = crate::SnapshotMeta::new(
+    Index::new(40),
+    Term::new(2),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      d,
+      l,
+      s,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(2),
+        9u64,
+        meta.clone(),
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+  }
+  let tep = m.group(&1).unwrap();
+  assert_eq!(
+    tep.state_machine().units,
+    units_before,
+    "the destructive install was refused, nothing restored"
+  );
+  assert!(tep.capture_debt().is_some(), "the debt stands untouched");
+  while m.poll_message().is_some() {}
+
+  // The fence lifts, the debt discharges through the debtor's own capture, and the SAME
+  // install then admits.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived");
+  m.lift_fork_barrier(&1, fork.split_index);
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert!(
+    resolutions.iter().any(|r| matches!(
+      r,
+      MergeResolution::Merged {
+        source: 2,
+        target: 1
+      }
+    )),
+    "the debt discharged: {resolutions:?}"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+    m.handle_message(
+      &1,
+      d,
+      l,
+      s,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(2),
+        9u64,
+        meta,
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+    assert!(
+      l.first_index() > Index::new(1),
+      "the post-discharge install re-baselined"
+    );
+  }
+  assert_eq!(
+    m.group(&1).unwrap().state_machine().units,
+    9,
+    "the same blob admits once nothing rides the old log"
+  );
 }
 
 /// A parked fork's standing capture fence no longer wedges a later merge into the same parent:

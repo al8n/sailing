@@ -224,7 +224,12 @@ where
       return; // nothing persisted yet — the eligibility deferral
     };
     let Ok((meta, total, chunk)) = read else {
-      return; // a fatal store read on a cure path must not poison a healthy leader
+      // The store contract makes this fatal (`SnapshotRead`) and the ordinary send path
+      // poisons on it; the cure path must too. The advertised follower is match-caught-up and
+      // deliberately stays in `Replicate`, so ordinary replication never exercises this read —
+      // swallowing it here would park that follower forever with no observable cause.
+      self.poison(PoisonReason::SnapshotRead);
+      return;
     };
     if meta.last_index() < boundary {
       return; // the blob does not carry the union yet — defer, the debt stays armed
@@ -1084,6 +1089,19 @@ where
       return;
     }
 
+    // THE DEBT WINDOW REFUSES DESTRUCTIVE INSTALLS. While a capture debt (own or inherited)
+    // stands, the consumed sources' preserved stores are the union's only restart derivation —
+    // and this replica's applied already covers every debt boundary (a debt exists only past
+    // its absorb's fold), so this genuinely-newer blob is pure catch-up, never the cure.
+    // Staging it would put a covering snapshot in the durable slot whose restart `Restore` arm
+    // re-baselines past the `CommitMerge` with the volatile debts lost and the source floors
+    // still non-terminal — restorable husks beside the absorbed union. The debts discharge
+    // through this endpoint's OWN forced capture on the fence timescale they already ride;
+    // silent, no ack, exactly as the slot guard below: the sender's heartbeat-paced resend
+    // re-drives, and once the chain discharges the retry admits.
+    if self.merge.capture_debt.is_some() || !self.merge.inherited_debts.is_empty() {
+      return;
+    }
     // SLOT MONOTONICITY: the store keeps ONE latest snapshot, so a submit is destructive — it
     // REPLACES whatever the slot holds. An inbound snapshot strictly below the slot's boundary must
     // therefore never reach `submit_snapshot`: the slot may be the only baseline for a prefix the
