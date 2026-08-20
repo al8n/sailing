@@ -288,6 +288,9 @@ where
     // An outstanding capture debt is pending durability work only the per-crank service drives;
     // a quiesced group would strand the union's capture until unrelated traffic woke the pump.
     || ep.capture_debt().is_some()
+    // A standing merge-cure debt is a wedged peer the pump predicate cannot see (it is not
+    // log-lagging); quiescing would silence the very cadence its cure rides.
+    || ep.has_cure_debts()
   {
     return false;
   }

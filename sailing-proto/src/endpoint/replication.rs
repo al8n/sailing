@@ -1312,6 +1312,15 @@ where
         );
       }
     }
+    // The merge-cure mint: a nonzero `stuck_boundary` is a tracked member reporting a park no
+    // local crank of its own can resolve — the one shape every leader-side signal is blind to.
+    // Mint (or refresh) the debt and answer immediately when eligible; the sweep re-drives the
+    // rest. Untracked senders fall to the courtesy machinery's turf.
+    let stuck = response.stuck_boundary();
+    if stuck != Index::ZERO && self.tracker.progress(&from).is_some() {
+      self.note_cure_debt(now, &from, stuck);
+      self.maybe_send_cure_snapshot(now, &from, stable);
+    }
     if let Some(pr) = self.tracker.progress_mut(&from) {
       pr.clear_probe_pause();
       // etcd FreeFirstOne: free one inflight slot so a Replicate peer whose in-flight window

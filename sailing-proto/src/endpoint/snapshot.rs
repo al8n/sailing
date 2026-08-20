@@ -180,6 +180,77 @@ where
   /// Two residuals are left to the embedder's catalog reap, by the golden architecture's own
   /// assignment: an oversized blob, and a leader that never captures a snapshot past the removal
   /// at all. Both leave the peer ignorant-but-alive, the safe failure direction.
+  /// Offer the out-of-band covering snapshot a merge-cure debt records — the courtesy sender's
+  /// shape with the gates the different authorization implies. The peer is a TRACKED member that
+  /// asked for exactly this (its advertisement is the mint), so there is no removal eligibility,
+  /// no futility term (the advertisement arrived at this leader's own term), and no inherited-tail
+  /// question (nothing here derives from this leader's applied configuration). What remains: the
+  /// blob must COVER the advertised boundary — a lower capture cannot carry the union the park is
+  /// waiting for; deferral costs nothing and the leader's own forced capture covers it promptly —
+  /// and the whole-blob frame bound, whose failure SIGNALS (`Event::MergeCureUndeliverable`)
+  /// instead of deferring silently: the courtesy residual leaves a removed peer ignorant-but-
+  /// alive, the safe direction, but this residual leaves a VOTER wedged — the disease itself.
+  /// `Progress` is never touched: the peer stays in `Replicate`, keeps receiving appends, and
+  /// keeps feeding the commit quorum through the whole transfer — `become_snapshot`'s own guard
+  /// names why pinning a match-covered voter in `Snapshot` state would be strictly worse.
+  pub(crate) fn maybe_send_cure_snapshot<S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Now,
+    peer: &I,
+    stable: &S,
+  ) {
+    if !self.role.is_leader() {
+      return;
+    }
+    let Some(debt) = self.cure_owed.get(peer) else {
+      return;
+    };
+    if self.tracker.progress(peer).is_none() {
+      // Removed since the advertisement: the courtesy machinery owns removed peers.
+      self.cure_owed.remove(peer);
+      return;
+    }
+    let (boundary, next_at) = (debt.boundary, debt.next_at);
+    if next_at.is_some_and(|at| now.mono() < at) {
+      return;
+    }
+    let Some(read) = stable.snapshot_chunk(0, crate::config::MAX_SNAPSHOT_CHUNK_BYTES) else {
+      return; // nothing persisted yet — the eligibility deferral
+    };
+    let Ok((meta, total, chunk)) = read else {
+      return; // a fatal store read on a cure path must not poison a healthy leader
+    };
+    if meta.last_index() < boundary {
+      return; // the blob does not carry the union yet — defer, the debt stays armed
+    }
+    let SnapshotChunkRead::Ready(blob) = chunk else {
+      return; // cold: the next advertisement or sweep re-drives
+    };
+    if blob.len() as u64 != total {
+      return;
+    }
+    let (term, me) = (self.term, self.config.id());
+    let encoded =
+      crate::wire::install_snapshot_encoded_len(term, &me, &meta, 0, 0, blob.len() as u64);
+    if encoded.saturating_add(crate::wire::GROUP_HEADER_RESERVE) > crate::wire::MAX_FRAME_BYTES {
+      self
+        .outputs
+        .events
+        .push_back(crate::Event::MergeCureUndeliverable(
+          crate::MergeCureUndeliverable::new(peer.cheap_clone(), boundary),
+        ));
+      return;
+    }
+    let interval = COURTESY_COOLDOWN_TIMEOUTS * self.config.election_timeout();
+    if let Some(debt) = self.cure_owed.get_mut(peer) {
+      debt.next_at = Some(now.mono() + interval);
+    }
+    self.outputs.outgoing.push_back(crate::Outgoing::new(
+      peer.cheap_clone(),
+      Message::InstallSnapshot(crate::InstallSnapshot::new(term, me, meta, blob)),
+    ));
+  }
+
   pub(crate) fn maybe_send_courtesy_snapshot<S: StableStore<NodeId = I>>(
     &mut self,
     now: Now,
@@ -1757,6 +1828,12 @@ where
     // before this point is the poison bail, and every statement after it goes through the
     // `progress_mut` lookup that an owed peer cannot satisfy.
     //
+    // The MERGE-CURE discharge sits differently: its peer IS tracked, so its response flows the
+    // FULL ordinary path below — no evict-and-return — and the debt simply drops on completed
+    // evidence at-or-past the advertised boundary. Nothing weaker discharges (a reject or a
+    // mid-transfer progress ack leaves it armed for the sweep's retry), and nothing here counts:
+    // evidence discharges, the advertisement re-mints.
+    //
     // CFT, stated at the site: this trusts an authenticated peer's own report about its own state,
     // which is exactly what the crash-fault model licenses — the peer is honest or it is crashed.
     // A peer that acked without installing has chosen to stay disarmed, which costs only itself:
@@ -1772,6 +1849,15 @@ where
     {
       self.courtesy_owed.remove(&from);
       return;
+    }
+    if !response.reject()
+      && !response.progress()
+      && self
+        .cure_owed
+        .get(&from)
+        .is_some_and(|debt| response.match_index() >= debt.boundary)
+    {
+      self.cure_owed.remove(&from);
     }
     if !self.role.is_leader() {
       return;

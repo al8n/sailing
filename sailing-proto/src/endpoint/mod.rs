@@ -1266,6 +1266,28 @@ const COURTESY_COOLDOWN_TIMEOUTS: u32 = 3;
 /// working limit.
 const COURTESY_DEBT_CAP: usize = 64;
 
+/// Election timeouts of advertisement silence after which a merge-cure debt expires: the
+/// advertiser re-stamps every response and re-drives an unsolicited one per timeout, so a few
+/// silent timeouts mean the park resolved (or its replica died — the catalog's turf either way).
+const CURE_EXPIRY_TIMEOUTS: u32 = 3;
+
+/// One advertised merge-cure obligation (see [`Endpoint::cure_owed`](field): the map's doc
+/// carries the why).
+#[derive(Debug)]
+struct CureDebt {
+  /// The advertised park boundary: the send is eligible only once this leader's DURABLE snapshot
+  /// covers it (deferral costs nothing — the cure must carry the union, and the leader's own
+  /// forced capture at its resolve makes the blob cover it promptly).
+  boundary: Index,
+  /// When the next offer may go out. `None` ⇒ due immediately, so the first advertisement is
+  /// answered on receipt rather than one cooldown later.
+  next_at: Option<Instant>,
+  /// The last advertisement's arrival — the cessation clock: a peer that stops advertising
+  /// resolved (or aborted) its park some other way, and the sweep expires the entry rather than
+  /// shipping blobs at a ghost.
+  refreshed_at: Instant,
+}
+
 /// A leader's COMMITTED-EVIDENCE debt to one peer this group's own configuration removed (#95).
 ///
 /// A debt is DISCHARGED BY EVIDENCE, never by a count of attempts. An earlier version carried a
@@ -1539,6 +1561,14 @@ where
   /// [`COURTESY_DEBT_CAP`] and by construction — only this replica's own committed removals mint
   /// entries, and each is discharged by the evidence its cure produces.
   courtesy_owed: BTreeMap<I, CourtesyDebt>,
+  /// The MERGE-CURE ledger, leader-side and volatile: peers whose heartbeat responses advertise a
+  /// locally-unresolvable merge park (`stuck_boundary`), owed an out-of-band covering snapshot the
+  /// ordinary progress machinery cannot send (a parked replica's match already covers every
+  /// boundary, and `become_snapshot` refuses exactly that shape — pinning it there would pause a
+  /// live voter's replication instead). Capped like the courtesy ledger; entries expire when the
+  /// peer stops advertising (the park resolved some other way) and re-mint on every advertisement,
+  /// so a crash-restarted peer re-enters through its own re-derived hint.
+  cure_owed: BTreeMap<I, CureDebt>,
 }
 
 // Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
@@ -1704,6 +1734,7 @@ where
       term_start_index: Index::ZERO,
       pending_farewells: BTreeMap::new(),
       courtesy_owed: BTreeMap::new(),
+      cure_owed: BTreeMap::new(),
     };
     ep.arm_election_timer(now);
     ep
@@ -1973,6 +2004,13 @@ where
       }
       Event::SplitApplied(e) => {
         tracing::info!(target: "sailing::consensus", index = e.index().get(), "split applied");
+      }
+      Event::MergeCureUndeliverable(e) => {
+        tracing::warn!(
+          target: "sailing::consensus",
+          boundary = e.boundary().get(),
+          "merge cure undeliverable: the covering blob exceeds the one-frame bound"
+        );
       }
       Event::SplitStale(e) => {
         tracing::warn!(
@@ -3005,6 +3043,34 @@ where
   /// removed, enforcing [`COURTESY_DEBT_CAP`]. A re-removal of the same peer REPLACES its debt: the
   /// newer removal is the one an offer must carry, so the discharge floor resets with it and an ack
   /// for the previous generation's blob no longer settles anything.
+  /// Mint (or refresh) the merge-cure debt an advertisement carries. The boundary only ever
+  /// RISES (a replayed lower advertisement must not regress a floor an offer was already sized
+  /// for); every refresh restarts the cessation clock. On overflow the entry with the FURTHEST
+  /// deadline — the most recently SENT — is evicted: the least-recently-served debts are exactly
+  /// the ones eviction must protect, or sustained wide wedging starves a rotating subset.
+  fn note_cure_debt(&mut self, now: Now, peer: &I, boundary: Index) {
+    if !self.cure_owed.contains_key(peer)
+      && self.cure_owed.len() >= COURTESY_DEBT_CAP
+      && let Some(victim) = self
+        .cure_owed
+        .iter()
+        .max_by_key(|(_, d)| d.next_at)
+        .map(|(p, _)| p.cheap_clone())
+    {
+      self.cure_owed.remove(&victim);
+    }
+    let entry = self
+      .cure_owed
+      .entry(peer.cheap_clone())
+      .or_insert(CureDebt {
+        boundary,
+        next_at: None,
+        refreshed_at: now.mono(),
+      });
+    entry.boundary = entry.boundary.max(boundary);
+    entry.refreshed_at = now.mono();
+  }
+
   fn note_courtesy_debt(&mut self, peer: &I, removal_index: Index) {
     if !self.courtesy_owed.contains_key(peer) && self.courtesy_owed.len() >= COURTESY_DEBT_CAP {
       // Evict the OLDEST debt — the lowest removal index, log indexes being monotone. Its peer
@@ -3143,6 +3209,22 @@ where
       .collect();
     for peer in due {
       self.maybe_send_courtesy_snapshot(now, &peer, stable);
+    }
+    // The merge-cure sweep, the same cadence: expire entries whose peer stopped advertising (the
+    // park resolved some other way — a ghost debt would ship whole blobs at nobody), then re-try
+    // the due remainder.
+    let expiry = self.config.election_timeout() * CURE_EXPIRY_TIMEOUTS;
+    self
+      .cure_owed
+      .retain(|_, d| now.mono().duration_since(d.refreshed_at) <= expiry);
+    let cure_due: std::vec::Vec<I> = self
+      .cure_owed
+      .iter()
+      .filter(|(_, d)| d.next_at.is_none_or(|at| at <= now.mono()))
+      .map(|(peer, _)| peer.cheap_clone())
+      .collect();
+    for peer in cure_due {
+      self.maybe_send_cure_snapshot(now, &peer, stable);
     }
   }
 
