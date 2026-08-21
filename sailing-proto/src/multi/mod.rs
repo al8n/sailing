@@ -21,7 +21,7 @@
 //! delegate here.
 
 mod engine;
-pub use engine::{EngineLog, EngineStable, EngineStorageError, GroupEngine};
+pub use engine::{EngineLog, EngineStable, EngineStorageError, GroupEngine, MultiEngine};
 
 mod group_id;
 pub use group_id::GroupId;
@@ -48,10 +48,36 @@ use std::{
 /// impl; a coordinator-embedder that brings its own storage brings its own impl, whose
 /// durability is that storage's job. [`NoFloors`] is the gen-0 convenience: every lookup is 0,
 /// which makes admission behave exactly as it did before floors existed (no fence).
+///
+/// # The single floor authority
+///
+/// This trait is the ONE canonical lineage accessor for the whole system. Every door that fences on
+/// a floor — a fresh create, a restore, a coordinator's factory admission, the merge service's
+/// propose-time gate, the fork relay's peek, and the atomic install's own internal re-check — reads
+/// it and nothing else. [`MultiEngine`] deliberately carries no second reader: it is a SUPERTRAIT
+/// bound on this one precisely so an engine has exactly one place to answer from. Two accessors with
+/// no requirement that they agree is a contract hole, and the doors are split across enough call
+/// sites that a divergent pair would fence some and admit others.
+///
+/// # Freshest read (NORMATIVE)
+///
+/// Both methods MUST answer with the FRESHEST value the implementation holds — a floor or lineage
+/// written this crank fences before its barrier lands, so an implementation that stages writes must
+/// answer `max(durable, staged)` rather than durable-only.
+///
+/// Reading ahead of the barrier is safe because both values are monotone: they only ever grow, so
+/// early visibility can only refuse admissions that durability would refuse too, never admit what it
+/// would fence. Answering durable-only is NOT safe, and the failure is concrete: a host that drains
+/// several commands per storage crank can stage a removal's floor and then, in the same batch,
+/// process a create for that id — a durable-only read still sees the pre-removal floor and admits
+/// the retired incarnation, after which the flush persists the fence beside a live endpoint already
+/// standing below it.
 pub trait FloorStore<G> {
-  /// The admission floor for `gid` (0 = never floored).
+  /// The admission floor for `gid` (0 = never floored). Freshest — see the trait's normative
+  /// clause.
   fn floor(&self, gid: &G) -> u64;
-  /// The id's current incarnation/shape counter (0 = unreshaped).
+  /// The id's current incarnation/shape counter (0 = unreshaped). Freshest, on the same
+  /// monotonicity argument as [`floor`](Self::floor).
   fn lineage(&self, gid: &G) -> u64;
 }
 

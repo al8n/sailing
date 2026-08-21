@@ -117,7 +117,7 @@ mod multi;
 pub use multi::{
   EngineLog, EngineStable, EngineStorageError, FORK_BASE_INDEX, FORK_BASE_TERM, FloorStore,
   GroupEngine, GroupFork, GroupId, GroupStores, MERGED_FLOOR, MergeBlocked, MergeBlockedCause,
-  MergeResolution, MultiRaft, NoFloors, floor_admits,
+  MergeResolution, MultiEngine, MultiRaft, NoFloors, floor_admits,
 };
 
 mod tracker;
