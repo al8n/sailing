@@ -97,6 +97,105 @@ impl LineageRecord {
   }
 }
 
+/// The multi-group storage surface a multi-Raft host drives: every co-located group's
+/// `(log, stable)` pair, the lineage records that fence a removed id's return, and ONE batched
+/// barrier over all of them. [`GroupEngine`] is the in-memory reference implementation; a durable
+/// engine renders the same surface over its own store, and a host generic over this trait accepts
+/// either without a line of change.
+///
+/// NOT object-safe, deliberately. The store handles are ASSOCIATED types — an engine's log and
+/// stable handles are its own concrete types — because a host must borrow a group's pair as
+/// `(&mut Log, &mut Stable)` across a whole drive call; boxing them would erase exactly the
+/// distinction the per-group borrow depends on. A host therefore owns its engine BY VALUE and
+/// monomorphizes against it: there is no `dyn MultiEngine`, and none is wanted.
+///
+/// Per-group store resolution comes from the [`GroupStores`](crate::GroupStores) supertrait and
+/// admission lookups from [`FloorStore`](crate::FloorStore), so neither is restated here.
+/// CONSTRUCTION stays off the trait: an engine's resources (a heap map, a directory, a
+/// write-ahead log) are its own to open, and only the code that knows the concrete engine can
+/// open them.
+pub trait MultiEngine<G, I>:
+  crate::GroupStores<G, Self::Log, Self::Stable> + crate::FloorStore<G>
+where
+  G: crate::GroupId,
+  I: crate::NodeId,
+{
+  /// The per-group log handle this engine lends.
+  type Log: crate::LogStore;
+  /// The per-group stable-state handle this engine lends, over the host's node id.
+  type Stable: crate::StableStore<NodeId = I>;
+
+  /// Cap every group's chunked-snapshot staging buffer, in bytes. Applies to every current and
+  /// future group; a transfer declaring more than the cap fails FATALLY rather than spinning on
+  /// a transfer that can never stage.
+  fn set_snapshot_staging_cap(&mut self, cap: usize);
+
+  /// The hosted group ids, ascending.
+  fn group_ids(&self) -> impl Iterator<Item = &G>;
+
+  /// How many times [`flush`](Self::flush) has run — every call counts, including a barrier that
+  /// released nothing. With [`ops_batched`](Self::ops_batched) this is the batch metric.
+  #[must_use]
+  fn barriers(&self) -> u64;
+
+  /// Total operations completed across every [`flush`](Self::flush) so far.
+  #[must_use]
+  fn ops_batched(&self) -> u64;
+
+  /// Whether ANY hosted group holds staged-but-unreleased work — the host's exact re-arm signal
+  /// for the next barrier. Staged work is invisible to the stores' `has_pending` by contract, so
+  /// this is the only honest answer to "is another barrier owed?"; pending lineage writes count.
+  #[must_use]
+  fn has_staged(&self) -> bool;
+
+  /// THE batch barrier: make every group's staged work VISIBLE at once — and DURABLE, for an
+  /// engine with durability to offer — releasing its completions into each owning group's poll
+  /// FIFO, and return how many completed. An engine whose barrier can FAIL fail-stops internally
+  /// rather than reporting it here: a host has no recovery for a half-applied barrier spanning
+  /// every group it hosts, so the count is total by construction.
+  fn flush(&mut self) -> usize;
+
+  /// Create EMPTY storage for `gid` — explicit admission. `false` (storage untouched) if the
+  /// group is already hosted.
+  fn add_group(&mut self, gid: G) -> bool;
+
+  /// Drop `gid`'s hosted storage. The id's LINEAGE — its generation, its floor, and the removal
+  /// ceiling behind [`removal_floor`](Self::removal_floor) — is deliberately RETAINED: a fence
+  /// exists precisely to outlive the group it fences. `false` if no such group.
+  fn remove_group(&mut self, gid: &G) -> bool;
+
+  /// The next boot epoch for `gid` — a per-group monotonic counter (first call returns 1) that
+  /// makes each incarnation's [`OpId`]s strictly exceed every prior incarnation's. `None` if no
+  /// such group is hosted, or if the counter is exhausted; the increment must never wrap, since a
+  /// wrapped epoch folds two incarnations onto one identity.
+  #[must_use = "`None` means no such group or an exhausted counter; the returned epoch is the restore_group argument"]
+  fn next_boot_epoch(&mut self, gid: &G) -> Option<u64>;
+
+  /// Write `gid`'s admission floor. MONOTONE: a belated lower write must never soften the fence,
+  /// which is what makes [`FloorStore`](crate::FloorStore)'s freshest reads safe. Durability is the
+  /// next barrier.
+  ///
+  /// READING the floor back is NOT on this trait, deliberately. The supertrait
+  /// [`FloorStore::floor`](crate::FloorStore::floor) is the single canonical accessor, and one
+  /// authority is the whole point: a second reader here could answer from durable-only state while
+  /// `FloorStore` answered freshest, and the admission doors are split across both — a create that
+  /// took the stale answer would admit an incarnation the fence had already condemned.
+  fn set_group_floor(&mut self, gid: &G, floor: u64);
+
+  /// Write `gid`'s lineage counter — monotone, freshest-read, and barrier-durable exactly as
+  /// [`set_group_floor`](Self::set_group_floor).
+  fn set_group_gen(&mut self, gid: &G, generation: u64);
+
+  /// The admission floor a REMOVAL of `gid` must persist — one past the highest generation this
+  /// incarnation could have minted on this host, or `0` for an id that never reshaped. Flooring
+  /// one past that ceiling discharges every outstanding gen-keyed authorization off the floor and
+  /// forces a recreate to admit strictly above it, with NO knowledge of any other group.
+  /// OVER-APPROXIMATION IS SAFE and UNDER-approximation is not: a floor may exceed the exact
+  /// ceiling (stricter re-admission), never fall below it.
+  #[must_use]
+  fn removal_floor(&self, gid: &G) -> u64;
+}
+
 /// A shared in-memory storage engine: ONE engine hosts EVERY co-located group's replicated log
 /// and stable state, keyed by group id, with a single batched visibility barrier
 /// ([`flush`](Self::flush)) spanning all of them.
@@ -309,10 +408,11 @@ where
       .boot_epochs = boot_epochs;
   }
 
-  /// `gid`'s admission floor (0 = never floored) — the FRESHEST value, `max(durable, staged)`.
-  /// Reading ahead of the barrier is safe because staging is monotone: a floor only ever grows,
-  /// so early visibility can only refuse admissions that durability would refuse too, never
-  /// admit what it would fence.
+  /// This reference engine's INTERNAL floor accessor — how it composes `max(durable, staged)` to
+  /// satisfy [`FloorStore::floor`](crate::FloorStore::floor). Not the seam: every consumer, inside
+  /// the container and out, reads the floor through `FloorStore`, which is the single canonical
+  /// accessor. Kept public only so this engine's own unit tests can inspect the composition
+  /// directly; there is deliberately no counterpart on [`MultiEngine`](crate::MultiEngine).
   #[must_use]
   pub fn group_floor(&self, gid: &G) -> u64 {
     let durable = self.lineage.get(gid).map_or(0, |r| r.floor);
@@ -320,9 +420,9 @@ where
     durable.max(staged)
   }
 
-  /// `gid`'s lineage counter — the unified incarnation/shape generation (0 = never reshaped).
-  /// Freshest value, `max(durable, staged)`, on the same monotonicity argument as
-  /// [`group_floor`](Self::group_floor).
+  /// This reference engine's INTERNAL lineage accessor, satisfying
+  /// [`FloorStore::lineage`](crate::FloorStore::lineage) the same way
+  /// [`group_floor`](Self::group_floor) satisfies the floor — and, like it, not the seam.
   #[must_use]
   pub fn group_gen(&self, gid: &G) -> u64 {
     let durable = self.lineage.get(gid).map_or(0, |r| r.generation);
@@ -452,6 +552,69 @@ where
       .groups
       .get_mut(group)
       .map(|s| (&mut s.log, &mut s.stable))
+  }
+}
+
+/// The reference engine IS a [`MultiEngine`]: every method delegates to the inherent one of the
+/// same name, which stays public because an embedder holding a concrete engine reaches for it
+/// without importing the trait. The engine's own surface is WIDER than the trait — `new`,
+/// [`len`](GroupEngine::len), [`is_empty`](GroupEngine::is_empty), and
+/// [`contains_group`](GroupEngine::contains_group) are inherent-only, construction because it is
+/// engine-specific and the rest because no host consults them.
+impl<G, I> crate::MultiEngine<G, I> for GroupEngine<G, I>
+where
+  G: crate::GroupId,
+  I: NodeId,
+{
+  type Log = EngineLog;
+  type Stable = EngineStable<I>;
+
+  fn set_snapshot_staging_cap(&mut self, cap: usize) {
+    Self::set_snapshot_staging_cap(self, cap);
+  }
+
+  fn group_ids(&self) -> impl Iterator<Item = &G> {
+    Self::group_ids(self)
+  }
+
+  fn barriers(&self) -> u64 {
+    Self::barriers(self)
+  }
+
+  fn ops_batched(&self) -> u64 {
+    Self::ops_batched(self)
+  }
+
+  fn has_staged(&self) -> bool {
+    Self::has_staged(self)
+  }
+
+  fn flush(&mut self) -> usize {
+    Self::flush(self)
+  }
+
+  fn add_group(&mut self, gid: G) -> bool {
+    Self::add_group(self, gid)
+  }
+
+  fn remove_group(&mut self, gid: &G) -> bool {
+    Self::remove_group(self, gid)
+  }
+
+  fn next_boot_epoch(&mut self, gid: &G) -> Option<u64> {
+    Self::next_boot_epoch(self, gid)
+  }
+
+  fn set_group_floor(&mut self, gid: &G, floor: u64) {
+    Self::set_group_floor(self, gid, floor);
+  }
+
+  fn set_group_gen(&mut self, gid: &G, generation: u64) {
+    Self::set_group_gen(self, gid, generation);
+  }
+
+  fn removal_floor(&self, gid: &G) -> u64 {
+    Self::removal_floor(self, gid)
   }
 }
 

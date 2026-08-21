@@ -1852,3 +1852,59 @@ fn a_below_floor_stamp_is_fenced_over_quic() {
     "a fenced entry is never a placement signal"
   );
 }
+
+/// THE QUIC ADMISSION DOOR fences off a STAGED removal floor.
+///
+/// The QUIC driver has no in-crate white-box harness (its loop needs a live endpoint), so the pin
+/// sits at the door itself: the coordinator's `create_group` takes the engine as its
+/// [`FloorStore`](crate::FloorStore) and must answer to the FRESHEST floor. That is the same read,
+/// through the same one accessor, that the reactor and compio stream drivers' batch tests exercise
+/// end to end — the window where a removal's floor is written but its barrier has not landed.
+///
+/// Red-proof: drop `lineage_staged` from `GroupEngine::group_floor` (what `FloorStore::floor`
+/// composes) and the create is ADMITTED at an incarnation its own removal already fenced.
+#[test]
+fn quic_admission_fences_on_a_staged_removal_floor() {
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([17u8; 16]);
+  let opts = ca
+    .cluster_tls(&san(1, &cluster))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+    .build();
+  let mut seed = [0u8; 32];
+  seed[0] = 1;
+  let mut c = MultiQuicCoordinator::<u64, u64, CountSm>::with_identity(opts, Some(seed), cluster);
+
+  // A RESHAPED id whose removal has just STAGED its fence: the floor is written, the barrier is not.
+  let mut engine: crate::GroupEngine<u64, u64> = crate::GroupEngine::new();
+  engine.set_group_gen(&7, 3);
+  let floor = engine.removal_floor(&7);
+  assert_eq!(floor, 4, "one past the incarnation the removal ended");
+  engine.set_group_floor(&7, floor);
+  assert!(
+    engine.has_staged(),
+    "the fence must still be owed a barrier, or this pins the durable read"
+  );
+  assert_eq!(
+    crate::FloorStore::floor(&engine, &7),
+    4,
+    "the one canonical accessor answers freshest"
+  );
+
+  // The door, at the incarnation the removal ended.
+  let verdict = c.create_group(
+    7,
+    single_voter(1),
+    Instant::ORIGIN,
+    1,
+    CountSm::default(),
+    3,
+    &engine,
+  );
+  assert_eq!(
+    verdict,
+    Err(crate::CreateGroupError::BelowFloor { floor: 4 }),
+    "the create must refuse off the staged floor, before any barrier"
+  );
+  assert!(c.group(&7).is_none(), "a refused create admits nothing");
+}
