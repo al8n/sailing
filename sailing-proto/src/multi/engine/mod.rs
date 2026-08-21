@@ -79,13 +79,18 @@ enum StagedLog {
   Compacted(Index),
 }
 
-/// One group id's lineage: the unified incarnation/shape counter and the admission floor. Kept
-/// per id, NOT per hosted group — a record must outlive [`GroupEngine::remove_group`], because
-/// fencing a removed incarnation's return is the whole point of a floor.
+/// One group id's lineage: the unified incarnation/shape counter, the admission floor, and the
+/// removal ceiling inherited from stores that are already gone. Kept per id, NOT per hosted group
+/// — a record must outlive [`GroupEngine::remove_group`], because fencing a removed incarnation's
+/// return is the whole point of a floor.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct LineageRecord {
   generation: u64,
   floor: u64,
+  /// The removal ceiling a torn-down incarnation's stores left behind — their EXACT value at the
+  /// moment they went (see [`GroupEngine::removal_floor`]): the record is what a re-admission is
+  /// fenced against, so dropping the stores must neither lower that fence nor invent one.
+  ceiling: u64,
 }
 
 impl LineageRecord {
@@ -94,6 +99,33 @@ impl LineageRecord {
   fn fold(&mut self, other: Self) {
     self.generation = self.generation.max(other.generation);
     self.floor = self.floor.max(other.floor);
+    self.ceiling = self.ceiling.max(other.ceiling);
+  }
+}
+
+/// The lineage generation `entry` names for its OWN group, or `0` for an entry that mints none.
+/// Every lineage move rides its group's own log as one of these four shape kinds — which is what
+/// lets [`GroupEngine::removal_floor`] fold its ceiling as entries are staged instead of scanning
+/// the log when a removal asks.
+fn shape_entry_gen(entry: &Entry) -> u64 {
+  match entry.kind() {
+    crate::EntryKind::Split => {
+      crate::wire::decode_split_payload(entry.data_bytes()).map_or(0, |p| p.parent_gen_after())
+    }
+    crate::EntryKind::PrepareMerge => crate::wire::decode_prepare_merge_payload(entry.data_bytes())
+      .map_or(0, |p| p.source_gen_after()),
+    crate::EntryKind::CommitMerge => crate::wire::decode_commit_merge_payload(entry.data_bytes())
+      .map_or(0, |p| p.target_gen_after()),
+    crate::EntryKind::RollbackMerge => {
+      crate::wire::decode_rollback_merge_payload(entry.data_bytes()).map_or(0, |p| {
+        if p.is_unfreeze() {
+          p.source_gen_after()
+        } else {
+          p.target_gen_after()
+        }
+      })
+    }
+    _ => 0,
   }
 }
 
@@ -190,8 +222,13 @@ where
   /// incarnation could have minted on this host, or `0` for an id that never reshaped. Flooring
   /// one past that ceiling discharges every outstanding gen-keyed authorization off the floor and
   /// forces a recreate to admit strictly above it, with NO knowledge of any other group.
-  /// OVER-APPROXIMATION IS SAFE and UNDER-approximation is not: a floor may exceed the exact
-  /// ceiling (stricter re-admission), never fall below it.
+  ///
+  /// The ceiling must count only state that SURVIVED. A generation named by an entry the log
+  /// later truncated away, or by a snapshot slot since replaced, must not reach this answer, and
+  /// rounding up is NOT a safe shortcut in either direction: it costs a never-reshaped id its
+  /// gen-0 rejoin, and a discarded mint at the highest working generation would carry the
+  /// implementation's `+ 1` onto the reserved terminal [`MERGED_FLOOR`](crate::MERGED_FLOOR),
+  /// forging a globally terminal verdict the merge service reads as authoritative.
   #[must_use]
   fn removal_floor(&self, gid: &G) -> u64;
 }
@@ -356,11 +393,24 @@ where
   }
 
   /// Drop `gid`'s storage — log, stable state, staged and released completions, and its
-  /// boot-epoch counter (the Phase-5 teardown seam). The id's LINEAGE record (gen + floor) is
-  /// deliberately retained: a floor exists precisely to outlive the group it fences. Returns
-  /// `false` if no such group.
+  /// boot-epoch counter (the Phase-5 teardown seam). The id's LINEAGE record (gen, floor, and the
+  /// removal ceiling the departing stores had folded) is deliberately retained: a floor exists
+  /// precisely to outlive the group it fences. Returns `false` if no such group.
   pub fn remove_group(&mut self, gid: &G) -> bool {
-    self.groups.remove(gid).is_some()
+    // `remove_entry` hands back the OWNED key, so inheriting the ceiling costs no `G: Clone` —
+    // and the inheritance must happen here, because the stores that hold it are about to go.
+    let Some((gid, storage)) = self.groups.remove_entry(gid) else {
+      return false;
+    };
+    let inherited = storage
+      .log
+      .shape_ceiling()
+      .max(storage.stable.meta_ceiling());
+    if inherited != 0 {
+      let rec = self.lineage.entry(gid).or_default();
+      rec.ceiling = rec.ceiling.max(inherited);
+    }
+    true
   }
 
   /// Whether storage for `gid` is hosted.
@@ -465,66 +515,62 @@ where
 
   /// The admission floor a REMOVAL of `gid` must persist — one past the id's removal CEILING,
   /// the highest generation this incarnation could have minted on this host: the engine's
-  /// mirrored lineage record ⊔ the stores' snapshot-meta lineage ⊔ a shape-kind scan of the
-  /// resident log (every `Split`/`PrepareMerge`/`CommitMerge`/`RollbackMerge` entry names the
-  /// generation it sets for its OWN group, and every lineage move rides the group's own log or
-  /// its snapshot meta — nothing else can mint). `0` (no fence) for an id that never reshaped,
-  /// preserving the gen-0 volatile-tombstone rejoin.
+  /// mirrored lineage record ⊔ the ceiling MAINTAINED over the id's stores. `0` (no fence) for an
+  /// id that never reshaped, preserving the gen-0 volatile-tombstone rejoin.
+  ///
+  /// # The stores' ceiling is maintained, not scanned
+  ///
+  /// Every lineage move rides the group's own log or its snapshot meta — nothing else can mint —
+  /// so the ceiling is folded AS THAT STATE IS WRITTEN: `submit_append` records each
+  /// `Split`/`PrepareMerge`/`CommitMerge`/`RollbackMerge` entry's own-group generation against
+  /// that entry's index, and `submit_snapshot` records the meta's. Answering costs a max over the
+  /// SHAPE entries alone rather than a walk of the log, which is what lets an engine that cannot
+  /// re-read its log from `&self` — a durable one — serve a removal at all. The maintained value
+  /// outlives the stores it came from: [`remove_group`](Self::remove_group) moves it into the id's
+  /// lineage record, because a fence exists to survive the teardown it fences.
   ///
   /// With the drivers' eager mirrors (admission, fork relay, and the merge lineage events) the
-  /// record leg already carries the ceiling, so the stores legs are almost always a no-op; they
-  /// exist for the crash window where an applied move's mirror never became durable and the
+  /// record leg already carries the ceiling, so the stores leg is almost always a no-op; it
+  /// exists for the crash window where an applied move's mirror never became durable and the
   /// group was never re-hosted (a stores-only removal). Flooring one past the ceiling makes
   /// every outstanding gen-keyed authorization (a merge-abort thaw obligation's `expected`
   /// above all) discharge off the floor and forces a recreate to admit strictly above it — with
-  /// NO knowledge of any other group. Over-approximation is safe: a truncated-away suffix entry
-  /// only raises the fence, never lowers what durability would demand. The `+ 1` SATURATES: a
-  /// ceiling at the highest working generation (one below the reserved terminal) floors at
-  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) — the id is then permanently retired, exactly the
-  /// terminal verdict a group that can never reshape again should carry — rather than wrapping
-  /// past the terminal to `0`.
+  /// NO knowledge of any other group.
+  ///
+  /// # The maintained ceiling is EXACT
+  ///
+  /// Every fold RETRACTS where the state behind it goes: a §5.3 conflict truncation pops the
+  /// superseded suffix's contributions, a compaction pops the prefix's, a `restore` clears them,
+  /// and a snapshot slot's contribution is replaced with the slot rather than accumulated. What
+  /// the legs answer is therefore exactly what a scan of the surviving resident log and the
+  /// current snapshot slots would answer, joined with the record — the value this method returned
+  /// when it did scan. Retraction loses no fence: compaction covers only the APPLIED prefix,
+  /// whose lineage is already mirrored into the record and stamped into the meta of the snapshot
+  /// it follows, while a truncated or re-baselined entry is one this log never kept at all.
+  ///
+  /// EXACTNESS IS A SAFETY REQUIREMENT, not tidiness — "round up, it only fences harder" fails at
+  /// both ends of the range. A gen-0 id whose one shape entry is truncated away must still answer
+  /// `0`, or it loses the volatile-tombstone rejoin that a never-reshaped id is entitled to. And a
+  /// discarded mint at the highest working generation would carry the saturating `+ 1` onto
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) — FORGING the globally terminal floor that the
+  /// per-crank merge service reads as authoritative (a dead target's thaw authorization, a husk's
+  /// retirement), which that constant's own contract classes as a consensus-safety violation. A
+  /// contribution the engine discarded can never reach this answer, so the terminal is reachable
+  /// only through state that genuinely survived.
+  ///
+  /// The `+ 1` SATURATES: a ceiling at the highest working generation (one below the reserved
+  /// terminal) floors at [`MERGED_FLOOR`](crate::MERGED_FLOOR) — the id is then permanently
+  /// retired, exactly the terminal verdict a group that can never reshape again should carry —
+  /// rather than wrapping past the terminal to `0`.
   #[must_use]
   pub fn removal_floor(&self, gid: &G) -> u64 {
-    let mut ceiling = self.group_gen(gid);
+    let mut ceiling = self
+      .group_gen(gid)
+      .max(self.lineage.get(gid).map_or(0, |r| r.ceiling));
     if let Some(storage) = self.groups.get(gid) {
-      let meta_gen = storage
-        .stable
-        .snapshot
-        .as_ref()
-        .map_or(0, |(m, _)| m.shape_gen())
-        .max(
-          storage
-            .stable
-            .durable_snapshot
-            .as_ref()
-            .map_or(0, SnapshotMeta::shape_gen),
-        );
-      ceiling = ceiling.max(meta_gen);
-      for entry in &storage.log.entries {
-        let minted = match entry.kind() {
-          crate::EntryKind::Split => crate::wire::decode_split_payload(entry.data_bytes())
-            .map_or(0, |p| p.parent_gen_after()),
-          crate::EntryKind::PrepareMerge => {
-            crate::wire::decode_prepare_merge_payload(entry.data_bytes())
-              .map_or(0, |p| p.source_gen_after())
-          }
-          crate::EntryKind::CommitMerge => {
-            crate::wire::decode_commit_merge_payload(entry.data_bytes())
-              .map_or(0, |p| p.target_gen_after())
-          }
-          crate::EntryKind::RollbackMerge => {
-            crate::wire::decode_rollback_merge_payload(entry.data_bytes()).map_or(0, |p| {
-              if p.is_unfreeze() {
-                p.source_gen_after()
-              } else {
-                p.target_gen_after()
-              }
-            })
-          }
-          _ => 0,
-        };
-        ceiling = ceiling.max(minted);
-      }
+      ceiling = ceiling
+        .max(storage.log.shape_ceiling())
+        .max(storage.stable.meta_ceiling());
     }
     if ceiling == 0 {
       0
@@ -640,6 +686,12 @@ pub struct EngineLog {
   staged: VecDeque<StagedLog>,
   /// Completions released by a barrier — what `poll`/`has_pending` see.
   ready: VecDeque<LogDone>,
+  /// The generation each RESIDENT shape entry names for its own group, keyed by that entry's
+  /// index and non-decreasing in index (appends stage in order). The log leg of
+  /// [`GroupEngine::removal_floor`]'s ceiling: maintained so a removal never re-reads the log, and
+  /// RETRACTED wherever the log discards content, so it stays exactly what a scan of the surviving
+  /// entries would find. Holds shape entries ONLY — never the ordinary traffic.
+  shape_contribs: VecDeque<(Index, u64)>,
 }
 
 impl EngineLog {
@@ -650,7 +702,21 @@ impl EngineLog {
       compacted_term: Term::ZERO,
       staged: VecDeque::new(),
       ready: VecDeque::new(),
+      shape_contribs: VecDeque::new(),
     }
+  }
+
+  /// The log leg of [`GroupEngine::removal_floor`]'s ceiling: the highest generation any SURVIVING
+  /// shape entry names. A max over the shape entries alone — never over the log — and a group
+  /// holds a handful of un-compacted shape moves at most, so this is a scan of nothing in the
+  /// ordinary case.
+  fn shape_ceiling(&self) -> u64 {
+    self
+      .shape_contribs
+      .iter()
+      .map(|(_, generation)| *generation)
+      .max()
+      .unwrap_or(0)
   }
 
   /// Release every staged completion into the poll FIFO (the barrier), returning how many.
@@ -739,6 +805,26 @@ impl LogStore for EngineLog {
         StagedLog::Appended { upto, .. } => *upto < fi_idx,
         StagedLog::Compacted(_) => true,
       });
+      // The superseded suffix's removal-ceiling contributions retract with the entries
+      // themselves, on the same discipline as the staged completions above. A mint this log
+      // never kept must not fence the id: it would cost a gen-0 id its rejoin, and at the top of
+      // the working range it would forge the terminal floor (see `GroupEngine::removal_floor`).
+      while self
+        .shape_contribs
+        .back()
+        .is_some_and(|(index, _)| *index >= fi_idx)
+      {
+        self.shape_contribs.pop_back();
+      }
+    }
+    // The removal ceiling folds HERE, while the entries are in hand: a durable engine cannot
+    // re-read its own log from `&self` to answer a removal, and this host's log is exactly where
+    // every one of its lineage moves rides.
+    for entry in entries {
+      let generation = shape_entry_gen(entry);
+      if generation != 0 {
+        self.shape_contribs.push_back((entry.index(), generation));
+      }
     }
     self.entries.extend_from_slice(entries);
     let upto = self.last_index();
@@ -756,6 +842,17 @@ impl LogStore for EngineLog {
     self.entries.drain(0..drain_count);
     self.offset = up_to;
     self.compacted_term = boundary_term;
+    // The compacted prefix's contributions leave with the entries — exactly what a scan of the
+    // surviving log would no longer find. No fence is lost: compaction covers only the APPLIED
+    // prefix, whose lineage the driver has already mirrored into the id's record, and the
+    // snapshot a compaction follows stamps that same counter into its meta (the meta leg).
+    while self
+      .shape_contribs
+      .front()
+      .is_some_and(|(index, _)| *index <= up_to)
+    {
+      self.shape_contribs.pop_front();
+    }
     self.staged.push_back(StagedLog::Compacted(up_to));
   }
 
@@ -766,6 +863,9 @@ impl LogStore for EngineLog {
     self.entries.clear();
     self.staged.clear();
     self.ready.clear();
+    // No entry survives, so no entry contributes: the installing snapshot's meta carries this
+    // group's lineage across the re-baseline, which is the meta leg's whole job.
+    self.shape_contribs.clear();
     self.offset = last_index;
     self.compacted_term = last_term;
   }
@@ -820,6 +920,13 @@ pub struct EngineStable<I> {
   /// The staging byte cap this group inherited from the engine (see
   /// [`GroupEngine::set_snapshot_staging_cap`]).
   staging_cap: usize,
+  /// The lineage the VISIBLE snapshot slot's meta claims (0 = no slot). REPLACED with the slot,
+  /// never accumulated: a displaced meta must stop counting toward the removal ceiling exactly
+  /// when it stops being the slot a reader would find.
+  visible_meta_gen: u64,
+  /// The lineage the DURABLE snapshot slot's meta claims (0 = no slot), advancing with that slot
+  /// at the barrier.
+  durable_meta_gen: u64,
 }
 
 impl<I> EngineStable<I> {
@@ -833,7 +940,16 @@ impl<I> EngineStable<I> {
       ready: VecDeque::new(),
       staging: None,
       staging_cap,
+      visible_meta_gen: 0,
+      durable_meta_gen: 0,
     }
+  }
+
+  /// The snapshot-meta leg of [`GroupEngine::removal_floor`]'s ceiling: what the CURRENT slots
+  /// claim — exactly what reading `snapshot()` and `durable_snapshot()` would find, and nothing
+  /// either slot used to hold.
+  fn meta_ceiling(&self) -> u64 {
+    self.visible_meta_gen.max(self.durable_meta_gen)
   }
 
   /// Release every staged completion into the poll FIFO (the barrier), returning how many. The
@@ -850,6 +966,9 @@ impl<I> EngineStable<I> {
     }
     self.durable = self.visible.clone();
     self.durable_snapshot = self.snapshot.as_ref().map(|(m, _)| m.clone());
+    // The durable slot's removal-ceiling contribution moves with the slot, so the two stay the
+    // same observation of one durability event.
+    self.durable_meta_gen = self.visible_meta_gen;
     let n = self.staged.len();
     self.ready.append(&mut self.staged);
     n
@@ -877,6 +996,10 @@ impl<I: NodeId> StableStore for EngineStable<I> {
   }
 
   fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<I>, data: Bytes) {
+    // The meta leg of the removal ceiling REPLACES with the slot: every capture stamps the live
+    // lineage counter, so a compacted-away shape move survives here — but only while this is
+    // still the meta the slot holds.
+    self.visible_meta_gen = meta.shape_gen();
     self.snapshot = Some((meta, data));
     self.staged.push_back(StableDone::SnapshotWritten(id));
   }

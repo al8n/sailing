@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ConfState, EntryKind, FloorStore, ForkId, NoFloors};
+use crate::{ConfState, EntryKind, FloorStore, ForkId, MERGED_FLOOR, NoFloors};
 
 fn empty_entry(term: u64, index: u64) -> Entry {
   Entry::new(
@@ -683,6 +683,482 @@ fn lineage_records_stage_read_fresh_and_survive_removal() {
     (0, 0),
     "NoFloors is the gen-0 world"
   );
+}
+
+/// The removal ceiling's ORACLE: the SCAN the maintained ceiling stands in for — the surviving
+/// resident log, the CURRENT snapshot slots, and the id's lineage record. Kept whole so the
+/// maintained value is checked against something other than itself, and read at the moment it is
+/// asked, which is exactly where a stale contribution would show.
+fn scanned_removal_floor(eng: &GroupEngine<u64, u64>, gid: &u64) -> u64 {
+  let mut ceiling = eng
+    .group_gen(gid)
+    .max(eng.lineage.get(gid).map_or(0, |r| r.ceiling));
+  if let Some(storage) = eng.groups.get(gid) {
+    let meta_gen = storage
+      .stable
+      .snapshot
+      .as_ref()
+      .map_or(0, |(m, _)| m.shape_gen())
+      .max(
+        storage
+          .stable
+          .durable_snapshot
+          .as_ref()
+          .map_or(0, SnapshotMeta::shape_gen),
+      );
+    ceiling = ceiling.max(meta_gen);
+    for entry in &storage.log.entries {
+      let minted = match entry.kind() {
+        EntryKind::Split => {
+          crate::wire::decode_split_payload(entry.data_bytes()).map_or(0, |p| p.parent_gen_after())
+        }
+        EntryKind::PrepareMerge => crate::wire::decode_prepare_merge_payload(entry.data_bytes())
+          .map_or(0, |p| p.source_gen_after()),
+        EntryKind::CommitMerge => crate::wire::decode_commit_merge_payload(entry.data_bytes())
+          .map_or(0, |p| p.target_gen_after()),
+        EntryKind::RollbackMerge => crate::wire::decode_rollback_merge_payload(entry.data_bytes())
+          .map_or(0, |p| {
+            if p.is_unfreeze() {
+              p.source_gen_after()
+            } else {
+              p.target_gen_after()
+            }
+          }),
+        _ => 0,
+      };
+      ceiling = ceiling.max(minted);
+    }
+  }
+  if ceiling == 0 {
+    0
+  } else {
+    ceiling.saturating_add(1)
+  }
+}
+
+/// The five shape roles a log entry can carry, each naming its OWN group's post-move lineage in
+/// a different payload field. The decoy values below make a mis-read field FAIL rather than
+/// coincide.
+#[derive(Debug, Clone, Copy)]
+enum Shape {
+  Split,
+  Freeze,
+  Absorb,
+  Abort,
+  Unfreeze,
+}
+
+/// A shape entry naming `gen_after` for its own group. Every field the extraction must IGNORE
+/// carries `gen_after + 7`, so reading the wrong one lands the ceiling above the oracle.
+fn shape_entry(index: u64, shape: Shape, gen_after: u64) -> Entry {
+  let decoy = gen_after.saturating_add(7);
+  let source = Bytes::from_static(&[9]);
+  let mut buf = Vec::new();
+  let kind = match shape {
+    Shape::Split => {
+      let p = crate::SplitPayload::new(source, decoy, gen_after, Bytes::new());
+      crate::wire::encode_split_payload(&p, &mut buf);
+      EntryKind::Split
+    }
+    Shape::Freeze => {
+      let p = crate::PrepareMergePayload::new(source, gen_after);
+      crate::wire::encode_prepare_merge_payload(&p, &mut buf);
+      EntryKind::PrepareMerge
+    }
+    Shape::Absorb => {
+      let p =
+        crate::CommitMergePayload::new(source, Index::new(index), Term::new(1), decoy, gen_after);
+      crate::wire::encode_commit_merge_payload(&p, &mut buf);
+      EntryKind::CommitMerge
+    }
+    Shape::Abort => {
+      let p = crate::RollbackMergePayload::abort(source, decoy, gen_after);
+      crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+      EntryKind::RollbackMerge
+    }
+    Shape::Unfreeze => {
+      let p = crate::RollbackMergePayload::unfreeze(gen_after);
+      crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+      EntryKind::RollbackMerge
+    }
+  };
+  Entry::new(Term::new(1), Index::new(index), kind, Bytes::from(buf))
+}
+
+/// One engine mutation in the ceiling differential — every move that can shift either the
+/// maintained ceiling or the oracle's answer.
+#[derive(Debug, Clone, Copy)]
+enum Step {
+  /// Append one entry at `index`; `None` is an ordinary command. An `index` at or below the
+  /// resident last index is the §5.3 conflict rewind, which retracts the superseded suffix.
+  Append {
+    index: u64,
+    shape: Option<Shape>,
+    gen_after: u64,
+  },
+  Compact {
+    up_to: u64,
+  },
+  /// REPLACE the visible snapshot slot with a meta claiming `shape_gen` at `last_index`.
+  Snapshot {
+    last_index: u64,
+    shape_gen: u64,
+  },
+  /// Re-baseline the log at `last_index` — the snapshot-install path.
+  Restore {
+    last_index: u64,
+  },
+  /// Mirror the group's live lineage counter into the engine record (what a driver does eagerly).
+  Mirror {
+    generation: u64,
+  },
+  Flush,
+  /// Tear the storage down and re-admit the id: the removal-to-rejoin cycle the floor fences.
+  RemoveAndReadmit,
+}
+
+fn apply_step(eng: &mut GroupEngine<u64, u64>, step: Step, op: &mut u64) {
+  *op += 1;
+  match step {
+    Step::Append {
+      index,
+      shape,
+      gen_after,
+    } => {
+      let entry = match shape {
+        Some(shape) => shape_entry(index, shape, gen_after),
+        None => empty_entry(1, index),
+      };
+      let (log, _) = eng.stores(&1).unwrap();
+      log.submit_append(OpId::new(*op), &[entry]);
+    }
+    Step::Compact { up_to } => {
+      let (log, _) = eng.stores(&1).unwrap();
+      log.compact(Index::new(up_to));
+    }
+    Step::Snapshot {
+      last_index,
+      shape_gen,
+    } => {
+      let meta = voter_meta(last_index, 1).with_shape_gen(shape_gen);
+      let (_, stable) = eng.stores(&1).unwrap();
+      stable.submit_snapshot(OpId::new(*op), meta, Bytes::from_static(&[1, 2, 3]));
+    }
+    Step::Restore { last_index } => {
+      let (log, _) = eng.stores(&1).unwrap();
+      log.restore(Index::new(last_index), Term::new(1));
+    }
+    Step::Mirror { generation } => eng.set_group_gen(&1, generation),
+    Step::Flush => {
+      eng.flush();
+    }
+    Step::RemoveAndReadmit => {
+      assert!(eng.remove_group(&1));
+      assert!(eng.add_group(1));
+    }
+  }
+}
+
+/// Shorthand for the vectors below: an ordinary command at `index`.
+const fn plain(index: u64) -> Step {
+  Step::Append {
+    index,
+    shape: None,
+    gen_after: 0,
+  }
+}
+
+/// Shorthand for the vectors below: a shape entry at `index` minting `gen_after`.
+const fn mint(index: u64, shape: Shape, gen_after: u64) -> Step {
+  Step::Append {
+    index,
+    shape: Some(shape),
+    gen_after,
+  }
+}
+
+/// THE CEILING DIFFERENTIAL. `removal_floor` maintains its ceiling as state is written instead of
+/// scanning the log when a removal asks, and the maintenance is EXACT: every vector below is
+/// replayed against the scan it replaced, asserting STRICT EQUALITY at every step — across
+/// conflict truncation, compaction, `restore`, snapshot-slot replacement, and the
+/// removal-to-rejoin cycle. Where a step also pins an ABSOLUTE answer, the vector carries it,
+/// because equality alone cannot catch two legs that drifted together.
+#[test]
+fn the_removal_ceiling_tracks_the_scan_exactly() {
+  // Every field a shape role must ignore is decoyed, so these vectors also pin the extraction:
+  // reading `source_gen_after` where `target_gen_after` is meant lands 7 above the oracle.
+  let vectors: &[&[(Step, Option<u64>)]] = &[
+    // Every shape role in one lineage, nothing dropped, then a MIRRORED teardown.
+    &[
+      (plain(1), Some(0)),
+      (mint(2, Shape::Split, 3), Some(4)),
+      (mint(3, Shape::Freeze, 5), Some(6)),
+      (Step::Flush, Some(6)),
+      (mint(4, Shape::Absorb, 9), Some(10)),
+      (mint(5, Shape::Abort, 11), Some(12)),
+      (mint(6, Shape::Unfreeze, 12), Some(13)),
+      (Step::Flush, Some(13)),
+      (Step::Mirror { generation: 12 }, Some(13)),
+      (
+        Step::Snapshot {
+          last_index: 6,
+          shape_gen: 12,
+        },
+        Some(13),
+      ),
+      (Step::Flush, Some(13)),
+      (Step::RemoveAndReadmit, Some(13)),
+    ],
+    // §5.3: a conflicting append supersedes the shape entry, and the ceiling RETRACTS with it —
+    // back to exactly the answer that stood before the doomed mint was ever staged.
+    &[
+      (mint(1, Shape::Freeze, 2), Some(3)),
+      (mint(2, Shape::Split, 6), Some(7)),
+      (plain(2), Some(3)),
+      (Step::Flush, Some(3)),
+      // And again, deeper: the rewind takes BOTH mints when it lands under them.
+      (mint(3, Shape::Absorb, 8), Some(9)),
+      (plain(1), Some(0)),
+      (Step::Flush, Some(0)),
+    ],
+    // Compaction pops the prefix: the surviving suffix's mint still answers, and once the last
+    // shape entry is compacted away the id is back to an unfenced gen-0 rejoin.
+    &[
+      (mint(1, Shape::Freeze, 2), Some(3)),
+      (plain(2), Some(3)),
+      (mint(3, Shape::Split, 5), Some(6)),
+      (Step::Compact { up_to: 2 }, Some(6)),
+      (Step::Compact { up_to: 3 }, Some(0)),
+      (Step::Flush, Some(0)),
+    ],
+    // The realistic compaction order — snapshot first, then drop the prefix: the meta leg picks
+    // up exactly what the log leg gives back.
+    &[
+      (mint(1, Shape::Freeze, 2), Some(3)),
+      (plain(2), Some(3)),
+      (mint(3, Shape::Split, 4), Some(5)),
+      (
+        Step::Snapshot {
+          last_index: 3,
+          shape_gen: 4,
+        },
+        Some(5),
+      ),
+      (Step::Compact { up_to: 3 }, Some(5)),
+      (Step::Flush, Some(5)),
+      (Step::Restore { last_index: 3 }, Some(5)),
+      (Step::Mirror { generation: 4 }, Some(5)),
+    ],
+    // A `restore` with NO covering meta clears the log leg outright — the re-baselined entry is
+    // one this log never kept.
+    &[
+      (mint(1, Shape::Absorb, 8), Some(9)),
+      (Step::Restore { last_index: 5 }, Some(0)),
+      (Step::Flush, Some(0)),
+    ],
+    // THE META LEG ALONE: a replica caught up by snapshot INSTALL never appended the shape
+    // entries, so the installed meta is the only place its lineage is written.
+    &[
+      (plain(1), Some(0)),
+      (
+        Step::Snapshot {
+          last_index: 4,
+          shape_gen: 6,
+        },
+        Some(7),
+      ),
+      (Step::Restore { last_index: 4 }, Some(7)),
+      (Step::Flush, Some(7)),
+      (Step::Mirror { generation: 6 }, Some(7)),
+      (Step::RemoveAndReadmit, Some(7)),
+    ],
+    // SLOT REPLACEMENT: a meta REPLACES its slot, it does not accumulate into it. While the
+    // durable slot still holds the older capture the higher lineage stands; once the barrier
+    // advances that slot too, the displaced meta stops counting entirely.
+    &[
+      (
+        Step::Snapshot {
+          last_index: 3,
+          shape_gen: 9,
+        },
+        Some(10),
+      ),
+      (Step::Flush, Some(10)),
+      (
+        Step::Snapshot {
+          last_index: 5,
+          shape_gen: 4,
+        },
+        Some(10),
+      ),
+      (Step::Flush, Some(5)),
+    ],
+    // THE STORES-ONLY TEARDOWN: nothing mirrored the freeze, so the record leg is what carries
+    // the fence across the teardown — the survival the floor exists for.
+    &[
+      (mint(1, Shape::Freeze, 2), Some(3)),
+      (Step::RemoveAndReadmit, Some(3)),
+      (plain(1), Some(3)),
+    ],
+    // The same teardown for a snapshot-installed replica, whose lineage lives ONLY in its meta.
+    &[
+      (
+        Step::Snapshot {
+          last_index: 4,
+          shape_gen: 6,
+        },
+        Some(7),
+      ),
+      (Step::RemoveAndReadmit, Some(7)),
+    ],
+    // An id that NEVER reshapes keeps the gen-0 rejoin through every move — no phantom record
+    // may appear, or a group that never split would come back fenced.
+    &[
+      (plain(1), Some(0)),
+      (plain(2), Some(0)),
+      (
+        Step::Snapshot {
+          last_index: 2,
+          shape_gen: 0,
+        },
+        Some(0),
+      ),
+      (Step::Compact { up_to: 2 }, Some(0)),
+      (Step::Flush, Some(0)),
+      (Step::RemoveAndReadmit, Some(0)),
+    ],
+    // A SURVIVING mint at the highest working generation does saturate onto the terminal: the id
+    // can never reshape again, which is the truthful verdict here.
+    &[(mint(1, Shape::Freeze, MERGED_FLOOR - 1), Some(MERGED_FLOOR))],
+  ];
+
+  for (v, steps) in vectors.iter().enumerate() {
+    let mut eng: GroupEngine<u64, u64> = GroupEngine::new();
+    assert!(eng.add_group(1));
+    assert_eq!(eng.removal_floor(&1), 0, "vector {v} starts unfenced");
+    let mut op = 0;
+    for (s, (step, pinned)) in steps.iter().enumerate() {
+      apply_step(&mut eng, *step, &mut op);
+      let maintained = eng.removal_floor(&1);
+      let scanned = scanned_removal_floor(&eng, &1);
+      assert_eq!(
+        maintained, scanned,
+        "[{v}] step {s} ({step:?}): the maintained ceiling and the scan disagree — the \
+         maintenance is exact or it is a fence over state that no longer exists"
+      );
+      if let Some(pinned) = pinned {
+        assert_eq!(
+          maintained, *pinned,
+          "[{v}] step {s} ({step:?}): both legs agree on {maintained}, but the answer this step \
+           owes is {pinned}"
+        );
+      }
+    }
+  }
+}
+
+/// A never-reshaped id keeps its gen-0 rejoin even after a shape entry was STAGED and then
+/// superseded. The mint rode an uncommitted suffix this log threw away, so it fences nothing:
+/// carrying it would strand the id above a floor no committed entry ever justified, and the
+/// volatile tombstone would be the only thing left admitting it back.
+#[test]
+fn a_superseded_mint_leaves_the_gen_zero_rejoin_intact() {
+  let mut eng: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(eng.add_group(1));
+  assert_eq!(eng.removal_floor(&1), 0, "never reshaped");
+
+  {
+    let (log, _) = eng.stores(&1).unwrap();
+    log.submit_append(OpId::new(1), &[shape_entry(1, Shape::Freeze, 1)]);
+  }
+  assert_eq!(eng.removal_floor(&1), 2, "while it stands, the mint fences");
+
+  // The §5.3 rewind: a conflicting append at the same index supersedes it.
+  {
+    let (log, _) = eng.stores(&1).unwrap();
+    log.submit_append(OpId::new(2), &[empty_entry(1, 1)]);
+  }
+  assert_eq!(
+    eng.removal_floor(&1),
+    0,
+    "a superseded mint fences nothing — the id never reshaped"
+  );
+
+  // The driver's removal order: read the floor, persist it, then drop the stores.
+  let floor = eng.removal_floor(&1);
+  eng.set_group_floor(&1, floor);
+  assert!(eng.remove_group(&1));
+  assert_eq!(
+    eng.removal_floor(&1),
+    0,
+    "the teardown inherits no phantom fence"
+  );
+  assert_eq!(eng.floor(&1), 0, "no floor was persisted");
+  assert!(
+    crate::floor_admits(eng.floor(&1), 0),
+    "the gen-0 volatile-tombstone rejoin stands"
+  );
+  assert!(eng.add_group(1), "and the id is re-admissible");
+}
+
+/// A SUPERSEDED mint at the top of the working range must not forge the reserved terminal. The
+/// `+ 1` saturates onto [`MERGED_FLOOR`] — the fence the merge service reads as authoritative
+/// when it authorizes a dead target's thaw or retires a husk — so a ceiling that kept a
+/// truncated-away generation would manufacture a globally terminal verdict out of an entry no
+/// replica ever committed. The retraction must restore the EXACT answer that stood before it.
+#[test]
+fn a_superseded_mint_cannot_forge_the_terminal_floor() {
+  let mut eng: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(eng.add_group(1));
+
+  // A move that genuinely survives — the answer the id must come back to.
+  {
+    let (log, _) = eng.stores(&1).unwrap();
+    log.submit_append(OpId::new(1), &[shape_entry(1, Shape::Freeze, 2)]);
+  }
+  let before = eng.removal_floor(&1);
+  assert_eq!(before, 3);
+
+  // A mint at the highest WORKING generation, staged and then superseded at the same index.
+  {
+    let (log, _) = eng.stores(&1).unwrap();
+    log.submit_append(
+      OpId::new(2),
+      &[shape_entry(2, Shape::Split, MERGED_FLOOR - 1)],
+    );
+  }
+  assert_eq!(
+    eng.removal_floor(&1),
+    MERGED_FLOOR,
+    "while it stands the saturation is truthful — the id could not reshape again"
+  );
+  {
+    let (log, _) = eng.stores(&1).unwrap();
+    log.submit_append(OpId::new(3), &[empty_entry(1, 2)]);
+  }
+
+  // The saturation lives in `removal_floor` itself, so the engine's own answer is the assertion
+  // point — no driver is needed to observe the forgery.
+  assert_ne!(
+    eng.removal_floor(&1),
+    MERGED_FLOOR,
+    "a superseded mint must NOT forge the terminal floor"
+  );
+  assert_eq!(
+    eng.removal_floor(&1),
+    before,
+    "the retraction restores exactly the answer the surviving state justifies"
+  );
+
+  let floor = eng.removal_floor(&1);
+  eng.set_group_floor(&1, floor);
+  assert!(eng.remove_group(&1));
+  assert_eq!(
+    eng.removal_floor(&1),
+    before,
+    "the teardown inherits the SURVIVING ceiling only"
+  );
+  assert_ne!(eng.floor(&1), MERGED_FLOOR, "no terminal floor persisted");
 }
 
 /// The Phase-2 payoff end to end: two multi-group coordinator hosts, each backed by ONE
