@@ -149,6 +149,41 @@ pub trait LogStore {
   /// The last index present.
   fn last_index(&self) -> Index;
 
+  /// The highest index whose ENTIRE VISIBLE PREFIX is DURABLE, or `None` if this store does not offer
+  /// the probe.
+  ///
+  /// Cheap, synchronous, NO I/O, side-effect-free — the same class as [`has_pending`](Self::has_pending).
+  /// The core calls it on the ordinary `handle_storage` path, so it must be a field read, never a disk
+  /// query.
+  ///
+  /// `None` — the default — means the store does not answer, and NOTHING changes for it: the
+  /// exactly-completing contract on [`poll`](Self::poll) and its documented SAFE STALLS stand exactly as
+  /// today (a lost `Appended` parks the ack it gates until a restart re-submits). A store that answers
+  /// `Some` lets the core heal that stall from the store's OWN evidence instead — it folds the answer into
+  /// the persist-before-ack watermark once the completion queue is quiescent, so a completion the store
+  /// dropped no longer wedges the gated path.
+  ///
+  /// **THE CLAMP (NORMATIVE — a SAFETY line):** the returned `N` is the highest index such that the ENTIRE
+  /// prefix `[first_index(), N]` of the CURRENT VISIBLE log content is durable. It is NOT the store's
+  /// physical durable tip. A staged §5.3 truncation (a conflicting [`submit_append`](Self::submit_append))
+  /// or a staged [`restore`](Self::restore) re-baseline REWRITES visible content, so the answer CAPS at
+  /// the last index where the durable bytes and the visible content still AGREE — a store must never
+  /// answer across a visible rewrite out of bytes belonging to the superseded content. Over-answering
+  /// manufactures a PHANTOM DURABLE REPLICA: the core acks a match the crash-surviving log does not back,
+  /// the leader counts it toward quorum, and it commits an entry a crash would lose (a non-quorum-durable
+  /// commit) — the same hazard the prefix-ordered durability rule on `submit_append` closes on the
+  /// completion path. Under-answering is always safe: the core folds with `max`, so a stale-low answer
+  /// (`Index::ZERO` included) is a provable no-op.
+  ///
+  /// This is the log-side mirror of the anti-visible-slot discipline
+  /// [`StableStore::durable_snapshot`](crate::StableStore::durable_snapshot) carries: the DURABLE reader
+  /// and the VISIBLE reader ([`last_index`](Self::last_index)) are distinct readers, and only the durable
+  /// one may back a durability decision.
+  #[inline]
+  fn durable_index(&self) -> Option<Index> {
+    None
+  }
+
   /// The term of the entry at `index`.
   ///
   /// **Domain contract (NORMATIVE):** the core routinely probes indices OUTSIDE the retained
@@ -295,6 +330,11 @@ pub trait LogStore {
   /// ack, never a lost-vote grant), it merely fails to make forward progress. A restart re-submits from
   /// the durable state and heals the stall. The contract is thus "eventually, exactly once"; violating
   /// it costs liveness (a wedge), never safety.
+  ///
+  /// A store that answers [`durable_index`](Self::durable_index) NARROWS that wedge without widening the
+  /// contract: once this completion queue is quiescent the core folds the probe's evidence, so a lost
+  /// completion heals within the run instead of at the next restart. A `None`-answering store keeps the
+  /// documented stall exactly as stated above.
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>>;
 
   /// Whether a subsequent [`poll`](Self::poll) would return `Some` — i.e. at least one completion
@@ -358,6 +398,34 @@ pub trait StableStore {
   /// pre-`lineage` blob decodes to `None` — exact, not merely conservative: no pre-`lineage` writer could
   /// ever have forked or adopted, so its log is unconditionally the token-less lineage's.
   fn hard_state(&self) -> HardState<Self::NodeId>;
+
+  /// The LAST DURABLE (fsync'd) [`HardState`], or `None` if this store does not offer the probe.
+  ///
+  /// Cheap, synchronous, NO I/O, side-effect-free — the same class as [`has_pending`](Self::has_pending).
+  ///
+  /// `None` — the default — means the store does not answer, and NOTHING changes for it: the
+  /// exactly-completing contract on [`poll`](Self::poll) and its documented SAFE STALLS stand exactly as
+  /// today (a lost `Wrote` parks the vote grant, the campaign, and the term-gated ack it fences until a
+  /// restart re-submits). A store that answers `Some` lets the core heal that stall from the store's OWN
+  /// evidence once the completion queue is quiescent.
+  ///
+  /// **NORMATIVE — DURABLE, never submit-visible:** the returned state is the one a crash RIGHT NOW would
+  /// leave behind — exactly the split [`hard_state`](Self::hard_state) already draws. A store that has
+  /// accepted a `submit_write` but not yet fsync'd it returns the PRIOR state here while `hard_state()`
+  /// may already show the new one; a sync store (durable when the write returns) returns the same value
+  /// from both. Returning the submit-visible state here would release a persist-before-respond gate on a
+  /// write a crash erases — the exact hole this method closes, the hard-state twin of
+  /// [`durable_snapshot`](Self::durable_snapshot)'s visible-slot rule.
+  ///
+  /// **Per-FIELD evidence:** the core reads each field of the answer as durable evidence for THAT FIELD
+  /// ALONE — the term for the term-durability gate, `(term, vote)` TOGETHER for a vote or self-vote grant,
+  /// `commit` for the durable commit floor, `lease_support` for the persist-before-advertise promise. A
+  /// store that mixed a durable field with a not-yet-durable one into one answer would release the gate
+  /// that field fences on evidence a crash erases.
+  #[inline]
+  fn durable_hard_state(&self) -> Option<HardState<Self::NodeId>> {
+    None
+  }
 
   /// Queue a hard-state write. Durable on the matching `poll` (completions are ordered).
   fn submit_write(&mut self, id: OpId, hard_state: HardState<Self::NodeId>);
@@ -537,6 +605,11 @@ pub trait StableStore {
   /// `StableDone` here, in FIFO order. A LOST completion is a store-contract violation: it STALLS the
   /// durability-gated path (a term/vote persist that never lands blocks the become-leader / cast-vote
   /// it fences) rather than advancing it — the safe direction — and a restart re-submits and heals.
+  ///
+  /// A store that answers [`durable_hard_state`](Self::durable_hard_state) NARROWS that wedge without
+  /// widening the contract: once this completion queue is quiescent the core releases each gate the
+  /// returned state's OWN field proves, so a lost completion heals within the run instead of at the next
+  /// restart. A `None`-answering store keeps the documented stall exactly as stated above.
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>>;
 
   /// Whether a subsequent [`poll`](Self::poll) would return `Some` — i.e. at least one completion
