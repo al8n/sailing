@@ -2279,6 +2279,1077 @@ fn back_to_back_split_proposals_are_gated_until_apply() {
   assert_eq!(meta.shape_gen(), 2);
 }
 
+/// A [`ForkGate`] answering from fixed sets — the container's stand-in for a driver's engine.
+#[derive(Default)]
+struct TestGate {
+  occupied: BTreeSet<u64>,
+  floors: BTreeMap<u64, u64>,
+}
+
+impl TestGate {
+  fn occupying(child: u64) -> Self {
+    Self {
+      occupied: [child].into_iter().collect(),
+      floors: BTreeMap::new(),
+    }
+  }
+
+  fn flooring(child: u64, floor: u64) -> Self {
+    Self {
+      occupied: BTreeSet::new(),
+      floors: [(child, floor)].into_iter().collect(),
+    }
+  }
+}
+
+impl ForkGate<u64> for TestGate {
+  fn contains_group(&self, gid: &u64) -> bool {
+    self.occupied.contains(gid)
+  }
+
+  fn floor(&self, gid: &u64) -> u64 {
+    self.floors.get(gid).copied().unwrap_or(0)
+  }
+}
+
+/// Build a host whose group 7 has a NONZERO committed split staged for `child`, ready to relay.
+fn host_with_staged_fork(child: u64) -> (MultiRaft<u64, u64, SplitSm>, VecLog, AsyncStable) {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(1);
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  follower_load_and_split(&mut m, &mut log, &mut stable, child);
+  (m, log, stable)
+}
+
+/// OCCUPIED CALLER STORAGE HOLDS. Occupancy says the id is spoken for, never that the stores ARE
+/// this fork's child — so the fork stays staged with its blob, its fence, and its reservation,
+/// and lands the moment the gate stops answering yes. The parent's guard never moves meanwhile.
+#[test]
+fn an_occupied_child_id_holds_the_fork_until_the_gate_clears() {
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  let gate = TestGate::occupying(200);
+
+  assert!(
+    m.poll_pending_fork_with(&gate).is_none(),
+    "occupied stores hold the fork instead of yielding it"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_some(),
+    "the held fork is still STAGED — blob, fence and reservation intact"
+  );
+  assert!(
+    m.group(&7).unwrap().fork_obligations_standing(),
+    "a held fork is an outstanding obligation by construction"
+  );
+  assert_eq!(
+    m.poll_split_conflict(),
+    Some((7, 200)),
+    "the hold surfaces one (parent, child) cue"
+  );
+  assert_eq!(m.poll_split_conflict(), None, "one cue per episode");
+  assert!(
+    m.poll_pending_fork_with(&gate).is_none(),
+    "still held, and re-examination does not re-cue"
+  );
+  assert_eq!(m.poll_split_conflict(), None);
+
+  // The gate stops answering yes and the very same fork lands.
+  let fork = m
+    .poll_pending_fork_with(&NoHold)
+    .expect("the released fork materializes");
+  assert_eq!((fork.parent, fork.child), (7, 200));
+  assert!(!fork.blob.is_empty(), "the partition rode the hold intact");
+}
+
+/// A CHILD BELOW ITS FLOOR is a verdict about the fork — the generation is fixed at the split and
+/// the floor only rises — so the relay abandons it deliberately: popped, its barrier resolved, and
+/// the refusal queued for the embedder rather than swallowed.
+#[test]
+fn a_child_below_its_floor_is_abandoned_deliberately() {
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  let gate = TestGate::flooring(200, 9);
+
+  assert!(
+    m.poll_pending_fork_with(&gate).is_none(),
+    "a below-floor child yields nothing"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the fork was consumed, not held"
+  );
+  assert!(
+    !m.group(&7).unwrap().fork_obligations_standing(),
+    "the parent's obligation resolved with the abandonment"
+  );
+  assert_eq!(
+    m.poll_split_refusal(),
+    Some((7, 200)),
+    "the embedder is told the child will never arrive by this route"
+  );
+  assert_eq!(m.poll_split_refusal(), None, "one refusal per fork");
+  assert_eq!(
+    m.poll_split_conflict(),
+    None,
+    "an abandonment is not a park: no cue"
+  );
+}
+
+/// ARM ORDER IS AN INVARIANT. A hosted child always has engine stores, so a gate consulted BEFORE
+/// the hosted-child branch would swallow every park into a stores-hold and make the ForkId
+/// redundant exit unreachable — a legitimately-arrived twin would wedge its parent forever. With
+/// an occupancy-answering gate active, a provenance-matched twin must still resolve REDUNDANT.
+#[test]
+fn a_hosted_child_still_resolves_redundant_with_the_gate_active() {
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  let token = staged_fork_id(&m, 7);
+  // The twin arrives carrying THIS split's token — the child is this fork, already materialized.
+  m.create_group(
+    200,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.group_mut(&200).unwrap().seed_fork_id_for_test(token);
+  let gate = TestGate::occupying(200);
+
+  assert!(
+    m.poll_pending_fork_with(&gate).is_none(),
+    "a redundant fork yields nothing"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the redundant arm ran: the fork resolved rather than holding forever"
+  );
+  assert_eq!(
+    m.poll_split_conflict(),
+    None,
+    "a redundant resolution is not a conflict"
+  );
+  assert_eq!(m.poll_split_refusal(), None, "nor a refusal");
+}
+
+/// Removing the parent takes its held fork and the cue with it: the obligation is gone, so a cue
+/// delivered afterwards could only goad the embedder into clearing a wedge that no longer exists.
+#[test]
+fn removing_the_parent_purges_a_held_fork_and_its_cue() {
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  let gate = TestGate::occupying(200);
+  assert!(m.poll_pending_fork_with(&gate).is_none(), "held");
+  // The cue is queued but NOT yet consumed — a driver's bounded tail deferred it.
+  m.remove_group(&7, &mut empty_stores()).unwrap();
+  assert_eq!(
+    m.poll_split_conflict(),
+    None,
+    "the parent's removal purged its undelivered cue"
+  );
+  assert!(
+    m.poll_pending_fork_with(&gate).is_none(),
+    "and left no fork behind to re-examine"
+  );
+}
+
+/// Deliver one committed Split entry to follower group 7 at `index` (prev = `index - 1`, term 1),
+/// giving `give` units to `child` at parent lineage `parent_gen_after`, and drain storage — the
+/// SECOND split a parent stages after its first one has been dealt with.
+fn follower_split_next(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  index: u64,
+  child: u64,
+  parent_gen_after: u64,
+  give: u8,
+) {
+  m.handle_message(
+    &7,
+    Instant::ORIGIN,
+    log,
+    stable,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::new(index - 1),
+      Term::new(1),
+      std::vec![crate::Entry::new(
+        Term::new(1),
+        Index::new(index),
+        crate::EntryKind::Split,
+        split_entry_bytes(child, 0, parent_gen_after, give),
+      )],
+      Index::new(index),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&7, Instant::ORIGIN, log, stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+}
+
+/// The durable log of a parent that took 3 units of load and then committed a split giving 2 of
+/// them to `child` — the crash-recovery source a restart replays the staged fork out of.
+fn split_survivor_log(child: u64) -> (VecLog, AsyncStable) {
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
+      crate::EntryKind::Split,
+      split_entry_bytes(child, 0, 1, 2),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(4));
+  (log, stable)
+}
+
+/// THE REMOVAL-TIME ABANDONMENT: a host holding a fork for `C` that then removes its OWN `C` has
+/// ended the very story this fork began, and the removed replica's [`ForkId`] PROVES the descent.
+/// The fork is abandoned deliberately — otherwise it survives the removal and lands on the clean
+/// slate the embedder's next consent makes, resurrecting a dead incarnation's baseline under an id
+/// that has moved on.
+#[test]
+fn removing_a_child_descended_from_a_held_fork_abandons_it() {
+  let (mut m, mut log, mut stable) = host_with_staged_fork(200);
+  // The fork HOLDS first: the caller's stores already hold 200 (a sibling replica's transferred
+  // baseline landed there), so the parent parks with one cue outstanding and undelivered.
+  let gate = TestGate::occupying(200);
+  assert!(
+    m.poll_pending_fork_with(&gate).is_none(),
+    "occupied stores hold the fork"
+  );
+  // That transferred baseline registers in the container carrying THIS split's token — the
+  // provenance a snapshot transfer preserves exactly as a local materialization would.
+  let token = staged_fork_id(&m, 7);
+  m.create_group(
+    200,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.group_mut(&200).unwrap().seed_fork_id_for_test(token);
+
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the held fork died with the incarnation it produced"
+  );
+  assert!(
+    !m.group(&7).unwrap().fork_obligations_standing(),
+    "its durability barrier resolved with it — the parent is not left fenced"
+  );
+  assert!(
+    !m.split_reserved(&200),
+    "and the child id's reservation released"
+  );
+  assert_eq!(
+    m.poll_split_refusal(),
+    Some((7, 200)),
+    "the abandonment is deliberate, so the embedder is told"
+  );
+  assert_eq!(m.poll_split_refusal(), None, "one refusal per fork");
+  assert_eq!(
+    m.poll_split_conflict(),
+    None,
+    "the park ended with the fork: its undelivered cue died with the episode"
+  );
+  assert!(
+    m.poll_pending_fork_with(&NoHold).is_none(),
+    "the id is free now and nothing is left to take it"
+  );
+  assert_eq!(
+    m.poll_relay_guard_advance(),
+    Some((7, 1)),
+    "the parent's guard advanced past the abandoned head fork, for the caller to mirror durably"
+  );
+  assert_eq!(m.poll_relay_guard_advance(), None, "one advance per fork");
+
+  // THE NEXT CHILD IS UNDAMAGED. Had the abandonment left the parent parked, this second fork's
+  // park would dedupe against the dead episode and its cue would never surface.
+  follower_commit_next(&mut m, &mut log, &mut stable, 5);
+  follower_split_next(&mut m, &mut log, &mut stable, 6, 201, 2, 1);
+  let gate = TestGate::occupying(201);
+  assert!(
+    m.poll_pending_fork_with(&gate).is_none(),
+    "the parent's next fork holds on its own occupied child id"
+  );
+  assert_eq!(
+    m.poll_split_conflict(),
+    Some((7, 201)),
+    "and cues for it — the dead park suppressed nothing"
+  );
+}
+
+/// The abandonment's guard advance is what makes it SURVIVE a crash. A parent restored from the
+/// durable log replays its split and re-stages the fork; fed the lineage record the caller
+/// mirrored at the removal, the container folds that re-staged fork to a resolved no-op instead of
+/// resurrecting the very fork the removal killed.
+#[test]
+fn the_mirrored_guard_folds_a_replayed_abandoned_fork() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = split_survivor_log(200);
+  m.restore_group(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_some(),
+    "the crash-replay re-staged the fork"
+  );
+  // The coordinators' restore path, replayed: the durable lineage record the removal's mirror
+  // advanced is fed back to the relay guard.
+  m.raise_relay_guard(&7, 1);
+
+  assert!(
+    m.poll_pending_fork_with(&NoHold).is_none(),
+    "the guard folds the replayed fork instead of relaying it a second time"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "and consumes it: the abandonment stands across the crash"
+  );
+  assert!(
+    !m.split_reserved(&200),
+    "the child id is not re-reserved by a dead fork"
+  );
+  assert_eq!(m.poll_split_conflict(), None, "a folded fork is not a park");
+  assert_eq!(
+    m.poll_split_refusal(),
+    None,
+    "nor a fresh refusal — the embedder was told once, at the removal"
+  );
+}
+
+/// The RED PROOF of the guard advance: the identical replay WITHOUT the mirrored record
+/// resurrects the abandoned fork and aims it at the free child id. This is what the removal-time
+/// abandonment would amount to if its guard bump were volatile only.
+#[test]
+fn a_replayed_abandoned_fork_resurrects_without_the_mirrored_guard() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = split_survivor_log(200);
+  m.restore_group(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+
+  let fork = m
+    .poll_pending_fork_with(&NoHold)
+    .expect("no guard, no defense: the dead fork relays again");
+  assert_eq!((fork.parent, fork.child), (7, 200));
+  assert_eq!(
+    fork.fsm.units, 2,
+    "carrying the dead incarnation's half onto the id's clean slate"
+  );
+}
+
+/// The ForkId of `parent`'s staged fork at split index `index` — the below-head twin of
+/// [`staged_fork_id`], for a queue with more than one fork in it.
+fn staged_fork_id_at(m: &MultiRaft<u64, u64, SplitSm>, parent: u64, index: u64) -> ForkId {
+  let f = m
+    .group(&parent)
+    .unwrap()
+    .staged_forks()
+    .find(|f| f.index == Index::new(index))
+    .expect("a fork is staged at that index");
+  mint_fork_id(
+    &parent,
+    f.parent_gen_after,
+    f.index,
+    f.split_term,
+    f.child_bytes.clone(),
+    f.child_gen,
+  )
+}
+
+/// A parent's durable log carrying TWO committed splits — 3 units of load, a split giving 2 to
+/// `first`, one more unit, then a split giving 1 to `second`. The crash-recovery source for the
+/// ordered-abandonment replay.
+fn two_split_survivor_log(first: u64, second: u64) -> (VecLog, AsyncStable) {
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(3),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
+      crate::EntryKind::Split,
+      split_entry_bytes(first, 0, 1, 2),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(5), crate::EntryKind::Normal, cmd),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(6),
+      crate::EntryKind::Split,
+      split_entry_bytes(second, 0, 2, 1),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(6));
+  (log, stable)
+}
+
+/// ORDERED ABANDONMENT BELOW THE HEAD. A lagging host applies a batch carrying two splits while a
+/// sibling has already materialized the LATER child and transferred its token-bearing baseline
+/// here. The first fork parks on an occupied id; the second's child is hosted-then-REMOVED, so the
+/// removal condemns a fork that is not at the head. It must not be consumed out of turn — that
+/// would reorder the queue and advance the guard past the fork still in front of it — and it must
+/// not be left alive either, or it heads later and resurrects the removed incarnation.
+#[test]
+fn a_removal_condemns_a_fork_below_the_head_and_the_drain_takes_it_in_order() {
+  let (mut m, mut log, mut stable) = host_with_staged_fork(200);
+  follower_commit_next(&mut m, &mut log, &mut stable, 5);
+  follower_split_next(&mut m, &mut log, &mut stable, 6, 201, 2, 1);
+  assert_eq!(
+    m.group(&7).unwrap().staged_forks().count(),
+    2,
+    "two forks are queued, in apply order"
+  );
+
+  // The FIRST fork parks: its child id is occupied by caller storage.
+  let gate = TestGate::occupying(200);
+  assert!(m.poll_pending_fork_with(&gate).is_none(), "the head parks");
+  // The SECOND fork's child arrived here by transfer, carrying that split's own token, and the
+  // embedder then tore it down.
+  let token = staged_fork_id_at(&m, 7, 6);
+  m.create_group(
+    201,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    44,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.group_mut(&201).unwrap().seed_fork_id_for_test(token);
+  m.remove_group(&201, &mut empty_stores()).unwrap();
+
+  // CONDEMNED, NOT CONSUMED. The queue is untouched, so the head keeps its place, and nothing about
+  // the second fork has been announced or advanced yet.
+  assert_eq!(
+    m.group(&7).unwrap().staged_forks().count(),
+    2,
+    "the marked fork stays queued behind the head"
+  );
+  assert_eq!(
+    m.group(&7).unwrap().peek_pending_fork().map(|f| f.index),
+    Some(Index::new(4)),
+    "and the head is still the FIRST fork"
+  );
+  assert_eq!(
+    m.poll_relay_guard_advance(),
+    None,
+    "the guard must not advance past a fork still staged in front of the condemned one"
+  );
+  assert_eq!(m.poll_split_refusal(), None, "nor is the refusal owed yet");
+  assert!(
+    m.split_reserved(&201),
+    "the condemned fork still reserves its child id while it is queued"
+  );
+
+  // The first fork's conflict clears and it materializes normally.
+  let first = m
+    .poll_pending_fork_with(&NoHold)
+    .expect("the head fork lands once its id frees");
+  assert_eq!((first.parent, first.child), (7, 200));
+
+  // NOW the mark is at the head, and the very next drain takes it — before any verdict.
+  assert!(
+    m.poll_pending_fork_with(&NoHold).is_none(),
+    "the condemned fork is consumed, never yielded onto the id it would resurrect"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the queue drained in order"
+  );
+  assert_eq!(
+    m.poll_split_refusal(),
+    Some((7, 201)),
+    "and the refusal surfaces at consumption"
+  );
+  assert_eq!(
+    m.poll_relay_guard_advance(),
+    Some((7, 2)),
+    "with the guard advance owed to the caller's durable record"
+  );
+  assert!(!m.split_reserved(&201), "the reservation released with it");
+}
+
+/// The replay half of the ordered abandonment: a parent restored from a durable log carrying BOTH
+/// splits re-stages both forks, and the mirrored guard folds both — the one that legitimately
+/// materialized and the one the removal condemned.
+#[test]
+fn the_mirrored_guard_folds_both_replayed_forks_after_an_ordered_abandonment() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = two_split_survivor_log(200, 201);
+  m.restore_group(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(
+    m.group(&7).unwrap().staged_forks().count(),
+    2,
+    "the crash-replay re-staged both forks"
+  );
+  m.raise_relay_guard(&7, 2);
+
+  assert!(
+    m.poll_pending_fork_with(&NoHold).is_none(),
+    "the guard folds both replayed forks"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "and consumes them: neither the materialized fork nor the abandoned one comes back"
+  );
+  assert!(!m.split_reserved(&200));
+  assert!(!m.split_reserved(&201));
+}
+
+/// THE CORE API'S OWN DOOR. Reached directly — no coordinator anywhere — a caller-driven fork
+/// install must refuse a child id a split owns, in BOTH windows: between propose and apply, and
+/// while the committed fork is staged. Without that fence a caller installs a group of its own at
+/// the reserved id carrying a token it chose; the genuine fork then finds the id hosted, matches
+/// that token, and resolves REDUNDANT — discarding the child partition's only local copy.
+#[test]
+fn the_exported_container_refuses_a_forged_fork_in_both_reservation_windows() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(
+    7,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+  )
+  .unwrap();
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  m.propose_split(
+    &7,
+    d,
+    &mut log,
+    &stable,
+    &200,
+    0,
+    Bytes::from_static(b"\x01"),
+  )
+  .unwrap()
+  .unwrap();
+
+  // A token of the caller's own choosing, over the id the in-flight split owns.
+  let forged = ForkId::new(
+    Bytes::from_static(b"forged-parent"),
+    1,
+    Index::new(1),
+    Term::new(1),
+    Bytes::from_static(b"forged-child"),
+    0,
+  );
+  let (mut clog, mut cstable) = (VecLog::default(), AsyncStable::default());
+  let refuse =
+    |m: &mut MultiRaft<u64, u64, SplitSm>, clog: &mut VecLog, cstable: &mut AsyncStable| {
+      m.create_group_from_fork(
+        200,
+        0,
+        single_node_cfg(1),
+        Instant::ORIGIN,
+        43,
+        SplitSm::default(),
+        Bytes::from_static(b"\x00"),
+        None,
+        Some(forged.clone()),
+        1,
+        clog,
+        cstable,
+      )
+    };
+  assert_eq!(
+    refuse(&mut m, &mut clog, &mut cstable),
+    Err(CreateGroupError::SplitReserved),
+    "the PROPOSE window refuses: the id is spoken for before the split even applies"
+  );
+  assert_eq!(
+    <VecLog as crate::LogStore>::last_index(&clog),
+    Index::ZERO,
+    "and refuses before any store write"
+  );
+
+  // Apply the split: the propose window closes and the STAGED window opens behind it.
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_some(),
+    "the committed fork is staged"
+  );
+  assert_eq!(
+    refuse(&mut m, &mut clog, &mut cstable),
+    Err(CreateGroupError::SplitReserved),
+    "the STAGED window refuses too"
+  );
+  assert_eq!(
+    <VecLog as crate::LogStore>::last_index(&clog),
+    Index::ZERO,
+    "still nothing written"
+  );
+
+  // The genuine fork then lands, its blob intact — nothing was discarded against a forged twin.
+  let fork = m
+    .poll_pending_fork_with(&NoHold)
+    .expect("the real fork materializes");
+  assert_eq!((fork.parent, fork.child), (7, 200));
+}
+
+/// A target group's durable log carrying a committed `CommitMerge` naming `source` at index 1,
+/// plus whatever `closer` puts at `k + 1` (index 2) — the coordinate the abort window reads.
+/// `None` leaves the window OPEN (commit stops at k); `Some(kind)` commits index 2 too.
+fn parked_target_log(source: u64, closer: Option<crate::EntryKind>) -> (VecLog, AsyncStable) {
+  let mut source_bytes = Vec::new();
+  Data::encode(&source, &mut source_bytes);
+  let payload = crate::CommitMergePayload::new(
+    Bytes::from(source_bytes.clone()),
+    Index::new(2),
+    Term::new(1),
+    1,
+    1,
+  );
+  let mut buf = Vec::new();
+  crate::wire::encode_commit_merge_payload(&payload, &mut buf);
+  let mut log = VecLog::default();
+  let mut entries = std::vec![crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::CommitMerge,
+    Bytes::from(buf),
+  )];
+  let commit = match closer {
+    None => Index::new(1),
+    Some(kind) => {
+      let data = if kind == crate::EntryKind::RollbackMerge {
+        let p = crate::RollbackMergePayload::abort(Bytes::from(source_bytes), 1, 1);
+        let mut b = Vec::new();
+        crate::wire::encode_rollback_merge_payload(&p, &mut b);
+        Bytes::from(b)
+      } else {
+        Bytes::new()
+      };
+      entries.push(crate::Entry::new(Term::new(1), Index::new(2), kind, data));
+      Index::new(2)
+    }
+  };
+  log.force_append(&entries);
+  let mut stable = AsyncStable::default();
+  stable.force_state(Term::new(1), Some(1u64), commit);
+  (log, stable)
+}
+
+/// A container holding a parent (group 7) with a staged fork for child `child`, and a target
+/// (group 1) parked on a committed `CommitMerge` naming that same `child` as its absorbed source.
+/// The child itself is NOT hosted — the wedge's shape, with C removed before the freeze (a park
+/// formed after a removal is refused `SpokenFor`/`Frozen`, so the committed entries are replayed
+/// in rather than proposed).
+fn fork_and_park_on_same_child(
+  child: u64,
+  closer: Option<crate::EntryKind>,
+) -> (MultiRaft<u64, u64, SplitSm>, MapStores) {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  let (mut plog, mut pstable) = split_survivor_log(child);
+  m.restore_group(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut plog,
+    &mut pstable,
+  )
+  .unwrap();
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_some(),
+    "the parent re-staged its fork"
+  );
+  let (mut tlog, mut tstable) = parked_target_log(child, closer);
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    SplitSm::default(),
+    1,
+    &mut tlog,
+    &mut tstable,
+  )
+  .unwrap();
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_some(),
+    "the target re-parked on the replayed CommitMerge"
+  );
+  stores.0.insert(1, (tlog, tstable));
+  stores.0.insert(7, (plog, pstable));
+  (m, stores)
+}
+
+/// THE COMMITTED-CONSUMED CHILD, abandoned. A parent stages a fork for `C` while a co-hosted target
+/// is parked absorbing `C`, and that park's abort window has LATCHED CLOSED — `k + 1` is committed
+/// and is not this merge's abort, so no abort can ever resurrect `C`. The fork must be abandoned
+/// TERMINALLY: the union subsumes its blob, and holding it instead keeps the parent's fence
+/// standing, which suppresses the cure advertisement that would deliver the covering snapshot the
+/// park is waiting for — the ring this closes.
+#[test]
+fn a_fork_for_a_latched_closed_parks_source_is_abandoned() {
+  let (mut m, mut stores) = fork_and_park_on_same_child(200, Some(crate::EntryKind::Empty));
+  assert!(
+    !m.group(&1)
+      .unwrap()
+      .pending_merge()
+      .unwrap()
+      .window_closed(),
+    "a freshly replayed park is minted undecided"
+  );
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty(),
+    "the source is unhosted, so nothing resolves — the pass only reads the window"
+  );
+  assert!(
+    m.group(&1)
+      .unwrap()
+      .pending_merge()
+      .unwrap()
+      .window_closed(),
+    "the CLOSED verdict latched onto the park"
+  );
+
+  // The parent's ONLY outstanding barrier in this fixture is this fork, so the fence emptying is
+  // observable directly.
+  assert!(m.group(&7).unwrap().fork_barrier_standing());
+  // Occupancy is asserted TOO: the consumed source's stores are retained in reality, and the
+  // refusal must win over them — that is why it is an Err-arm verdict.
+  let gate = TestGate::occupying(200);
+  assert!(
+    m.poll_pending_fork_with(&gate).is_none(),
+    "the fork is abandoned, not yielded"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "and consumed rather than held"
+  );
+  assert_eq!(
+    m.poll_split_refusal(),
+    Some((7, 200)),
+    "the embedder is told the child will never arrive by this route"
+  );
+  assert!(
+    !m.group(&7).unwrap().fork_barrier_standing(),
+    "the parent's fence empties — the advertisement gate's fork leg clears"
+  );
+}
+
+/// THE M1 NEGATIVE. A park whose window is still OPEN is UNDECIDED: rollback deliberately races a
+/// parked commit, and an abort resurrects the source. Nothing may be abandoned on that evidence.
+/// Composed with the abort actually landing at `k + 1`: the fork is still staged when the source
+/// thaws, which is the only reason the child can still be materialized.
+#[test]
+fn an_open_park_abandons_nothing_and_the_abort_leaves_the_fork_staged() {
+  let (mut m, mut stores) = fork_and_park_on_same_child(200, None);
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty(),
+    "an open window resolves nothing"
+  );
+  assert!(
+    !m.group(&1)
+      .unwrap()
+      .pending_merge()
+      .unwrap()
+      .window_closed(),
+    "an OPEN window must not latch — the merge is undecided"
+  );
+  // The consumed source's stores are retained in reality, so the gate reports the id occupied —
+  // and occupancy is a HOLD, the conservative direction. (With no stores at all the fork yields
+  // and installs a child the open park is absorbing: a pre-existing residual, reachable on main
+  // and not closed here — the absorb-pending leg deliberately does not fire on an undecided park.)
+  let gate = TestGate::occupying(200);
+  assert!(
+    m.poll_pending_fork_with(&gate).is_none(),
+    "the child id is spoken for by an undecided park, so the fork holds"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_some(),
+    "STAGED, not abandoned: an abort would resurrect this child"
+  );
+  assert_eq!(m.poll_split_refusal(), None, "and nothing was refused");
+
+  // Now the abort lands at k + 1 — the race the abort-window design is built on.
+  let (mut m2, mut stores2) =
+    fork_and_park_on_same_child(200, Some(crate::EntryKind::RollbackMerge));
+  let _ = m2.service_merge_applies(Instant::ORIGIN, &mut stores2);
+  assert!(
+    !m2
+      .group(&1)
+      .unwrap()
+      .pending_merge()
+      .is_some_and(|p| p.window_closed()),
+    "an ABORT window never latches closed"
+  );
+  assert!(
+    m2.group(&7).unwrap().peek_pending_fork().is_some(),
+    "the fork survives the abort — the child is alive again and still materializable"
+  );
+}
+
+/// THE STALE-LATCH LIFECYCLE, and the reason the latch lives on the PARK. A target resolves one
+/// absorb and immediately parks on the next: the second park must start UNDECIDED. A latch stored
+/// beside the endpoint's merge state instead would carry the first park's CLOSED verdict onto the
+/// second and refuse a source no committed coordinate has decided — a source that is still
+/// abortable, and whose id an embedder may legitimately be admitting right now.
+#[test]
+fn a_new_park_does_not_inherit_the_previous_parks_latch() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    // Park one's source is merged away here: absent WITH the terminal floor, which resolves that
+    // park by abort on the very pass that latches its window.
+    [90u64].into_iter().collect(),
+  );
+  let mut log = VecLog::default();
+  let mut entries = Vec::new();
+  for (idx, source) in [(1u64, Some(90u64)), (2, None), (3, Some(99))] {
+    entries.push(match source {
+      None => crate::Entry::new(
+        Term::new(1),
+        Index::new(idx),
+        crate::EntryKind::Empty,
+        Bytes::new(),
+      ),
+      Some(src) => {
+        let mut sb = Vec::new();
+        Data::encode(&src, &mut sb);
+        let payload =
+          crate::CommitMergePayload::new(Bytes::from(sb), Index::new(2), Term::new(1), 1, 1);
+        let mut buf = Vec::new();
+        crate::wire::encode_commit_merge_payload(&payload, &mut buf);
+        crate::Entry::new(
+          Term::new(1),
+          Index::new(idx),
+          crate::EntryKind::CommitMerge,
+          Bytes::from(buf),
+        )
+      }
+    });
+  }
+  log.force_append(&entries);
+  let mut stable = AsyncStable::default();
+  // Committed through index 3: park one's `k + 1` (index 2) is decided, park two's (index 4) is not.
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m.restore_group(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  stores.0.insert(1, (log, stable));
+  let first = m.group(&1).unwrap().pending_merge().expect("park one");
+  assert_eq!(first.at(), Index::new(1));
+  assert!(!first.window_closed(), "minted undecided");
+
+  // The pass latches park one (its window is CLOSED) and resolves it by abort; the drain then
+  // reaches index 3 and parks again, this time with nothing committed at `k + 1`.
+  for _ in 0..4 {
+    let _ = m.service_merge_applies(now, &mut stores);
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+    if m
+      .group(&1)
+      .unwrap()
+      .pending_merge()
+      .is_some_and(|p| p.at() == Index::new(3))
+    {
+      break;
+    }
+  }
+  let second = m.group(&1).unwrap().pending_merge().expect("park two");
+  assert_eq!(second.at(), Index::new(3), "a NEW park, on the next commit");
+  assert!(
+    !second.window_closed(),
+    "and it starts undecided — nothing about park one carried over"
+  );
+
+  // The door agrees: park two's source is unhosted and undecided, so admitting it is allowed.
+  // With an endpoint-scoped latch this is where the stale CLOSED verdict would refuse it.
+  m.create_group(99, 0, single_node_cfg(1), now, 9, SplitSm::default())
+    .expect("an undecided park must not refuse its own source's admission");
+}
+
+/// ARM ORDER IS AN INVARIANT: a hosted child carrying THIS fork's exact
+/// provenance token still resolves REDUNDANT, because the hosted-child branch runs before the gate
+/// and before any refusal is computed. The absorb evidence stands throughout.
+#[test]
+fn a_matching_token_still_resolves_redundant_while_the_absorb_leg_stands() {
+  let (mut m, mut stores) = fork_and_park_on_same_child(200, Some(crate::EntryKind::Empty));
+  // The child materialized here BEFORE the window closed — a sibling replica's transferred
+  // baseline, carrying this very split's token. (Admission afterwards is refused `AbsorbPending`
+  // by the absorb-pending leg, which is the point: the arrival has to predate it, exactly as it does in the
+  // shape this pins.)
+  let token = staged_fork_id(&m, 7);
+  m.create_group(
+    200,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.group_mut(&200).unwrap().seed_fork_id_for_test(token);
+
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty()
+  );
+  assert!(
+    m.group(&1)
+      .unwrap()
+      .pending_merge()
+      .unwrap()
+      .window_closed(),
+    "the absorb leg is live for this id"
+  );
+
+  assert!(
+    m.poll_pending_fork_with(&NoHold).is_none(),
+    "a redundant fork yields nothing"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the REDUNDANT arm ran — the fork resolved against its own materialization"
+  );
+  assert_eq!(
+    m.poll_split_refusal(),
+    None,
+    "redundant is not a refusal: the child exists, it was not abandoned"
+  );
+}
+
+/// BOOT ORDER. The latch is written by `service_merge_applies` alone, and restore replay does not
+/// run it — so a target restored from a durable log whose replayed applies re-park comes back
+/// UNDECIDED, whatever the log says about `k + 1`. Ordinary restart recovery is unaffected by the
+/// new leg, and the first service pass after boot is what decides the window.
+#[test]
+fn a_restored_park_comes_back_undecided() {
+  let (mut m, mut stores) = fork_and_park_on_same_child(200, Some(crate::EntryKind::Empty));
+  assert!(
+    !m.group(&1)
+      .unwrap()
+      .pending_merge()
+      .unwrap()
+      .window_closed(),
+    "restore replay re-parked WITHOUT latching, though k + 1 is committed in the log"
+  );
+  // ...and the fork is untouched until a service pass has actually read the window.
+  assert!(m.group(&7).unwrap().peek_pending_fork().is_some());
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty()
+  );
+  assert!(
+    m.group(&1)
+      .unwrap()
+      .pending_merge()
+      .unwrap()
+      .window_closed(),
+    "the first service pass is what decides it"
+  );
+}
+
 /// The ForkId the container mints for `parent`'s currently-staged head fork — the exact
 /// provenance token a genuine twin (a sibling replica's transferred baseline) carries. Peeks the
 /// staged `PendingFork` and mints through the same `mint_fork_id` the relay uses, so a test can
@@ -3214,7 +4285,10 @@ fn pre_hosted_twin_resolves_redundant_without_parking() {
   // the split gives away, and carrying this fork's exact provenance.
   let idx = follower_load_and_split(&mut m, &mut log, &mut stable, 200);
   let f = staged_fork_id(&m, 7);
-  m.create_group_from_fork(
+  // The RELAY's own path, not the caller-driven door: a sibling materialized this fork and its
+  // baseline arrived here, which is how a token-bearing twin reaches an id a staged fork reserves.
+  // The public door refuses exactly that id, by design.
+  m.create_group_from_fork_unreserved(
     200,
     0,
     single_node_cfg(1),
@@ -12759,8 +13833,25 @@ fn a_structurally_held_park_signals_its_cause_once_per_transition() {
     "the edge holds for as long as the cause does"
   );
 
-  // Hosting the source changes what is holding the park: the union is materializable here in
-  // principle now, just not yet folded. A different cause is a fresh transition.
+  // The source can no longer be ADMITTED while this park stands: its window has latched CLOSED,
+  // so the id is committed-consumed and every admission door refuses it. Reviving a husk beside a
+  // union whose consumption no abort can contest is exactly what that refusal exists to stop —
+  // the cause-transition this used to drive is unreachable from here by design, and the sibling
+  // test below covers it from a source hosted before the window closed.
+  assert_eq!(
+    m.create_group(42, 0, single_node_cfg(1), now, 9, SplitSm::default()),
+    Err(CreateGroupError::AbsorbPending),
+  );
+}
+
+/// The other cause on the same edge machinery: a source hosted here but BEHIND its freeze
+/// expectation holds the park for a different reason, and the change of cause is a fresh
+/// transition. The source is admitted before the first service pass — while the park is still
+/// undecided — because a latched-CLOSED park refuses the admission outright.
+#[test]
+fn a_park_held_by_a_behind_source_signals_its_own_cause() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = under_hosted_park_host();
   m.create_group(42, 0, single_node_cfg(1), now, 9, SplitSm::default())
     .unwrap();
   assert!(m.service_merge_applies(now, &mut stores).is_empty());

@@ -97,6 +97,61 @@ impl<G> FloorStore<G> for NoFloors {
   }
 }
 
+/// The facts a fork RELAY needs that the container cannot see for itself: whether the caller's
+/// storage already holds the child id, and that id's admission floor. The container asks at the
+/// moment it would hand a committed fork out, and maps the answers to a verdict itself
+/// ([`MultiRaft::poll_pending_fork_with`]) — the gate reports, it does not decide.
+///
+/// [`NoHold`] is the answer of a caller with no storage to consult, and the default the
+/// no-argument [`poll_pending_fork`](MultiRaft::poll_pending_fork) supplies.
+///
+/// # Cost contract
+///
+/// This is consulted O(parked × yields) per relay drain — every parked parent is re-examined at
+/// the top of every drain — so both methods MUST be in-memory and allocation-free. A durable
+/// engine caches its lineage and floor maps and answers from the cache; reaching storage here
+/// would put an I/O per parked fork on every crank.
+pub trait ForkGate<G> {
+  /// Whether the caller's storage already holds `gid`'s stores. Occupancy is not provenance: a
+  /// `true` says only that the id is spoken for, which is why it HOLDS the fork rather than
+  /// refusing it.
+  fn contains_group(&self, gid: &G) -> bool;
+
+  /// `gid`'s admission floor (0 = never floored) — the same value the coordinators' admission
+  /// gates read, so a fork and a create answer to one fence.
+  fn floor(&self, gid: &G) -> u64;
+}
+
+/// The gate of a caller holding no storage of its own: nothing is occupied and nothing is
+/// floored, which is [`poll_pending_fork`](MultiRaft::poll_pending_fork)'s behavior before the
+/// gate existed. The [`NoFloors`] idiom, for the relay.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoHold;
+
+impl<G> ForkGate<G> for NoHold {
+  fn contains_group(&self, _gid: &G) -> bool {
+    false
+  }
+
+  fn floor(&self, _gid: &G) -> u64 {
+    0
+  }
+}
+
+/// Why a parent's head fork is parked. One mechanism, two causes: the resolution triggers, the
+/// re-examination sweep, the one-shot cue and its purge are identical, so only the diagnosis
+/// differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParkCause {
+  /// The child id is already HOSTED here and its token is not this fork's (arm (c)).
+  HostedChild,
+  /// The caller's gate says the id is momentarily spoken for: occupied stores, or a tombstone
+  /// mid-rejoin. NOT a committed-consumed source — an outstanding absorb debt, or a park whose
+  /// abort window has latched CLOSED, is a verdict about the fork rather than a window that can
+  /// close, so those abandon it TERMINALLY instead of holding.
+  Blocked,
+}
+
 /// Per-group storage a `MultiStreamCoordinator` uses to drive each group's endpoint when inbound
 /// bytes span multiple groups. The caller implements it over its own per-group store table.
 ///
@@ -285,7 +340,7 @@ fn write_fork_baseline<I, L, S>(
 /// split entry, so the token is replica-identical: the parent id (its canonical `Data` encoding),
 /// the parent's lineage after the split (`parent_gen_after`), the split entry's `(index, term)`,
 /// and the child's already-canonical id bytes and incarnation.
-fn mint_fork_id<G: GroupId>(
+pub(crate) fn mint_fork_id<G: GroupId>(
   parent: &G,
   parent_gen_after: u64,
   split_index: Index,
@@ -348,9 +403,17 @@ where
 /// One committed, container-relayed fork: everything a driver needs to materialize the child
 /// group behind its engine barrier. Yielded by [`MultiRaft::poll_pending_fork`] after the typed
 /// child id decoded, the replay guard passed, and the child config was rebuilt from the parent's
-/// local tuning under the fork's voter set. The fields are deliberately public — this is a
-/// transfer record the driver destructures into
-/// [`create_group_from_fork`](MultiRaft::create_group_from_fork).
+/// local tuning under the fork's voter set. The fields are deliberately readable — this is a
+/// transfer record a driver reads to drive its own bookkeeping.
+///
+/// It is NOT constructible outside this crate, and that is load-bearing rather than tidiness:
+/// POSSESSION OF ONE IS THE CAPABILITY to install a child through the reservation-free relay door
+/// (`create_group_from_relayed_fork` on either coordinator). Only the container mints these, and
+/// only for a committed split whose coordinates it verified. A caller able to forge one could hand
+/// itself an exactly-minted [`ForkId`] — the token is derived from public, deterministic split
+/// coordinates — and so pass the redundant-token check that authorizes discarding a genuine
+/// staged fork.
+#[non_exhaustive]
 pub struct GroupFork<G, I, F> {
   /// The parent group (the split entry rode its log).
   pub parent: G,
@@ -577,6 +640,30 @@ where
   }) {
     return Err(CreateGroupError::AbsorbPending);
   }
+  // THE SECOND LEG, and the earlier one in the merge's life: a hosted target PARKED on a
+  // `CommitMerge` that names this gid as its absorbed source, whose abort window has LATCHED
+  // CLOSED. Closed means `k + 1` is committed and is not this merge's abort, so no abort can ever
+  // contest it again — the consumption is decided, and this id is spoken for by a union that has
+  // not yet been able to materialize here. A bare or OPEN park NEVER qualifies: it is undecided,
+  // rollback deliberately races a parked commit, and an abort resurrects the source.
+  //
+  // Why refusing admission is sound, twice over. (a) A latched-Closed park already authorizes the
+  // resolver's `Resolve` arm to DESTROY the source endpoint outright; refusing to ADMIT one is
+  // strictly weaker than the destruction the same evidence already licenses. (b) The park stops
+  // the target's apply drain at `k - 1`, so every fork staged on that endpoint carries a split
+  // index below `k` and the absorbed union SUBSUMES its blob — nothing is lost by refusing, and no
+  // later re-split can stage while the park stands.
+  //
+  // ORDERING DEPENDENCY, load-bearing: this leg answers `true` even when the source is still
+  // HOSTED, and it is correct only because the `Exists` check above runs first. Lifting this
+  // predicate out of `validate_new_group` and consulting it standalone would refuse a live,
+  // hosted, still-abortable id.
+  if groups.values().any(|ep| {
+    ep.pending_merge()
+      .is_some_and(|p| p.window_closed() && p.source_bytes().as_ref() == encoded.as_slice())
+  }) {
+    return Err(CreateGroupError::AbsorbPending);
+  }
   Ok(())
 }
 
@@ -611,7 +698,7 @@ where
   /// drain — the resolution triggers are CHILD-side (removal, catch-up), so no parent dispatch
   /// re-marks these. Membership doubles as the conflict-signal dedupe: one
   /// [`poll_split_conflict`](Self::poll_split_conflict) signal per park episode.
-  parked: BTreeSet<G>,
+  parked: BTreeMap<G, ParkCause>,
   /// Pending `(parent, child)` split-conflict signals, pushed once per park episode and HELD
   /// until consumed: a driver publishing on a bounded tail peeks
   /// ([`peek_split_conflict`](Self::peek_split_conflict)), publishes, and consumes only on
@@ -620,6 +707,18 @@ where
   /// still-queued signal ([`unpark`](Self::unpark)) — delivered after resolution it would be
   /// stale — so queued signals always name currently-parked parents.
   conflicts: VecDeque<(G, G)>,
+  /// Pending `(parent, child)` split-REFUSAL signals: a committed fork the relay abandoned
+  /// deliberately, because the refusal is a verdict about the fork itself and no host state will
+  /// ever change it. Peek/consume-on-accept like [`conflicts`](Self::conflicts) — a refusal is
+  /// one-shot too — but never purged: the abandonment already happened and the embedder is owed
+  /// the news whatever else resolves.
+  refusals: VecDeque<(G, G)>,
+  /// Pending `(parent, lineage)` relay-guard advances the caller must MIRROR into its durable
+  /// lineage record. Pushed only by the removal-time fork abandonment, whose volatile guard bump
+  /// would otherwise be lost on a crash and let the replayed split re-stage the very fork the
+  /// removal killed. Every other advance already rides a durable write the caller makes anyway
+  /// (a relayed fork's child registration), so this queue exists for that one arm.
+  guard_advances: VecDeque<(G, u64)>,
   /// The last [`MergeBlockedCause`] signalled per target — the EDGE that makes
   /// [`poll_merge_blocked`](Self::poll_merge_blocked) fire once per transition instead of once per
   /// crank. An entry lives exactly as long as the target's park or capture debt does (dropped at
@@ -679,8 +778,10 @@ where
       dirty_events_set: BTreeSet::new(),
       dirty_forks: VecDeque::new(),
       dirty_forks_set: BTreeSet::new(),
-      parked: BTreeSet::new(),
+      parked: BTreeMap::new(),
       conflicts: VecDeque::new(),
+      refusals: VecDeque::new(),
+      guard_advances: VecDeque::new(),
       merge_blocked_seen: BTreeMap::new(),
       merge_blocked_attempts: BTreeMap::new(),
       merge_blocked: VecDeque::new(),
@@ -923,7 +1024,141 @@ where
         ep.clear_abandoned(&source_key);
       }
     }
+    self.abandon_fork_this_removal_descends_from(gid, removed.as_ref());
     removed
+  }
+
+  /// TERMINALLY abandon a staged fork the replica just torn down PROVABLY descends from — the
+  /// removal-time arm of the fork relay's provenance discipline.
+  ///
+  /// The hazard: a host that STAGES a fork for child `C`, then removes its own `C` and consents to
+  /// `C` again, offers the held fork a clean slate to land on. What lands is the dead
+  /// incarnation's baseline, and its inherited parent cells then coexist with whatever the new
+  /// incarnation became elsewhere. A relay that holds indefinitely makes that shape deterministic
+  /// rather than a one-batch race, which is why the hold needs this arm beside it.
+  ///
+  /// THE DISCRIMINATOR IS PROVENANCE, never occupancy. Only a removed endpoint carrying THIS
+  /// fork's exact [`ForkId`] is evidence that the embedder just ended the story this very fork
+  /// began — transfers and restarts carry the token, so a baseline that arrived by snapshot counts
+  /// exactly as one materialized here. A token-less or differently-tokened removal is a SQUATTER
+  /// leaving: it says nothing about the fork, which keeps its blob and its hold and lands when the
+  /// id is consented to again. Getting this backwards would destroy a legitimate child partition's
+  /// only local copy on the strength of an unrelated id's teardown.
+  ///
+  /// THE SCAN COVERS THE WHOLE STAGED QUEUE, and the reason is snapshot transfer. A fork behind
+  /// the head does NOT need this host to have relayed it for its child to be hosted here: a
+  /// sibling replica can materialize that later child and transfer its token-bearing baseline
+  /// over, so the child is hosted-here-and-then-removed while an earlier fork is still parked in
+  /// front of it. Scanning only the head leaves that fork condemned by nothing; once the earlier
+  /// fork resolves and consent lifts the tombstone, it heads and resurrects the removed
+  /// incarnation.
+  ///
+  /// ORDERED DEFERRAL is what reaches it without breaking the queue. A head hit is consumed
+  /// immediately; a hit BELOW the head is MARKED and left exactly where it is, because consuming
+  /// it out of turn would either reorder the FIFO the replay guard depends on or advance that
+  /// guard past forks still staged in front of it. The drain then consumes a marked fork the
+  /// instant it reaches the head — before examining it — so the abandonment lands in apply order
+  /// and every guard advance is still a head advance.
+  fn abandon_fork_this_removal_descends_from(
+    &mut self,
+    gid: &G,
+    removed: Option<&Endpoint<I, F, R>>,
+  ) {
+    let Some(token) = removed.and_then(Endpoint::fork_id) else {
+      return;
+    };
+    let mut child_key = Vec::new();
+    gid.encode(&mut child_key);
+    let child_key = Bytes::from(child_key);
+    // Byte-compare the child id FIRST: minting allocates, and the relay path's cost contract is
+    // allocation-free, so only a fork that actually names this child pays for a token.
+    let hit = self.groups.iter().find_map(|(parent, ep)| {
+      let head = ep.peek_pending_fork().map(|f| f.index);
+      ep.staged_forks().find_map(|fork| {
+        if fork.child_bytes != child_key {
+          return None;
+        }
+        let minted = mint_fork_id(
+          parent,
+          fork.parent_gen_after,
+          fork.index,
+          fork.split_term,
+          fork.child_bytes.clone(),
+          fork.child_gen,
+        );
+        (minted == token).then(|| {
+          (
+            parent.cheap_clone(),
+            fork.index,
+            fork.parent_gen_after,
+            head == Some(fork.index),
+          )
+        })
+      })
+    });
+    let Some((parent, split_index, parent_gen_after, at_head)) = hit else {
+      return;
+    };
+    if !at_head {
+      // Condemned in place. Nothing else moves: the fork keeps its blob, its barrier and its
+      // position, and the guard stays put — advancing it now would fold the forks staged AHEAD of
+      // this one into duplicates and drop them.
+      if let Some(ep) = self.groups.get_mut(&parent) {
+        ep.mark_fork_abandoned(split_index);
+      }
+      return;
+    }
+    // Deliberate abandonment, exactly as the `Terminal` verdict performs it: the barrier resolves
+    // (the parent must not stay fenced for a fork that will never land) and the embedder is told.
+    if let Some(ep) = self.groups.get_mut(&parent)
+      && let Some((fork, _fsm)) = ep.pop_pending_fork()
+    {
+      ep.resolve_fork(fork.index);
+    }
+    // The guard advance the `Redundant` arm makes for the same reason: this head fork is finished
+    // with, so a replayed split entry re-staging it must fold to a resolved no-op instead of
+    // resurrecting it. Legal precisely BECAUSE it is the head — no earlier staged fork of this
+    // parent is left behind for the advance to skip over.
+    self.lineage.insert(parent.cheap_clone(), parent_gen_after);
+    self
+      .guard_advances
+      .push_back((parent.cheap_clone(), parent_gen_after));
+    // The sweep's Resolved arm, mirrored: leaving the parent parked would strand it (its
+    // resolution triggers are child-side), and leaving the stale conflict signal queued would
+    // suppress the cue its NEXT child is owed.
+    self.unpark(&parent);
+    if self.dirty_forks_set.insert(parent.cheap_clone()) {
+      self.dirty_forks.push_back(parent.cheap_clone());
+    }
+    self.refusals.push_back((parent, gid.cheap_clone()));
+  }
+
+  /// Consume `gid`'s condemned HEAD fork — the deferred half of the removal-time abandonment,
+  /// performing there what a head hit performs at the removal itself: the fork is popped, its
+  /// durability barrier resolved, the guard advanced past it (legal now, and only now, because it
+  /// is the head), and the refusal surfaced. Reported as `Resolved`, so the caller re-examines this
+  /// same parent and the next staged fork takes its turn.
+  fn consume_abandoned_head_fork(&mut self, gid: &G) -> HeadFork<G, I, F> {
+    let Some(ep) = self.groups.get_mut(gid) else {
+      return HeadFork::Empty;
+    };
+    let Some((fork, _fsm)) = ep.pop_pending_fork() else {
+      return HeadFork::Empty;
+    };
+    ep.resolve_fork(fork.index);
+    self
+      .lineage
+      .insert(gid.cheap_clone(), fork.parent_gen_after);
+    self
+      .guard_advances
+      .push_back((gid.cheap_clone(), fork.parent_gen_after));
+    // The child id the mark named. Undecodable is unreachable — the mark was set by matching this
+    // very encoding against a removed group's id — so the refusal is simply skipped rather than
+    // guessed at.
+    if let Ok(child) = G::decode_exact(fork.child_bytes.clone()) {
+      self.refusals.push_back((gid.cheap_clone(), child));
+    }
+    HeadFork::Resolved
   }
 
   /// Whether any OTHER hosted target owes `gid` (a merge source) a thaw for the EXACT freeze
@@ -1175,7 +1410,7 @@ where
   fn unpark(&mut self, gid: &G) {
     // Signals are queued only while their parent is parked (the queue invariant this helper
     // maintains), so a no-op removal proves there is nothing to purge.
-    if self.parked.remove(gid) {
+    if self.parked.remove(gid).is_some() {
       self.conflicts.retain(|(parent, _)| parent != gid);
     }
   }
@@ -1297,14 +1532,21 @@ where
   /// Whether a split IN FLIGHT on this host reserves `gid` as its child id: some hosted group
   /// has a proposed-but-unapplied split naming it (the leader's propose→apply window), or a
   /// committed fork naming it staged in the relay queue — parked conflicts included. The
-  /// coordinators refuse create/restore/fork admission of a reserved id and the drivers'
-  /// factory pre-build gate declines it, closing the window the propose-time `ChildExists`
-  /// check cannot see; an id admitted anyway (before the split arrived) is the parked-conflict
-  /// case [`poll_pending_fork`](Self::poll_pending_fork) holds safe. Purely derived from live
-  /// consensus state, so it releases by construction at every resolution: a stale-mint apply
-  /// ends the propose window, a resolution arm consumes the staged fork, a yield hands it to
-  /// the driver — whose materialization of that very fork therefore passes this predicate —
-  /// and a park keeps it held until the conflict resolves.
+  /// This fences the OTHER admission doors: the coordinators refuse embedder create/restore of a
+  /// reserved id and the drivers' factory pre-build gate declines it, closing the window the
+  /// propose-time `ChildExists` check cannot see. The FORK path does not consult it and must not —
+  /// a committed fork's materialization is the split CLAIMING its own id, not another door asking
+  /// for it, and the id is reserved by that very fork while it is staged. An id admitted anyway
+  /// (before the split arrived) is the parked-conflict case
+  /// [`poll_pending_fork`](Self::poll_pending_fork) holds safe.
+  ///
+  /// TWO COMMITTED FORKS naming one child need no fence between them either: the first installs,
+  /// and the second finds the child hosted and parks on it under provenance — its token differs,
+  /// so it is held, never discarded.
+  ///
+  /// Purely derived from live consensus state, so it releases by construction at every
+  /// resolution: a stale-mint apply ends the propose window, a resolution arm consumes the staged
+  /// fork, an install consumes it, and a park keeps it held until the conflict resolves.
   #[must_use]
   pub fn split_reserved(&self, gid: &G) -> bool {
     let mut bytes = Vec::new();
@@ -1399,13 +1641,32 @@ where
   /// embedder acts, and a genuinely-reshaped twin still resolves the moment its token arrives here
   /// (the token is fixed at the split, so later reshaping never changes it).
   pub fn poll_pending_fork(&mut self) -> Option<GroupFork<G, I, F>> {
+    self.poll_pending_fork_with(&NoHold)
+  }
+
+  /// [`poll_pending_fork`](Self::poll_pending_fork) over a caller-supplied [`ForkGate`] — the
+  /// facts about the CALLER's storage that decide whether a fork can be handed out at all.
+  ///
+  /// The gate is consulted at the would-be yield and its answers are mapped HERE: a child id
+  /// below its admission floor (or at the reserved terminal) is a verdict about the fork, which
+  /// no host state will change, so the fork is abandoned deliberately — popped, its barrier
+  /// resolved, the refusal queued for [`poll_split_refusal`](Self::poll_split_refusal). A
+  /// COMMITTED-CONSUMED child id is the same kind of verdict and takes the same exit: an
+  /// outstanding capture debt names it, or a hosted park whose abort window latched CLOSED is
+  /// absorbing it, and in either case the union subsumes whatever the fork carries. Occupied
+  /// stores are not a verdict about anything: they say the id is spoken for, so the fork HOLDS,
+  /// staged at the head with its blob, its fence, and its reservation intact, on the same
+  /// machinery a hosted-child conflict parks on. The distinction is load-bearing — a consumed
+  /// source's stores are RETAINED, so treating that as occupancy would hold the fork on the very
+  /// state the absorb is waiting to release.
+  pub fn poll_pending_fork_with(&mut self, gate: &impl ForkGate<G>) -> Option<GroupFork<G, I, F>> {
     // Parked parents first: their resolution triggers are child-side, so the dirty queue —
     // marked only by parent dispatches — cannot be relied on to revisit them. Skip the scan and
     // its allocation entirely when nothing is parked (the overwhelmingly common case).
     if !self.parked.is_empty() {
-      let parked: Vec<G> = self.parked.iter().map(CheapClone::cheap_clone).collect();
+      let parked: Vec<G> = self.parked.keys().map(CheapClone::cheap_clone).collect();
       for gid in parked {
-        match self.examine_head_fork(&gid) {
+        match self.examine_head_fork(&gid, gate) {
           HeadFork::Empty => {
             self.unpark(&gid);
           }
@@ -1431,12 +1692,12 @@ where
     }
     while let Some(gid) = self.dirty_forks.front().map(CheapClone::cheap_clone) {
       // A parked parent's queue is owned by the sweep above (head-of-line by design).
-      if self.parked.contains(&gid) {
+      if self.parked.contains_key(&gid) {
         self.dirty_forks.pop_front();
         self.dirty_forks_set.remove(&gid);
         continue;
       }
-      match self.examine_head_fork(&gid) {
+      match self.examine_head_fork(&gid, gate) {
         HeadFork::Empty | HeadFork::Parked => {
           self.dirty_forks.pop_front();
           self.dirty_forks_set.remove(&gid);
@@ -1452,7 +1713,18 @@ where
   /// Examine (and where possible resolve or yield) `gid`'s HEAD staged fork — the one shared
   /// arm evaluation both [`poll_pending_fork`](Self::poll_pending_fork) phases run. The head
   /// fork is consumed only on a resolution or a yield; a park leaves it staged untouched.
-  fn examine_head_fork(&mut self, gid: &G) -> HeadFork<G, I, F> {
+  fn examine_head_fork(&mut self, gid: &G, gate: &impl ForkGate<G>) -> HeadFork<G, I, F> {
+    // TAKE BEFORE EXAMINE. A fork a removal condemned below the head is consumed the moment it
+    // reaches the head, ahead of any verdict: it was already judged, by the teardown of the very
+    // incarnation it produced, and the gate can only re-decide it wrongly — the id it names is
+    // free again, so every arm here would let it land.
+    if self
+      .groups
+      .get(gid)
+      .is_some_and(Endpoint::head_fork_is_abandoned)
+    {
+      return self.consume_abandoned_head_fork(gid);
+    }
     enum Verdict<G> {
       Poison,
       /// Resolve the head fork's barrier and consume it (duplicate / non-member arms).
@@ -1463,6 +1735,11 @@ where
       Redundant,
       /// No conflict: advance the guard and yield (the config rebuild may still refuse).
       Yield(G),
+      /// The id is SPOKEN FOR — occupied caller storage, or container state no install can pass
+      /// through. Park on the second cause; the fork stays staged.
+      Hold(G),
+      /// A verdict about the FORK, true here forever: abandon it deliberately.
+      Terminal(G),
     }
     let verdict = {
       let Some(ep) = self.groups.get(gid) else {
@@ -1504,7 +1781,69 @@ where
             Verdict::Park(child)
           }
         } else {
-          Verdict::Yield(child)
+          // ARM ORDER IS AN INVARIANT. The gate is consulted only HERE, at the would-be yield,
+          // strictly after the hosted-child branch above. A hosted child always has engine
+          // stores, so asking the gate first would swallow every park into a stores-hold and
+          // make the ForkId redundant exit above unreachable — a legitimately-arrived twin would
+          // wedge its parent forever.
+          //
+          // The verdict split is not about which refusals we happened to enumerate. A refusal
+          // about the FORK — a generation the child can never clear, an id that cannot encode, a
+          // config no host would accept — is true here forever, so abandoning is the honest
+          // answer. Everything else says only that the id is momentarily spoken for, and the
+          // fork is the partition's only local copy: it HOLDS. `CreateGroupError` is
+          // `#[non_exhaustive]`, so the compiler itself demands the default arm below, and the
+          // default is HOLD — enumeration is the fast path, never the safety boundary.
+          //
+          // The split RESERVATION needs no check on either side. It fences the other admission
+          // doors, and the fork path does not consult it — so there is nothing here to refuse
+          // against, and nothing to hold for: a sibling fork naming this same child resolves by
+          // install-then-park, not by fencing.
+          // Checking it here would block the fork on itself.
+          let floor = gate.floor(&child);
+          match ep.config().with_voter_set(fork.voters.clone()) {
+            // The child's boot config is rebuilt from a voter set FIXED at the split, so a
+            // config the ordinary admission validation refuses is refused here forever (A8).
+            Err(_) => Verdict::Terminal(child),
+            Ok(child_config) => {
+              let refusal = validate_working_generation(fork.child_gen)
+                .and_then(|()| {
+                  // The reserved-terminal leg of `floor_admits` is already spent: the working-
+                  // generation check above refused it, so a failure here is the floor itself.
+                  if floor_admits(floor, fork.child_gen) {
+                    Ok(())
+                  } else {
+                    Err(CreateGroupError::BelowFloor { floor })
+                  }
+                })
+                .and_then(|()| {
+                  validate_new_group(&self.groups, &self.host_id, &child, &child_config)
+                });
+              match refusal {
+                // ONE PREDICATE, ONE VERDICT: the absorb refusal is `validate_new_group`'s alone.
+                // The occupancy guard below deliberately no longer re-tests it — two copies of one
+                // condition reaching opposite verdicts is how the id ended up held forever.
+                Ok(()) if gate.contains_group(&child) => Verdict::Hold(child),
+                Ok(()) => Verdict::Yield(child),
+                Err(
+                  CreateGroupError::ReservedGeneration
+                  | CreateGroupError::BelowFloor { .. }
+                  | CreateGroupError::InvalidGroupId
+                  | CreateGroupError::NodeIdMismatch
+                  // A COMMITTED-CONSUMED source: a capture debt names it, or a latched-Closed park
+                  // is absorbing it. Either way the id is dead here forever — the union subsumes
+                  // whatever this fork carries, and no host state can change that. It must stay an
+                  // Err-arm verdict: routing it through the `Ok` guard would let the consumed
+                  // source's own RETAINED STORES re-assert occupancy and hold the fork, which is
+                  // exactly the ring this closes — the held fork's barrier suppresses the cure
+                  // advertisement that would deliver the covering snapshot, so nothing ever folds,
+                  // no floor is ever written, and the stores are never released.
+                  | CreateGroupError::AbsorbPending,
+                ) => Verdict::Terminal(child),
+                Err(_) => Verdict::Hold(child),
+              }
+            }
+          }
         }
       } else {
         Verdict::Poison
@@ -1539,12 +1878,43 @@ where
         HeadFork::Resolved
       }
       Verdict::Park(child) => {
-        // Set-insert is the dedupe: one conflict signal per park episode, re-armed only after
+        // Map-insert is the dedupe: one conflict signal per park episode, re-armed only after
         // a resolution removes the parent from the parked set.
-        if self.parked.insert(gid.cheap_clone()) {
+        if self
+          .parked
+          .insert(gid.cheap_clone(), ParkCause::HostedChild)
+          .is_none()
+        {
           self.conflicts.push_back((gid.cheap_clone(), child));
         }
         HeadFork::Parked
+      }
+      Verdict::Hold(child) => {
+        // The SECOND CAUSE on the one mechanism: the fork stays staged at the head, so its blob
+        // survives, its barrier stays outstanding, its child id stays reserved, and this
+        // parent's later forks stay structurally behind it. The parked sweep re-examines it
+        // every drain — the resolution triggers are all caller-side or child-side, so nothing
+        // re-marks this parent as dirty.
+        if self
+          .parked
+          .insert(gid.cheap_clone(), ParkCause::Blocked)
+          .is_none()
+        {
+          self.conflicts.push_back((gid.cheap_clone(), child));
+        }
+        HeadFork::Parked
+      }
+      Verdict::Terminal(child) => {
+        // DELIBERATE abandonment: the blob is dropped knowingly, which is only ever sound for a
+        // verdict about the fork itself. The barrier resolves — the parent must not stay fenced
+        // for a fork that can never land here — and the refusal is queued for the embedder.
+        if let Some(ep) = self.groups.get_mut(gid)
+          && let Some((fork, _fsm)) = ep.pop_pending_fork()
+        {
+          ep.resolve_fork(fork.index);
+        }
+        self.refusals.push_back((gid.cheap_clone(), child));
+        HeadFork::Resolved
       }
       Verdict::Yield(child) => {
         // Rebuild the child's boot config: the parent's local tuning under the fork's voter
@@ -1561,10 +1931,14 @@ where
           return HeadFork::Empty;
         };
         let Some(config) = config else {
+          // Unreachable: the verdict above rebuilt this same config and turned a failure into
+          // `Terminal`. Kept as the defensive resolve it always was, now also telling the
+          // embedder rather than swallowing the fork silently.
           ep.resolve_fork(fork.index);
           self
             .lineage
             .insert(gid.cheap_clone(), fork.parent_gen_after);
+          self.refusals.push_back((gid.cheap_clone(), child));
           return HeadFork::Resolved;
         };
         self
@@ -1623,6 +1997,49 @@ where
   /// holds its replay source.
   pub fn poll_split_conflict(&mut self) -> Option<(G, G)> {
     self.conflicts.pop_front()
+  }
+
+  /// Whether `gid`'s fork relay still owes something: its head fork is PARKED (held), or a
+  /// conflict/refusal signal naming it is queued and no driver has taken it yet.
+  ///
+  /// A driver reads this as a liveness obligation. A parent in this state must not be allowed to
+  /// go quiet — the doctrine a merge park already follows: the cue is the embedder's only prompt
+  /// to clear a standing hold, and a quiesced parent with its cue still queued would wait for
+  /// unrelated traffic to deliver it.
+  #[must_use]
+  pub fn fork_relay_pending(&self, gid: &G) -> bool {
+    self.parked.contains_key(gid)
+      || self.conflicts.iter().any(|(parent, _)| parent == gid)
+      || self.refusals.iter().any(|(parent, _)| parent == gid)
+  }
+
+  /// The next `(parent, child)` SPLIT-REFUSAL signal, left queued — the delivered-before-consumed
+  /// half, exactly as [`peek_split_conflict`](Self::peek_split_conflict). A refusal says the
+  /// relay ABANDONED a committed fork because no host state could ever let it land: the blob is
+  /// gone and the parent's fence is released, so this is the embedder's only record that a
+  /// child it was promised will never arrive by this route.
+  #[must_use]
+  pub fn peek_split_refusal(&self) -> Option<(G, G)> {
+    self
+      .refusals
+      .front()
+      .map(|(parent, child)| (parent.cheap_clone(), child.cheap_clone()))
+  }
+
+  /// Drain the next `(parent, child)` SPLIT-REFUSAL signal. Unlike a park's conflict cue this is
+  /// never purged: the abandonment already happened, so the news stays owed however the rest of
+  /// the id's story turns out.
+  pub fn poll_split_refusal(&mut self) -> Option<(G, G)> {
+    self.refusals.pop_front()
+  }
+
+  /// Drain the next `(parent, lineage)` relay-guard advance owed to the caller's DURABLE lineage
+  /// record. Only the removal-time fork abandonment queues one: its guard bump is the sole advance
+  /// with no durable write of its own to ride, and losing it to a crash would let the parent's
+  /// replayed split re-stage the abandoned fork against the very clean slate the removal made.
+  /// Drain it beside the removal's floor write, under the same barrier.
+  pub fn poll_relay_guard_advance(&mut self) -> Option<(G, u64)> {
+    self.guard_advances.pop_front()
   }
 
   /// The next group whose endpoint FAIL-STOPPED — a storage/apply fault poisoned it — reported once
@@ -1918,8 +2335,56 @@ where
   /// (a fork's baseline needs the prior epoch to itself) and
   /// [`CreateGroupError::StorageInUse`] when the stores already hold state (a fork never
   /// overwrites used storage). Refusal happens BEFORE any store write.
+  ///
+  /// # The reservation fence
+  ///
+  /// THIS IS THE PUBLIC, CALLER-DRIVEN DOOR: the caller chooses the id, the blob and the token, so
+  /// an id an in-flight or staged split owns is refused here ([`CreateGroupError::SplitReserved`]),
+  /// in BOTH windows — between propose and apply, and while the committed fork is staged. Without
+  /// it a caller could install a group of its own making at a reserved child id; the genuine fork
+  /// then finds the id hosted, and resolves REDUNDANT against a token the caller supplied, which
+  /// discards the child partition's only local copy. The relay's own materialization is not this
+  /// door — it goes through the crate-private form below, whose ticket is a container-minted
+  /// [`GroupFork`] nobody outside this crate can construct.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_fork<L, S>(
+    &mut self,
+    gid: G,
+    generation: u64,
+    config: Config<I>,
+    now: impl Into<Now>,
+    seed: u64,
+    fsm: F,
+    snapshot: Bytes,
+    read_only: Option<ReadOnlyOption>,
+    fork_id: Option<ForkId>,
+    boot_epoch: u64,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    if self.split_reserved(&gid) {
+      return Err(CreateGroupError::SplitReserved);
+    }
+    self.create_group_from_fork_unreserved(
+      gid, generation, config, now, seed, fsm, snapshot, read_only, fork_id, boot_epoch, log,
+      stable,
+    )
+  }
+
+  /// The reservation-free fork install, reachable only from inside this crate — the relay's
+  /// materialization, whose ticket is a [`GroupFork`] the container minted for a committed split it
+  /// verified. Consulting the reservation here would refuse the very admission it protects: the
+  /// fork's own parent reserves the id while it is staged, so the split could never claim it.
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn create_group_from_fork_unreserved<L, S>(
     &mut self,
     gid: G,
     generation: u64,
@@ -2106,6 +2571,42 @@ where
   /// refusal happens BEFORE any store write.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_fork_with_rng<L, S>(
+    &mut self,
+    gid: G,
+    generation: u64,
+    config: Config<I>,
+    now: impl Into<Now>,
+    rng: R,
+    fsm: F,
+    snapshot: Bytes,
+    read_only: Option<ReadOnlyOption>,
+    fork_id: Option<ForkId>,
+    boot_epoch: u64,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    // The same public door, the same fence: see [`create_group_from_fork`](Self::create_group_from_fork).
+    if self.split_reserved(&gid) {
+      return Err(CreateGroupError::SplitReserved);
+    }
+    self.create_group_from_fork_with_rng_unreserved(
+      gid, generation, config, now, rng, fsm, snapshot, read_only, fork_id, boot_epoch, log, stable,
+    )
+  }
+
+  /// The RNG-carrying twin of
+  /// [`create_group_from_fork_unreserved`](Self::create_group_from_fork_unreserved), crate-private
+  /// for the same reason.
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn create_group_from_fork_with_rng_unreserved<L, S>(
     &mut self,
     gid: G,
     generation: u64,
@@ -3495,6 +3996,16 @@ where
         }
         None => continue,
       };
+      // LATCH THE CLOSED VERDICT before the arms run. Hoisted to here rather than into the
+      // `Closed` arm below because that arm holds an immutable `self.groups` borrow for the whole
+      // source lookup; taking the mutable endpoint borrow here is borrow-clean and reads the same
+      // window this crank just computed. Monotone while this park lives, and it dies with the park
+      // at every resolution site by construction — the flag is a field of the park itself.
+      if window == MergeWindow::Closed
+        && let Some(tep) = self.groups.get_mut(&tgid)
+      {
+        tep.latch_merge_window_closed();
+      }
       let verdict = match window {
         MergeWindow::Abort => Verdict::Abort,
         MergeWindow::Open | MergeWindow::Stall => Verdict::Wait,

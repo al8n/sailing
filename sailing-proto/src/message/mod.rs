@@ -475,6 +475,24 @@ impl<I: CheapClone> HeartbeatResponse<I> {
 /// keeping the token generic-free while matching byte-for-byte across replicas. A blob digest would
 /// harden this further against a re-fork at identical coordinates, but any distinct split already
 /// differs in `(split_index, split_term)`, so it is deferred.
+///
+/// That exactness premise has ONE documented hole, and it is the floors' to close: a token is
+/// unique across incarnations only while the embedder floors what it retires. Under `NoFloors` a
+/// recreated parent may re-mint a removed incarnation's generations, so it can re-reach identical
+/// `(parent_incarnation, split_index, split_term)` coordinates and forge a colliding token — the
+/// same cost of opting out of floors the removal purge documents. Consumers that ACT on a match
+/// (the redundant-fork exit, the removal-time abandonment) inherit that embedder's bargain; a
+/// floored embedder has no collision to reason about.
+///
+/// The CONSUMED-SOURCE refusal carries a carve-out of the same shape, on both of its legs. A fork
+/// naming an id that an outstanding capture debt — or a park whose abort window latched CLOSED —
+/// is absorbing is abandoned terminally. Under a floored embedder that is permanent, because the
+/// floor lands at the discharge and refuses the id forever after. Under `NoFloors` it is
+/// TRANSIENT: the refusal evaporates when the debt discharges or the park resolves, and both legs
+/// are INCARNATION-BLIND — they match the id's bytes, so a recreated id is refused by a park
+/// naming the incarnation that died. Combined with `propose_split` not consulting either leg, a
+/// foreign-led re-split's legitimate fork can be killed there. The floors are what make the
+/// refusal a fact about the id rather than a fact about this moment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForkId {
   parent: Bytes,
@@ -486,7 +504,15 @@ pub struct ForkId {
 }
 
 impl ForkId {
-  /// Construct a fork identity from its committed split coordinates. `parent`/`child` are the
+  /// Construct a fork identity from its committed split coordinates.
+  ///
+  /// DELIBERATELY PUBLIC, and the token is deliberately not a capability: constructing one grants
+  /// nothing, because every path that could act on a token is fenced on its own. The admission
+  /// DOORS are the fence — the caller-driven fork installs refuse a reserved child id in both
+  /// windows, so a chosen token can never reach a baseline at an id a split owns — and the relay's
+  /// own door takes every input from the container-minted `GroupFork` instead of from a caller.
+  /// Out-of-crate harnesses need to fabricate tokens precisely to test the provenance checks that
+  /// reject them, which restricting this would prevent while closing nothing. `parent`/`child` are the
   /// group ids' canonical `Data` encodings; `parent_incarnation` is the parent's lineage AFTER the
   /// split (its `parent_gen_after`), and `(split_index, split_term)` locate the split entry in the
   /// parent's log — together an unforgeable fingerprint of exactly one committed split.

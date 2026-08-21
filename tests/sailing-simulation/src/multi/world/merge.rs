@@ -789,6 +789,12 @@ impl MultiWorld {
     self.fork_fence_wedge_set().contains(&gid)
   }
 
+  /// Per-group membership in the tombstone-held fork set — see
+  /// [`retired_hold_park`](Self::retired_hold_park) for why this one is unconditional.
+  pub(crate) fn retired_hold_wedge(&self, gid: u64) -> bool {
+    self.retired_hold_wedge_set().contains(&gid)
+  }
+
   /// The full set of groups (live AND retired) wedged in the tracked under-hosted parked-absorb
   /// class (#106): every merge participant transitively blocked by an under-hosted merge conf. The
   /// storm-profile quiesce and calm windows certify these past instead of panicking — deliberately
@@ -921,6 +927,48 @@ impl MultiWorld {
       .copied()
       .filter(|&g| self.fork_fence_coupled_park(g))
       .collect();
+    self.propagate_merge_block(base)
+  }
+
+  /// Whether `gid` is a merge participant whose progress is blocked by a HELD fork — one the relay
+  /// parked because its child id is TOMBSTONED in this world's catalog. Both legs are verified from
+  /// MODEL state, never inferred from the symptom: a conflict cue this world RECORDED for
+  /// `(node, gid)` naming the child, and that child's `retired` flag in the catalog. A merely
+  /// merge-waiting group with no such record is not in the class and still trips every gate.
+  ///
+  /// Unlike the #106 and #110 classes this is NOT a filed liveness gap awaiting a cure, which is
+  /// why it is certified UNCONDITIONALLY rather than only under a storm profile: it belongs with
+  /// `group_frozen` among the BY-DESIGN refusals. The embedder tombstoned the child, the relay is
+  /// refusing to drop the partition that tombstone stranded, and `clear_tombstone` releases both —
+  /// which `a_retired_hold_releases_its_merge_on_consent` drives end to end. Without that release
+  /// test this predicate would be silence rather than certification.
+  pub(crate) fn retired_hold_park(&self, gid: u64) -> bool {
+    let participant =
+      self.group_frozen(gid) || self.group_freeze_seen(gid) || self.group_merge_parked(gid);
+    participant
+      && self.node_ids.iter().any(|&n| {
+        self.fork_conflicts.get(&(n, gid)).is_some_and(|idxs| {
+          idxs
+            .values()
+            .any(|c| self.groups.get(c).is_some_and(|m| m.retired))
+        })
+      })
+  }
+
+  /// The full set of groups wedged behind a tombstone-held fork, built exactly as the other two
+  /// classes: base from [`retired_hold_park`](Self::retired_hold_park), then the SAME cascade
+  /// closure folds in the target parked on a source that cannot be consumed. EMPTY whenever no
+  /// held fork names a retired child, so every other merge stays obliged to converge.
+  pub(crate) fn retired_hold_wedge_set(&self) -> BTreeSet<u64> {
+    let base: BTreeSet<u64> = self
+      .groups
+      .keys()
+      .copied()
+      .filter(|&g| self.retired_hold_park(g))
+      .collect();
+    if base.is_empty() {
+      return BTreeSet::new();
+    }
     self.propagate_merge_block(base)
   }
 

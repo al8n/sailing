@@ -342,8 +342,9 @@ impl MultiWorld {
     self.split_refused
   }
 
-  /// Split-conflict signals drained across the run (unreachable under fresh-minted child ids;
-  /// counted so a future reachable path is visible, never silently swallowed).
+  /// Split-conflict signals drained across the run. Reachable since the relay learned to HOLD:
+  /// a fork whose child id the catalog gate reports spoken-for parks and signals once, so this
+  /// counts held episodes as well as hosted-child conflicts.
   #[cfg(test)]
   pub(crate) fn split_conflicts_observed(&self) -> u64 {
     self.split_conflicts
