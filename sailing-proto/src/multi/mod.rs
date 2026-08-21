@@ -3403,7 +3403,7 @@ where
         self.note_if_poisoned(&tgid);
         continue;
       };
-      let mut w1_unresolvable = false;
+      let mut locally_unresolvable = false;
       enum Verdict {
         Resolve,
         Abort,
@@ -3498,7 +3498,7 @@ where
             if stores.floor(&source) == crate::MERGED_FLOOR {
               Verdict::Abort
             } else {
-              w1_unresolvable = true;
+              locally_unresolvable = true;
               Verdict::Wait
             }
           }
@@ -3513,7 +3513,7 @@ where
       // exactly the host-local-proof clear the witness rules forbid). Every other verdict, and a
       // standing gate leg, clears it — the hint never outlives the shape that justified it, and
       // a parked replica applies nothing, so a clear gate leg cannot re-arm within the episode.
-      if w1_unresolvable
+      if locally_unresolvable
         && let Some((tlog, _)) = stores.stores(&tgid)
         && let Some(tep) = self.groups.get_mut(&tgid)
       {
@@ -3532,7 +3532,7 @@ where
       // the park waits (its exit is the hosted replica's own lifecycle, or the propagated
       // terminal floor). A decode failure withholds too: fail-closed.
       let mut crossing_decode_corrupt = false;
-      let hosted_crossing: Option<G> = if w1_unresolvable {
+      let hosted_crossing: Option<G> = if locally_unresolvable {
         self.groups.get(&tgid).and_then(|t| {
           t.crossing_sources()
             .iter()
@@ -3559,13 +3559,13 @@ where
         self.note_if_poisoned(&tgid);
         continue;
       }
-      let crossing_blocks = w1_unresolvable
+      let crossing_blocks = locally_unresolvable
         && self
           .groups
           .get(&tgid)
           .is_some_and(|t| !t.crossing_scan_current())
         || hosted_crossing.is_some();
-      let advertise = w1_unresolvable
+      let advertise = locally_unresolvable
         && !crossing_blocks
         && self.groups.get(&tgid).is_some_and(|t| {
           // The walk must have reached this crank's committed frontier with every payload
@@ -3595,7 +3595,7 @@ where
           // it (the composed cause above carries the actionable identity then). The other
           // `Wait` — an abort window still undecided — is the merge's ordinary decision
           // latency and closes with the next committed coordinate.
-          if w1_unresolvable && hosted_crossing.is_none() {
+          if locally_unresolvable && hosted_crossing.is_none() {
             self.note_merge_blocked(&tgid, &source, park_at, MergeBlockedCause::SourceUnhosted);
           }
         }

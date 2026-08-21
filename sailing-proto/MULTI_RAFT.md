@@ -394,7 +394,7 @@ Every park above resolves from committed state, but three shapes hold a park —
 — on a timescale no consensus event closes. Each has a cure, and none of the cures weakens a
 barrier.
 
-### W1 — the under-hosted park
+### The under-hosted park
 
 A replica that never hosted the source (lifecycle churn tore it down, or the replica joined after
 the source dissolved) cannot fold: the union is not materializable here, and aborting instead
@@ -449,7 +449,7 @@ residual leaves a removed peer ignorant-but-alive, the safe direction, while thi
 VOTER wedged. Chunked cure transfer is the eventual exit; until it lands the signal is the whole
 contract, and recovery falls to the embedder's catalog like any dead group.
 
-### W2 — the fence-deferred capture
+### The fence-deferred capture
 
 A parked absorb whose forced capture a STRUCTURAL replay fence refuses — a staged fork's
 durability barrier, or an undischarged abort obligation — would otherwise hold the park for that

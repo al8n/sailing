@@ -57,7 +57,7 @@ fn assert_membership_band_bounds(band: &str, reports: &[MultiVoprReport]) {
   );
 }
 
-/// The RETIRED exemption, kept as an assertion. The merge-liveness cure closed both filed classes —
+/// The RETIRED exemption, kept as an assertion. The merge-liveness cure closed both #106/#110 classes —
 /// #110's fork-fence coupling resolves through the fence-deferred absorb (`Absorbed` → capture debt
 /// → `Merged`), and #106's under-hosted park advertises its boundary and adopts the leader's
 /// covering snapshot — so a run that still carries either shape at run end has REGRESSED. The
@@ -441,7 +441,7 @@ fn soak_reshape_profile() {
 /// witness proves the race arm drew).
 ///
 /// THE EXEMPTION IS RETIRED HERE: the band ran through
-/// [`run_multi_vopr_certifying_tracked_wedges`] while the filed #106/#110 wedges were reachable from
+/// [`run_multi_vopr_certifying_tracked_wedges`] while the #106/#110 wedges were reachable from
 /// this merge-heavy schedule; the cure closed both, so it is back on the plain [`run_multi_vopr`] and
 /// a reached wedge is a FAILURE again — the quiesce panics naming the stuck gids and dumping each
 /// one's merge block (frozen/parked, its counterpart's live and hosting status), which is the
@@ -541,7 +541,7 @@ fn merge_band_smoke() {
 /// Determinism holds under the merge profile too: the same (seed, ticks, profile) replays to
 /// the identical report, merge counters included. This is the ONE band still on the certifying
 /// runner, deliberately: it is where the classifiers stay wired and ASSERTED — the merge-heavy
-/// schedule the filed #106/#110 shapes were reachable from, run with both classes computed and both
+/// schedule the #106/#110 shapes were reachable from, run with both classes computed and both
 /// counters required zero, so a regression is named by its class here rather than read off a generic
 /// quiesce dump. Determinism holds because both replays share the flag.
 #[test]
@@ -559,7 +559,7 @@ fn merge_profile_same_seed_same_report() {
   );
   assert!(
     r.merges_absorbed > 0,
-    "seed 43 must exercise the fence-deferred absorb — this schedule reached the filed wedge \
+    "seed 43 must exercise the fence-deferred absorb — this schedule reached the #110 wedge \
      before the cure, so a zero here means the defer path is inert exactly where it matters"
   );
 }
@@ -586,7 +586,7 @@ fn merge_profile_same_seed_same_report() {
 /// cargo test --release -p sailing-simulation --test multi_vopr -- --ignored merge_compacting_band_smoke
 /// ```
 #[test]
-#[ignore = "the merge×compaction band — opt-in for RUNTIME only (~45s); the apply stall it was filed for no longer reproduces. Run explicitly, --release."]
+#[ignore = "the merge×compaction band — opt-in for RUNTIME only (~45s); the apply stall behind it no longer reproduces. Run explicitly, --release."]
 fn merge_compacting_band_smoke() {
   let mut total_registered = 0u64;
   let mut total_rollbacks = 0u64;
@@ -782,8 +782,8 @@ fn soak_merge_compacting_profile() {
   );
 }
 
-/// THE FILED #110 REPRO, converging without an exemption. Seeds 62 and 67 of the lifecycle-churn
-/// profile are the coordinates the fork-fence coupling was filed from — a merge park held behind a
+/// THE #110 REPRO, converging without an exemption. Seeds 62 and 67 of the lifecycle-churn
+/// profile are #110's own coordinates — a merge park held behind a
 /// parked fork's standing capture fence on the same parent, two individually sound designs
 /// composing into a deadlock. The cure defers the fenced absorb (`Absorbed`, a capture debt
 /// discharged into `Merged`) instead of blocking on the fence, so both seeds must now reach run end
@@ -800,7 +800,7 @@ fn lifecycle_seeds_62_and_67_converge() {
     let r =
       run_multi_vopr_certifying_tracked_wedges(seed, 200, MultiProfile::lifecycle_churn_reshape());
     std::eprintln!(
-      "filed lifecycle seed {seed}: absorbed={} registered={} prepared={} groups_created={} \
+      "#110 lifecycle seed {seed}: absorbed={} registered={} prepared={} groups_created={} \
        committed={}",
       r.merges_absorbed,
       r.merges_registered,
@@ -814,20 +814,20 @@ fn lifecycle_seeds_62_and_67_converge() {
     );
     assert!(
       r.merges_registered > 0,
-      "seed {seed} never resolved an absorb — the filed coordinates must still exercise the merge \
+      "seed {seed} never resolved an absorb — the #110 coordinates must still exercise the merge \
        machinery, or the repro has drifted off its shape: {r:?}"
     );
-    assert_no_tracked_exemption("filed lifecycle", seed, &r);
+    assert_no_tracked_exemption("#110 lifecycle", seed, &r);
     absorbed += r.merges_absorbed;
   }
   assert!(
     absorbed > 0,
-    "neither filed seed deferred a fenced absorb — the capture debt is inert on the very \
-     coordinates the fork-fence coupling was filed from (absorbed={absorbed})"
+    "neither seed deferred a fenced absorb — the capture debt is inert on the very \
+     coordinates #110 names (absorbed={absorbed})"
   );
 }
 
-/// THE FILED #106/#110 MERGE SEED, converging without an exemption. Seed 43 of the merge profile is
+/// THE #106/#110 MERGE SEED, converging without an exemption. Seed 43 of the merge profile is
 /// the schedule the fence-deferred absorb was proven on; its determinism twin
 /// ([`merge_profile_same_seed_same_report`]) pins the report's purity, and this pins the property
 /// that report carries — the run reaches quiesce with both classifiers empty, and the defer is what
@@ -836,7 +836,7 @@ fn lifecycle_seeds_62_and_67_converge() {
 fn merge_reshape_seed_43_converges() {
   let r = run_multi_vopr_certifying_tracked_wedges(43, 3_000, MultiProfile::merge_reshape());
   std::eprintln!(
-    "filed merge seed 43: absorbed={} registered={} groups_created={} committed={}",
+    "#106/#110 merge seed 43: absorbed={} registered={} groups_created={} committed={}",
     r.merges_absorbed,
     r.merges_registered,
     r.groups_created,
@@ -846,9 +846,9 @@ fn merge_reshape_seed_43_converges() {
     r.groups_created >= 2 && r.committed > 0,
     "seed 43 vacuous: {r:?}"
   );
-  assert_no_tracked_exemption("filed merge", 43, &r);
+  assert_no_tracked_exemption("#106/#110 merge", 43, &r);
   assert!(
     r.merges_absorbed > 0,
-    "seed 43 never deferred a fenced absorb — the debt path is inert on the filed schedule: {r:?}"
+    "seed 43 never deferred a fenced absorb — the debt path is inert on this schedule: {r:?}"
   );
 }
