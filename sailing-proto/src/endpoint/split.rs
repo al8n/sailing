@@ -149,11 +149,30 @@ where
     self.split.outstanding.remove(&index);
   }
 
-  /// Whether any fork durability barrier stands — the cure-advertisement gate's fork leg: an
-  /// adopting install's restart takes the `Compact` arm at its boundary, which would destroy a
-  /// staged fork's only replay derivation, so a fork-fenced host never advertises.
+  /// Whether any fork durability barrier stands — the REPLAY-derivation predicate, and the
+  /// cure-advertisement gate's fork leg: an adopting install's restart takes the `Compact` arm at
+  /// its boundary, which would destroy a staged fork's only replay derivation, so a fork-fenced
+  /// host never advertises. Deliberately NOT the consumption predicate (see
+  /// [`fork_obligations_standing`](Self::fork_obligations_standing)): a rebaseline retires the
+  /// replay derivation this one guards, and clears it accordingly.
   pub(crate) fn fork_barrier_standing(&self) -> bool {
     !self.split.outstanding.is_empty()
+  }
+
+  /// Whether this endpoint still owes ANY staged fork — the CONSUMPTION predicate: while it holds,
+  /// no merge teardown may consume this endpoint (the absorb Resolve arm and the husk dissolve both
+  /// hold) and no freeze may be proposed against it as a source, because destroying it would take
+  /// the split-away half's only local derivation with it.
+  ///
+  /// Strictly wider than [`fork_barrier_standing`](Self::fork_barrier_standing), and the gap is the
+  /// REBASELINED-QUEUED fork:
+  /// [`note_fork_barrier_rebaselined`](Self::note_fork_barrier_rebaselined) clears a still-queued
+  /// fork's barrier — the log replay it fenced is already gone, so standing it could only wedge —
+  /// while deliberately KEEPING the queue entry, because its in-memory blob keeps the child
+  /// materializable for the process lifetime. That blob is then the child's ONLY local derivation,
+  /// so a cleared barrier says nothing about whether this endpoint is safe to destroy.
+  pub(crate) fn fork_obligations_standing(&self) -> bool {
+    !self.split.outstanding.is_empty() || !self.split.pending_forks.is_empty()
   }
 
   /// A snapshot install re-baselined the log to `boundary`, discarding every split entry

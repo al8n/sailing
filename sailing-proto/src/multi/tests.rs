@@ -4316,6 +4316,14 @@ fn prepare_merge_defers_a_source_reshaping_by_a_split() {
   assert!(!m.group(&2).unwrap().split_in_flight());
   let fork = m.poll_pending_fork().expect("the fork relays out");
   assert_eq!(fork.child, 3);
+  // THE BARRIER HALF, between the fork's materialization and its baseline's durability: the
+  // source's log is still the child's only local recovery derivation, and the absorb behind this
+  // freeze would consume it. Same refusal — the source's split machinery is not finished.
+  assert_eq!(
+    m.prepare_merge(&2, now, &mut stores, &1),
+    Some(Err(MergeError::SplitInFlight)),
+    "a source whose staged fork is not yet durable defers the freeze"
+  );
   m.lift_fork_barrier(&2, split_idx);
   {
     m.prepare_merge(&2, now, &mut stores, &1).unwrap().unwrap();
@@ -10427,6 +10435,57 @@ fn a_backlogged_group_cannot_starve_its_co_hosted_neighbors() {
   );
 }
 
+/// `parent` alone, carrying nothing but a STANDING fork durability barrier: a squatter created at
+/// `child` parks its staged fork, so the barrier never lifts on its own and the split entry stays
+/// the child's only local recovery derivation. Only the parent gets a store — a test that needs the
+/// squatter to lead supplies its own. Returns the container, the stores, the split index, and the
+/// parent leader's instant.
+fn fork_fenced_source_fixture(
+  parent: u64,
+  child: u64,
+) -> (MultiRaft<u64, u64, SplitSm>, MapStores, Index, Instant) {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  let (mut plog, mut pstable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(
+    parent,
+    0,
+    single_node_cfg(1).with_snapshot_threshold(1),
+    now,
+    42,
+    SplitSm::default(),
+  )
+  .unwrap();
+  let d = lead_single_split(&mut m, parent, &mut plog, &mut pstable);
+  for _ in 0..3 {
+    commit_one_split(&mut m, parent, d, &mut plog, &mut pstable);
+  }
+  let split_idx = m
+    .propose_split(
+      &parent,
+      d,
+      &mut plog,
+      &pstable,
+      &child,
+      0,
+      Bytes::from_static(b"\x02"),
+    )
+    .unwrap()
+    .unwrap();
+  m.create_group(child, 0, single_node_cfg(1), d, 43, SplitSm::default())
+    .unwrap();
+  m.flush_appends(&parent, d, &plog, &pstable).unwrap();
+  while matches!(
+    m.handle_storage(&parent, d, &mut plog, &mut pstable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert!(m.poll_pending_fork().is_none(), "parked on the squatter");
+  assert_eq!(m.poll_split_conflict(), Some((parent, child)));
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(parent, (plog, pstable));
+  (m, stores, split_idx, d)
+}
+
 /// The fork-parked-then-merge composition: a squatter at the child id parks the fork on group 1
 /// (its capture fence stands at the split index), then source 2 freezes for the merge into 1 and
 /// the `CommitMerge` parks above the standing fence. Returns the container, the stores, the
@@ -10604,6 +10663,16 @@ fn a_foreign_led_absorb_of_a_debtor_discharges_the_inherited_debt() {
     let (l, s) = stores.0.get_mut(&3).unwrap();
     drain_storage(&mut m, 3, d3, l, s);
   }
+  // The debtor's own fork barrier holds its consumption until the child's baseline is durable —
+  // its log is that child's only local recovery derivation. Release it: the squatter leaves, the
+  // fork yields, and the driver's flush report lifts the barrier.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the hold");
+  m.lift_fork_barrier(&1, fork.split_index);
+  assert!(
+    m.group(&1).unwrap().capture_debt().is_some(),
+    "the debt is still live at the consumption: the resolver runs ahead of the debt pass"
+  );
   let resolutions = m.service_merge_applies(d3, &mut stores);
   assert_eq!(
     resolutions,
@@ -10657,6 +10726,15 @@ fn a_husked_debtor_retires_with_its_inherited_debt_discharged() {
   assert!(m.group(&1).unwrap().is_frozen());
 
   stores.1.insert(1);
+  // The husk's own fork barrier holds its retirement until the child's baseline is durable — its
+  // log is that child's only local recovery derivation. Release it as the driver would.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the hold");
+  m.lift_fork_barrier(&1, fork.split_index);
+  assert!(
+    m.group(&1).unwrap().capture_debt().is_some(),
+    "the debt is still live at the retirement: the husk dissolve runs ahead of the debt pass"
+  );
   let resolutions = m.service_merge_applies(d, &mut stores);
   assert_eq!(
     resolutions,
@@ -10671,6 +10749,381 @@ fn a_husked_debtor_retires_with_its_inherited_debt_discharged() {
   );
   assert!(!m.contains_group(&1), "the husk dissolved");
   assert!(stores.0.contains_key(&1) && stores.0.contains_key(&2));
+}
+
+/// The fork durability barrier is HOST-LOCAL, so a sibling whose staged child's baseline already
+/// flushed sees no barrier and can legally propose and commit this source's consumption — the
+/// local propose-time refusal never ran. Reproduced past the door with a direct freeze append (the
+/// cross-host shape): consuming the source here would drop the `Split` entry that is the staged
+/// child's only local recovery derivation, so the Resolve arm HOLDS the park instead. The hold is
+/// LIVE — the barrier lifts on the child's own baseline flush, which nothing the park blocks can
+/// delay.
+#[test]
+fn a_sources_standing_fork_barrier_holds_its_consumption() {
+  let (mut m, mut stores, split_idx, d) = fork_fenced_source_fixture(1, 200);
+  assert!(
+    m.group(&1).unwrap().capture_debt().is_none(),
+    "the source carries the fork barrier and nothing else"
+  );
+
+  let (mut log3, mut stable3) = (VecLog::default(), AsyncStable::default());
+  m.create_group(3, 0, single_node_cfg(1), d, 45, SplitSm::default())
+    .unwrap();
+  let d3 = lead_single_split(&mut m, 3, &mut log3, &mut stable3);
+  stores.0.insert(3, (log3, stable3));
+
+  // The foreign-led freeze on the fork-fenced source, appended past the propose gate exactly as a
+  // cross-host commit arrives.
+  let freeze_idx = {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let mut tb = Vec::new();
+    Data::encode(&3u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 2),
+      &mut fbuf,
+    );
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(d, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    let idx = l.last_index();
+    drain_storage(&mut m, 1, d, l, s);
+    idx
+  };
+  assert!(m.group(&1).unwrap().is_frozen());
+
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    m.group_mut(&3)
+      .unwrap()
+      .propose_merge_entry(
+        d3,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(1, freeze_idx, 2, 1),
+      )
+      .unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  assert!(m.group(&3).unwrap().pending_merge().is_some(), "parked");
+
+  assert!(
+    m.service_merge_applies(d3, &mut stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  // THE HOLD: everything else about this absorb is ready, and the standing barrier alone keeps the
+  // source's log — the staged child's recovery derivation — from being torn down.
+  assert!(
+    m.service_merge_applies(d3, &mut stores).is_empty(),
+    "the standing fork barrier holds the source's consumption"
+  );
+  assert!(m.contains_group(&1), "the fork-fenced source stands");
+  assert!(
+    m.group(&3).unwrap().pending_merge().is_some(),
+    "the park stands with it"
+  );
+
+  // The barrier lifts: the squatter leaves, the parked fork yields, and the driver's flush report
+  // releases it — the very next crank consumes the source.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the hold");
+  assert_eq!(fork.split_index, split_idx);
+  m.lift_fork_barrier(&1, fork.split_index);
+  let resolutions = m.service_merge_applies(d3, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 3
+    }],
+    "the lifted barrier releases the absorb"
+  );
+  assert!(!m.contains_group(&1), "the source was consumed");
+}
+
+/// The husk twin of the same host-local barrier: the absorb resolved ELSEWHERE and only the
+/// terminal floor propagated here, so no local park ever names this frozen source. Retiring it
+/// while the barrier stands would destroy the staged child's only local recovery derivation, so
+/// the dissolve holds — and releases on the very next crank once the child's baseline is durable.
+#[test]
+fn a_husks_standing_fork_barrier_holds_its_retirement() {
+  let (mut m, mut stores, split_idx, d) = fork_fenced_source_fixture(1, 200);
+
+  // The foreign-led freeze toward an UNHOSTED target: nothing here can ever park against it.
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let mut tb = Vec::new();
+    Data::encode(&7u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 2),
+      &mut fbuf,
+    );
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(d, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+  }
+  assert!(m.group(&1).unwrap().is_frozen());
+
+  stores.1.insert(1);
+  assert!(
+    m.service_merge_applies(d, &mut stores).is_empty(),
+    "the standing fork barrier holds the husk's retirement"
+  );
+  assert!(m.contains_group(&1), "the fork-fenced husk stands");
+
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the hold");
+  assert_eq!(fork.split_index, split_idx);
+  m.lift_fork_barrier(&1, fork.split_index);
+  assert_eq!(
+    m.service_merge_applies(d, &mut stores),
+    std::vec![MergeResolution::Retired { source: 1 }],
+    "the lifted barrier releases the retirement"
+  );
+  assert!(!m.contains_group(&1), "the husk dissolved");
+}
+
+/// The barrier is not the whole obligation. A covering install rebaselines past the split entry and
+/// CLEARS the still-queued fork's capture barrier — the log replay it fenced is already gone — while
+/// deliberately keeping the queue entry, whose in-memory blob is then the child's ONLY local
+/// derivation. A barrier-keyed hold would read clear here and let the consumption destroy exactly
+/// that blob, so the hold keys on the queue too.
+#[test]
+fn a_rebaselined_queued_fork_still_holds_its_parents_consumption() {
+  let (mut m, mut stores, split_idx, d) = fork_fenced_source_fixture(1, 200);
+
+  // The covering install, then its completion: the restore rebaselines past the split entry.
+  let meta = crate::SnapshotMeta::new(
+    Index::new(40),
+    Term::new(2),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      d,
+      l,
+      s,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(2),
+        9u64,
+        meta,
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+    assert!(
+      l.first_index() > split_idx,
+      "the completion rebaselined past the split entry"
+    );
+  }
+  let ep = m.group(&1).unwrap();
+  assert!(
+    !ep.fork_barrier_standing(),
+    "the rebaseline retired the replay derivation and cleared its barrier"
+  );
+  assert!(
+    ep.peek_pending_fork().is_some(),
+    "the queue entry is KEPT: its blob still materializes the child"
+  );
+  assert!(
+    ep.fork_obligations_standing(),
+    "the consumption predicate still stands on the queued fork alone"
+  );
+
+  // The install deposed the parent; re-lead it so the cross-host freeze can be appended, and the
+  // freeze then rides the NEW term.
+  let d1 = {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    lead_single_split(&mut m, 1, l, s)
+  };
+  let (mut log3, mut stable3) = (VecLog::default(), AsyncStable::default());
+  m.create_group(3, 0, single_node_cfg(1), d1, 45, SplitSm::default())
+    .unwrap();
+  let d3 = lead_single_split(&mut m, 3, &mut log3, &mut stable3);
+  stores.0.insert(3, (log3, stable3));
+
+  let freeze_idx = {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let mut tb = Vec::new();
+    Data::encode(&3u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 2),
+      &mut fbuf,
+    );
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(d1, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    let idx = l.last_index();
+    drain_storage(&mut m, 1, d1, l, s);
+    idx
+  };
+  let freeze_term = m
+    .group(&1)
+    .unwrap()
+    .freeze_term()
+    .expect("the applied freeze recorded its term");
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    m.group_mut(&3)
+      .unwrap()
+      .propose_merge_entry(
+        d3,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes_at(1, freeze_idx, freeze_term, 2, 1),
+      )
+      .unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  assert!(m.group(&3).unwrap().pending_merge().is_some(), "parked");
+
+  assert!(
+    m.service_merge_applies(d3, &mut stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  // THE HOLD, on a source whose capture barrier reads CLEAR.
+  assert!(
+    m.service_merge_applies(d3, &mut stores).is_empty(),
+    "the queued fork holds the consumption though its barrier was rebaselined away"
+  );
+  assert!(m.contains_group(&1), "the source stands");
+  assert!(
+    m.group(&1).unwrap().peek_pending_fork().is_some(),
+    "the blob was not destroyed"
+  );
+
+  // The release: the squatter leaves and the relay hands the fork to the driver, emptying the
+  // queue. Nothing is left to lift — the rebaseline already took the barrier — so the very next
+  // crank consumes the source.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the hold");
+  assert_eq!(fork.split_index, split_idx);
+  assert!(
+    !m.group(&1).unwrap().fork_obligations_standing(),
+    "the relay emptied the queue"
+  );
+  assert_eq!(
+    m.service_merge_applies(d3, &mut stores),
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 3
+    }],
+    "the emptied queue releases the absorb"
+  );
+  assert!(!m.contains_group(&1), "the source was consumed");
+}
+
+/// The composition with NO local release: the parked fork's child id IS the merge target. The fork
+/// waits on the occupant, the occupant is `MergeParked` on this very absorb, and the absorb waits on
+/// the fork — a three-way wait no crank can break. The hold is still the right answer: without it
+/// this shape SILENTLY DROPPED the split-away half at consumption, and a loud, signalled wedge an
+/// embedder can act on is strictly better than silent data loss. The `ForkFence` observation is that
+/// signal; the release protocol for the composition is tracked separately.
+#[test]
+fn a_fork_whose_child_is_the_merge_target_wedges_loudly() {
+  // Source 5 splits child 2 and 2 is occupied, so the fork parks; 5 → 2 is direction-valid.
+  let (mut m, mut stores, _split_idx, d) = fork_fenced_source_fixture(5, 2);
+  let (mut log2, mut stable2) = (VecLog::default(), AsyncStable::default());
+  let d2 = lead_single_split(&mut m, 2, &mut log2, &mut stable2);
+  commit_one_split(&mut m, 2, d2, &mut log2, &mut stable2);
+  stores.0.insert(2, (log2, stable2));
+
+  // The foreign-led freeze of the parent toward its own child id, appended past the propose gate
+  // (which refuses it locally — the source's staged fork stands) exactly as a cross-host commit
+  // arrives.
+  let freeze_idx = {
+    let (l, s) = stores.0.get_mut(&5).unwrap();
+    let mut tb = Vec::new();
+    Data::encode(&2u64, &mut tb);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 2),
+      &mut fbuf,
+    );
+    m.group_mut(&5)
+      .unwrap()
+      .propose_merge_entry(d, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    let idx = l.last_index();
+    drain_storage(&mut m, 5, d, l, s);
+    idx
+  };
+  assert!(m.group(&5).unwrap().is_frozen());
+  {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(
+        d2,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(5, freeze_idx, 2, 1),
+      )
+      .unwrap();
+    drain_storage(&mut m, 2, d2, l, s);
+  }
+  let park = m.group(&2).unwrap().pending_merge().expect("parked").at();
+
+  assert!(
+    m.service_merge_applies(d2, &mut stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, d2, l, s);
+  }
+  // The wedge, re-derived every crank and never resolving on its own.
+  for _ in 0..4 {
+    assert!(
+      m.service_merge_applies(d2, &mut stores).is_empty(),
+      "nothing resolves: the fork and the park each wait on the other"
+    );
+  }
+  assert!(m.contains_group(&5), "the source stands, blob intact");
+  assert!(
+    m.group(&5).unwrap().peek_pending_fork().is_some(),
+    "the split-away half was not dropped — the whole point of the hold"
+  );
+  assert!(
+    m.group(&2).unwrap().pending_merge().is_some(),
+    "the park stands with it"
+  );
+
+  // The loud half: ONE observation naming the pair, deduped across every repeat crank.
+  assert_eq!(
+    m.poll_merge_blocked(),
+    Some(crate::MergeBlocked {
+      target: 2,
+      source: 5,
+      boundary: park,
+      cause: MergeBlockedCause::ForkFence,
+    }),
+    "the wedge is signalled with an actionable identity"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the edge dedupe absorbs the per-crank repeats"
+  );
 }
 
 /// The Defer twin: the consuming target's own capture is fenced by an ABORT obligation whose
@@ -10752,6 +11205,15 @@ fn a_deferred_absorb_chains_the_consumed_debtors_debts() {
     let (l, s) = stores.0.get_mut(&3).unwrap();
     drain_storage(&mut m, 3, d3, l, s);
   }
+  // The debtor's own fork barrier holds its consumption until the child's baseline is durable;
+  // release it so the abort fence on the TARGET is the only fence this arm still classifies on.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the hold");
+  m.lift_fork_barrier(&1, fork.split_index);
+  assert!(
+    m.group(&1).unwrap().capture_debt().is_some(),
+    "the debt is still live at the consumption: the resolver runs ahead of the debt pass"
+  );
   let resolutions = m.service_merge_applies(d3, &mut stores);
   assert_eq!(
     resolutions,
@@ -11194,6 +11656,11 @@ fn a_crash_inside_the_debt_window_re_parks_and_converges() {
 fn a_debt_holding_target_refuses_further_reshape_verbs() {
   let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
   defer_to_absorbed(&mut m, &mut stores, d);
+  // Release the fork barrier first: it refuses a freeze on its own (`SplitInFlight`), and the
+  // probe below must reach the DEBT's refusal.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let fork = m.poll_pending_fork().expect("the fork survived the wait");
+  m.lift_fork_barrier(&1, fork.split_index);
 
   // Named counterparts for the refused verbs: 3 as a would-be source into 1, and 0 as a
   // would-be target of 1 (merges run higher-id into lower-id, so the source-side probe needs
@@ -11357,12 +11824,30 @@ fn commit_merge_bytes(
   source_gen_after: u64,
   target_gen_after: u64,
 ) -> Bytes {
+  commit_merge_bytes_at(
+    source,
+    freeze_index,
+    Term::new(1),
+    source_gen_after,
+    target_gen_after,
+  )
+}
+
+/// [`commit_merge_bytes`] with the freeze's TERM settable — for a source whose freeze was appended
+/// under a later term than its first (an install deposed it before the freeze).
+fn commit_merge_bytes_at(
+  source: u64,
+  freeze_index: Index,
+  freeze_term: Term,
+  source_gen_after: u64,
+  target_gen_after: u64,
+) -> Bytes {
   let mut sb = Vec::new();
   source.encode(&mut sb);
   let p = crate::CommitMergePayload::new(
     Bytes::from(sb),
     freeze_index,
-    Term::new(1),
+    freeze_term,
     source_gen_after,
     target_gen_after,
   );
