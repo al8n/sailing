@@ -154,15 +154,21 @@ impl MultiWorld {
   }
 
   /// Drain every host's committed, relay-ready forks into materializations — the driver's
-  /// fork-drain, played by the world, INCLUDING the coordinator-admission gate the product
-  /// runs at this edge (floor, then tombstone): a late fork whose child id the catalog has
-  /// retired — or outpaced by recreation — resolves REFUSED. Returns whether anything happened.
+  /// fork-drain, played by the world. The world's CATALOG is the relay's gate, exactly as a
+  /// driver's engine and coordinator are the product's: a retired id reads as spoken-for and
+  /// HOLDS the fork (the container keeps it staged; a later remove/clear releases it), while a
+  /// generation below the catalog's floor is a verdict about the fork and is abandoned. The
+  /// world therefore keeps no hold state of its own. Returns whether anything happened.
   pub(super) fn pump_forks(&mut self) -> bool {
     let mut progressed = false;
     for node in self.node_ids.clone() {
       loop {
-        let host = self.hosts.get_mut(&node).expect("host exists");
-        let Some(fork) = host.poll_pending_fork() else {
+        let polled = {
+          let gate = CatalogGate(&self.groups);
+          let host = self.hosts.get_mut(&node).expect("host exists");
+          host.poll_pending_fork_with(&gate)
+        };
+        let Some(fork) = polled else {
           break;
         };
         progressed = true;
@@ -190,37 +196,26 @@ impl MultiWorld {
             meta.fold_baselines.retain(|(_, values)| !values.is_empty());
           }
         }
-        // The pure container cannot see retirement — the coordinators own that refusal, and
-        // this catalog check models it. A lagging parent replica can apply the split AFTER the
-        // child's registered incarnation was retired (or recreated past the fork's
-        // generation); materializing then would squat a replica the lifecycle verbs rightly
-        // assume gone. Refusal is the product's arm verbatim: no materialization, the parent's
-        // fence lifts (a fork that will never land here must not pin the parent), and the id
-        // stays with the ordinary lifecycle — a later recreation admits cleanly.
-        if self
-          .groups
-          .get(&fork.child)
-          .is_some_and(|m| m.retired || fork.child_gen < m.generation)
-        {
-          self.split_refused += 1;
-          // The REFUSE arm resolves the barrier without materializing — clear the fence this child's
-          // split index pinned on `(node, parent)`, so a stale record cannot outlive the resolved
-          // conflict (#110). The child is retired here, so the redundant-fold reconciliation below
-          // (keyed on the child being HOSTED) can never catch it; this arm must clear it explicitly.
-          self.clear_fork_fence(node, fork.parent, fork.child);
-          self
-            .hosts
-            .get_mut(&node)
-            .expect("host exists")
-            .lift_fork_barrier(&fork.parent, fork.split_index);
-          continue;
-        }
-        // The MATERIALIZE arm wires the child HERE — exact knowledge that the fork resolved, no
+        // Both the retirement and the floor arms moved INTO the container, reached through the
+        // catalog gate: a retired id holds the fork, a below-floor generation abandons it. What
+        // reaches here has passed both, so this is the MATERIALIZE arm — it wires the child HERE — exact knowledge that the fork resolved, no
         // inference: clear its fence right at the wire (#110).
         let (materialized_parent, materialized_child) = (fork.parent, fork.child);
         self.register_split_child(&fork);
         self.wire_fork_replica(node, fork);
         self.clear_fork_fence(node, materialized_parent, materialized_child);
+      }
+      // TERMINAL refusals: the container abandoned these deliberately, its own `resolve_fork`
+      // already lifting the parent's fence. The world still clears its #110 fence record, which
+      // the redundant-fold reconciliation below cannot reach (it keys on a HOSTED child).
+      let refused: Vec<(u64, u64)> = {
+        let host = self.hosts.get_mut(&node).expect("host exists");
+        core::iter::from_fn(|| host.poll_split_refusal()).collect()
+      };
+      for (parent, child) in refused {
+        progressed = true;
+        self.split_refused += 1;
+        self.clear_fork_fence(node, parent, child);
       }
       // Conflict signals are drained and counted, never acted on: see the field docs for why
       // the world's embedder model leaves a squatter in place. Beyond the count, the standing fence
@@ -654,5 +649,21 @@ impl MultiWorld {
       );
       drop(ctx); // no panic: disarm silently
     }
+  }
+}
+
+/// The world's group CATALOG, presented as the fork relay's gate — the sim's stand-in for the
+/// driver's engine plus its coordinator. A retired id reads as OCCUPIED, because a tombstone is a
+/// window (`clear_tombstone` lifts it) and never a verdict; the catalog's registered generation is
+/// the id's admission floor, and a fork below it can never land.
+struct CatalogGate<'a>(&'a std::collections::BTreeMap<u64, super::lifecycle::GroupMeta>);
+
+impl sailing_proto::ForkGate<u64> for CatalogGate<'_> {
+  fn contains_group(&self, gid: &u64) -> bool {
+    self.0.get(gid).is_some_and(|m| m.retired)
+  }
+
+  fn floor(&self, gid: &u64) -> u64 {
+    self.0.get(gid).map_or(0, |m| m.generation)
   }
 }

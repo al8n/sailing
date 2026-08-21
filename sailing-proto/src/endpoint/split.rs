@@ -50,6 +50,13 @@ pub(crate) struct SplitState<I, F> {
   /// fork is resolved INDIVIDUALLY ([`Endpoint::resolve_fork`]): resolving a newer fork (a
   /// dropped duplicate) must never free an older, still-unflushed one.
   pub(crate) outstanding: BTreeSet<Index>,
+  /// Split indexes whose staged forks the removal-time abandonment has CONDEMNED but not yet
+  /// consumed — the below-head arm of that discipline. The queue is strictly FIFO and its replay
+  /// guard is a single monotone counter, so a fork behind the head cannot be taken out of turn
+  /// without either reordering the queue or advancing the guard past forks still staged in front
+  /// of it. Marking defers instead: the drain consumes a marked fork the moment it reaches the
+  /// head, before examining it, which keeps both invariants intact.
+  pub(crate) abandoned: BTreeSet<Index>,
   /// The group's LINEAGE counter — one unified monotone per-id value for incarnation and shape
   /// (seeded from the admission generation / recovered snapshot meta; bumped to
   /// `parent_gen_after` when a split applies). Stamped into every snapshot meta this endpoint
@@ -96,6 +103,7 @@ impl<I, F> SplitState<I, F> {
       pending_forks: VecDeque::new(),
       forked_fsms: VecDeque::new(),
       outstanding: BTreeSet::new(),
+      abandoned: BTreeSet::new(),
       shape_gen: lineage,
       restored_lineage: lineage,
       pending_split_index: Index::ZERO,
@@ -133,6 +141,7 @@ where
   /// [`resolve_fork`](Self::resolve_fork) does.
   pub(crate) fn pop_pending_fork(&mut self) -> Option<(PendingFork<I>, F)> {
     let fork = self.split.pending_forks.pop_front()?;
+    self.split.abandoned.remove(&fork.index);
     let fsm = self
       .split
       .forked_fsms
@@ -149,12 +158,37 @@ where
     self.split.outstanding.remove(&index);
   }
 
+  /// Every staged fork in apply order — the removal-time abandonment's scan, which must reach past
+  /// the head: a sibling's later split child can be hosted-here-then-removed while an earlier fork
+  /// is still parked in front of it.
+  pub(crate) fn staged_forks(&self) -> impl Iterator<Item = &PendingFork<I>> {
+    self.split.pending_forks.iter()
+  }
+
+  /// Condemn the fork staged at exactly `index` without consuming it. Takes effect when that fork
+  /// reaches the head; until then it changes nothing, so no earlier fork's barrier, blob or
+  /// ordering is disturbed.
+  pub(crate) fn mark_fork_abandoned(&mut self, index: Index) {
+    self.split.abandoned.insert(index);
+  }
+
+  /// Whether the HEAD staged fork was condemned by a removal — the drain's take-before-examine
+  /// check, so a condemned fork is never offered a verdict it could pass.
+  pub(crate) fn head_fork_is_abandoned(&self) -> bool {
+    self
+      .split
+      .pending_forks
+      .front()
+      .is_some_and(|f| self.split.abandoned.contains(&f.index))
+  }
+
   /// Whether any fork durability barrier stands — the REPLAY-derivation predicate, and the
   /// cure-advertisement gate's fork leg: an adopting install's restart takes the `Compact` arm at
   /// its boundary, which would destroy a staged fork's only replay derivation, so a fork-fenced
   /// host never advertises. Deliberately NOT the consumption predicate (see
   /// [`fork_obligations_standing`](Self::fork_obligations_standing)): a rebaseline retires the
   /// replay derivation this one guards, and clears it accordingly.
+  /// SCRATCH DIAGNOSTIC (uncommitted).
   pub(crate) fn fork_barrier_standing(&self) -> bool {
     !self.split.outstanding.is_empty()
   }
@@ -171,6 +205,10 @@ where
   /// while deliberately KEEPING the queue entry, because its in-memory blob keeps the child
   /// materializable for the process lifetime. That blob is then the child's ONLY local derivation,
   /// so a cleared barrier says nothing about whether this endpoint is safe to destroy.
+  ///
+  /// A HELD fork — one the relay parked because its child id is spoken for — is a queued fork, so
+  /// this predicate covers it BY CONSTRUCTION: no merge teardown can consume a parent while it
+  /// still owes a partition that has nowhere to go.
   pub(crate) fn fork_obligations_standing(&self) -> bool {
     !self.split.outstanding.is_empty() || !self.split.pending_forks.is_empty()
   }
@@ -181,10 +219,14 @@ where
   /// stand forever against a coordinate no replay can ever need), so its barrier clears; the
   /// queue entry itself is KEPT — self-contained, it keeps the child materializable from the
   /// in-memory blob for the process lifetime, strictly better than dropping it, and a later
-  /// examination still resolves it redundant against a transferred twin's token. A fork already
-  /// POPPED (the driver's pop→flush→lift window) keeps its barrier: `resolve_fork` lifts it when
-  /// the flush (or the container's drop) completes, and freeing it early would release the fence
-  /// under an in-flight materialization whose baseline is not yet durable.
+  /// examination still resolves it redundant against a transferred twin's token. This covers a
+  /// HELD fork too — one parked because its child id is spoken for is queued, not popped, so a
+  /// covering rebaseline clears its barrier and the retained blob keeps the child materializable.
+  ///
+  /// A fork already POPPED keeps its barrier: `resolve_fork` lifts it when the flush (or the
+  /// container's drop) completes, and freeing it early would release the fence under an in-flight
+  /// materialization whose baseline is not yet durable. That case is now exactly one thing — the
+  /// driver's one-crank pop→flush→lift window — since a blocked fork is never popped.
   pub(crate) fn note_fork_barrier_rebaselined(&mut self, boundary: Index) {
     let queued: BTreeSet<Index> = self.split.pending_forks.iter().map(|f| f.index).collect();
     self

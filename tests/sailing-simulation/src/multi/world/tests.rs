@@ -1631,6 +1631,124 @@ fn alignment_never_masks_a_genuine_value_divergence() {
   assert_eq!(v.oracle, "agreement");
 }
 
+/// THE RELEASE COMPOSITION — what makes certifying a tombstone-held wedge honest rather than
+/// silent. A held fork keeps its parent unconsumable (`fork_obligations_standing`), so a merge
+/// naming that parent as SOURCE parks on the replica holding it. The embedder's own consent
+/// releases both.
+///
+/// The valve here is `recreate_group`, and it RAISES THE ID'S FLOOR — so the release runs through
+/// the TERMINAL arm, not a landing: the gen-0 fork can never clear a gen-1 floor, which is a
+/// verdict about the fork, so its blob is dropped DELIBERATELY. That is sound precisely because
+/// recreation is the embedder declaring the old incarnation gone; it is the same consent that
+/// authorizes the tombstone. What must then be true is that the obligation discharges and the
+/// merge the hold was blocking completes, with the conservation ledger green over what remains.
+#[test]
+fn a_retired_hold_releases_its_merge_on_consent() {
+  // Source encodes ABOVE target under the LE-byte-string direction rule.
+  let (source, target, child) = (11u64, 10u64, 300u64);
+  let mut w = MultiWorld::new(23);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(source, &all);
+  w.create_group(target, &all);
+  assert!(w.run_until(3_000, |w| {
+    w.leader_of(source).is_some() && w.leader_of(target).is_some()
+  }));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(source, key, u64::from(key));
+    propose_until_accepted(&mut w, source, &payload);
+  }
+  propose_until_accepted(&mut w, target, &crate::multi::encode_gkv(target, 0, 900));
+  assert!(w.run_until(2_000, |w| {
+    (0..3).all(|n| w.applied_of(n, source).len() >= 8)
+  }));
+
+  // Node 2 lags the split: isolate it, split on {0,1}, then retire the child while node 2 still
+  // has the split entry ahead of it. Healing leaves node 2 holding a fork it cannot land.
+  w.isolate(2);
+  assert!(w.run_until(3_000, |w| w.leader_of(source).is_some_and(|l| l != 2)));
+  propose_split_until_accepted(&mut w, source, child, 4);
+  assert!(w.run_until(3_000, |w| w.splits_applied() == 1));
+  w.remove_group(child);
+  w.heal(2);
+  assert!(
+    w.run_until(4_000, |w| w.split_conflicts_observed() >= 1),
+    "node 2's late fork never signalled its hold"
+  );
+  assert_eq!(
+    w.split_refused_observed(),
+    0,
+    "a tombstone holds the fork, it does not abandon it"
+  );
+
+  // Now merge the held fork's PARENT away as the source. The freeze is proposed at the leader,
+  // whose own fork resolved at materialization, so it commits — and then node 2, which still owes
+  // its held fork, cannot let its replica be consumed.
+  colocate_source_onto_target(&mut w, source, target);
+  merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(source, target)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
+    w.propose_commit_merge(target, source)
+  });
+  assert!(
+    w.run_until(6_000, |w| w.merges_resolved() >= 2),
+    "the hosts without a held fork resolve the absorb"
+  );
+  // The wedge must be STABLE, not merely slow: with the hold standing, a long quiet window buys
+  // no further progress and node 2 keeps its source replica.
+  w.run_until(8_000, |_| false);
+  assert_eq!(
+    w.merges_resolved(),
+    2,
+    "the replica owing a held fork must NOT be consumed"
+  );
+  assert!(
+    w.hosting_nodes(source).contains(&2),
+    "node 2 still holds the un-consumable source replica: {:?}",
+    w.hosting_nodes(source)
+  );
+
+  // THE CONSENT, in two acts, and the second is not ceremony. Recreation raises the id's floor
+  // past the fork's generation — the embedder declaring the old incarnation gone, which is what
+  // finally makes the fork refusable. But a HOSTED child is examined before any gate (a hosted
+  // child always has stores, so a gate consulted first would swallow every conflict into a
+  // stores-hold and make the provenance exit unreachable), so while the new incarnation occupies
+  // the id the fork simply parks on it instead. Freeing the id lets the relay reach the floor it
+  // can never clear, and the fork resolves TERMINALLY: blob dropped, obligation discharged.
+  w.recreate_group(child);
+  assert!(w.run_until(3_000, |w| w.generation_of(child) == 1));
+  assert_eq!(
+    w.split_refused_observed(),
+    0,
+    "while the new incarnation holds the id, the fork parks on it rather than resolving"
+  );
+  w.remove_group(child);
+  assert!(
+    w.run_until(6_000, |w| w.split_refused_observed() == 1),
+    "the raised floor never settled the held fork once the id was free"
+  );
+  // The merge now COMPLETES on the last host: the source leaves every replica and the target is
+  // no longer parked on it. (`merges_resolved` counts absorb resolutions and does not tick for a
+  // replica released this way, so the completion is asserted on the state, not the counter.)
+  assert!(
+    w.run_until(8_000, |w| w.hosting_nodes(source).is_empty()),
+    "the released obligation never let the last host give up its source replica: \
+     resolved={} target={} hosting_source={:?}",
+    w.merges_resolved(),
+    w.merge_block_dbg(target),
+    w.hosting_nodes(source),
+  );
+  assert!(
+    !w.group_merge_parked(target),
+    "the target is no longer parked on the absorbed source: {}",
+    w.merge_block_dbg(target)
+  );
+  w.finalize_conservation_or_panic(23);
+}
+
 /// A LATE fork — a lagging parent replica applying the committed split after the child's
 /// incarnation was retired — must resolve REFUSED at the world's materialization edge, exactly
 /// as the product's coordinator admission (floor → tombstone) refuses it at the driver's
@@ -1638,7 +1756,7 @@ fn alignment_never_masks_a_genuine_value_divergence() {
 /// lifecycle. Materializing instead squats a replica under a retired gid, and the next
 /// recreation trips container admission with `Exists` on that node.
 #[test]
-fn late_fork_for_a_retired_child_refuses_and_recreation_admits() {
+fn late_fork_for_a_retired_child_holds_and_recreation_admits() {
   let mut w = MultiWorld::new(5);
   for n in 0..3 {
     w.add_node(n);
@@ -1682,18 +1800,21 @@ fn late_fork_for_a_retired_child_refuses_and_recreation_admits() {
   // Retire the child while the straggler still has the split entry ahead of it.
   w.remove_group(300);
 
-  // Heal: the straggler catches up, applies the split, and its late fork refuses against the
-  // tombstone.
+  // Heal: the straggler catches up, applies the split, and its late fork HOLDS against the
+  // tombstone. A tombstone is a window — `recreate_group` lifts it — so it is never grounds to
+  // drop the fork's blob; the relay parks it and says so once.
   w.heal(2);
   assert!(
-    w.run_until(4_000, |w| w.split_refused_observed() == 1),
-    "the late fork never resolved refused"
+    w.run_until(4_000, |w| w.split_conflicts_observed() >= 1),
+    "the late fork never signalled its hold"
   );
-  assert!(
-    !w.hosts_group(2, 300),
-    "a refused fork must not materialize"
+  assert_eq!(
+    w.split_refused_observed(),
+    0,
+    "a tombstone must hold the fork, never abandon it"
   );
-  assert_eq!(w.splits_applied(), 1, "a refused fork registers nothing");
+  assert!(!w.hosts_group(2, 300), "a held fork must not materialize");
+  assert_eq!(w.splits_applied(), 1, "a held fork registers nothing");
 
   // The straggler's fence resolved with the refusal: fresh parent load applies EVERYWHERE.
   propose_until_accepted(&mut w, 100, &crate::multi::encode_gkv(100, 0, 500));
@@ -1717,6 +1838,11 @@ fn late_fork_for_a_retired_child_refuses_and_recreation_admits() {
     w.run_until(4_000, |w| w.leader_of(300).is_some()),
     "the recreated child never elected: {}",
     w.dbg_group(300)
+  );
+  assert_eq!(
+    w.split_refused_observed(),
+    0,
+    "the fork was held throughout, never abandoned"
   );
   propose_until_accepted(&mut w, 300, &crate::multi::encode_gkv(300, 0, 600));
   assert!(
@@ -3728,13 +3854,25 @@ fn fork_fence_clears_on_the_refuse_arm_so_a_later_park_is_not_exempted() {
   w.inject_fork_conflict_for_child(2, 10, fence, 200);
   assert!(w.has_fork_fence_below(2, 10, sailing_proto::Index::new(u64::MAX)));
 
-  // Retire the child while node 2 still has the split entry ahead of it, then heal: node 2 applies the
-  // split and its late fork REFUSES against the tombstone — the fence's resolution arm.
+  // Retire the child while node 2 still has the split entry ahead of it, then heal: node 2 applies
+  // the split and its late fork HOLDS on the tombstone. Recreation raises the id's floor past the
+  // fork's generation, which IS a verdict about the fork — that is the refuse arm, and the fence's
+  // resolution arm with it.
   w.remove_group(200);
   w.heal(2);
   assert!(
+    w.run_until(4_000, |w| w.split_conflicts_observed() >= 1),
+    "the late fork never signalled its hold"
+  );
+  // Recreate, then retire again: what the recreation leaves behind is a FLOOR at generation 1,
+  // and a gen-0 fork can never clear it. That is a verdict about the fork rather than about the
+  // id, so this is the arm that abandons — and the arm that resolves the fence.
+  w.recreate_group(200);
+  assert!(w.run_until(2_000, |w| w.generation_of(200) == 1));
+  w.remove_group(200);
+  assert!(
     w.run_until(4_000, |w| w.split_refused_observed() == 1),
-    "the late fork never resolved refused"
+    "the floor left by the recreation never refused the stale fork"
   );
   assert!(
     !w.hosts_group(2, 200),

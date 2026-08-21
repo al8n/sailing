@@ -2468,12 +2468,153 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
   );
 }
 
+/// THE PUBLIC FORK DOOR IS FENCED, and the forged token dies on it. `create_group_from_fork` is
+/// callable by anyone holding a coordinator, with a blob and a `ForkId` of their choosing — and a
+/// `ForkId` is minted from PUBLIC, DETERMINISTIC split coordinates, so a caller can compute the
+/// exact token the genuine fork will carry. Were the reservation not enforced here, that caller
+/// could install a token-matching squatter at the reserved child id in either reservation window;
+/// the committed fork would then find the id hosted, match the token, and resolve REDUNDANT —
+/// silently discarding the partition. The fence refuses both windows, forged token and all, and
+/// the genuine fork still lands afterwards through the sealed relay door.
+#[test]
+fn the_public_fork_door_refuses_a_forged_token_in_both_reservation_windows() {
+  let now = Instant::ORIGIN;
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut c = SplitCoord::new();
+  engine.add_group(100);
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    SplitSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  let d = c.group(&100).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c.handle_timeout(&100, d, l, s).unwrap();
+  }
+  settle_engine(&mut c, &mut engine, &[100], d);
+  for _ in 0..3 {
+    let (l, s) = engine.stores(&100).unwrap();
+    c.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"))
+      .unwrap()
+      .unwrap();
+    settle_engine(&mut c, &mut engine, &[100], d);
+  }
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c.propose_split(
+      &100,
+      d,
+      l,
+      s,
+      &300,
+      0,
+      Bytes::from_static(b"\x02"),
+      &NoFloors,
+    )
+    .expect("the parent is hosted")
+    .expect("the leader appends the split");
+  }
+
+  // WINDOW A — proposed, not yet applied. The attacker cannot know the token yet, but the door
+  // must refuse regardless of what it is handed.
+  let (mut scratch_l, mut scratch_s) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    c.create_group_from_fork(
+      300,
+      single_voter(1),
+      now,
+      9,
+      SplitSm::default(),
+      fork_blob(1),
+      None,
+      None,
+      1,
+      0,
+      &NoFloors,
+      &mut scratch_l,
+      &mut scratch_s,
+    ),
+    Err(CreateGroupError::SplitReserved),
+    "window A: the public door refuses a reserved child id"
+  );
+
+  // WINDOW B — the split applied and its fork is STAGED, so the exact token is now derivable from
+  // the committed coordinates. Hand the door that very token: it must still refuse.
+  settle_engine(&mut c, &mut engine, &[100], d);
+  let forged = staged_fork_id_of(&c, 100);
+  assert_eq!(
+    c.create_group_from_fork(
+      300,
+      single_voter(1),
+      now,
+      9,
+      SplitSm::default(),
+      fork_blob(1),
+      None,
+      Some(forged),
+      1,
+      0,
+      &NoFloors,
+      &mut scratch_l,
+      &mut scratch_s,
+    ),
+    Err(CreateGroupError::SplitReserved),
+    "window B: an EXACTLY-minted token buys nothing at the public door"
+  );
+  assert_eq!(
+    scratch_l.last_index(),
+    Index::ZERO,
+    "every refusal wrote nothing"
+  );
+
+  // THE GENUINE FORK STILL LANDS, through the sealed relay door that takes the container's own
+  // yielded record — the ticket no caller can forge.
+  let fork = c.poll_pending_fork().expect("the committed split relays");
+  let config = fork.config.clone();
+  engine.add_group(300);
+  let epoch = engine.next_boot_epoch(&300).unwrap();
+  {
+    let (l, s) = engine.stores(&300).unwrap();
+    c.create_group_from_relayed_fork(fork, config, now, 1, epoch, &NoFloors, l, s)
+      .expect("the relayed fork materializes through the sealed door");
+  }
+  assert!(
+    c.group(&300).is_some(),
+    "the child the attacker could not squat is now the genuine fork's"
+  );
+}
+
+/// The staged head fork's minted token — the value a direct caller can derive for itself from the
+/// committed split's public coordinates.
+fn staged_fork_id_of(c: &SplitCoord, parent: u64) -> crate::ForkId {
+  let f = c
+    .group(&parent)
+    .unwrap()
+    .peek_pending_fork()
+    .expect("a fork is staged on the parent");
+  crate::multi::mint_fork_id(
+    &parent,
+    f.parent_gen_after,
+    f.index,
+    f.split_term,
+    f.child_bytes.clone(),
+    f.child_gen,
+  )
+}
+
 /// The split reservation walks the whole fork lifecycle at the admission edge: from the
-/// leader's propose (window A) through the staged fork (window B), every admission path —
-/// create, restore, fork — refuses the child id with the typed verdict, and the factory-gate
-/// predicate reads true; the reservation releases exactly when the relay yields the fork to
-/// the driver, which is why the fork's OWN materialization passes the very gate that refused
-/// everyone else; thereafter the id refuses as plain `Exists`. Without the reservation every one of
+/// leader's propose (window A) through the staged fork (window B), every OTHER admission path —
+/// create and restore — refuses the child id with the typed verdict, and the factory-gate
+/// predicate reads true. The FORK door is outside the fence by design (see
+/// [`MultiRaft::split_reserved`]): the reservation exists to stop other doors squatting an id a
+/// split owns, and the fork IS that split claiming it. The reservation releases when the relay
+/// yields; thereafter the id refuses as plain `Exists`. Without the reservation every one of
 /// these admissions succeeds — planting the squatter whose conflict the relay must then park around.
 #[test]
 fn admission_refuses_an_in_flight_splits_child_id() {
@@ -2555,24 +2696,10 @@ fn admission_refuses_an_in_flight_splits_child_id() {
     ),
     Err(CreateGroupError::SplitReserved)
   );
-  assert_eq!(
-    c.create_group_from_fork(
-      300,
-      single_voter(1),
-      now,
-      9,
-      SplitSm::default(),
-      fork_blob(1),
-      None,
-      None,
-      1,
-      0,
-      &NoFloors,
-      &mut scratch_l,
-      &mut scratch_s,
-    ),
-    Err(CreateGroupError::SplitReserved)
-  );
+  // The FORK door is deliberately outside this fence and is not exercised here: a committed
+  // fork's materialization is the split CLAIMING its own id, not another door asking for it, so
+  // consulting the reservation there would refuse the very admission it exists to protect (the
+  // id is reserved BY that fork). See `MultiRaft::split_reserved`.
   assert_eq!(
     scratch_l.last_index(),
     Index::ZERO,
@@ -2595,11 +2722,11 @@ fn admission_refuses_an_in_flight_splits_child_id() {
     Err(CreateGroupError::SplitReserved)
   );
 
-  // YIELD releases the reservation — the fork's own materialization must pass the gate.
+  // YIELD releases the reservation: the fork is consumed, so neither leg holds any longer.
   let fork = c.poll_pending_fork().expect("the committed split relays");
   assert!(
     !c.is_split_reserved(&300),
-    "yielded to the driver: the fork is now the id's one admitted writer"
+    "yielded to the driver: nothing stages this child id any more"
   );
   engine.add_group(300);
   let epoch = engine.next_boot_epoch(&300).unwrap();
@@ -2620,7 +2747,7 @@ fn admission_refuses_an_in_flight_splits_child_id() {
       l,
       s,
     )
-    .expect("the yielded fork materializes through the same admission path");
+    .expect("the yielded fork materializes");
   }
   engine.set_group_gen(&100, fork.parent_gen_after);
   engine.flush();

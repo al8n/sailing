@@ -314,16 +314,74 @@ where
     if self.retired.contains(&gid) {
       return Err(CreateGroupError::Retired);
     }
-    // The split reservation: an in-flight split's child id refuses admission from EVERY other
-    // path (embedder create/restore, a local fork, the factory's gate at the drivers), so the
-    // committed fork's materialization never finds its id occupied by a same-session admission.
-    // Derived from live consensus state — it releases on its own when the fork resolves.
+    // THE RESERVATION FENCE STANDS ON THIS DOOR. This is the public, caller-driven fork install —
+    // anyone holding a coordinator can call it with a blob and a token of their choosing — so a
+    // child id an in-flight or staged split owns must refuse here. The relay's own materialization
+    // does not come through this door: it goes through
+    // [`create_group_from_relayed_fork`](Self::create_group_from_relayed_fork), whose ticket is a
+    // container-minted fork nobody outside this crate can construct.
     if self.multi.split_reserved(&gid) {
       return Err(CreateGroupError::SplitReserved);
     }
     let key = gid.cheap_clone();
     self.multi.create_group_from_fork(
       gid, generation, config, now, seed, fsm, snapshot, read_only, fork_id, boot_epoch, log,
+      stable,
+    )?;
+    self.purge_unknown_signal(&key);
+    Ok(())
+  }
+
+  /// Materialize a child from a fork the CONTAINER yielded — the relay's door, and the only one
+  /// that skips the split reservation.
+  ///
+  /// The ticket is possession of a [`GroupFork`](crate::GroupFork): the container mints them, only
+  /// for a committed split whose coordinates it verified, and nothing outside this crate can
+  /// construct one. That is what makes skipping the reservation safe here and nowhere else — the
+  /// reservation fences the OTHER admission doors from squatting an id a split owns, and this call
+  /// IS that split claiming its own id. Consulting the predicate here would refuse the very
+  /// admission it exists to protect: the fork's own parent reserves the id while it is staged, and
+  /// a sibling parent that named the same child reserves it too. Under the relay's hold such a
+  /// refusal has nowhere to go but the caller's fail-closed floor, which in release drops the
+  /// partition. Two committed forks racing one child need no fence between them either — the first
+  /// installs, and the second parks on the hosted child under provenance.
+  ///
+  /// `config` is the child's boot config after the caller's reshape-birth transform; every other
+  /// input is taken from the fork itself, so no caller-supplied token can reach the baseline.
+  #[allow(clippy::too_many_arguments)]
+  pub fn create_group_from_relayed_fork<L, S>(
+    &mut self,
+    fork: crate::GroupFork<G, I, F>,
+    config: Config<I>,
+    now: impl Into<Now>,
+    seed: u64,
+    boot_epoch: u64,
+    floors: &impl FloorStore<G>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    I: Data,
+  {
+    validate_floor(floors.floor(&fork.child), fork.child_gen)?;
+    if self.retired.contains(&fork.child) {
+      return Err(CreateGroupError::Retired);
+    }
+    let key = fork.child.cheap_clone();
+    self.multi.create_group_from_fork_unreserved(
+      fork.child,
+      fork.child_gen,
+      config,
+      now,
+      seed,
+      fork.fsm,
+      fork.blob,
+      fork.read_only,
+      Some(fork.fork_id),
+      boot_epoch,
+      log,
       stable,
     )?;
     self.purge_unknown_signal(&key);
@@ -604,6 +662,11 @@ where
       // discharge), but every frame for it is exactly as moot, and an unknown-group advisory
       // here would prompt the embedder (or the factory, whose own gate also refuses) to revive
       // a husk beside the absorbed union. Same posture as the tombstone: drop silently.
+      //
+      // DELIBERATELY DEBT-ONLY. The admission doors also refuse a source named by a
+      // latched-CLOSED park, but this fence must NOT: a park in that state is waiting for the
+      // covering snapshot that resolves it, and the cure chain rides the CONSUMED SOURCE's own
+      // frames. Dropping them here would starve the very cure the park is waiting on.
       if self.multi.debt_names(&group) {
         continue;
       }
@@ -1030,6 +1093,10 @@ where
 
   /// Whether any hosted target's outstanding capture debt names `gid` as its absorbed source
   /// (see [`MultiRaft::debt_names`]) — the drivers' factory and lifecycle gates consult this.
+  ///
+  /// The FACTORY needs no separate park leg: a solicited build goes through `create_group`, whose
+  /// `validate_new_group` already refuses a committed-consumed source on both legs — the debt this
+  /// predicate reports and the latched-CLOSED park beside it.
   pub fn debt_names(&self, gid: &G) -> bool {
     self.multi.debt_names(gid)
   }
@@ -1038,7 +1105,20 @@ where
   /// [`MultiRaft::poll_pending_fork`]) — the driver drains this every crank BEFORE its storage
   /// crank, so the same crank's engine flush covers the materialization.
   pub fn poll_pending_fork(&mut self) -> Option<crate::GroupFork<G, I, F>> {
-    self.multi.poll_pending_fork()
+    self.poll_pending_fork_with(&crate::NoHold)
+  }
+
+  /// [`poll_pending_fork`](Self::poll_pending_fork) over the caller's [`ForkGate`](crate::ForkGate), AUGMENTED
+  /// with this coordinator's tombstone set before the container sees it — never merely
+  /// forwarded, because `retired` is state the container does not hold.
+  pub fn poll_pending_fork_with(
+    &mut self,
+    gate: &impl crate::ForkGate<G>,
+  ) -> Option<crate::GroupFork<G, I, F>> {
+    self.multi.poll_pending_fork_with(&CoordGate {
+      retired: &self.retired,
+      outer: gate,
+    })
   }
 
   /// Resolve the fork staged at exactly `split_index` on `parent` (see
@@ -1063,6 +1143,34 @@ where
   /// tail accepted the peeked event.
   pub fn poll_split_conflict(&mut self) -> Option<(G, G)> {
     self.multi.poll_split_conflict()
+  }
+
+  /// The next `(parent, child)` SPLIT-REFUSAL signal, left queued (see
+  /// [`MultiRaft::peek_split_refusal`]): the driver publishes it on its bounded lifecycle tail and
+  /// consumes only once the tail accepts.
+  #[must_use]
+  pub fn peek_split_refusal(&self) -> Option<(G, G)> {
+    self.multi.peek_split_refusal()
+  }
+
+  /// Drain the next `(parent, child)` SPLIT-REFUSAL signal — a committed fork the relay abandoned
+  /// deliberately (see [`MultiRaft::poll_split_refusal`]).
+  pub fn poll_split_refusal(&mut self) -> Option<(G, G)> {
+    self.multi.poll_split_refusal()
+  }
+
+  /// Drain the next `(parent, lineage)` relay-guard advance owed to the caller's DURABLE lineage
+  /// record (see [`MultiRaft::poll_relay_guard_advance`]). Removal-time fork abandonment is its
+  /// only source; mirror it beside the removal's floor write.
+  pub fn poll_relay_guard_advance(&mut self) -> Option<(G, u64)> {
+    self.multi.poll_relay_guard_advance()
+  }
+
+  /// Whether `gid`'s fork relay still owes something — a held head fork or an undelivered
+  /// conflict/refusal signal (see [`MultiRaft::fork_relay_pending`]).
+  #[must_use]
+  pub fn fork_relay_pending(&self, gid: &G) -> bool {
+    self.multi.fork_relay_pending(gid)
   }
 
   /// Drain the next FAIL-STOPPED group id (see [`MultiRaft::poll_poisoned`]); the driver surfaces
@@ -1442,6 +1550,30 @@ where
 {
   fn default() -> Self {
     Self::new()
+  }
+}
+
+/// The driver's [`ForkGate`](crate::ForkGate) AUGMENTED with the one fact only this coordinator holds: the
+/// tombstone. `retired` is coordinator state — the container cannot see it, and a driver would
+/// have to reach across the seam for it — so a relayed fork for a tombstoned id must learn its
+/// answer here. It reads as OCCUPANCY, not refusal: `clear_tombstone` lifts a tombstone, so the
+/// two-act rejoin is a window, never a verdict.
+struct CoordGate<'a, G, Outer> {
+  retired: &'a BTreeSet<G>,
+  outer: &'a Outer,
+}
+
+impl<G, Outer> crate::ForkGate<G> for CoordGate<'_, G, Outer>
+where
+  G: GroupId,
+  Outer: crate::ForkGate<G>,
+{
+  fn contains_group(&self, gid: &G) -> bool {
+    self.retired.contains(gid) || self.outer.contains_group(gid)
+  }
+
+  fn floor(&self, gid: &G) -> u64 {
+    self.outer.floor(gid)
   }
 }
 

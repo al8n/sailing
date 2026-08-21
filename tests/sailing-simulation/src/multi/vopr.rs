@@ -578,6 +578,10 @@ pub struct MultiVoprReport {
   /// explicit overlap, so the two RAW counters are never misread as disjoint. ALWAYS `0` under an
   /// unphased profile.
   pub exemption_overlap: u64,
+  /// Groups certified past on the TOMBSTONE-HELD FORK class: a merge blocked because a participant
+  /// still owes a fork the relay holds for a retired child id. Counted on EVERY profile, because
+  /// unlike the two filed classes this one is by-design behavior with an embedder-held valve.
+  pub retired_hold_wedges_exempted: u64,
   /// HOSTED RETIRED HUSKS the run-end quiesce safety pass visited — gids with a lingering replica
   /// (a merged-away source frozen on a lagging host) that are NOT in `live_groups`. The witness that
   /// the unconditional safety worklist reaches beyond the live set; nonzero only when a husk survived
@@ -967,8 +971,9 @@ fn calm_window(
       // agreement and applied-history integrity (the absorbed content is covered off-band by the
       // run-end conservation ledger and the sorted absorbed branch) — a liveness exemption never gates
       // safety.
-      if exempt_tracked
-        && (w.tracked_underhosted_merge_wedge(gid) || w.fork_fence_coupled_wedge(gid))
+      if w.retired_hold_wedge(gid)
+        || (exempt_tracked
+          && (w.tracked_underhosted_merge_wedge(gid) || w.fork_fence_coupled_wedge(gid)))
       {
         // The expected set is built exactly as the quiesce sweep builds it, so this checkpoint's
         // integrity verdict is identical to run-end's — the point of catching a divergent replica
@@ -1010,6 +1015,11 @@ fn calm_window(
       // committed load from it would misread the filed liveness gap as a livelock.
       if w.group_frozen(gid)
         || !w.live_groups().contains(&gid)
+        // A merge held open by a TOMBSTONE-HELD fork refuses progress by design, exactly as a
+        // frozen group does: the embedder retired the child, the relay will not drop the partition
+        // that stranded, and `clear_tombstone` releases both. Cause-verified from model state, so a
+        // merge stuck for any other reason still trips.
+        || w.retired_hold_wedge(gid)
         || (exempt_tracked
           && (w.tracked_underhosted_merge_wedge(gid) || w.fork_fence_coupled_wedge(gid)))
       {
@@ -1180,13 +1190,11 @@ fn quiesce(
     // the under-hosted parked-absorb (#106) and the fork-fence coupling (#110), each the whole merge
     // component transitively blocked by its root. Unphased profiles pass `exempt_tracked = false`, so
     // both sets are empty (never computed) and this is the bare `all(converged_group)` — byte-identical.
-    let wedge = if exempt_tracked {
-      let mut s = w.tracked_merge_wedge_set();
-      s.extend(w.fork_fence_wedge_set());
-      s
-    } else {
-      BTreeSet::new()
-    };
+    let mut wedge = w.retired_hold_wedge_set();
+    if exempt_tracked {
+      wedge.extend(w.tracked_merge_wedge_set());
+      wedge.extend(w.fork_fence_wedge_set());
+    }
     if live
       .iter()
       .all(|&gid| converged_group(w, gid) || wedge.contains(&gid))
@@ -1204,7 +1212,12 @@ fn quiesce(
   } else {
     (BTreeSet::new(), BTreeSet::new())
   };
-  let exempted: BTreeSet<u64> = underhosted.union(&forkfence).copied().collect();
+  let retired_hold = w.retired_hold_wedge_set();
+  let exempted: BTreeSet<u64> = underhosted
+    .union(&forkfence)
+    .copied()
+    .chain(retired_hold.iter().copied())
+    .collect();
   // Count BOTH raw predicate sets INDEPENDENTLY: a group satisfying both predicates contributes to
   // both counters (and both seed lists in the sweep), so neither class can hide the other. The
   // `exempted` union is what the liveness gate certifies past; the raw counters are the per-class
@@ -1212,6 +1225,7 @@ fn quiesce(
   report.tracked_merge_wedges_exempted += underhosted.len() as u64;
   report.fork_fence_couplings_exempted += forkfence.len() as u64;
   report.exemption_overlap += underhosted.intersection(&forkfence).count() as u64;
+  report.retired_hold_wedges_exempted += retired_hold.len() as u64;
   if !converged {
     // Only a NON-exempt group that failed to converge is a wedge worth panicking on; if every
     // straggler is the tracked class the loop already certified and we never reach here.
@@ -1249,7 +1263,12 @@ fn quiesce(
   let frozen: Vec<(u64, u64)> = w
     .frozen_replicas()
     .into_iter()
-    .filter(|&(_, gid)| !(exempt_tracked && exempted.contains(&gid)))
+    // The tombstone-held class filters UNCONDITIONALLY (it is by-design, not a filed gap): a
+    // source frozen behind a fork the relay holds for a retired child cannot be absorbed until
+    // the embedder clears the tombstone. The two filed classes stay storm-gated.
+    .filter(|&(_, gid)| {
+      !(retired_hold.contains(&gid) || (exempt_tracked && exempted.contains(&gid)))
+    })
     .collect();
   if !frozen.is_empty() {
     let groups: BTreeSet<u64> = frozen.iter().map(|&(_, gid)| gid).collect();

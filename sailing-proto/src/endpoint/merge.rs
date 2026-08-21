@@ -32,6 +32,24 @@ pub struct PendingMergeApply {
   target_gen_after: u64,
   /// The `CommitMerge` entry's own index `k` (the drain parked at `k - 1`).
   at: Index,
+  /// THE LATCHED WINDOW VERDICT: whether this park's abort window was ever observed
+  /// [`MergeWindow::Closed`] — i.e. `k + 1` is committed and is not this merge's abort, so no
+  /// abort can ever contest it again. Minted `false`, set once by the resolver, monotone for as
+  /// long as THIS park lives, and gone with it: the flag rides the park itself rather than the
+  /// endpoint's [`MergeState`], so a fan-in target's NEXT park starts undecided instead of
+  /// inheriting a verdict about the previous one.
+  ///
+  /// It is a LATCH because evaluation is not monotone even though the fact is: a cold or briefly
+  /// invisible read of the coordinate returns [`MergeWindow::Stall`], so re-reading can flap
+  /// Closed → Stall while the committed content it describes cannot change. Callers that must not
+  /// flap read the latch.
+  ///
+  /// VOLATILE, and safely so. A crash re-derives the window from the replayed log, and replay can
+  /// only ever be BEHIND the live evaluation, never ahead of it in the unsafe direction: a durable
+  /// commit index never recovers above the truth, so a replayed `Closed` is always genuine and a
+  /// replayed `Open` merely withholds a verdict this park had already earned. Consumers therefore
+  /// treat an unlatched park as undecided, which is the conservative direction.
+  window_closed: bool,
 }
 
 impl PendingMergeApply {
@@ -51,7 +69,21 @@ impl PendingMergeApply {
       source_gen_after,
       target_gen_after,
       at,
+      window_closed: false,
     }
+  }
+
+  /// Whether this park's abort window has been observed CLOSED (see
+  /// [`window_closed`](Self::window_closed)).
+  #[inline(always)]
+  pub fn window_closed(&self) -> bool {
+    self.window_closed
+  }
+
+  /// Latch the CLOSED verdict. Monotone and idempotent; only the resolver calls it, and only from
+  /// the branch that just read [`MergeWindow::Closed`] for this very park.
+  pub(crate) const fn latch_window_closed(&mut self) {
+    self.window_closed = true;
   }
 
   /// The absorbed (source) group id's canonical `Data` encoding (an O(1) shared handle).
@@ -419,6 +451,14 @@ where
   /// group would never reach).
   pub fn pending_merge(&self) -> Option<&PendingMergeApply> {
     self.merge.pending_apply.as_ref()
+  }
+
+  /// Latch this park's window verdict as CLOSED — the resolver's write, made where it has just
+  /// read [`MergeWindow::Closed`] for this park. No-op when nothing is parked.
+  pub(crate) fn latch_merge_window_closed(&mut self) {
+    if let Some(pending) = self.merge.pending_apply.as_mut() {
+      pending.latch_window_closed();
+    }
   }
 
   /// The TARGET id this frozen source's freeze named (`None` when not frozen) — the claim the

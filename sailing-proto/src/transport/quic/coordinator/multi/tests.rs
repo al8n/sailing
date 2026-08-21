@@ -1609,24 +1609,10 @@ fn quic_admission_refuses_an_in_flight_splits_child_id() {
     ),
     Err(CreateGroupError::SplitReserved)
   );
-  assert_eq!(
-    c.create_group_from_fork(
-      300,
-      single_voter(1),
-      Instant::ORIGIN,
-      9,
-      CountSm::default(),
-      fork_blob(1),
-      None,
-      None,
-      1,
-      0,
-      &NoFloors,
-      &mut scratch_l,
-      &mut scratch_s,
-    ),
-    Err(CreateGroupError::SplitReserved)
-  );
+  // The FORK door is deliberately outside this fence and is not exercised here: a committed
+  // fork's materialization is the split CLAIMING its own id, not another door asking for it, so
+  // consulting the reservation there would refuse the very admission it exists to protect (the
+  // id is reserved BY that fork). See `MultiRaft::split_reserved`.
   assert_eq!(
     scratch_l.last_index(),
     Index::ZERO,
