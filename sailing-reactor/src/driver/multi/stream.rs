@@ -680,26 +680,11 @@ where
         .lifecycle_tx
         .try_send(LifecycleEvent::Poisoned { group });
     }
-    // A structurally held merge surfaces on the same tail, once per transition of its cause —
-    // DELIVERED-BEFORE-CONSUMED like the conflict signal: the hold is re-derived every crank,
-    // but the once-per-transition dedupe is not, so popping ahead of a full tail would silence
-    // a hold that needs embedder action for as long as its cause stands. Consume only on
-    // acceptance; a resolved hold's queued signal is purged at the coordinator.
-    while let Some(blocked) = self.coord.peek_merge_blocked() {
-      if self
-        .lifecycle_tx
-        .try_send(LifecycleEvent::MergeBlocked {
-          target: blocked.target,
-          source: blocked.source,
-          boundary: blocked.boundary,
-          cause: blocked.cause,
-        })
-        .is_err()
-      {
-        break;
-      }
-      let _ = self.coord.poll_merge_blocked();
-    }
+    // Held-merge observations deliberately do NOT publish here: this drain runs BEFORE the
+    // service pass, and a hold can resolve OUTSIDE any service crank (a cure blob adopts at
+    // receipt, an admission drifts the cause) — publishing first would ship an observation the
+    // end-of-crank retirement is about to prove stale. The post-service drain, which reads
+    // strictly after that retirement, is the ONLY publication point.
   }
 
   fn storage_crank(&mut self, now: Now) {
