@@ -1,3 +1,15 @@
+//! The durability seam: submission choke-points, the durable watermarks the persist-before-ack /
+//! -respond / -advertise gates read, and the `handle_storage` completion drain that advances them.
+//!
+//! The stores are EXACTLY-COMPLETING ([`LogStore::poll`] / [`StableStore::poll`]): every accepted
+//! submission surfaces exactly one completion, and a LOST completion is a contract violation whose cost
+//! is a SAFE STALL — the gated ack, grant, or advertisement is withheld rather than issued.
+//!
+//! SCOPE of the reconciliation legs below: a lost completion heals WHEN THE STORE ANSWERS a durable
+//! probe ([`LogStore::durable_index`] / [`StableStore::durable_hard_state`]) — the standing evidence
+//! stands in for the vanished completion once that store's queue is quiescent. A store that answers
+//! `None` (the default) keeps every stall documented on those seams exactly as it is: the heal is a
+//! second source for the same fact, never a weaker durability rule.
 use super::*;
 use crate::{AppendResponse, HardState, LogDone, SnapshotResponse, StableDone, StorageProgress};
 
@@ -529,7 +541,9 @@ where
   /// matching `Wrote` completion drains. A LOST completion is a store-contract violation that STALLS the
   /// response — the SAFE direction, since a peer never observed the ungranted vote / unacked append — and
   /// a restart re-submits from the durable state and heals it. Missing a completion costs liveness, never
-  /// §5.1 safety.
+  /// §5.1 safety. A store that answers [`StableStore::durable_hard_state`](crate::StableStore::durable_hard_state)
+  /// heals it sooner — [`reconcile_durable_hard_state`](Self::reconcile_durable_hard_state) releases the
+  /// withheld grant/ack off that evidence — but a `None`-answering store keeps exactly the stall above.
   pub(crate) fn ensure_term_durable<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
     if self.poison.poisoned {
       return;
@@ -743,6 +757,19 @@ where
       }
     }
 
+    // The same missed/coalesced-completion reconciliation for the LOG and HARD-STATE seams, which the
+    // snapshot fallbacks above have no counterpart for: a lost `Appended` leaves `durable_index` — and
+    // the ack it gates — parked, and a lost `Wrote` leaves the term/commit/lease floor un-advanced with
+    // its vote grant, campaign, and term-gated acks parked, in both cases until a restart re-submits.
+    // Where the store offers a durable probe, that standing evidence stands in for the completion; where
+    // it does not (the `None` default), the documented safe stalls remain exactly as they are today.
+    if !self.reconcile_durable_index(now, log, stable) {
+      return StorageProgress::Drained;
+    }
+    if !self.reconcile_durable_hard_state(now, log, stable) {
+      return StorageProgress::Drained;
+    }
+
     // Reclaim an abandoned chunked receive whose boundary the now-advanced recoverable prefix has passed
     // (a snapshot/AppendEntries race where the log caught up first), freeing its staging buffer rather than
     // pinning it until a future supersede or restart. A fatal term-read in the Log-Matching proof poisons
@@ -907,6 +934,22 @@ where
     if let Some(upto) = upto {
       self.durable.durable_index = self.durable.durable_index.max(upto);
     }
+    self.release_log_pending(now, log, stable, opid);
+  }
+
+  /// The POST-WATERMARK half of a log-durability completion: discharge the deferred action the
+  /// now-durable append was gating. Shared with the missed-completion reconciliation leg
+  /// ([`reconcile_durable_index`](Self::reconcile_durable_index)), so evidence-driven healing releases
+  /// through EXACTLY this code — a copy could drift from the completion path it is meant to stand in for.
+  fn release_log_pending<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Now,
+    log: &mut L,
+    stable: &S,
+    opid: OpId,
+  ) where
+    F::Snapshot: Data,
+  {
     match self.take_log_pending(opid) {
       Some(Pending::FollowerAck { to, match_index }) => {
         // `match_index` is the extent this append proved (its `last_new`). `send_or_gate_append_ack`
@@ -963,8 +1006,27 @@ where
     {
       self.durable.durable_lease_support = self.durable.last_submitted_lease_support;
     }
-    match self.take_stable_pending(opid) {
-      Some(Pending::CastVote { to, term }) => {
+    if let Some(pending) = self.take_stable_pending(opid) {
+      self.release_stable_pending(now, log, stable, pending);
+    }
+    // release any success ack that was deferred because `self.term` was not yet durable. The term
+    // may have just become durable via this completion.
+    self.flush_term_gated_acks();
+  }
+
+  /// The POST-WATERMARK half of a stable-durability completion: act on the deferred `(term, vote)`
+  /// action the now-durable write was gating. Shared with the missed-completion reconciliation leg
+  /// ([`reconcile_durable_hard_state`](Self::reconcile_durable_hard_state)) — which SELECTS by the
+  /// evidence rather than by op-id, but must ACT identically — so there is exactly one release body.
+  fn release_stable_pending<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Now,
+    log: &mut L,
+    stable: &mut S,
+    pending: Pending<I>,
+  ) {
+    match pending {
+      Pending::CastVote { to, term } => {
         // Only emit the grant if the term hasn't changed and we still hold the vote for `to`.
         // If either condition is false the write was superseded by a term advance; drop silently.
         if term == self.term && self.voted_for.as_ref() == Some(&to) {
@@ -983,7 +1045,7 @@ where
       // quorum is already met (single-node now, or peer votes that arrived before this completion),
       // become leader — the self-vote backing the quorum is persisted, so a crash + restart can
       // never replay it as a vote for a different candidate in the same term.
-      Some(Pending::Campaign { term })
+      Pending::Campaign { term }
         if term == self.term
           && self.role.is_candidate()
           && self.tracker.vote_result(&self.votes).is_won() =>
@@ -992,8 +1054,143 @@ where
       }
       _ => {}
     }
-    // release any success ack that was deferred because `self.term` was not yet durable. The term
-    // may have just become durable via this completion.
+  }
+
+  /// Whether anything is still waiting on LOG durability: an accepted append whose completion has not
+  /// been observed (`inflight_append_upto` — the watermark's own denominator), or a success ack parked
+  /// behind the `ack_watermark()` clamp. The "something is genuinely outstanding" half of the log-side
+  /// reconciliation gate; when this is false nothing was lost, so there is nothing to heal.
+  fn log_durability_outstanding(&self) -> bool {
+    !self.durable.inflight_append_upto.is_empty()
+      || self.durable.term_gated_append_ack.is_some()
+      || self.durable.term_gated_snapshot_ack.is_some()
+      || self.durable.shortcut_gated_snapshot_ack.is_some()
+  }
+
+  /// The stable-seam twin of [`log_durability_outstanding`](Self::log_durability_outstanding): a
+  /// deferred vote/campaign action, a success ack parked on the term gate, or a SUBMITTED watermark
+  /// (term, commit, lease floor) whose completion has not been observed.
+  fn stable_durability_outstanding(&self) -> bool {
+    !self.pending_stable.is_empty()
+      || self.durable.term_gated_append_ack.is_some()
+      || self.durable.term_gated_snapshot_ack.is_some()
+      || self.durable.shortcut_gated_snapshot_ack.is_some()
+      || self.durable.last_submitted_term > self.durable.durable_term
+      || self.durable.last_submitted_commit > self.durable.durable_commit_index
+      || self.durable.last_submitted_lease_support > self.durable.durable_lease_support
+  }
+
+  /// Heal a MISSED `LogDone::Appended` from the store's own durable frontier. Returns `false` if the
+  /// release poisoned the node (the caller fail-stops).
+  ///
+  /// The completion is the ONLY carrier of log durability, so a lost one leaves `durable_index` — and
+  /// therefore the ack it gates — parked until a restart re-submits. [`LogStore::durable_index`] is a
+  /// SECOND, standing source of the same fact, so when the store offers it the stall heals here instead.
+  ///
+  /// GATED exactly like the missed-completion snapshot fallbacks: a waiter genuinely outstanding AND the
+  /// store QUIESCENT. A quiescent completion queue can no longer deliver the missing completion, so its
+  /// absence is provably a loss; a queue that still holds completions is merely LATE, and acting ahead of
+  /// its drain would release an ack before the store's own accounting arrives.
+  fn reconcile_durable_index<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Now,
+    log: &mut L,
+    stable: &S,
+  ) -> bool
+  where
+    F::Snapshot: Data,
+  {
+    if !self.log_durability_outstanding() || log.has_pending() {
+      return true;
+    }
+    let Some(d) = log.durable_index() else {
+      return true;
+    };
+    // MAX-fold the WATERMARK: a store answering below what the core already holds (a conservative clamp
+    // across a truncation or a re-baseline, or simply a stale frontier) leaves it exactly as it was.
+    self.durable.durable_index = self.durable.durable_index.max(d);
+    // The DRAIN, however, always runs. A stale answer is a no-op for the watermark, never a reason to
+    // skip releasing: the two questions are distinct, and conflating them strands records. A COALESCING
+    // store — one that emits only its batch's final completion — delivers a LATER append's completion
+    // while dropping an EARLIER one's; that completion raises the watermark to the batch tip and removes
+    // only its OWN record, leaving the earlier record and the action it gates orphaned at or below a
+    // watermark the probe now merely CONFIRMS. Draining against the POST-FOLD watermark releases every
+    // record proven by evidence from EITHER source, exactly as each one's own completion would have —
+    // through the shared release, never a copy. Durability is prefix-ordered (NORMATIVE on
+    // `submit_append`), so `upto <= covered` proves that append durable; the records are pushed in
+    // non-decreasing index order, so the covered set is a FRONT PREFIX.
+    let covered = self.durable.durable_index;
+    while self
+      .durable
+      .inflight_append_upto
+      .front()
+      .is_some_and(|(_, upto)| *upto <= covered)
+    {
+      let (opid, _) = self
+        .durable
+        .inflight_append_upto
+        .pop_front()
+        .expect("checked front above");
+      self.release_log_pending(now, log, stable, opid);
+      // The release can poison (commit advance, apply, deferred-read flush) exactly as the completion
+      // path can → fail-stop the storage handler.
+      if self.poison.poisoned {
+        return false;
+      }
+    }
+    true
+  }
+
+  /// Heal a MISSED `StableDone::Wrote` from the store's own durable [`HardState`]. Returns `false` if the
+  /// release poisoned the node (the caller fail-stops).
+  ///
+  /// The log leg's twin, with the same outstanding-AND-quiescent gate and the same reason for it. What
+  /// differs is the EVIDENCE: a completion's op-id is ordered against the whole submit sequence, so it
+  /// proves everything submitted at or before it; a durable `HardState` proves only what it ITSELF
+  /// carries. Every fold and every release below therefore keys on a FIELD of the returned state.
+  fn reconcile_durable_hard_state<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Now,
+    log: &mut L,
+    stable: &mut S,
+  ) -> bool {
+    if !self.stable_durability_outstanding() || stable.has_pending() {
+      return true;
+    }
+    let Some(hs) = stable.durable_hard_state() else {
+      return true;
+    };
+    // Fold each durable watermark off the field that proves it — NEVER the `last_submitted_*` shape
+    // `on_stable_wrote` uses. Copying that shape onto store evidence would claim a newer IN-FLIGHT term
+    // (or commit, or lease floor) durable on the evidence of an OLDER one, releasing a persist-before-
+    // respond gate on a write a crash still erases.
+    self.durable.durable_term = self.durable.durable_term.max(hs.term());
+    self.durable.durable_commit_index = self.durable.durable_commit_index.max(hs.commit());
+    self.durable.durable_lease_support = self
+      .durable
+      .durable_lease_support
+      .max(hs.promised_lease_support());
+    // Discharge only the deferred actions this state PROVES: a `CastVote` needs the durable state to
+    // carry that exact vote AT that term, a `Campaign` the node's own self-vote at its term. Re-scanning
+    // from the front each round keeps the walk correct across a release that mutates the queue.
+    let me = self.config.id();
+    let durable_vote = hs.vote();
+    while let Some(i) = self.pending_stable.iter().position(|(_, p)| match p {
+      Pending::CastVote { to, term } => *term == hs.term() && durable_vote.as_ref() == Some(to),
+      Pending::Campaign { term } => *term == hs.term() && durable_vote.as_ref() == Some(&me),
+      _ => false,
+    }) {
+      let (_, pending) = self.pending_stable.remove(i).expect("position is in range");
+      self.release_stable_pending(now, log, stable, pending);
+      // `become_leader` can poison (its no-op append) exactly as the completion path can → fail-stop.
+      if self.poison.poisoned {
+        return false;
+      }
+    }
+    // Drive the same post-advance hook a real completion drives, so a term (or, through
+    // `flush_shortcut_gated_ack`, a commit floor) that this evidence just proved durable releases the
+    // acks it was gating.
     self.flush_term_gated_acks();
+    true
   }
 }

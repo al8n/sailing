@@ -1008,3 +1008,257 @@ impl StableStore for AsyncStable {
     !self.completions.is_empty()
   }
 }
+
+/// A [`VecLog`] that SWALLOWS `Appended` completions: the append is made durable exactly as usual, but
+/// its completion is dropped before the endpoint ever sees it. That is the store-contract violation
+/// [`LogStore::poll`] documents — the gated ack has no completion to fire on — and the honest
+/// [`LogStore::durable_index`] answer is the evidence the core heals from. `answer_probe(false)` turns it
+/// back into a `None`-answering store: the control that pins the unchanged, documented stall.
+#[derive(Debug)]
+pub(crate) struct SwallowLog {
+  inner: VecLog,
+  /// How many further `Appended` completions `poll` swallows.
+  swallow_appended: usize,
+  /// When `Some`, `durable_index` answers THIS instead of the inner store's honest frontier — the
+  /// stale/lower-answer case.
+  forced_durable_index: Option<Index>,
+  /// When false, `durable_index` answers `None` (a store that does not offer the probe).
+  answer_probe: bool,
+}
+
+impl Default for SwallowLog {
+  fn default() -> Self {
+    Self {
+      inner: VecLog::default(),
+      swallow_appended: 0,
+      forced_durable_index: None,
+      answer_probe: true,
+    }
+  }
+}
+
+impl SwallowLog {
+  /// Swallow the next `n` `Appended` completions (the appends still become durable).
+  pub(crate) fn swallow_next_appended(&mut self, n: usize) {
+    self.swallow_appended += n;
+  }
+
+  /// Answer [`LogStore::durable_index`] (`true`, the default) or return `None` from it (`false`).
+  pub(crate) fn answer_probe(&mut self, on: bool) {
+    self.answer_probe = on;
+  }
+
+  /// Override the probe's answer — a stale/lower frontier than the core already holds.
+  pub(crate) fn force_durable_index(&mut self, at: Option<Index>) {
+    self.forced_durable_index = at;
+  }
+
+  /// Queue `n` no-op `Compacted` completions, so a `handle_storage` drain hits its per-queue budget and
+  /// leaves this store non-quiescent at the reconciliation point.
+  pub(crate) fn queue_filler_completions(&mut self, n: usize) {
+    for _ in 0..n {
+      self
+        .inner
+        .completions
+        .push_back(LogDone::Compacted(Index::ZERO));
+    }
+  }
+
+  /// Hold `Appended` completions (a deferred fsync) — delegates to [`VecLog::hold_appends`].
+  pub(crate) fn hold_appends(&mut self, on: bool) {
+    self.inner.hold_appends(on);
+  }
+
+  /// Release the held completions — delegates to [`VecLog::flush_held_appends`].
+  pub(crate) fn flush_held_appends(&mut self) {
+    self.inner.flush_held_appends();
+  }
+}
+
+impl LogStore for SwallowLog {
+  type Error = Infallible;
+
+  fn first_index(&self) -> Index {
+    self.inner.first_index()
+  }
+
+  fn last_index(&self) -> Index {
+    self.inner.last_index()
+  }
+
+  fn durable_index(&self) -> Option<Index> {
+    if !self.answer_probe {
+      return None;
+    }
+    self
+      .forced_durable_index
+      .or_else(|| self.inner.durable_index())
+  }
+
+  fn term(&self, index: Index) -> Result<Term, Self::Error> {
+    self.inner.term(index)
+  }
+
+  fn entries(&self, range: Range<Index>, max_bytes: u64) -> Result<EntriesRead<'_>, Self::Error> {
+    self.inner.entries(range, max_bytes)
+  }
+
+  fn submit_append(&mut self, id: OpId, entries: &[Entry]) {
+    self.inner.submit_append(id, entries);
+  }
+
+  fn compact(&mut self, up_to: Index) {
+    self.inner.compact(up_to);
+  }
+
+  fn restore(&mut self, last_index: Index, last_term: Term) {
+    self.inner.restore(last_index, last_term);
+  }
+
+  fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
+    loop {
+      let done = self.inner.poll()?;
+      if self.swallow_appended > 0 && matches!(done, Ok(LogDone::Appended(_))) {
+        // The completion VANISHES here; the entries stay durable in the inner store, so the frontier
+        // still reports them.
+        self.swallow_appended -= 1;
+        continue;
+      }
+      return Some(done);
+    }
+  }
+
+  fn has_pending(&self) -> bool {
+    self.inner.has_pending()
+  }
+}
+
+/// The stable-seam twin of [`SwallowLog`]: an [`AsyncStable`] that SWALLOWS `Wrote` completions. The
+/// write still reaches the durable slot (the inner store folds it when the completion is polled), so
+/// [`StableStore::durable_hard_state`] answers honestly while the gate the write fences has nothing to
+/// fire on.
+#[derive(Debug)]
+pub(crate) struct SwallowStable {
+  inner: AsyncStable,
+  /// How many further `Wrote` completions `poll` swallows.
+  swallow_wrote: usize,
+  /// When false, `durable_hard_state` answers `None`.
+  answer_probe: bool,
+}
+
+impl Default for SwallowStable {
+  fn default() -> Self {
+    Self {
+      inner: AsyncStable::default(),
+      swallow_wrote: 0,
+      answer_probe: true,
+    }
+  }
+}
+
+impl SwallowStable {
+  /// Swallow the next `n` `Wrote` completions (the writes still become durable).
+  pub(crate) fn swallow_next_wrote(&mut self, n: usize) {
+    self.swallow_wrote += n;
+  }
+
+  /// Answer [`StableStore::durable_hard_state`] (`true`, the default) or return `None` (`false`).
+  pub(crate) fn answer_probe(&mut self, on: bool) {
+    self.answer_probe = on;
+  }
+
+  /// Hold `Wrote` completions (a deferred fsync) — delegates to [`AsyncStable::hold_writes`]. The held
+  /// write is NOT durable, so the probe keeps answering the PRIOR state.
+  pub(crate) fn hold_writes(&mut self, on: bool) {
+    self.inner.hold_writes(on);
+  }
+
+  /// Queue `n` no-op `SnapshotWritten` completions (no pending capture or install keys on them), so a
+  /// `handle_storage` drain hits its per-queue budget and leaves this store non-quiescent at the
+  /// reconciliation point.
+  pub(crate) fn queue_filler_completions(&mut self, n: usize) {
+    for i in 0..n {
+      self.inner.completions.push_back((
+        StableDone::SnapshotWritten(OpId::new(u64::MAX - i as u64)),
+        None,
+      ));
+    }
+  }
+}
+
+impl StableStore for SwallowStable {
+  type NodeId = u64;
+  type Error = Infallible;
+
+  fn hard_state(&self) -> HardState<u64> {
+    self.inner.hard_state()
+  }
+
+  fn durable_hard_state(&self) -> Option<HardState<u64>> {
+    if !self.answer_probe {
+      return None;
+    }
+    self.inner.durable_hard_state()
+  }
+
+  fn submit_write(&mut self, id: OpId, hard_state: HardState<u64>) {
+    self.inner.submit_write(id, hard_state);
+  }
+
+  fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<u64>, data: Bytes) {
+    self.inner.submit_snapshot(id, meta, data);
+  }
+
+  fn snapshot(&self) -> Option<(SnapshotMeta<u64>, Bytes)> {
+    self.inner.snapshot()
+  }
+
+  fn snapshot_chunk(
+    &self,
+    offset: u64,
+    len: u64,
+  ) -> Option<Result<(SnapshotMeta<u64>, u64, SnapshotChunkRead), Self::Error>> {
+    self.inner.snapshot_chunk(offset, len)
+  }
+
+  fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
+    self.inner.durable_snapshot()
+  }
+
+  fn accept_snapshot_chunk(
+    &mut self,
+    meta: &SnapshotMeta<u64>,
+    total_len: u64,
+    offset: u64,
+    data: &Bytes,
+  ) -> Result<u64, Self::Error> {
+    self
+      .inner
+      .accept_snapshot_chunk(meta, total_len, offset, data)
+  }
+
+  fn take_staged_snapshot(&mut self, meta: &SnapshotMeta<u64>) -> Option<Bytes> {
+    self.inner.take_staged_snapshot(meta)
+  }
+
+  fn discard_snapshot_staging(&mut self) {
+    self.inner.discard_snapshot_staging();
+  }
+
+  fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
+    loop {
+      let done = self.inner.poll()?;
+      if self.swallow_wrote > 0 && matches!(done, Ok(StableDone::Wrote(_))) {
+        // The completion VANISHES here. The inner store already folded the write into its durable slot
+        // when it polled, so the probe still reports it — a lost completion, not a lost write.
+        self.swallow_wrote -= 1;
+        continue;
+      }
+      return Some(done);
+    }
+  }
+
+  fn has_pending(&self) -> bool {
+    self.inner.has_pending()
+  }
+}

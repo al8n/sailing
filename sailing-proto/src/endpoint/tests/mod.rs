@@ -702,6 +702,7 @@ mod leaseguard;
 mod membership;
 mod merge;
 mod misc;
+mod persistence;
 mod read_index;
 mod replication;
 mod restart;
