@@ -141,7 +141,6 @@ fn bench_fork_e2e(c: &mut Criterion) {
               fsm,
               snapshot,
               None,
-              None,
               1,
               &mut log,
               &mut stable,

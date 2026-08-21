@@ -1744,7 +1744,6 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
       CountSm::default(),
       fork_blob(3),
       None,
-      None,
       1,
       0,
       &NoFloors,
@@ -1768,7 +1767,6 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
     1,
     CountSm::default(),
     fork_blob(3),
-    None,
     None,
     1,
     0,
@@ -1809,7 +1807,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       CountSm::default(),
       fork_blob(3),
       None,
-      None,
       1,
       1,
       &Floors(2),
@@ -1827,7 +1824,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       CountSm::default(),
       fork_blob(3),
       None,
-      None,
       1,
       u64::MAX,
       &Floors(2),
@@ -1844,7 +1840,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       1,
       CountSm::default(),
       fork_blob(3),
-      None,
       None,
       1,
       u64::MAX,
@@ -1866,7 +1861,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       CountSm::default(),
       fork_blob(3),
       None,
-      None,
       1,
       u64::MAX - 1,
       &Floors(MERGED_FLOOR),
@@ -1886,7 +1880,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       1,
       CountSm::default(),
       fork_blob(3),
-      None,
       None,
       1,
       u64::MAX,
@@ -1909,7 +1902,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
     1,
     CountSm::default(),
     fork_blob(3),
-    None,
     None,
     1,
     2,
@@ -1940,7 +1932,6 @@ fn fork_refuses_boot_epoch_zero() {
       1,
       CountSm::default(),
       fork_blob(3),
-      None,
       None,
       0,
       0,
@@ -1975,7 +1966,6 @@ fn fork_purges_a_queued_unknown_group_signal() {
       2,
       CountSm::default(),
       fork_blob(3),
-      None,
       None,
       1,
       0,
@@ -2268,31 +2258,18 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
   }
   settle_engine(&mut c1, &mut engine, &[100], d);
   let fork = c1.poll_pending_fork().expect("the committed split relays");
-  assert_eq!((fork.child, fork.parent_gen_after), (300, 1));
+  assert_eq!(((*fork.child()), fork.parent_gen_after()), (300, 1));
   engine.add_group(300);
   let epoch = engine.next_boot_epoch(&300).unwrap();
+  let (gen_after, split_at) = (fork.parent_gen_after(), fork.split_index());
   {
     let (l, s) = engine.stores(&300).unwrap();
-    c1.create_group_from_fork(
-      300,
-      fork.config,
-      now,
-      1,
-      fork.fsm,
-      fork.blob,
-      fork.read_only,
-      None,
-      epoch,
-      fork.child_gen,
-      &NoFloors,
-      l,
-      s,
-    )
-    .expect("the fork materializes over the fresh stores");
+    c1.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, s)
+      .expect("the fork materializes over the fresh stores");
   }
-  engine.set_group_gen(&100, fork.parent_gen_after);
+  engine.set_group_gen(&100, gen_after);
   engine.flush();
-  c1.lift_fork_barrier(&100, fork.split_index);
+  c1.lift_fork_barrier(&100, split_at);
 
   // The child accrues REAL post-fork progress: it elects and commits 2 entries of its own.
   let dc = c1.group(&300).unwrap().poll_timeout().unwrap();
@@ -2357,30 +2334,17 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
     "the child's storage is already hosted in the engine"
   );
   let epoch = engine.next_boot_epoch(&300).unwrap();
+  let split_at2 = fork.split_index();
   let refusal = {
     let (l, s) = engine.stores(&300).unwrap();
-    c2.create_group_from_fork(
-      300,
-      fork.config,
-      now,
-      1,
-      fork.fsm,
-      fork.blob,
-      fork.read_only,
-      None,
-      epoch,
-      fork.child_gen,
-      &NoFloors,
-      l,
-      s,
-    )
+    c2.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, s)
   };
   assert_eq!(
     refusal,
     Err(CreateGroupError::StorageInUse),
     "a fork never overwrites used storage"
   );
-  c2.lift_fork_barrier(&100, fork.split_index);
+  c2.lift_fork_barrier(&100, split_at2);
   {
     let (l, _) = engine.stores(&300).unwrap();
     assert_eq!(l.last_index(), used_last, "the refusal wrote nothing");
@@ -2468,16 +2432,17 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
   );
 }
 
-/// THE PUBLIC FORK DOOR IS FENCED, and the forged token dies on it. `create_group_from_fork` is
-/// callable by anyone holding a coordinator, with a blob and a `ForkId` of their choosing — and a
-/// `ForkId` is minted from PUBLIC, DETERMINISTIC split coordinates, so a caller can compute the
-/// exact token the genuine fork will carry. Were the reservation not enforced here, that caller
-/// could install a token-matching squatter at the reserved child id in either reservation window;
-/// the committed fork would then find the id hosted, match the token, and resolve REDUNDANT —
-/// silently discarding the partition. The fence refuses both windows, forged token and all, and
-/// the genuine fork still lands afterwards through the sealed relay door.
+/// THE PUBLIC FORK DOOR IS FENCED, AND TOKEN-LESS. `create_group_from_fork` is callable by anyone
+/// holding a coordinator, so it is fenced two ways. It no longer ACCEPTS provenance at all — the
+/// parameter is gone, so a caller cannot stamp its own content with an identity, which matters
+/// because a `ForkId` is minted from PUBLIC, DETERMINISTIC split coordinates and any caller can
+/// compute the exact token a genuine fork will carry. And it refuses a RESERVED child id in every
+/// window — between propose and apply, while the fork is staged, and (the window the pop used to
+/// open) between the yield and the sealed install. Without either fence a caller could install a
+/// squatter the committed fork then matches and resolves REDUNDANT against, silently discarding
+/// the partition.
 #[test]
-fn the_public_fork_door_refuses_a_forged_token_in_both_reservation_windows() {
+fn the_public_fork_door_is_fenced_in_every_window_and_takes_no_provenance() {
   let now = Instant::ORIGIN;
   let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
   let mut c = SplitCoord::new();
@@ -2533,7 +2498,6 @@ fn the_public_fork_door_refuses_a_forged_token_in_both_reservation_windows() {
       SplitSm::default(),
       fork_blob(1),
       None,
-      None,
       1,
       0,
       &NoFloors,
@@ -2544,10 +2508,10 @@ fn the_public_fork_door_refuses_a_forged_token_in_both_reservation_windows() {
     "window A: the public door refuses a reserved child id"
   );
 
-  // WINDOW B — the split applied and its fork is STAGED, so the exact token is now derivable from
-  // the committed coordinates. Hand the door that very token: it must still refuse.
+  // WINDOW B — the split applied and its fork is STAGED. The token is derivable from the committed
+  // coordinates now, but there is nowhere to put it: the door takes none. The reservation refuses
+  // regardless.
   settle_engine(&mut c, &mut engine, &[100], d);
-  let forged = staged_fork_id_of(&c, 100);
   assert_eq!(
     c.create_group_from_fork(
       300,
@@ -2557,7 +2521,6 @@ fn the_public_fork_door_refuses_a_forged_token_in_both_reservation_windows() {
       SplitSm::default(),
       fork_blob(1),
       None,
-      Some(forged),
       1,
       0,
       &NoFloors,
@@ -2576,36 +2539,17 @@ fn the_public_fork_door_refuses_a_forged_token_in_both_reservation_windows() {
   // THE GENUINE FORK STILL LANDS, through the sealed relay door that takes the container's own
   // yielded record — the ticket no caller can forge.
   let fork = c.poll_pending_fork().expect("the committed split relays");
-  let config = fork.config.clone();
   engine.add_group(300);
   let epoch = engine.next_boot_epoch(&300).unwrap();
   {
     let (l, s) = engine.stores(&300).unwrap();
-    c.create_group_from_relayed_fork(fork, config, now, 1, epoch, &NoFloors, l, s)
+    c.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, s)
       .expect("the relayed fork materializes through the sealed door");
   }
   assert!(
     c.group(&300).is_some(),
     "the child the attacker could not squat is now the genuine fork's"
   );
-}
-
-/// The staged head fork's minted token — the value a direct caller can derive for itself from the
-/// committed split's public coordinates.
-fn staged_fork_id_of(c: &SplitCoord, parent: u64) -> crate::ForkId {
-  let f = c
-    .group(&parent)
-    .unwrap()
-    .peek_pending_fork()
-    .expect("a fork is staged on the parent");
-  crate::multi::mint_fork_id(
-    &parent,
-    f.parent_gen_after,
-    f.index,
-    f.split_term,
-    f.child_bytes.clone(),
-    f.child_gen,
-  )
 }
 
 /// The split reservation walks the whole fork lifecycle at the admission edge: from the
@@ -2722,36 +2666,24 @@ fn admission_refuses_an_in_flight_splits_child_id() {
     Err(CreateGroupError::SplitReserved)
   );
 
-  // YIELD releases the reservation: the fork is consumed, so neither leg holds any longer.
+  // YIELD hands the staged leg over to the YIELDED one: the fork is out of the queue but still
+  // owns the id until it installs, so the door stays shut across that window too.
   let fork = c.poll_pending_fork().expect("the committed split relays");
   assert!(
-    !c.is_split_reserved(&300),
-    "yielded to the driver: nothing stages this child id any more"
+    c.is_split_reserved(&300),
+    "yielded to the driver, and still this fork's id until the sealed install completes"
   );
   engine.add_group(300);
   let epoch = engine.next_boot_epoch(&300).unwrap();
+  let (gen_after, split_at) = (fork.parent_gen_after(), fork.split_index());
   {
     let (l, s) = engine.stores(&300).unwrap();
-    c.create_group_from_fork(
-      300,
-      fork.config,
-      now,
-      1,
-      fork.fsm,
-      fork.blob,
-      fork.read_only,
-      None,
-      epoch,
-      fork.child_gen,
-      &NoFloors,
-      l,
-      s,
-    )
-    .expect("the yielded fork materializes");
+    c.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, s)
+      .expect("the yielded fork materializes");
   }
-  engine.set_group_gen(&100, fork.parent_gen_after);
+  engine.set_group_gen(&100, gen_after);
   engine.flush();
-  c.lift_fork_barrier(&100, fork.split_index);
+  c.lift_fork_barrier(&100, split_at);
 
   // Post-resolution the id is simply hosted: the refusal class hands over to `Exists`.
   assert_eq!(
@@ -2984,35 +2916,65 @@ fn coordinator_teardown_inherits_the_participant_gate_without_tombstoning() {
 /// reason — the record is exact, not conservative.
 #[test]
 fn a_forked_groups_hard_state_records_its_lineage_from_birth() {
-  use crate::{ForkId, Index, Term};
   let mut c = MultiCoord::new();
   let now = Instant::ORIGIN;
 
-  let token = ForkId::new(
-    bytes::Bytes::from_static(&[7u8]),
-    1,
-    Index::new(4),
-    Term::new(2),
-    bytes::Bytes::from_static(&[100u8]),
-    1,
-  );
-  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
-  c.create_group_from_fork(
+  // A TOKEN-BEARING birth comes through the sealed relay door, which is the only path that carries
+  // provenance now: the container hands the install its own minted token, and the caller-driven
+  // door below installs token-less by construction.
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut sc = SplitCoord::new();
+  engine.add_group(100);
+  sc.create_group(
     100,
     single_voter(1),
     now,
     1,
-    CountSm::default(),
-    fork_blob(3),
-    None,
-    Some(token.clone()),
-    1,
+    SplitSm::default(),
     0,
     &NoFloors,
-    &mut log,
-    &mut stable,
   )
   .unwrap();
+  let d = sc.group(&100).unwrap().poll_timeout().unwrap();
+  {
+    let (l, st) = engine.stores(&100).unwrap();
+    sc.handle_timeout(&100, d, l, st).unwrap();
+  }
+  settle_engine(&mut sc, &mut engine, &[100], d);
+  for _ in 0..3 {
+    let (l, st) = engine.stores(&100).unwrap();
+    sc.submit_propose(&100, d, l, st, &Bytes::from_static(b"c"))
+      .unwrap()
+      .unwrap();
+    settle_engine(&mut sc, &mut engine, &[100], d);
+  }
+  {
+    let (l, st) = engine.stores(&100).unwrap();
+    sc.propose_split(
+      &100,
+      d,
+      l,
+      st,
+      &300,
+      0,
+      Bytes::from_static(b"\x02"),
+      &NoFloors,
+    )
+    .unwrap()
+    .unwrap();
+  }
+  settle_engine(&mut sc, &mut engine, &[100], d);
+  let fork = sc.poll_pending_fork().expect("the committed split relays");
+  let token = fork.fork_id().clone();
+  engine.add_group(300);
+  let epoch = engine.next_boot_epoch(&300).unwrap();
+  {
+    let (l, st) = engine.stores(&300).unwrap();
+    sc.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, st)
+      .expect("the sealed door installs");
+  }
+  engine.flush();
+  let (_, stable) = engine.stores(&300).unwrap();
   assert_eq!(
     stable.hard_state().lineage(),
     Some(&token),
@@ -3037,7 +2999,6 @@ fn a_forked_groups_hard_state_records_its_lineage_from_birth() {
     CountSm::default(),
     fork_blob(3),
     None,
-    None,
     1,
     0,
     &NoFloors,
@@ -3047,7 +3008,8 @@ fn a_forked_groups_hard_state_records_its_lineage_from_birth() {
   .unwrap();
   assert!(
     stable2.hard_state().lineage().is_none(),
-    "an untokened fork records None — exact, not conservative"
+    "and the caller-driven door records None — token-less by construction, exact rather than \
+     conservative"
   );
 }
 

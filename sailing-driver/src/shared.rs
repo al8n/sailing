@@ -32,7 +32,10 @@ use std::{
   },
 };
 
-use sailing_proto::{EntriesRead, Entry, EntryKind, Event, FailoverReadWindow, Index, LogStore};
+use sailing_proto::{
+  EntriesRead, Entry, EntryKind, Event, FailoverReadWindow, FloorStore, ForkGate, GroupId, Index,
+  LogStore, MultiEngine, NodeId,
+};
 
 use futures_channel::oneshot;
 
@@ -690,6 +693,42 @@ impl<I: sailing_proto::NodeId, R: Clone, F> Routing<I, R, F> {
     // Best-effort tail: try_send drops on full — the tail must never block consensus.
     let _ = self.events.try_send(event);
     advanced
+  }
+}
+
+/// A host's ENGINE, presented to the fork relay as its [`ForkGate`]: the two facts the container
+/// cannot see for itself. The relay asks at the moment it would hand a committed fork out, and maps
+/// the answers itself — occupancy HOLDS the fork, a floor the child cannot clear abandons it.
+///
+/// Both answers are plain map lookups on the engine, which is what the gate's cost contract
+/// requires: it is consulted once per parked parent per relay drain.
+pub struct EngineGate<'a, E, I> {
+  engine: &'a E,
+  _id: core::marker::PhantomData<I>,
+}
+
+impl<'a, E, I> EngineGate<'a, E, I> {
+  /// Present `engine` as the relay's gate.
+  pub fn new(engine: &'a E) -> Self {
+    Self {
+      engine,
+      _id: core::marker::PhantomData,
+    }
+  }
+}
+
+impl<G, I, E> ForkGate<G> for EngineGate<'_, E, I>
+where
+  G: GroupId,
+  I: NodeId,
+  E: MultiEngine<G, I>,
+{
+  fn contains_group(&self, gid: &G) -> bool {
+    MultiEngine::contains_group(self.engine, gid)
+  }
+
+  fn floor(&self, gid: &G) -> u64 {
+    FloorStore::floor(self.engine, gid)
   }
 }
 

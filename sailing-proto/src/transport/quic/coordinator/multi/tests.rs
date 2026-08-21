@@ -1052,7 +1052,6 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
       CountSm::default(),
       fork_blob(3),
       None,
-      None,
       1,
       0,
       &NoFloors,
@@ -1076,7 +1075,6 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
     1,
     CountSm::default(),
     fork_blob(3),
-    None,
     None,
     1,
     0,
@@ -1118,7 +1116,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       CountSm::default(),
       fork_blob(3),
       None,
-      None,
       1,
       1,
       &Floors(2),
@@ -1136,7 +1133,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       CountSm::default(),
       fork_blob(3),
       None,
-      None,
       1,
       u64::MAX,
       &Floors(2),
@@ -1153,7 +1149,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       1,
       CountSm::default(),
       fork_blob(3),
-      None,
       None,
       1,
       u64::MAX,
@@ -1175,7 +1170,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       CountSm::default(),
       fork_blob(3),
       None,
-      None,
       1,
       u64::MAX - 1,
       &Floors(MERGED_FLOOR),
@@ -1195,7 +1189,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
       1,
       CountSm::default(),
       fork_blob(3),
-      None,
       None,
       1,
       u64::MAX,
@@ -1218,7 +1211,6 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
     1,
     CountSm::default(),
     fork_blob(3),
-    None,
     None,
     1,
     2,
@@ -1251,7 +1243,6 @@ fn fork_refuses_boot_epoch_zero() {
       1,
       CountSm::default(),
       fork_blob(3),
-      None,
       None,
       0,
       0,
@@ -1294,7 +1285,6 @@ fn fork_purges_a_queued_unknown_group_signal() {
     1,
     CountSm::default(),
     fork_blob(3),
-    None,
     None,
     1,
     0,
@@ -1524,8 +1514,8 @@ fn quic_restore_seeds_the_replay_guard_from_the_floor_seam() {
   let fork = b
     .poll_pending_fork()
     .expect("a lineage-blind guard seed relays the replayed fork");
-  assert_eq!((fork.child, fork.parent_gen_after), (300, 1));
-  assert_eq!(fork.fsm.units, 1, "the re-forked half");
+  assert_eq!(((*fork.child()), fork.parent_gen_after()), (300, 1));
+  assert_eq!(fork.fsm().units, 1, "the re-forked half");
 }
 
 /// The QUIC twin of the split-reservation admission gate (window A — the leader's

@@ -188,7 +188,6 @@ where
   /// host never advertises. Deliberately NOT the consumption predicate (see
   /// [`fork_obligations_standing`](Self::fork_obligations_standing)): a rebaseline retires the
   /// replay derivation this one guards, and clears it accordingly.
-  /// SCRATCH DIAGNOSTIC (uncommitted).
   pub(crate) fn fork_barrier_standing(&self) -> bool {
     !self.split.outstanding.is_empty()
   }

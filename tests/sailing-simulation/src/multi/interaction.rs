@@ -688,27 +688,14 @@ impl MultiInteractionEnv {
         };
         forked = true;
         produced = true;
-        let (parent, child, split_index) = (fork.parent, fork.child, fork.split_index);
+        let (parent, child, split_index) = (*fork.parent(), *fork.child(), fork.split_index());
         self
           .stores
           .insert((id, child), (MemLog::new(), MemStable::new()));
         let (log, stable) = self.stores.get_mut(&(id, child)).expect("fresh stores");
         let host = self.hosts.get_mut(&id).expect("host exists");
         host
-          .create_group_from_fork(
-            child,
-            fork.child_gen,
-            fork.config,
-            now,
-            id,
-            fork.fsm,
-            fork.blob,
-            fork.read_only,
-            Some(fork.fork_id),
-            1,
-            log,
-            stable,
-          )
+          .create_group_from_relayed_fork(fork, now, id, 1, log, stable)
           .unwrap_or_else(|e| panic!("fork of g{child} on n{id}: {e:?}"));
         host.lift_fork_barrier(&parent, split_index);
         let inherited = host

@@ -334,6 +334,16 @@ fn write_fork_baseline<I, L, S>(
   log.restore(FORK_BASE_INDEX, FORK_BASE_TERM);
 }
 
+/// Force pre-vote + check-quorum on for a RESHAPE-BORN group's config — the ONE derivation every
+/// fork-child birth applies, so every replica of a split child boots with byte-identical knobs.
+/// A reshaping id's steady-state membership churn is exactly where an ignorant removed voter would
+/// otherwise depose a live leader. Independent of the seed config's flags: embedder-created groups
+/// and fresh day-0 factory births keep their configured (etcd-parity) defaults.
+#[must_use]
+pub fn reshape_born_prevention<I>(config: Config<I>) -> Config<I> {
+  config.with_pre_vote(true).with_check_quorum(true)
+}
+
 /// Mint a child's [`ForkId`] from one committed split's coordinates — the single source of the
 /// provenance token, minted identically at the relay YIELD (into the [`GroupFork`] the driver
 /// installs) and at the parked-fork REDUNDANT check. Every input is a property of the committed
@@ -400,49 +410,123 @@ where
   Ok(())
 }
 
-/// One committed, container-relayed fork: everything a driver needs to materialize the child
-/// group behind its engine barrier. Yielded by [`MultiRaft::poll_pending_fork`] after the typed
-/// child id decoded, the replay guard passed, and the child config was rebuilt from the parent's
-/// local tuning under the fork's voter set. The fields are deliberately readable — this is a
-/// transfer record a driver reads to drive its own bookkeeping.
+/// One committed, container-relayed fork: everything the relay door needs to materialize the child
+/// group behind a driver's engine barrier. Yielded by [`MultiRaft::poll_pending_fork`] after the
+/// typed child id decoded, the replay guard passed, and the child config was rebuilt from the
+/// parent's local tuning under the fork's voter set.
 ///
-/// It is NOT constructible outside this crate, and that is load-bearing rather than tidiness:
-/// POSSESSION OF ONE IS THE CAPABILITY to install a child through the reservation-free relay door
-/// (`create_group_from_relayed_fork` on either coordinator). Only the container mints these, and
-/// only for a committed split whose coordinates it verified. A caller able to forge one could hand
-/// itself an exactly-minted [`ForkId`] — the token is derived from public, deterministic split
-/// coordinates — and so pass the redundant-token check that authorizes discarding a genuine
-/// staged fork.
+/// It is NOT constructible outside this crate, and its fields are NOT writable from outside it —
+/// both halves are load-bearing rather than tidiness. POSSESSION OF ONE IS THE CAPABILITY to
+/// install a child through the reservation-free relay door
+/// ([`MultiRaft::create_group_from_relayed_fork`] and the coordinators' twins), and IMMUTABILITY is
+/// what makes possession mean anything: a caller holding a genuine yield for child A must not be
+/// able to retarget it at child B, swap its half or its blob, or restamp its incarnation, because
+/// the door trusts the value's contents precisely because the container minted them. Possession of
+/// A authorizes installing A — nothing else.
+///
+/// A forgeable or mutable fork would also hand its holder an exactly-minted [`ForkId`] for content
+/// of its choosing (the token derives from public, deterministic split coordinates), and so pass
+/// the redundant-token check that authorizes discarding a genuine staged fork — the child
+/// partition's only local copy.
+///
+/// Every field is READABLE through an accessor — a driver and a harness drive their own records
+/// off them, and the forked half is inspectable too. None is WRITABLE, and no accessor hands out a
+/// `&mut`: observing what the container minted is not the same as choosing it.
 #[non_exhaustive]
 pub struct GroupFork<G, I, F> {
   /// The parent group (the split entry rode its log).
-  pub parent: G,
+  parent: G,
   /// The child group id, decoded from the committed payload.
-  pub child: G,
+  child: G,
   /// The child's incarnation under the unified lineage counter (normally 0).
-  pub child_gen: u64,
+  child_gen: u64,
   /// The parent's lineage counter after this split — already folded into the container's relay
   /// guard when this fork is yielded.
-  pub parent_gen_after: u64,
+  parent_gen_after: u64,
   /// The child's boot config: the parent's LOCAL tuning with voters := the parent's voter set
   /// at the split entry (this host keeps its own node id).
-  pub config: Config<I>,
+  config: Config<I>,
   /// The forked state-machine half, handed to the child as its restore vessel.
-  pub fsm: F,
+  fsm: F,
   /// The child's authoritative recovery blob, derived at the parent's apply point
   /// (`encode(fsm.snapshot())` of the half — the two correspond by construction).
-  pub blob: Bytes,
+  blob: Bytes,
   /// The read mode the child inherits through its baseline meta (`None` for a never-migrated
   /// parent: the child falls back to its config, exactly as a restart would).
-  pub read_only: Option<ReadOnlyOption>,
+  read_only: Option<ReadOnlyOption>,
   /// The split entry's index in the PARENT's log — the fork durability barrier's anchor, handed
   /// back through [`MultiRaft::lift_fork_barrier`] once the child's baseline is flush-durable.
-  pub split_index: Index,
-  /// The child's durable PROVENANCE token, minted from this committed split's coordinates. The
-  /// driver passes it to [`create_group_from_fork`](MultiRaft::create_group_from_fork) so the
-  /// manufactured baseline persists it; a group that never went through a fork baseline carries no
-  /// such token, which is what lets a parked fork resolve REDUNDANT only against an exact match.
-  pub fork_id: ForkId,
+  split_index: Index,
+  /// The child's durable PROVENANCE token, minted from this committed split's coordinates and
+  /// persisted by the manufactured baseline; a group that never went through a fork baseline
+  /// carries no such token, which is what lets a parked fork resolve REDUNDANT only against an
+  /// exact match.
+  fork_id: ForkId,
+}
+
+impl<G, I, F> GroupFork<G, I, F> {
+  /// The parent group whose committed split produced this fork.
+  #[must_use]
+  pub const fn parent(&self) -> &G {
+    &self.parent
+  }
+
+  /// The child group id this fork materializes.
+  #[must_use]
+  pub const fn child(&self) -> &G {
+    &self.child
+  }
+
+  /// The child's incarnation under the unified lineage counter.
+  #[must_use]
+  pub const fn child_gen(&self) -> u64 {
+    self.child_gen
+  }
+
+  /// The parent's lineage counter after this split — what a caller mirrors into its durable
+  /// lineage record once the child's baseline is durable.
+  #[must_use]
+  pub const fn parent_gen_after(&self) -> u64 {
+    self.parent_gen_after
+  }
+
+  /// The child's boot config, as the container rebuilt it. A caller may derive its own transformed
+  /// config from this and hand THAT to the door; what it cannot do is change what this fork is.
+  #[must_use]
+  pub const fn config(&self) -> &Config<I> {
+    &self.config
+  }
+
+  /// The child's authoritative recovery blob.
+  #[must_use]
+  pub const fn blob(&self) -> &Bytes {
+    &self.blob
+  }
+
+  /// The read mode the child inherits through its baseline meta.
+  #[must_use]
+  pub const fn read_only(&self) -> Option<ReadOnlyOption> {
+    self.read_only
+  }
+
+  /// The split entry's index in the parent's log — the fork durability barrier's anchor.
+  #[must_use]
+  pub const fn split_index(&self) -> Index {
+    self.split_index
+  }
+
+  /// The child's durable provenance token.
+  #[must_use]
+  pub const fn fork_id(&self) -> &ForkId {
+    &self.fork_id
+  }
+
+  /// The forked state-machine half, for inspection only — the door consumes the fork by value, so
+  /// a shared reference here can observe the half but never substitute it.
+  #[must_use]
+  pub const fn fsm(&self) -> &F {
+    &self.fsm
+  }
 }
 
 /// One resolved parked merge from a [`MultiRaft::service_merge_applies`] crank — what the
@@ -719,6 +803,16 @@ where
   /// removal killed. Every other advance already rides a durable write the caller makes anyway
   /// (a relayed fork's child registration), so this queue exists for that one arm.
   guard_advances: VecDeque<(G, u64)>,
+  /// Child ids of forks this container has YIELDED but whose install has not yet completed — the
+  /// reservation's third leg. The staged leg ends at the pop, so without this the id is unreserved
+  /// for the whole window between the yield and the sealed install, and the caller-driven door
+  /// would admit a group of the caller's making at an id a committed split already owns.
+  ///
+  /// Inserted at the single yield site and removed at the single install site, so the pairing is
+  /// local; a caller that abandons a yielded fork without installing releases it explicitly
+  /// ([`release_yielded_fork`](Self::release_yielded_fork)), because a leaked entry would squat the
+  /// id permanently.
+  yielded: BTreeSet<G>,
   /// The last [`MergeBlockedCause`] signalled per target — the EDGE that makes
   /// [`poll_merge_blocked`](Self::poll_merge_blocked) fire once per transition instead of once per
   /// crank. An entry lives exactly as long as the target's park or capture debt does (dropped at
@@ -782,6 +876,7 @@ where
       conflicts: VecDeque::new(),
       refusals: VecDeque::new(),
       guard_advances: VecDeque::new(),
+      yielded: BTreeSet::new(),
       merge_blocked_seen: BTreeMap::new(),
       merge_blocked_attempts: BTreeMap::new(),
       merge_blocked: VecDeque::new(),
@@ -1549,29 +1644,20 @@ where
   /// fork, an install consumes it, and a park keeps it held until the conflict resolves.
   #[must_use]
   pub fn split_reserved(&self, gid: &G) -> bool {
+    if self.yielded.contains(gid) {
+      return true;
+    }
     let mut bytes = Vec::new();
     gid.encode(&mut bytes);
     self.groups.values().any(|ep| ep.split_reserves(&bytes))
   }
 
-  /// Every admission gate [`create_group_from_fork`](Self::create_group_from_fork) applies
-  /// BEFORE it consumes the child's state machine and blob, run against the same state and in the
-  /// same order — so a relay can learn its verdict while it can still HOLD the fork. `Ok` here and
-  /// an unchanged container means that call cannot refuse.
-  ///
-  /// The store-shape gate is deliberately absent: a fork installs into stores the caller just
-  /// created, and a caller that finds them occupied has already stopped.
-  pub fn fork_admission_check(
-    &self,
-    gid: &G,
-    generation: u64,
-    config: &Config<I>,
-  ) -> Result<(), CreateGroupError>
-  where
-    I: NodeId,
-  {
-    validate_working_generation(generation)?;
-    validate_new_group(&self.groups, &self.host_id, gid, config)
+  /// Release a YIELDED fork's reservation without installing it — for a caller that received a
+  /// fork and then abandoned it (a fail-closed floor on its own side, say). The relay's own
+  /// install releases the entry itself, so this is only for the abandon path; leaving the entry
+  /// behind would squat the child id for the container's lifetime.
+  pub fn release_yielded_fork(&mut self, child: &G) {
+    self.yielded.remove(child);
   }
 }
 
@@ -1825,21 +1911,70 @@ where
                 // condition reaching opposite verdicts is how the id ended up held forever.
                 Ok(()) if gate.contains_group(&child) => Verdict::Hold(child),
                 Ok(()) => Verdict::Yield(child),
+                // ABANDONMENT NEEDS PERMANENCE, not merely a refusal. A floor alone does not
+                // authorize destroying fork content; a MONOTONE floor does, because it is the only
+                // refusal class that provably can never lift at this host. Every refusal that CAN
+                // lift — occupied stores, a tombstone, a config the caller may fix — HOLDS. These
+                // four cannot: a generation is fixed at the split, an id that does not encode never
+                // will, and a node-id mismatch is about this host, not this moment.
+                //
+                // Evidence note for anyone extending this list: a green VOPR is NOT evidence for
+                // the below-floor abandonment. A wholly-refused child never registers a
+                // `SplitRecord`, so the conservation walk never judges the pair — the transition
+                // pin (`a_held_fork_terminalizes_when_its_floor_rises`) and the deliberate-abandon
+                // unit are the evidence that exists.
                 Err(
                   CreateGroupError::ReservedGeneration
                   | CreateGroupError::BelowFloor { .. }
                   | CreateGroupError::InvalidGroupId
-                  | CreateGroupError::NodeIdMismatch
-                  // A COMMITTED-CONSUMED source: a capture debt names it, or a latched-Closed park
-                  // is absorbing it. Either way the id is dead here forever — the union subsumes
-                  // whatever this fork carries, and no host state can change that. It must stay an
-                  // Err-arm verdict: routing it through the `Ok` guard would let the consumed
-                  // source's own RETAINED STORES re-assert occupancy and hold the fork, which is
-                  // exactly the ring this closes — the held fork's barrier suppresses the cure
-                  // advertisement that would deliver the covering snapshot, so nothing ever folds,
-                  // no floor is ever written, and the stores are never released.
-                  | CreateGroupError::AbsorbPending,
+                  | CreateGroupError::NodeIdMismatch,
                 ) => Verdict::Terminal(child),
+                // A COMMITTED-CONSUMED child id — but abandoning a fork DESTROYS its blob, so the
+                // verdict is Terminal only where the loss is provably nothing. The subsumption
+                // argument is narrow: it holds when THIS parent is itself the absorbing target and
+                // the fork was staged BELOW the park coordinate, because the park stops this
+                // endpoint's apply drain at `k - 1`, so such a fork predates the freeze and the
+                // absorbed union contains its half. Both facts live on the endpoint being examined
+                // — no cross-endpoint reasoning, and nothing here consults another group's state.
+                //
+                // For an UNRELATED parent whose committed split merely names the same id, the
+                // union cannot contain that child-half at all: Terminal there is data loss. Those
+                // HOLD, on the fail-safe default — an undecidable-locally fork wedges
+                // diagnosably and never drops.
+                //
+                // The refusal must stay an Err-arm verdict either way: routing it through the `Ok`
+                // guard would let the consumed source's own RETAINED STORES re-assert occupancy,
+                // which is the ring this closes — a held fork's barrier suppresses the cure
+                // advertisement that delivers the covering snapshot, so nothing folds, no floor is
+                // written, and the stores are never released.
+                //
+                // ASYMMETRY WITH THE ADMISSION DOORS, deliberate: `validate_new_group` refuses this
+                // id outright for every door, because a door holds no blob — refusing there loses
+                // nothing and is the safe strengthening. This arm holds the partition's only
+                // local copy, so its scope is exactly the subsumption proof.
+                Err(CreateGroupError::AbsorbPending) => {
+                  let park = ep.pending_merge();
+                  let names_this_child = park.is_some_and(|p| {
+                    p.window_closed() && p.source_bytes().as_ref() == fork.child_bytes.as_ref()
+                  });
+                  let below_the_park = park.is_some_and(|p| fork.index < p.at());
+                  // AT-or-ABOVE is UNREACHABLE, and the reason is the same drain-stop the
+                  // subsumption rests on: the park holds this endpoint's apply at `k - 1`, and a
+                  // fork is staged only when its `Split` entry APPLIES, so no split at or past `k`
+                  // can have staged while this park stands — on the live path or on a restore
+                  // replay, which parks at the same coordinate and stops there too. Asserted rather
+                  // than tested because the state cannot be constructed through any public door.
+                  debug_assert!(
+                    !names_this_child || below_the_park,
+                    "a fork staged at or past its own target's park coordinate"
+                  );
+                  let subsumed = names_this_child && below_the_park;
+                  if subsumed {
+                    Verdict::Terminal(child)
+                  } else {
+                    Verdict::Hold(child)
+                  }
+                }
                 Err(_) => Verdict::Hold(child),
               }
             }
@@ -1954,6 +2089,9 @@ where
           fork.child_bytes.clone(),
           fork.child_gen,
         );
+        // THE RESERVATION CARRIES ON PAST THE POP. The staged leg just ended, and the install has
+        // not begun; between them the id is this fork's and no other door may take it.
+        self.yielded.insert(child.cheap_clone());
         HeadFork::Yield(GroupFork {
           parent: gid.cheap_clone(),
           child,
@@ -2357,7 +2495,6 @@ where
     fsm: F,
     snapshot: Bytes,
     read_only: Option<ReadOnlyOption>,
-    fork_id: Option<ForkId>,
     boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
@@ -2373,8 +2510,82 @@ where
     if self.split_reserved(&gid) {
       return Err(CreateGroupError::SplitReserved);
     }
+    // NO CALLER PROVENANCE. This door installs TOKEN-LESS, always: a [`ForkId`] is mintable from
+    // public split coordinates, so accepting one here would let a caller stamp its own content
+    // with a genuine fork's identity — and the relay's redundant-fork exit, seeing an exact match,
+    // would then discard the real partition as already-materialized. Provenance enters through the
+    // sealed [`create_group_from_relayed_fork`] door or a wire snapshot install, both of which take
+    // it from the container's own record rather than a caller's.
     self.create_group_from_fork_unreserved(
-      gid, generation, config, now, seed, fsm, snapshot, read_only, fork_id, boot_epoch, log,
+      gid, generation, config, now, seed, fsm, snapshot, read_only, None, boot_epoch, log, stable,
+    )
+  }
+
+  /// Materialize a child from a fork the CONTAINER yielded — the relay's door, and the only public
+  /// one that skips the split reservation.
+  ///
+  /// The ticket is POSSESSION of a [`GroupFork`]: only the container mints them, only for a
+  /// committed split whose coordinates it verified, and nothing outside this crate can construct or
+  /// mutate one. That is what makes skipping the reservation safe here and nowhere else — the
+  /// reservation fences the OTHER admission doors from squatting an id a split owns, and this call
+  /// IS that split claiming its own id. Consulting the predicate here would refuse the very
+  /// admission it exists to protect.
+  ///
+  /// The fork is CONSUMED and destructured internally, and it supplies EVERYTHING — including the
+  /// child's boot config. MEMBERSHIP COMES FROM THE COMMITTED SPLIT, never from the caller: the
+  /// fork's config carries the parent's voter set at the split entry, identical on every replica
+  /// because the split rode the parent's totally-ordered log. A caller-supplied config would let
+  /// two hosts install the same child id, blob and token under DISJOINT sole-voter sets and then
+  /// commit conflicting histories under one identity — no gate downstream can catch that, because
+  /// every other input matches.
+  ///
+  /// The only divergence from the committed config is
+  /// [`reshape_born_prevention`], applied here so it is applied identically everywhere.
+  pub fn create_group_from_relayed_fork<L, S>(
+    &mut self,
+    fork: GroupFork<G, I, F>,
+    now: impl Into<Now>,
+    seed: u64,
+    boot_epoch: u64,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    let GroupFork {
+      child,
+      child_gen,
+      config,
+      fsm,
+      blob,
+      read_only,
+      fork_id,
+      ..
+    } = fork;
+    let config = reshape_born_prevention(config);
+    // The yield-to-install window closes here, whatever the install returns: the fork has been
+    // consumed by value, so no second attempt can follow and holding the reservation open would
+    // squat the id forever. The unreserved form below never consults the reservation, so this
+    // door cannot refuse itself on the entry it is about to drop.
+    self.yielded.remove(&child);
+    self.create_group_from_fork_unreserved(
+      child,
+      child_gen,
+      config,
+      now,
+      seed,
+      fsm,
+      blob,
+      read_only,
+      Some(fork_id),
+      boot_epoch,
+      log,
       stable,
     )
   }
@@ -2580,7 +2791,6 @@ where
     fsm: F,
     snapshot: Bytes,
     read_only: Option<ReadOnlyOption>,
-    fork_id: Option<ForkId>,
     boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
@@ -2593,12 +2803,13 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
-    // The same public door, the same fence: see [`create_group_from_fork`](Self::create_group_from_fork).
+    // The same public door: the same fence, and the same token-less install — see
+    // [`create_group_from_fork`](Self::create_group_from_fork).
     if self.split_reserved(&gid) {
       return Err(CreateGroupError::SplitReserved);
     }
     self.create_group_from_fork_with_rng_unreserved(
-      gid, generation, config, now, rng, fsm, snapshot, read_only, fork_id, boot_epoch, log, stable,
+      gid, generation, config, now, rng, fsm, snapshot, read_only, None, boot_epoch, log, stable,
     )
   }
 

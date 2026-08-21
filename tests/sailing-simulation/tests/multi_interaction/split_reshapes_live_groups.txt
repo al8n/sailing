@@ -234,12 +234,23 @@ n1: applied=2
 
 campaign g=200 2
 ----
-g200 n2 candidate term=2
-g200 RequestVote term=2 last=1/1 prevote=false
-g200 RequestVote term=2 last=1/1 prevote=false
+g200 n2 pre-candidate term=1
+g200 RequestVote term=2 last=1/1 prevote=true
+g200 RequestVote term=2 last=1/1 prevote=true
 
 stabilize g=200
 ----
+> n1 recv g200 RequestVote term=2 last=1/1 prevote=true
+> n3 recv g200 RequestVote term=2 last=1/1 prevote=true
+> n1 ready
+  g200 VoteResponse term=2 prevote=true reject=false
+> n3 ready
+  g200 VoteResponse term=2 prevote=true reject=false
+> n2 recv g200 VoteResponse term=2 prevote=true reject=false
+> n2 recv g200 VoteResponse term=2 prevote=true reject=false
+> n2 ready
+  g200 RequestVote term=2 last=1/1 prevote=false
+  g200 RequestVote term=2 last=1/1 prevote=false
 > n1 recv g200 RequestVote term=2 last=1/1 prevote=false
 > n3 recv g200 RequestVote term=2 last=1/1 prevote=false
 > n1 ready

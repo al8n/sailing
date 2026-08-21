@@ -344,9 +344,24 @@ pub enum LifecycleEvent<G, I> {
   /// child id is floored or tombstoned here, its config is invalid, or its engine storage
   /// already holds a used incarnation's durable state (which a fork never overwrites — the
   /// parent-only crash-restore replay). The parent's snapshot fence over the split index has
-  /// been resolved and the parent continues on its shrunk half; the child does NOT run here
-  /// until the embedder acts — restore it over its own storage, or place it elsewhere and let
-  /// the ordinary lifecycle paths (solicitation, snapshot from a live member) bring it back.
+  /// been resolved and the parent continues on its shrunk half.
+  ///
+  /// WHAT THE EMBEDDER CAN DO DEPENDS ON WHICH REFUSAL FIRED, and the two are not alike.
+  ///
+  /// A NON-TERMINAL refusal — an invalid config, used storage, or a removal floor the id can be
+  /// recreated above — leaves the child genuinely rejoinable: restore it over its own storage, or
+  /// place it elsewhere and let the ordinary lifecycle paths (solicitation, snapshot from a live
+  /// member) bring it back. The half survives somewhere, so there is something to bring back.
+  ///
+  /// A TERMINAL refusal — the id floored at the reserved terminal, or consumed by a committed
+  /// merge — means the id is dead here for good, and THE HALF IS GONE WITH IT. The split's apply
+  /// already moved those cells out of the parent, so re-splitting the shrunken parent re-derives
+  /// an empty half; there is no local copy left to place. The embedder's remedy is a FRESH-ID
+  /// split for future data, not a recovery of this one.
+  ///
+  /// The distinction is worth stating plainly because the abandonment destroys the staged blob at
+  /// the pop, while THIS event is only guaranteed to be delivered eventually — the two are not
+  /// simultaneous, and an embedder reading the event has already lost the option to intervene.
   SplitRefused {
     /// The parent group the split rode.
     parent: G,
@@ -371,12 +386,18 @@ pub enum LifecycleEvent<G, I> {
   /// durable snapshot slot holds a DIFFERENT lineage's never-installed leftover refuses the
   /// fork's transfer too — the leftover is the surviving evidence of a lifecycle breach, so it
   /// resolves by re-materializing the joiner, not by overwriting the evidence.) A POPULATED
-  /// occupant — an older incarnation's replica, or an
-  /// unrelated group at the id — can only be resolved by PLACEMENT: remove the hosted child
-  /// (the fork then materializes and [`SplitApplied`](Self::SplitApplied) fires — removal
-  /// tombstones the id, so pair it with [`MultiHandle::clear_tombstone`] before the next drain,
-  /// or the abandoned fork surfaces as [`SplitRefused`](Self::SplitRefused) and the child
-  /// rejoins by the ordinary lifecycle paths). A sibling's transfer can NEVER convert it: the
+  /// occupant — an older incarnation's replica, or an unrelated group at the id — can only be
+  /// resolved by PLACEMENT: remove the hosted child, then clear its tombstone
+  /// ([`MultiHandle::clear_tombstone`]). A tombstone does not refuse the fork — the relay's gate
+  /// reports it as occupancy, so the fork simply keeps HOLDING until consent lifts it.
+  ///
+  /// Whether that release delivers the child depends on what the occupant was. A gen-0 occupant
+  /// that never reshaped takes no removal floor, so remove-and-clear lands the fork and
+  /// [`SplitApplied`](Self::SplitApplied) fires — the guaranteed path. A RESHAPED occupant's
+  /// removal writes a floor one past its ceiling, and the held fork's generation can never clear
+  /// it: consent then releases the fork into a TERMINAL abandonment, surfacing as
+  /// [`SplitRefused`](Self::SplitRefused) with the half gone (see that event's contract). Which
+  /// outcome an id gets is decided by its own history, not by the order of the two calls. A sibling's transfer can NEVER convert it: the
   /// receive path refuses a cross-lineage snapshot into a replica holding another lineage's
   /// committed content (silently on the wire — watch the endpoint's refusal counter), because
   /// destructively replacing a populated replica over the wire is exactly the loss the lineage

@@ -7,7 +7,7 @@ use std::{
   collections::VecDeque,
   sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
   },
 };
 
@@ -649,6 +649,7 @@ impl StableStore for SharedStable {
 pub struct DelegatingEngine {
   inner: GroupEngine<u64, u64>,
   watch: Arc<EngineWatch>,
+  probe: Option<u64>,
 }
 
 /// What a [`DelegatingEngine`] reports back to the test that handed it in. Shared, because the
@@ -663,6 +664,12 @@ pub struct EngineWatch {
   /// skipped its final barrier leaves this TRUE — on a durable engine that is acked work rolled
   /// back, a retired incarnation free to return.
   pub staged_at_drop: AtomicBool,
+  /// The probed group's durable term, refreshed at every barrier. The engine MOVES into the
+  /// driver, so this is the only honest window onto stores a test can no longer reach — and the
+  /// only one available once a held fork's reservation refuses `restore_group`.
+  pub probe_term: AtomicU64,
+  /// The probed group's last log index, refreshed alongside [`probe_term`](Self::probe_term).
+  pub probe_last_index: AtomicU64,
 }
 
 #[allow(dead_code)]
@@ -672,13 +679,25 @@ impl DelegatingEngine {
     Self {
       inner: GroupEngine::new(),
       watch,
+      probe: None,
     }
   }
 
   /// A foreign engine that ALREADY holds stores — the shape a durable engine has after a restart,
   /// which no host could be handed before the engine seam went public.
   pub fn preloaded(inner: GroupEngine<u64, u64>, watch: Arc<EngineWatch>) -> Self {
-    Self { inner, watch }
+    Self {
+      inner,
+      watch,
+      probe: None,
+    }
+  }
+
+  /// Report `gid`'s durable term and last index through the watch at every barrier — the test's
+  /// window onto stores that have moved inside the driver.
+  pub fn probing(mut self, gid: u64) -> Self {
+    self.probe = Some(gid);
+    self
   }
 }
 
@@ -733,7 +752,20 @@ impl MultiEngine<u64, u64> for DelegatingEngine {
 
   fn flush(&mut self) -> usize {
     self.watch.barriers.fetch_add(1, Ordering::SeqCst);
-    self.inner.flush()
+    let released = self.inner.flush();
+    if let Some(gid) = self.probe
+      && let Some((log, stable)) = self.inner.stores(&gid)
+    {
+      self
+        .watch
+        .probe_last_index
+        .store(log.last_index().get(), Ordering::SeqCst);
+      self
+        .watch
+        .probe_term
+        .store(stable.hard_state().term().get(), Ordering::SeqCst);
+    }
+    released
   }
 
   fn add_group(&mut self, gid: u64) -> bool {

@@ -5246,7 +5246,7 @@ async fn a_fork_wedges_on_occupied_child_stores_and_lands_once_they_clear() {
     acceptor,
     DriverConfig::default(),
     // The squatter: unrelated stores under the CHILD id, carrying content of their own.
-    DelegatingEngine::preloaded(preloaded_engine(&[child]), watch.clone()),
+    DelegatingEngine::preloaded(preloaded_engine(&[child]), watch.clone()).probing(child),
   )
   .await
   .expect("the host binds over a preloaded engine");
@@ -5297,21 +5297,30 @@ async fn a_fork_wedges_on_occupied_child_stores_and_lands_once_they_clear() {
     "no child endpoint was built over the squatter's stores"
   );
 
-  // THE SQUATTER'S STORES ARE UNTOUCHED — they still restore, carrying their own term, which a
-  // fork baseline written over them could not have left behind.
-  handle
+  // THE RESERVATION STANDS while the fork is held — the fork never popped, so it still owns its
+  // child id and every OTHER admission door is refused. That is what makes the wedge safe: no
+  // squatter can be planted under the id the held fork is waiting for.
+  let err = handle
     .restore_group(child, config(1, vec![1]), 1, CountSm::default(), 0)
     .await
-    .expect("the wedged fork left the occupying stores recoverable");
-  let status = handle
-    .group(child)
-    .status()
-    .await
-    .expect("the restored squatter answers");
+    .expect_err("a held fork's child id refuses every other admission door");
   assert!(
-    status.term.get() >= PRELOAD_TERM,
-    "the squatter's own state survived the wedge, got {:?}",
-    status.term
+    matches!(&err, DriverError::Rejected { reason } if reason.contains("reserved by an in-flight split")),
+    "the typed reservation refusal, got {err:?}"
+  );
+
+  // THE SQUATTER'S STORES ARE UNTOUCHED. Reading them back through the driver is exactly what the
+  // refusal above forbids, so the engine reports its own content instead — the handle the test
+  // kept when it handed the engine in.
+  assert_eq!(
+    watch.probe_term.load(Ordering::SeqCst),
+    PRELOAD_TERM,
+    "the squatter's durable term survived the wedge untouched"
+  );
+  assert_eq!(
+    watch.probe_last_index.load(Ordering::SeqCst),
+    2,
+    "and so did its log"
   );
 
   // Nothing was abandoned while all that happened.
@@ -5359,6 +5368,7 @@ async fn wedge_two_forks_on_a_one_slot_tail() -> (
   flume::Receiver<LifecycleEvent<u64, u64>>,
   (u64, u64),
   (u64, u64),
+  sailing_reactor::EngineMetrics,
 ) {
   let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
   let (p1, c1) = (100u64, 300u64);
@@ -5384,6 +5394,7 @@ async fn wedge_two_forks_on_a_one_slot_tail() -> (
   .await
   .expect("the host binds over a preloaded engine");
   let lifecycle = handle.lifecycle().clone();
+  let metrics = driver.engine_metrics();
   tokio::spawn(driver.run());
 
   for (parent, child) in [(p1, c1), (p2, c2)] {
@@ -5403,7 +5414,7 @@ async fn wedge_two_forks_on_a_one_slot_tail() -> (
     // the two cues is the order of the splits and the second is the one that finds no slot.
     tokio::time::sleep(Duration::from_millis(200)).await;
   }
-  (handle, lifecycle, (p1, c1), (p2, c2))
+  (handle, lifecycle, (p1, c1), (p2, c2), metrics)
 }
 
 /// A wedge's conflict cue is the embedder's ONLY prompt to clear it — the held fork deliberately
@@ -5412,7 +5423,7 @@ async fn wedge_two_forks_on_a_one_slot_tail() -> (
 /// fork, and nothing to act on. Once the tail drains, the deferred cue arrives, exactly once.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_wedge_cue_defers_on_a_full_tail_instead_of_vanishing() {
-  let (handle, lifecycle, first, second) = wedge_two_forks_on_a_one_slot_tail().await;
+  let (handle, lifecycle, first, second, _metrics) = wedge_two_forks_on_a_one_slot_tail().await;
 
   // The one slot holds the FIRST pair's cue; draining it is what frees the tail.
   await_lifecycle(&lifecycle, "the first wedge's cue", |ev| {
@@ -5444,12 +5455,62 @@ async fn a_wedge_cue_defers_on_a_full_tail_instead_of_vanishing() {
   handle.shutdown().await.expect("the multi host tears down");
 }
 
+/// THE QUIET PARENT. A cue deferred by a full tail has nobody to come back for it: the container
+/// runs no timer, and a peerless parent with nothing to replicate generates no wakes of its own.
+/// Two things have to hold — the driver must re-arm itself while a cue is owed, and a parent owing
+/// one must not be allowed to quiesce — or the embedder waits for unrelated traffic to deliver the
+/// only prompt it will get. Let the host go fully quiet, drain one slot, and require the deferred
+/// cue PROMPTLY, with nothing else happening on the host at all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deferred_cue_reaches_a_quiet_parent_without_any_other_traffic() {
+  let (handle, lifecycle, first, second, metrics) = wedge_two_forks_on_a_one_slot_tail().await;
+
+  // GO QUIET: no submits, no lifecycle verbs, nothing. Well past the election window, so a host
+  // that treats these parents as idle has had every chance to quiesce them.
+  tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+  // THE PREMISE, made explicit: a parent owing a held fork and an undelivered cue is NOT
+  // quiesce-eligible. Were it, its deadlines would stop being armed and the one prompt the
+  // embedder gets would wait on unrelated traffic that a peerless host never produces.
+  assert_eq!(
+    metrics.quiesced_groups(),
+    0,
+    "a parent owing a fork hold must not quiesce"
+  );
+
+  // Drain exactly one slot — the first wedge's cue — and free the tail.
+  await_lifecycle(&lifecycle, "the first wedge's cue", |ev| {
+    matches!(ev, LifecycleEvent::SplitConflict { parent, child } if (*parent, *child) == first)
+  })
+  .await;
+
+  // The deferred cue must now arrive on the driver's own cadence. A short bound is the point: a
+  // cue that only lands once something else wakes the host is the defect.
+  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the deferred cue never reached a quiet parent: nothing re-armed the pump"
+    );
+    let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(250), lifecycle.recv_async()).await
+    else {
+      continue;
+    };
+    if matches!(&ev, LifecycleEvent::SplitConflict { parent, child } if (*parent, *child) == second)
+    {
+      break;
+    }
+  }
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
 /// The purge half, the container pump's "a park that resolves first purges it there" parity: a cue
 /// still queued behind a full tail when its fork RESOLVES must never surface afterwards, or the
 /// embedder is sent to clear a wedge that is already gone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_cue_is_purged_when_its_fork_lands_first() {
-  let (handle, lifecycle, first, second) = wedge_two_forks_on_a_one_slot_tail().await;
+  let (handle, lifecycle, first, second, _metrics) = wedge_two_forks_on_a_one_slot_tail().await;
   let (_, c2) = second;
 
   // Clear the SECOND wedge's blocker while its cue is still stuck behind the full tail.

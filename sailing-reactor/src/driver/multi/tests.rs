@@ -635,7 +635,7 @@ fn the_factory_gate_refuses_a_debt_named_source_and_releases_at_the_discharge() 
   let fork = multi
     .poll_pending_fork()
     .expect("the fork survived the wait");
-  multi.lift_fork_barrier(&1, fork.split_index);
+  multi.lift_fork_barrier(&1, fork.split_index());
   assert_eq!(
     multi.service_merge_applies(d, &mut engine),
     vec![MergeResolution::Merged {
