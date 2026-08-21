@@ -34,6 +34,8 @@ use std::{
 
 use sailing_proto::{EntriesRead, Entry, EntryKind, Event, FailoverReadWindow, Index, LogStore};
 
+use futures_channel::oneshot;
+
 use crate::DriverError;
 
 /// The shared in-flight submit budget (count AND payload bytes), cloned into every
@@ -688,6 +690,57 @@ impl<I: sailing_proto::NodeId, R: Clone, F> Routing<I, R, F> {
     // Best-effort tail: try_send drops on full — the tail must never block consensus.
     let _ = self.events.try_send(event);
     advanced
+  }
+}
+
+/// A lifecycle reply WITHHELD until the barrier that makes its command's engine writes durable —
+/// the multi drivers' persist-before-reply queue (see each driver's command drain for the rule).
+///
+/// The reply and its budget reservation travel together: the operation is not finished, and its
+/// slot not free, until the caller can observe the verdict.
+pub enum PendingAck<I> {
+  /// An admission verdict — a create, a create-from-fork, or a restore.
+  Admission {
+    /// The caller's reply channel.
+    reply: oneshot::Sender<Result<(), DriverError<I>>>,
+    /// The verdict, held back until the covering barrier has run.
+    verdict: Result<(), DriverError<I>>,
+    /// The owning budget reservation, released with the reply.
+    reservation: ReservationGuard,
+  },
+  /// A removal verdict: whether a group with this id was hosted.
+  Removal {
+    /// The caller's reply channel.
+    reply: oneshot::Sender<Result<bool, DriverError<I>>>,
+    /// The verdict, held back until the covering barrier has run.
+    verdict: Result<bool, DriverError<I>>,
+    /// The owning budget reservation, released with the reply.
+    reservation: ReservationGuard,
+  },
+}
+
+impl<I> PendingAck<I> {
+  /// Release the verdict to its caller and free the reservation. A receiver that stopped awaiting
+  /// is not an error — the send is best-effort exactly as it is on the immediate path.
+  pub fn send(self) {
+    match self {
+      Self::Admission {
+        reply,
+        verdict,
+        reservation,
+      } => {
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
+      Self::Removal {
+        reply,
+        verdict,
+        reservation,
+      } => {
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
+    }
   }
 }
 

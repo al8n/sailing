@@ -192,16 +192,16 @@ pub(crate) struct PairFloors<G> {
 
 impl<G: sailing_proto::GroupId> PairFloors<G> {
   /// Snapshot `source` and `target`'s floors + lineage off the engine.
-  pub(crate) fn snapshot<I>(
-    engine: &sailing_proto::GroupEngine<G, I>,
-    source: &G,
-    target: &G,
-  ) -> Self {
+  pub(crate) fn snapshot<I, E>(engine: &E, source: &G, target: &G) -> Self
+  where
+    I: sailing_proto::NodeId,
+    E: sailing_proto::MultiEngine<G, I>,
+  {
     let read = |gid: &G| {
       (
         gid.cheap_clone(),
-        engine.group_floor(gid),
-        engine.group_gen(gid),
+        sailing_proto::FloorStore::floor(engine, gid),
+        sailing_proto::FloorStore::lineage(engine, gid),
       )
     };
     Self {

@@ -30,7 +30,7 @@ mod tests;
 
 use std::{net::SocketAddr, sync::Arc};
 
-use sailing_proto::{Config, Event, GroupId, RecordIo, StateMachine};
+use sailing_proto::{Config, Event, GroupEngine, GroupId, MultiEngine, RecordIo, StateMachine};
 
 use sailing_driver::{
   BindError, BoxedGroupFactory, DriverConfigError, GroupBlueprint, GroupFactory, GroupHandle,
@@ -58,6 +58,12 @@ pub type ShardRecordLayers<I, R> =
 /// OWN instance — factories are stateful (`&mut self` phases) and a plane must never share one.
 /// `None` leaves that plane factory-less.
 type FactorySlots<G, I, F> = Box<dyn FnMut(usize) -> Option<BoxedGroupFactory<G, I, F>>>;
+
+/// The per-plane storage engines: consulted once per shard at [`ShardedCompioHost::spawn`] (on
+/// the spawning thread), each product then moving into its own plane. `Send` because it crosses
+/// the plane-thread boundary, and one engine per plane BY CONSTRUCTION — a shared engine would
+/// put two cores behind one barrier, which is the cross-core cost the planes exist to avoid.
+type PlaneEngines<E> = Box<dyn FnMut(usize) -> E + Send>;
 
 /// FNV-1a over one group id's canonical [`Data`](sailing_proto::Data) encoding — deterministic
 /// across processes, platforms, and runs (no `RandomState`, no pointer identity), which is what
@@ -300,7 +306,7 @@ fn shard_addr(base: SocketAddr, shard: usize) -> Option<SocketAddr> {
 ///   `base port + i` — the ADDRESSING contract mirrors the [`ShardMap`]'s: every node of the
 ///   cluster runs the same K, the same map, and the same port convention (or the same explicit
 ///   per-shard lists), so `shard(g)` on one node always reaches `shard(g)` on another.
-/// - Per-plane engines: each plane owns its own [`GroupEngine`](sailing_proto::GroupEngine) —
+/// - Per-plane engines: each plane owns its own engine, the in-memory [`GroupEngine`] today —
 ///   K independent batch barriers, no cross-core barrier contention, observable per plane
 ///   through [`ShardedMultiHandle::engine_metrics`].
 /// - Per-plane multi semantics unchanged: coalescing, quiescence, tombstones, lifecycle
@@ -317,7 +323,7 @@ fn shard_addr(base: SocketAddr, shard: usize) -> Option<SocketAddr> {
 ///
 /// `spawn` blocks briefly: it starts the K plane threads and waits for each plane's bind
 /// verdict, so a returned handle means every listener is bound and every plane is running.
-pub struct ShardedCompioHost<G, I, F, R>
+pub struct ShardedCompioHost<G, I, F, R, E = GroupEngine<G, I>>
 where
   F: StateMachine,
 {
@@ -326,6 +332,7 @@ where
   peers: Vec<Node<I, SocketAddr>>,
   record_layers: ShardRecordLayers<I, R>,
   factories: Option<FactorySlots<G, I, F>>,
+  engines: PlaneEngines<E>,
   snapshot_staging_cap: Option<usize>,
   driver_cfg: DriverConfig,
 }
@@ -337,7 +344,10 @@ enum ListenAddrs {
   Explicit(Vec<SocketAddr>),
 }
 
-impl<G, I, F, R> ShardedCompioHost<G, I, F, R>
+/// The constructor, which names the plane engine CONCRETELY: a defaulted type parameter does not
+/// infer in expression position, so binding `new` to [`GroupEngine`] is what keeps every call site
+/// turbofish-free. The builders and `spawn` live on the generic block below.
+impl<G, I, F, R> ShardedCompioHost<G, I, F, R, GroupEngine<G, I>>
 where
   G: GroupId + Send,
   I: sailing_proto::NodeId + Send,
@@ -367,11 +377,26 @@ where
       peers,
       record_layers,
       factories: None,
+      engines: Box::new(|_| GroupEngine::new()),
       snapshot_staging_cap: None,
       driver_cfg,
     }
   }
+}
 
+/// The builders and the plane spawn, over ANY engine behind the [`MultiEngine`] seam.
+impl<G, I, F, R, E> ShardedCompioHost<G, I, F, R, E>
+where
+  G: GroupId + Send,
+  I: sailing_proto::NodeId + Send,
+  F: StateMachine + Send + 'static,
+  F::Command: sailing_proto::Data + Send,
+  F::Snapshot: sailing_proto::Data,
+  F::Response: Clone + Send,
+  F::Error: core::error::Error,
+  R: RecordIo + 'static,
+  E: MultiEngine<G, I> + Send + 'static,
+{
   /// Replace the port convention with one explicit listen address per plane (for hosts whose
   /// shards cannot share one IP or a contiguous port range). The list length must equal the
   /// map's shard count — validated at [`spawn`](Self::spawn). Peer dialing keeps the base + `i`
@@ -402,8 +427,38 @@ where
     self
   }
 
-  /// Cap every plane engine's chunked-snapshot staging buffers (the
-  /// [`GroupEngine`](sailing_proto::GroupEngine) knob, applied per plane).
+  /// Build each plane's storage engine with `per_shard` instead of the default in-memory
+  /// [`GroupEngine`] — the seam a durable engine enters the sharded host through.
+  ///
+  /// CONTRACT: `per_shard` is invoked ONCE per plane index, on the SPAWNING thread, and the
+  /// engine it returns MOVES into that plane and is never touched from anywhere else. One engine
+  /// per plane is therefore structural, not a convention to keep: two planes behind one barrier
+  /// would reintroduce exactly the cross-core contention the plane model exists to avoid, and
+  /// `E: Send` is what carries each engine to its thread. Index `i` is the same shard index
+  /// [`ShardMap::shard`] returns, so a durable engine can key its storage by plane.
+  ///
+  /// This CHANGES the host's engine type, so it reads first in a builder chain; every other step
+  /// carries over unchanged and may be applied on either side of it.
+  #[must_use]
+  pub fn with_engine_factory<E2, Fac>(self, per_shard: Fac) -> ShardedCompioHost<G, I, F, R, E2>
+  where
+    E2: MultiEngine<G, I> + Send + 'static,
+    Fac: FnMut(usize) -> E2 + Send + 'static,
+  {
+    ShardedCompioHost {
+      map: self.map,
+      listen: self.listen,
+      peers: self.peers,
+      record_layers: self.record_layers,
+      factories: self.factories,
+      engines: Box::new(per_shard),
+      snapshot_staging_cap: self.snapshot_staging_cap,
+      driver_cfg: self.driver_cfg,
+    }
+  }
+
+  /// Cap every plane engine's chunked-snapshot staging buffers (the engine-wide knob, applied
+  /// per plane).
   #[must_use]
   pub fn with_snapshot_staging_cap(mut self, cap: usize) -> Self {
     self.snapshot_staging_cap = Some(cap);
@@ -479,6 +534,7 @@ where
             plane: shard,
           }) as BoxedGroupFactory<G, I, F>
         });
+      let engine = (self.engines)(shard);
       let staging_cap = self.snapshot_staging_cap;
       let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<Verdict<G, I, F>>();
       let thread = match std::thread::Builder::new()
@@ -501,8 +557,8 @@ where
                 return;
               }
             };
-            let bound = CompioMultiStreamDriver::bind_with_tails(
-              addr, peers, dialer, acceptor, driver_cfg, tails,
+            let bound = CompioMultiStreamDriver::bind_with_tails_in(
+              addr, peers, dialer, acceptor, driver_cfg, tails, engine,
             )
             .await;
             let (mut driver, handle) = match bound {

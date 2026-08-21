@@ -6,10 +6,15 @@
 
 mod common;
 
-use std::{net::SocketAddr, rc::Rc, time::Duration};
+use std::{
+  net::SocketAddr,
+  rc::Rc,
+  sync::{Arc, atomic::Ordering},
+  time::Duration,
+};
 
 use bytes::Bytes;
-use common::{CountSm, TrapSm};
+use common::{CountSm, DelegatingEngine, EngineWatch, PRELOAD_TERM, TrapSm, preloaded_engine};
 use sailing_compio::{
   CompioMultiStreamDriver, DriverConfig, DriverError, GroupHandle, LifecycleEvent, MultiHandle,
   Node,
@@ -678,4 +683,310 @@ async fn a_retired_incarnations_frames_are_fenced_on_compio() {
   for h in &handles {
     h.shutdown().await.expect("the multi host tears down");
   }
+}
+
+/// Compile-level proof that the ENGINE SEAM is publicly reachable on THIS surface: from a crate
+/// that can see only `sailing-compio`'s public API, a foreign `MultiEngine` binds this host. The
+/// loopback suites above already prove the host runs, so this is never invoked — what it pins is
+/// that `bind_with_engine` exists, is public, and accepts an engine this crate built itself.
+#[allow(dead_code)]
+async fn a_foreign_engine_binds_this_host(
+  addr: SocketAddr,
+  watch: std::sync::Arc<EngineWatch>,
+) -> (
+  CompioMultiStreamDriver<u64, u64, CountSm, Labeled<Passthrough>, DelegatingEngine>,
+  MultiHandle<u64, u64, CountSm>,
+) {
+  let (dialer, acceptor) = plain_factories(1);
+  CompioMultiStreamDriver::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+    DelegatingEngine::new(watch),
+  )
+  .await
+  .expect("the host binds over a foreign engine")
+}
+
+/// A host handed an engine that ALREADY holds a group's stores must never build a FRESH endpoint
+/// over them: occupied stores are recovered state, and a term-0 endpoint would ack success and
+/// then truncate that durable history on its first append. Both creation flavors refuse typed —
+/// the fork flavor on the same fact, since occupied child stores mean the child's baseline already
+/// exists — the stores come through untouched (they still RESTORE, carrying their own term), and a
+/// different id is unaffected.
+#[compio::test]
+async fn a_preloaded_engine_refuses_fresh_creation_and_keeps_its_stores() {
+  // Port 0: this host is PEERLESS, so nothing needs to find it — let the OS pick and keep the
+  // suite free of fixed-port collisions.
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let gid = 100u64;
+  let watch = Arc::new(EngineWatch::default());
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _, _>::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+    DelegatingEngine::preloaded(preloaded_engine(&[gid]), watch.clone()),
+  )
+  .await
+  .expect("the host binds over a preloaded engine");
+  compio::runtime::spawn(driver.run()).detach();
+
+  let err = handle
+    .create_group(gid, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect_err("a fresh create over recovered stores must refuse");
+  assert!(
+    matches!(err, DriverError::StoredStateExists),
+    "the typed occupied-stores refusal, got {err:?}"
+  );
+
+  let err = handle
+    .create_group_from_fork(
+      gid,
+      config(1, vec![1]),
+      1,
+      CountSm::default(),
+      Bytes::from_static(b"child-baseline"),
+      0,
+    )
+    .await
+    .expect_err("a fork install over occupied child stores must refuse");
+  assert!(
+    matches!(err, DriverError::StoredStateExists),
+    "the typed occupied-stores refusal, got {err:?}"
+  );
+
+  // THE STORES ARE UNTOUCHED. They still restore, and what comes back is what was put in: a
+  // create that had overwritten them would have left a term-0 endpoint behind.
+  handle
+    .restore_group(gid, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("the refused creates left the stores recoverable");
+  let status = handle
+    .group(gid)
+    .status()
+    .await
+    .expect("the restored group answers");
+  assert!(
+    status.term.get() >= PRELOAD_TERM,
+    "the recovered term came from the preloaded stores, got {:?}",
+    status.term
+  );
+
+  // The refusal is about OCCUPIED STORES, not about creates: a fresh id still admits.
+  handle
+    .create_group(200, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("a fresh id is unaffected");
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// PERSIST-BEFORE-REPLY across a teardown. A removal stages its admission floor and the removal
+/// itself; the `Shutdown` behind it in the SAME bounded drain exits the loop before the crank that
+/// would have flushed. Without the teardown barrier a conforming durable engine reboots with the
+/// acked removal rolled back — a retired incarnation free to return. The success verdict must
+/// therefore be released only behind a barrier that ran, and the loop must not exit owning staged
+/// work.
+#[compio::test]
+async fn a_removal_is_acked_only_behind_the_barrier_that_covers_it() {
+  // Port 0: this host is PEERLESS, so nothing needs to find it — let the OS pick and keep the
+  // suite free of fixed-port collisions.
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let gid = 100u64;
+  let watch = Arc::new(EngineWatch::default());
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _, _>::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+    DelegatingEngine::new(watch.clone()),
+  )
+  .await
+  .expect("the host binds over a foreign engine");
+  compio::runtime::spawn(driver.run()).detach();
+
+  // Generation 3 makes this a RESHAPED id, so its removal floor is non-zero — the write whose
+  // loss is a safety rollback rather than a re-runnable inconvenience.
+  handle
+    .create_group(gid, config(1, vec![1]), 1, CountSm::default(), 3)
+    .await
+    .expect("group admission");
+  let before = watch.barriers.load(Ordering::SeqCst);
+
+  // PRIME THE DRAIN. An idle driver is parked in its select, whose command arm takes exactly ONE
+  // command and then cranks — so two queued commands would be handled a crank apart, and the
+  // removal would flush normally. This throwaway `Status` absorbs that single wake, leaving the
+  // two below to the bounded drain at the top of the NEXT iteration: handled together, with the
+  // exit breaking out before any crank. That is the shape a `Shutdown` racing a removal has.
+  let probe_handle = handle.group(gid);
+  let mut probe = std::pin::pin!(probe_handle.status());
+  assert!(
+    futures_util::FutureExt::now_or_never(probe.as_mut()).is_none(),
+    "the status probe parks, with its command already queued"
+  );
+
+  // Now the removal and the `Shutdown`, queued without ever yielding to the driver in between.
+  let mut removal = std::pin::pin!(handle.remove_group(gid));
+  assert!(
+    futures_util::FutureExt::now_or_never(removal.as_mut()).is_none(),
+    "the removal parks on its reply, with its command already queued"
+  );
+  handle.shutdown().await.expect("the multi host tears down");
+
+  let removed = removal
+    .await
+    .expect("the removal verdict survives the teardown");
+  assert!(removed, "the group was hosted");
+  assert!(
+    watch.barriers.load(Ordering::SeqCst) > before,
+    "a barrier ran between the removal and its ack"
+  );
+  assert!(
+    !watch.staged_at_drop.load(Ordering::SeqCst),
+    "the loop did not exit owning staged work"
+  );
+}
+
+/// The teardown barrier's other exit path: the LAST HANDLE DROPPED. The command channel
+/// disconnects mid-drain, which leaves the loop exactly as a `Shutdown` does — with a removal's
+/// floor staged and no crank left to flush it. Nobody is waiting for the verdict here, which is
+/// precisely why the barrier cannot be left to the ack path to trigger.
+#[compio::test]
+async fn a_disconnected_channel_still_runs_the_teardown_barrier() {
+  // Port 0: this host is PEERLESS, so nothing needs to find it — let the OS pick and keep the
+  // suite free of fixed-port collisions.
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let gid = 100u64;
+  let watch = Arc::new(EngineWatch::default());
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _, _>::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+    DelegatingEngine::new(watch.clone()),
+  )
+  .await
+  .expect("the host binds over a foreign engine");
+  let task = compio::runtime::spawn(driver.run());
+
+  handle
+    .create_group(gid, config(1, vec![1]), 1, CountSm::default(), 3)
+    .await
+    .expect("group admission");
+  let before = watch.barriers.load(Ordering::SeqCst);
+
+  // PRIME THE DRAIN. An idle driver is parked in its select, whose command arm takes exactly ONE
+  // command and then cranks — so two queued commands would be handled a crank apart, and the
+  // removal would flush normally. This throwaway `Status` absorbs that single wake, leaving the
+  // two below to the bounded drain at the top of the NEXT iteration: handled together, with the
+  // exit breaking out before any crank. That is the shape a `Shutdown` racing a removal has.
+  //
+  // Both futures and the probe's group projection live in this block and die at its end: the loop
+  // exits on a DISCONNECTED channel, so one surviving sender clone would hold it open forever.
+  // Nobody awaits the removal verdict here, which is exactly why the barrier cannot be left to
+  // the ack path to trigger.
+  {
+    let probe_handle = handle.group(gid);
+    let mut probe = std::pin::pin!(probe_handle.status());
+    assert!(
+      futures_util::FutureExt::now_or_never(probe.as_mut()).is_none(),
+      "the status probe parks, with its command already queued"
+    );
+    let mut removal = std::pin::pin!(handle.remove_group(gid));
+    assert!(
+      futures_util::FutureExt::now_or_never(removal.as_mut()).is_none(),
+      "the removal parks on its reply, with its command already queued"
+    );
+  }
+  drop(handle);
+  // The run loop returns nothing but its completion: awaiting it is how the test observes the
+  // teardown, engine drop included.
+  let _ = task.await;
+
+  assert!(
+    watch.barriers.load(Ordering::SeqCst) > before,
+    "the disconnect exit ran its final barrier"
+  );
+  assert!(
+    !watch.staged_at_drop.load(Ordering::SeqCst),
+    "the loop did not exit owning staged work"
+  );
+}
+
+/// The fork wedge on the compio plane — the reactor suite carries the full matrix (the squatter's
+/// surviving content and the release half); what this pins here is the anti-loss half, which is
+/// the one that cannot be allowed to differ between the two drivers. A committed NON-EMPTY split
+/// whose child id is occupied by unrelated stores must be HELD, never abandoned: the parent has
+/// already shrunk, so a refusal would lift its fence and drop the partition's only local copy.
+#[compio::test]
+async fn a_fork_wedges_on_occupied_child_stores() {
+  // Port 0: this host is PEERLESS, so nothing needs to find it.
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let parent = 100u64;
+  let child = 300u64;
+  let watch = Arc::new(EngineWatch::default());
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _, _>::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+    // The squatter: unrelated stores under the CHILD id.
+    DelegatingEngine::preloaded(preloaded_engine(&[child]), watch.clone()),
+  )
+  .await
+  .expect("the host binds over a preloaded engine");
+  let lifecycle = handle.lifecycle().clone();
+  compio::runtime::spawn(driver.run()).detach();
+
+  handle
+    .create_group(parent, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("parent admission");
+  let p = handle.group(parent);
+  for i in 0..5u64 {
+    assert_eq!(
+      submit_anywhere(std::slice::from_ref(&p), b"unit").await,
+      i + 1
+    );
+  }
+  p.propose_split(child, 7, Bytes::from_static(&[2]))
+    .await
+    .expect("the split commits on the parent");
+
+  // A `SplitRefused` here IS the loss; the hold announces itself with the conflict cue.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let mut held = false;
+  while !held {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the fork reached no verdict in time"
+    );
+    while let Ok(ev) = lifecycle.try_recv() {
+      assert!(
+        !matches!(&ev, LifecycleEvent::SplitRefused { parent: pp, child: cc } if *pp == parent && *cc == child),
+        "THE LOSS: the fork was ABANDONED over an occupied id — the parent's fence lifted and \
+         the partition blob went with it"
+      );
+      held |= matches!(&ev, LifecycleEvent::SplitConflict { parent: pp, child: cc } if *pp == parent && *cc == child);
+    }
+    compio::time::sleep(Duration::from_millis(20)).await;
+  }
+  assert!(
+    handle.group(child).status().await.is_err(),
+    "no child endpoint was built over the squatter's stores"
+  );
+
+  handle.shutdown().await.expect("the multi host tears down");
 }

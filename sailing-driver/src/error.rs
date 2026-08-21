@@ -55,6 +55,25 @@ pub enum DriverError<I> {
   /// incarnation that would masquerade as recovered state. A durable engine is the roadmap cure.
   #[error("no stored state to restore for this group")]
   NoStoredState,
+  /// A fresh CREATE named a group the host's engine ALREADY holds stores for. Occupied stores are
+  /// recovered state, not a blank slate: building a term-0 endpoint over them would ack success
+  /// and then truncate durable history on the first append, and a fork's manufactured baseline
+  /// would overwrite a child that already exists durably. The host fails closed and touches
+  /// nothing — no endpoint is built and the stores are left exactly as they were.
+  ///
+  /// This is the SAFETY half of the contract: never overwrite recovered state. The LIVENESS half —
+  /// reconciling that state into a running group — belongs to the RESTART path, so a caller
+  /// holding an engine with existing stores enters through
+  /// [`restore_group`](crate::MultiHandle::restore_group). The two refusals are exact duals: this
+  /// one refuses stores that EXIST, [`NoStoredState`](Self::NoStoredState) refuses stores that do
+  /// not.
+  ///
+  /// Unreachable on a host that builds its own empty engine — there an occupied store always means
+  /// a live same-process group, and the container's own `Exists` refusal answers first. This
+  /// variant exists for the engine-accepting constructors, which can be handed the stores a
+  /// previous process left behind.
+  #[error("the host already holds stored state for this group")]
+  StoredStateExists,
   /// A user query (or failover-query) closure PANICKED while running on the driver thread. The
   /// panic is caught at the handle seam so the driver survives — on a multi host every other
   /// co-located group keeps running — and the caller receives this instead of a silently dropped
