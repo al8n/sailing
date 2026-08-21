@@ -1,0 +1,156 @@
+name: Multi-VOPR Deep Sweep
+
+# Exhaustive, fault-injecting fuzz of the MULTI-GROUP consensus core
+# (`sailing_simulation::run_multi_vopr`) across a WIDE band of deterministic seeds, under EVERY
+# reshape/lifecycle profile — composed crash + partition + lossy-network + membership churn +
+# split/merge/lifecycle events, with the per-tick safety-oracle suite (per-group safety, cross-talk,
+# one-identity, calm-window liveness, quiesce) asserting on EVERY tick. This is the multi-group twin
+# of `vopr-deep-sweep.yml`: far too slow for the per-commit gate (the fast, non-`#[ignore]`d bands in
+# `multi_vopr.rs` / `multi_vopr_profiles.rs` cover that in `ci.yml`), so the deep sweep runs on a
+# schedule + on demand, SHARDED across runners so the wall-clock stays reasonable.
+#
+# Determinism: every `run_multi_vopr(seed, ticks, profile)` is a pure function of
+# `(seed, ticks, profile)` with no wall-clock, no RNG, and no hash-iteration-order dependence — so it
+# is reproducible across platforms and opt levels. A failure prints `seed=<S> tick=<T>`; reproduce it
+# ANYWHERE with `run_multi_vopr(<S>, <ticks>, <profile>)`, which is exactly what a developer runs
+# locally to debug.
+#
+# Eight profiles, each its own `#[ignore]`d soak function with its own env prefix (so a CI job can
+# slice any one independently of the others) and — unlike the single-group sweep — its own default
+# tick budget baked into the test, NOT overridden here: there is deliberately no `ticks` input. The
+# four "deep" profiles (default, snapshot-heavy, reshape, merge) default to 40_000 ticks per seed,
+# while the phase-biased "storm" profiles concentrate their rare reshaping verbs into bursts and so
+# need far fewer ticks to be non-vacuous (split-storm, merge-storm, lifecycle default to 4_000;
+# mixed-reshape to 6_000). A shared tick count would either starve the deep profiles or waste hours on
+# the storm ones, so this workflow only slices SEEDS and leaves each soak's own default alone.
+#
+# Schedule ROTATION: a scheduled run shifts its band by `run_number * total_seeds`, so successive runs
+# sweep an ever-advancing window ([0,N), [N,2N), [2N,3N), …) — continuous coverage of NEW seeds instead
+# of re-running the same low band forever. A manual dispatch keeps the [0, total_seeds) band, a
+# reproducible regression sweep. (The per-commit `ci.yml` covers the fast bands on every push.)
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_seeds:
+        description: "Sweep seeds 0..total_seeds per profile, split across 4 shards (try 64 or 128)"
+        default: "64"
+        required: false
+  schedule:
+    # Weekly: Tuesday 05:29 UTC — offset from the single-group sweep's Monday 04:17 so the two deep
+    # sweeps don't stampede the runner pool on the same day.
+    - cron: "29 5 * * 2"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sweep:
+    name: shard ${{ matrix.shard }}/4 · ${{ matrix.profile.id }}
+    timeout-minutes: 240
+    strategy:
+      # Never cancel sibling shards/profiles on a failure — we want the FULL landscape of failing
+      # seeds in one run, not just the first.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+        profile:
+          - id: default
+            binary: multi_vopr
+            fn: soak_default_profile
+            prefix: MULTI_VOPR
+          - id: snapshot-heavy
+            binary: multi_vopr
+            fn: soak_snapshot_heavy_profile
+            prefix: MULTI_VOPR_SNAPSHOT
+          - id: reshape
+            binary: multi_vopr
+            fn: soak_reshape_profile
+            prefix: MULTI_VOPR_RESHAPE
+          - id: merge
+            binary: multi_vopr
+            fn: soak_merge_profile
+            prefix: MULTI_VOPR_MERGE
+          - id: split-storm
+            binary: multi_vopr_profiles
+            fn: soak_split_storm
+            prefix: MULTI_VOPR_SPLIT_STORM
+          - id: merge-storm
+            binary: multi_vopr_profiles
+            fn: soak_merge_storm
+            prefix: MULTI_VOPR_MERGE_STORM
+          - id: mixed-reshape
+            binary: multi_vopr_profiles
+            fn: soak_mixed_reshape
+            prefix: MULTI_VOPR_MIXED
+          - id: lifecycle
+            binary: multi_vopr_profiles
+            fn: soak_lifecycle_churn_reshape
+            prefix: MULTI_VOPR_LIFECYCLE
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-multi-vopr-sweep-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-multi-vopr-sweep-
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Compute this shard's seed slice and run the sweep
+        env:
+          TOTAL: ${{ github.event.inputs.total_seeds || '64' }}
+          SHARDS: "4"
+          SHARD: ${{ matrix.shard }}
+          EVENT: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
+          PREFIX: ${{ matrix.profile.prefix }}
+          BINARY: ${{ matrix.profile.binary }}
+          TEST_FN: ${{ matrix.profile.fn }}
+        run: |
+          set -euo pipefail
+          # SCHEDULE band ROTATION: a scheduled run advances the seed frontier by a fresh TOTAL each run
+          # (run_number * TOTAL), so successive runs sweep [0,TOTAL), [TOTAL,2·TOTAL), … rather than the same
+          # low band forever. Every other event (manual dispatch) keeps the [0, TOTAL) regression band. The
+          # 4 shards then split THIS run's band [BASE, BASE+TOTAL) — the same slice bounds feed every
+          # profile in this shard, since each profile's soak reads its seed range from its own env prefix.
+          if [ "$EVENT" = "schedule" ]; then
+            BASE=$(( RUN_NUMBER * TOTAL ))
+          else
+            BASE=0
+          fi
+          BAND_END=$(( BASE + TOTAL ))
+          # Ceil division so 4 shards always cover the band; the tail shard takes the remainder.
+          PER=$(( (TOTAL + SHARDS - 1) / SHARDS ))
+          START=$(( BASE + SHARD * PER ))
+          END=$(( START + PER ))
+          [ "$END" -gt "$BAND_END" ] && END=$BAND_END || true
+          if [ "$START" -ge "$END" ]; then
+            echo "::notice title=shard ${SHARD} (${PREFIX})::empty slice (START=${START} >= band end ${BAND_END}) — skipping"
+            exit 0
+          fi
+          echo "::notice title=shard ${SHARD} (${PREFIX})::sweeping seeds [${START}, ${END}) (band base ${BASE}) — ${BINARY}::${TEST_FN}, ticks at the soak's own default"
+          # Release build: the sweep is compute-bound; release is ~5-10x faster and finds the SAME
+          # bugs. Each (shard, profile) cell is one disjoint seed slice for that profile's own soak.
+          # `--ignored` is required (every soak is `#[ignore]`d); `--` separates libtest args.
+          env "${PREFIX}"_SEED_START=$START "${PREFIX}"_SEED_END=$END \
+            cargo test --release -p sailing-simulation --test "${BINARY}" "${TEST_FN}" -- --ignored --nocapture
+
+  # Single aggregate status: green iff EVERY (shard, profile) cell passed (a failed cell leaves `sweep`
+  # failed, so this job is skipped and the workflow reports failure). Gives one check to gate on / watch.
+  sweep-result:
+    name: multi-deep-sweep result
+    needs: sweep
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All Multi-VOPR deep-sweep shards passed."
