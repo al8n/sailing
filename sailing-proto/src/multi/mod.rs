@@ -457,8 +457,14 @@ pub enum MergeBlockedCause {
   /// lineage — so the cure advertisement is withheld, outcome-blind and fail-closed, and the
   /// park waits on the hosted replica's own lifecycle or the propagated terminal floor.
   CrossedHostedSource,
-  /// The union is absorbed and serving; its durability capture waits on a staged fork's
-  /// durability barrier. The fork conflict's resolution is the exit.
+  /// A staged fork holds the merge. Two shapes, one exit — the fork conflict's resolution:
+  /// the union is absorbed and serving while its durability capture waits on the TARGET's own fork
+  /// barrier, or the park has not folded at all because the SOURCE still owes a staged fork whose
+  /// child baseline is not yet locally durable (consuming it would destroy that child's only local
+  /// derivation). The second shape has no local exit when the fork's child id IS the merge target:
+  /// the fork waits on the occupant, the occupant is parked on this absorb, and the absorb waits on
+  /// the fork. That composition needs embedder action, which is why it is signalled rather than
+  /// silently resolved.
   ForkFence,
   /// The union is absorbed and serving; its durability capture waits on an undischarged abort
   /// obligation. The named source's thaw is the exit.
@@ -2553,7 +2559,17 @@ where
     // gate) can no longer tell the two moves apart. The exact dual of `propose_split` refusing a
     // freezing parent ([`SplitError::Frozen`]): split and freeze are mutually exclusive on a group.
     // TRANSIENT — the split applies, then the same freeze mints from the post-split counter.
-    if sep.split_in_flight() {
+    //
+    // The STAGED-FORK leg outlives that apply: until the child's baseline is locally durable, this
+    // source carries the child's only local derivation — its log, or (once a rebaseline has retired
+    // the log's replay) the queued fork's in-memory blob — and the absorb that follows a freeze
+    // DESTROYS the endpoint holding both. The source's split machinery is simply not finished, so
+    // the same refusal covers it. Host-local, and therefore only half a door: a sibling that
+    // already flushed the child's baseline sees no obligation and can commit the freeze from there,
+    // which is why the resolver's own fork holds — not this refusal — are the actual guarantee.
+    // Transient the same way: the obligation clears when the driver reports the child's baseline
+    // durable.
+    if sep.split_in_flight() || sep.fork_obligations_standing() {
       return Some(Err(MergeError::SplitInFlight));
     }
     // NB: a source with a target-role abort still in flight is deliberately NOT fenced here. Unlike
@@ -3668,6 +3684,31 @@ where
           if self.owes_a_drivable_thaw(&source) {
             continue;
           }
+          // THE STAGED-FORK LEG. The obligation is HOST-LOCAL — a sibling whose staged child's
+          // baseline already flushed sees none at all — so a freeze of this source can be proposed
+          // and committed elsewhere while it still stands HERE, and the local propose-time refusal
+          // never ran. Consuming the holder destroys the staged child's ONLY local derivation (the
+          // `Split` entry, or the queued fork's blob once a rebaseline retired the entry), and an
+          // under-replicated child plus a crash on this host would then lose it outright. So HOLD
+          // the park. Unlike the abort fence — whose clearing witness can ride ABOVE the park,
+          // which is why that one chains debts rather than waits — this clears when the DRIVER
+          // reports the CHILD's own baseline durable, independent of anything the park blocks: the
+          // hold is live, and the first crank after the release resolves. A parked target is never
+          // quiesce-eligible, so the park keeps being reached until then.
+          //
+          // The ONE composition with no local release is a fork whose child id IS this target: the
+          // fork waits on the occupant, the occupant is `MergeParked` on this very absorb, and the
+          // absorb waits here. Signalling it is deliberate — before the hold this shape silently
+          // DROPPED the split-away half at consumption, and a loud wedge an embedder can see is the
+          // strictly better failure until a release protocol for it exists.
+          if self
+            .groups
+            .get(&source)
+            .is_some_and(Endpoint::fork_obligations_standing)
+          {
+            self.note_merge_blocked(&tgid, &source, park_at, MergeBlockedCause::ForkFence);
+            continue;
+          }
           // THE INHERITED-DEBT LEG. A capture debt is HOST-LOCAL — this replica's fences
           // deferred the capture while siblings captured cleanly — so a foreign-led freeze can
           // legally commit this source's consumption while its debt still stands HERE: the
@@ -3997,6 +4038,20 @@ where
       // must not dissolve — dropping the obligation strands the upstream source. A decode-corrupt owed
       // id poisons the husk and holds.
       if self.owes_a_drivable_thaw(&gid) {
+        continue;
+      }
+      // THE STAGED-FORK LEG (the Resolve arm's, for the husk): the obligation is HOST-LOCAL, so the
+      // claimant that absorbed this lineage elsewhere — and wrote the terminal floor this dissolve
+      // keys on — never saw it. Retiring destroys the staged child's only local derivation, losing
+      // an under-replicated child to a crash here. It clears on the CHILD's own baseline flush,
+      // which nothing this dissolve blocks can delay, so the hold is live: the first crank after
+      // the release retires the husk. SILENT, unlike the Resolve arm's twin — a husk holds no park
+      // to key an observation on, and a conflicting fork already cued its own signal.
+      if self
+        .groups
+        .get(&gid)
+        .is_some_and(Endpoint::fork_obligations_standing)
+      {
         continue;
       }
       // THE INHERITED-DEBT LEG (the Resolve arm's, for the husk): the debt is HOST-LOCAL, so a

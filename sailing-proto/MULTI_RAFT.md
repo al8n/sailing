@@ -377,7 +377,17 @@ The five legs are the CLOSED product of the choreography's participant states �
   absorb of it until the thaw pass discharges the obligation.
 
 The pending-`CommitMerge` windows need no leg of their own: the absorb barrier holds the source
-`Frozen` and the target `MergeParked` throughout.
+`Frozen` and the target `MergeParked` throughout. A source that still owes a STAGED FORK is held the
+same two ways as an owed thaw — refused `SplitInFlight` at the freeze door, and its absorb (or husk
+dissolve) held every crank — because consuming it destroys the split-away half's only local
+derivation: the `Split` entry, or the queued fork's in-memory blob once a rebaseline has retired that
+entry (which clears the CAPTURE barrier while deliberately keeping the queue, so the hold keys on
+both). The obligation is host-local, so a sibling that already flushed the child's baseline can
+commit the consumption anyway, which is why the resolver's holds — not the door — are the guarantee.
+The one composition with no local release is a fork whose child id IS the merge target: the fork
+waits on the occupant, the occupant is `MergeParked` on this absorb, and the absorb waits on the
+fork. It is signalled `MergeBlockedCause::ForkFence` rather than resolved — the hold turns what was
+a silent drop of the split-away half into a wedge an embedder can see and act on.
 
 Recovery for a genuinely-DEAD participant is the embedder's catalog, exactly like any dead group:
 a frozen source or parked target is restored (or floored), and the ONE deliberate escape is an
