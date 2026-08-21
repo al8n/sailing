@@ -127,7 +127,6 @@ fn fork_boots_at_the_synthetic_baseline() {
     preloaded_sm(3),
     blob.clone(),
     None,
-    None,
     1,
     &mut log,
     &mut stable,
@@ -195,7 +194,6 @@ fn fork_admission_matches_create_group() {
       preloaded_sm(3),
       fork_blob(3),
       None,
-      None,
       1,
       &mut log,
       &mut stable
@@ -213,7 +211,6 @@ fn fork_admission_matches_create_group() {
       42,
       preloaded_sm(3),
       fork_blob(3),
-      None,
       None,
       1,
       &mut log,
@@ -234,7 +231,6 @@ fn fork_admission_matches_create_group() {
         42,
         preloaded_sm(3),
         fork_blob(3),
-        None,
         None,
         1,
         &mut log,
@@ -278,7 +274,6 @@ fn fork_refuses_boot_epoch_zero() {
       preloaded_sm(3),
       fork_blob(3),
       None,
-      None,
       0,
       &mut log,
       &mut stable
@@ -299,7 +294,6 @@ fn fork_refuses_boot_epoch_zero() {
       preloaded_sm(3),
       fork_blob(3),
       None,
-      None,
       0,
       &mut log,
       &mut stable
@@ -318,7 +312,6 @@ fn fork_refuses_boot_epoch_zero() {
     42,
     preloaded_sm(3),
     fork_blob(3),
-    None,
     None,
     1,
     &mut log,
@@ -357,7 +350,6 @@ fn create_rejects_the_reserved_terminal_generation() {
       42,
       preloaded_sm(3),
       fork_blob(3),
-      None,
       None,
       1,
       &mut log,
@@ -398,7 +390,6 @@ fn fork_refuses_used_stores_before_any_write() {
       42,
       preloaded_sm(3),
       fork_blob(3),
-      None,
       None,
       1,
       log,
@@ -464,7 +455,6 @@ fn fork_refuses_used_stores_before_any_write() {
       Prng::new(42),
       preloaded_sm(3),
       fork_blob(3),
-      None,
       None,
       1,
       &mut log,
@@ -592,7 +582,6 @@ fn fork_blob_is_authoritative_over_the_vessel() {
     preloaded_sm(5),
     fork_blob(9),
     None,
-    None,
     1,
     &mut log,
     &mut stable,
@@ -641,7 +630,6 @@ fn fork_with_a_corrupt_blob_poisons_only_that_group() {
     42,
     CountSm::default(),
     Bytes::from_static(&[1, 2, 3]),
-    None,
     None,
     1,
     &mut log7,
@@ -798,7 +786,6 @@ fn forked_group_elects_off_the_baseline() {
     preloaded_sm(4),
     fork_blob(4),
     None,
-    None,
     1,
     &mut la,
     &mut sa,
@@ -812,7 +799,6 @@ fn forked_group_elects_off_the_baseline() {
     43,
     preloaded_sm(4),
     fork_blob(4),
-    None,
     None,
     1,
     &mut lb,
@@ -886,7 +872,6 @@ fn fork_then_store_roundtrip_equals_restore() {
     42,
     preloaded_sm(6),
     fork_blob(6),
-    None,
     None,
     1,
     &mut log,
@@ -1363,7 +1348,6 @@ fn drive_forked_leader_and_fresh_joiner() -> ForkJoin {
     42,
     preloaded_sm(3),
     fork_blob(3),
-    None,
     None,
     1,
     &mut la,
@@ -1964,30 +1948,32 @@ fn committed_split_relays_a_group_fork() {
 
   // The relay: a typed GroupFork with the parent's voters remapped and the apply-derived blob.
   let fork = m.poll_pending_fork().expect("one fork relayed");
-  assert_eq!(fork.parent, 7);
-  assert_eq!(fork.child, 200);
-  assert_eq!(fork.child_gen, 0);
+  assert_eq!((*fork.parent()), 7);
+  assert_eq!((*fork.child()), 200);
+  assert_eq!(fork.child_gen(), 0);
   assert_eq!(
-    fork.parent_gen_after, 1,
+    fork.parent_gen_after(),
+    1,
     "first split bumps the lineage to 1"
   );
-  assert_eq!(fork.split_index, idx);
-  assert_eq!(fork.fsm.units, 2, "the forked half");
+  assert_eq!(fork.split_index(), idx);
+  assert_eq!(fork.fsm().units, 2, "the forked half");
   assert_eq!(
-    fork.blob,
+    *fork.blob(),
     fork_blob(2),
     "the apply-derived blob matches the half"
   );
-  assert_eq!(fork.config.id(), 1);
-  assert_eq!(fork.config.voters(), &[1u64]);
+  assert_eq!(fork.config().id(), 1);
+  assert_eq!(fork.config().voters(), &[1u64]);
   assert_eq!(
-    fork.config.snapshot_threshold(),
+    fork.config().snapshot_threshold(),
     1,
     "the child inherits the parent's local knobs"
   );
-  assert!(fork.config.pre_vote());
+  assert!(fork.config().pre_vote());
   assert_eq!(
-    fork.read_only, None,
+    fork.read_only(),
+    None,
     "a never-migrated parent hands the child no explicit mode"
   );
   assert!(m.poll_pending_fork().is_none(), "exactly one fork");
@@ -2105,15 +2091,19 @@ fn same_mint_split_noops_at_apply_and_conserves_state() {
     "3 - 2: the parent shrank ONCE (the stale mint must not shrink it again)"
   );
   let fork = m.poll_pending_fork().expect("the first fork relays");
-  assert_eq!((fork.child, fork.parent_gen_after), (200, 1));
-  assert_eq!(fork.fsm.units, 2, "child 1 holds the single given-up half");
+  assert_eq!(((*fork.child()), fork.parent_gen_after()), (200, 1));
+  assert_eq!(
+    fork.fsm().units,
+    2,
+    "child 1 holds the single given-up half"
+  );
   assert!(
     m.poll_pending_fork().is_none(),
     "the stale mint staged NO fork"
   );
   // Conservation: every unit is in exactly one of parent / child 1.
   assert_eq!(
-    m.group(&7).unwrap().state_machine().units + fork.fsm.units,
+    m.group(&7).unwrap().state_machine().units + fork.fsm().units,
     3
   );
 
@@ -2366,8 +2356,184 @@ fn an_occupied_child_id_holds_the_fork_until_the_gate_clears() {
   let fork = m
     .poll_pending_fork_with(&NoHold)
     .expect("the released fork materializes");
-  assert_eq!((fork.parent, fork.child), (7, 200));
-  assert!(!fork.blob.is_empty(), "the partition rode the hold intact");
+  assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
+  assert!(
+    !fork.blob().is_empty(),
+    "the partition rode the hold intact"
+  );
+}
+
+/// MEMBERSHIP COMES FROM THE COMMITTED SPLIT. The sealed door takes no config, so two replicas
+/// installing the same fork cannot land the child under different voter sets — the shape that would
+/// let one id carry two conflicting committed histories with every other input matching. Both
+/// containers derive the same config from the fork itself, and the only divergence from the
+/// committed one is the reshape-born knob forcing, applied inside the container on both.
+#[test]
+fn two_replicas_install_one_fork_under_identical_voter_sets() {
+  let voters = |m: &MultiRaft<u64, u64, SplitSm>| -> Vec<u64> {
+    m.group(&200)
+      .unwrap()
+      .conf_state()
+      .voters()
+      .iter()
+      .copied()
+      .collect()
+  };
+  let mut installed = Vec::new();
+  for seed in [43u64, 99] {
+    let (mut m, _log, _stable) = host_with_staged_fork(200);
+    let fork = m.poll_pending_fork_with(&NoHold).expect("relays");
+    // What the committed split says the child's membership is — identical on both replicas
+    // because the split rode the parent's totally-ordered log.
+    let committed: Vec<u64> = fork.config().voters().to_vec();
+    let (mut flog, mut fstable) = (VecLog::default(), AsyncStable::default());
+    m.create_group_from_relayed_fork(fork, Instant::ORIGIN, seed, 1, &mut flog, &mut fstable)
+      .expect("the sealed door installs");
+    assert_eq!(
+      voters(&m),
+      committed,
+      "the installed child's voters are the committed split's, not any caller's"
+    );
+    installed.push(voters(&m));
+  }
+  assert_eq!(
+    installed[0], installed[1],
+    "and both replicas agree — there is no caller-shaped input left to diverge on"
+  );
+  assert!(
+    installed[0].len() > 1,
+    "non-vacuous: the committed voter set is the parent's, not a sole-voter default"
+  );
+}
+
+/// THE POST-YIELD WINDOW. The pop ends the STAGED leg of the reservation, not the reservation:
+/// between the yield and the sealed install the child id still belongs to this committed split, and
+/// the caller-driven door must refuse it. Without that leg the id is briefly unclaimed, and a
+/// caller can install its own content there — which the genuine fork then finds hosted.
+#[test]
+fn a_yielded_but_uninstalled_forks_child_is_still_reserved() {
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  let fork = m
+    .poll_pending_fork_with(&NoHold)
+    .expect("the committed split relays");
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the staged leg ended at the pop — the reservation must not have ended with it"
+  );
+  assert!(m.split_reserved(&200), "the yielded leg holds the id");
+
+  let (mut clog, mut cstable) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    m.create_group_from_fork(
+      200,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      43,
+      SplitSm::default(),
+      Bytes::from_static(b"\x00"),
+      None,
+      1,
+      &mut clog,
+      &mut cstable,
+    ),
+    Err(CreateGroupError::SplitReserved),
+    "the public door refuses the id a yielded fork is on its way to install"
+  );
+  assert_eq!(
+    <VecLog as crate::LogStore>::last_index(&clog),
+    Index::ZERO,
+    "and refuses before any store write"
+  );
+
+  // The SEALED install still succeeds — the door that holds the container's own record is not
+  // fenced by the entry it is about to drop.
+  let (mut flog, mut fstable) = (VecLog::default(), AsyncStable::default());
+  m.create_group_from_relayed_fork(fork, Instant::ORIGIN, 44, 1, &mut flog, &mut fstable)
+    .expect("the sealed door installs the fork it was handed");
+  assert!(
+    !m.split_reserved(&200),
+    "and the entry is gone with it — a leaked one would squat the id for good"
+  );
+  assert!(m.contains_group(&200), "the child is hosted");
+}
+
+/// The other completion path releases the entry too: a fork abandoned TERMINALLY was never yielded,
+/// so nothing is left standing for it, and a caller that receives a fork and then abandons it
+/// releases explicitly. Either way the id ends up claimed by nothing.
+#[test]
+fn an_abandoned_fork_leaves_no_reservation_behind() {
+  // Terminal at the gate: the fork is consumed inside the container, never yielded.
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  let floored = TestGate::flooring(200, crate::MERGED_FLOOR);
+  assert!(m.poll_pending_fork_with(&floored).is_none());
+  assert_eq!(m.poll_split_refusal(), Some((7, 200)));
+  assert!(
+    !m.split_reserved(&200),
+    "a terminally abandoned fork holds nothing: neither leg stands"
+  );
+
+  // Yielded and then abandoned by the caller: the explicit release is what clears it.
+  let (mut m2, _l2, _s2) = host_with_staged_fork(201);
+  let fork = m2.poll_pending_fork_with(&NoHold).expect("relays");
+  assert!(m2.split_reserved(&201), "yielded, so reserved");
+  drop(fork);
+  m2.release_yielded_fork(&201);
+  assert!(
+    !m2.split_reserved(&201),
+    "the caller released what it will never install"
+  );
+}
+
+/// THE HELD → TERMINAL TRANSITION. A hold is not a verdict, and the fork proves it by surviving one
+/// and then answering the next gate honestly: held while the id is merely occupied, abandoned the
+/// moment the id's floor rises to the reserved terminal. This is the pin for the below-floor
+/// abandonment, because a wholly-refused child never registers a conservation pair — the sweep
+/// cannot see this, so the assertion has to.
+#[test]
+fn a_held_fork_terminalizes_when_its_floor_rises() {
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+
+  // HELD: the caller's stores are occupied, which says the id is spoken for and nothing more.
+  let occupied = TestGate::occupying(200);
+  assert!(m.poll_pending_fork_with(&occupied).is_none(), "held");
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_some(),
+    "the blob, the fence and the reservation all stand through a hold"
+  );
+  assert!(m.group(&7).unwrap().fork_obligations_standing());
+  assert_eq!(
+    m.poll_split_conflict(),
+    Some((7, 200)),
+    "one cue per episode"
+  );
+  assert_eq!(m.poll_split_conflict(), None);
+
+  // The SAME child id now answers at the reserved terminal — a floor that can never lift.
+  let floored = TestGate::flooring(200, crate::MERGED_FLOOR);
+  assert!(
+    m.poll_pending_fork_with(&floored).is_none(),
+    "a terminal floor yields nothing"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "and consumes the fork: the verdict is about the fork, not the moment"
+  );
+  assert!(
+    !m.group(&7).unwrap().fork_obligations_standing(),
+    "the parent's barrier resolved with it rather than standing forever"
+  );
+  assert_eq!(
+    m.poll_split_refusal(),
+    Some((7, 200)),
+    "exactly one refusal is queued"
+  );
+  assert_eq!(m.poll_split_refusal(), None, "and only one");
+  assert_eq!(
+    m.poll_split_conflict(),
+    None,
+    "the transition emits NO second cue — the park ended, it did not re-form"
+  );
 }
 
 /// A CHILD BELOW ITS FLOOR is a verdict about the fork — the generation is fixed at the split and
@@ -2683,9 +2849,10 @@ fn a_replayed_abandoned_fork_resurrects_without_the_mirrored_guard() {
   let fork = m
     .poll_pending_fork_with(&NoHold)
     .expect("no guard, no defense: the dead fork relays again");
-  assert_eq!((fork.parent, fork.child), (7, 200));
+  assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
   assert_eq!(
-    fork.fsm.units, 2,
+    fork.fsm().units,
+    2,
     "carrying the dead incarnation's half onto the id's clean slate"
   );
 }
@@ -2885,7 +3052,7 @@ fn the_mirrored_guard_folds_both_replayed_forks_after_an_ordered_abandonment() {
 /// the reserved id carrying a token it chose; the genuine fork then finds the id hosted, matches
 /// that token, and resolves REDUNDANT — discarding the child partition's only local copy.
 #[test]
-fn the_exported_container_refuses_a_forged_fork_in_both_reservation_windows() {
+fn the_exported_containers_public_fork_door_is_fenced_and_token_less() {
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   m.create_group(
@@ -2910,15 +3077,9 @@ fn the_exported_container_refuses_a_forged_fork_in_both_reservation_windows() {
   .unwrap()
   .unwrap();
 
-  // A token of the caller's own choosing, over the id the in-flight split owns.
-  let forged = ForkId::new(
-    Bytes::from_static(b"forged-parent"),
-    1,
-    Index::new(1),
-    Term::new(1),
-    Bytes::from_static(b"forged-child"),
-    0,
-  );
+  // A token of the caller's own choosing is no longer even EXPRESSIBLE at this door: the parameter
+  // is gone, so the public install is token-less by construction and nothing a caller supplies can
+  // wear a genuine fork's identity. What remains to prove is the reservation, in both windows.
   let (mut clog, mut cstable) = (VecLog::default(), AsyncStable::default());
   let refuse =
     |m: &mut MultiRaft<u64, u64, SplitSm>, clog: &mut VecLog, cstable: &mut AsyncStable| {
@@ -2931,7 +3092,6 @@ fn the_exported_container_refuses_a_forged_fork_in_both_reservation_windows() {
         SplitSm::default(),
         Bytes::from_static(b"\x00"),
         None,
-        Some(forged.clone()),
         1,
         clog,
         cstable,
@@ -2974,33 +3134,72 @@ fn the_exported_container_refuses_a_forged_fork_in_both_reservation_windows() {
   let fork = m
     .poll_pending_fork_with(&NoHold)
     .expect("the real fork materializes");
-  assert_eq!((fork.parent, fork.child), (7, 200));
+  assert_eq!((*fork.parent(), *fork.child()), (7, 200));
+  assert!(
+    m.split_reserved(&200),
+    "and the reservation OUTLIVES the yield: the pop ended the staged leg, not the id's claim, so \
+     the window between the yield and the sealed install is fenced too"
+  );
 }
 
-/// A target group's durable log carrying a committed `CommitMerge` naming `source` at index 1,
-/// plus whatever `closer` puts at `k + 1` (index 2) — the coordinate the abort window reads.
-/// `None` leaves the window OPEN (commit stops at k); `Some(kind)` commits index 2 too.
-fn parked_target_log(source: u64, closer: Option<crate::EntryKind>) -> (VecLog, AsyncStable) {
+/// One group's durable log that both SPLITS to `child` at index 4 and later COMMITS a merge
+/// absorbing `child` as its source at index 6 — the split-then-reunite shape, with the fork staged
+/// BELOW the park coordinate exactly as the drain-stop guarantees. `closer` is what sits at the
+/// park's `k + 1` (index 7): `None` leaves the window OPEN (commit stops at 6).
+fn split_then_absorb_log(child: u64, closer: Option<crate::EntryKind>) -> (VecLog, AsyncStable) {
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
   let mut source_bytes = Vec::new();
-  Data::encode(&source, &mut source_bytes);
+  Data::encode(&child, &mut source_bytes);
+  // `target_gen_after` must clear the bump the split at index 4 already made, or the apply-time
+  // lineage guard reads the commit as a stale mint and no-ops it instead of parking.
   let payload = crate::CommitMergePayload::new(
     Bytes::from(source_bytes.clone()),
     Index::new(2),
     Term::new(1),
     1,
-    1,
+    2,
   );
-  let mut buf = Vec::new();
-  crate::wire::encode_commit_merge_payload(&payload, &mut buf);
-  let mut log = VecLog::default();
-  let mut entries = std::vec![crate::Entry::new(
-    Term::new(1),
-    Index::new(1),
-    crate::EntryKind::CommitMerge,
-    Bytes::from(buf),
-  )];
+  let mut cbuf = Vec::new();
+  crate::wire::encode_commit_merge_payload(&payload, &mut cbuf);
+  let mut entries = std::vec![
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone()
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone()
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(3),
+      crate::EntryKind::Normal,
+      cmd.clone()
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
+      crate::EntryKind::Split,
+      split_entry_bytes(child, 0, 1, 2),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(5), crate::EntryKind::Normal, cmd),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(6),
+      crate::EntryKind::CommitMerge,
+      Bytes::from(cbuf),
+    ),
+  ];
   let commit = match closer {
-    None => Index::new(1),
+    None => Index::new(6),
     Some(kind) => {
       let data = if kind == crate::EntryKind::RollbackMerge {
         let p = crate::RollbackMergePayload::abort(Bytes::from(source_bytes), 1, 1);
@@ -3010,21 +3209,22 @@ fn parked_target_log(source: u64, closer: Option<crate::EntryKind>) -> (VecLog, 
       } else {
         Bytes::new()
       };
-      entries.push(crate::Entry::new(Term::new(1), Index::new(2), kind, data));
-      Index::new(2)
+      entries.push(crate::Entry::new(Term::new(1), Index::new(7), kind, data));
+      Index::new(7)
     }
   };
+  let mut log = VecLog::default();
   log.force_append(&entries);
   let mut stable = AsyncStable::default();
   stable.force_state(Term::new(1), Some(1u64), commit);
   (log, stable)
 }
 
-/// A container holding a parent (group 7) with a staged fork for child `child`, and a target
-/// (group 1) parked on a committed `CommitMerge` naming that same `child` as its absorbed source.
-/// The child itself is NOT hosted — the wedge's shape, with C removed before the freeze (a park
-/// formed after a removal is refused `SpokenFor`/`Frozen`, so the committed entries are replayed
-/// in rather than proposed).
+/// A container whose group 7 is BOTH the parent of a staged fork for `child` and the target parked
+/// on a committed `CommitMerge` absorbing that same `child` — the only shape in which abandoning
+/// the fork loses nothing. The child itself is not hosted: C was removed before the freeze (a park
+/// formed after a removal is refused `SpokenFor`/`Frozen`), so the committed entries are replayed
+/// in rather than proposed.
 fn fork_and_park_on_same_child(
   child: u64,
   closer: Option<crate::EntryKind>,
@@ -3034,7 +3234,7 @@ fn fork_and_park_on_same_child(
     std::collections::BTreeMap::new(),
     std::collections::BTreeSet::new(),
   );
-  let (mut plog, mut pstable) = split_survivor_log(child);
+  let (mut log, mut stable) = split_then_absorb_log(child, closer);
   m.restore_group(
     7,
     single_node_cfg(1),
@@ -3042,32 +3242,19 @@ fn fork_and_park_on_same_child(
     42,
     SplitSm::default(),
     1,
-    &mut plog,
-    &mut pstable,
+    &mut log,
+    &mut stable,
   )
   .unwrap();
   assert!(
     m.group(&7).unwrap().peek_pending_fork().is_some(),
     "the parent re-staged its fork"
   );
-  let (mut tlog, mut tstable) = parked_target_log(child, closer);
-  m.restore_group(
-    1,
-    single_node_cfg(1),
-    Instant::ORIGIN,
-    7,
-    SplitSm::default(),
-    1,
-    &mut tlog,
-    &mut tstable,
-  )
-  .unwrap();
   assert!(
-    m.group(&1).unwrap().pending_merge().is_some(),
-    "the target re-parked on the replayed CommitMerge"
+    m.group(&7).unwrap().pending_merge().is_some(),
+    "and re-parked on the replayed CommitMerge absorbing that same child"
   );
-  stores.0.insert(1, (tlog, tstable));
-  stores.0.insert(7, (plog, pstable));
+  stores.0.insert(7, (log, stable));
   (m, stores)
 }
 
@@ -3081,7 +3268,7 @@ fn fork_and_park_on_same_child(
 fn a_fork_for_a_latched_closed_parks_source_is_abandoned() {
   let (mut m, mut stores) = fork_and_park_on_same_child(200, Some(crate::EntryKind::Empty));
   assert!(
-    !m.group(&1)
+    !m.group(&7)
       .unwrap()
       .pending_merge()
       .unwrap()
@@ -3094,7 +3281,7 @@ fn a_fork_for_a_latched_closed_parks_source_is_abandoned() {
     "the source is unhosted, so nothing resolves — the pass only reads the window"
   );
   assert!(
-    m.group(&1)
+    m.group(&7)
       .unwrap()
       .pending_merge()
       .unwrap()
@@ -3127,6 +3314,81 @@ fn a_fork_for_a_latched_closed_parks_source_is_abandoned() {
   );
 }
 
+/// THE UNRELATED PARENT. The subsumption argument that licenses abandoning a fork is narrow: it
+/// rests on the park stopping THIS endpoint's drain at `k - 1`, so a fork staged here below the
+/// park predates the freeze and the absorbed union contains its half. An unrelated parent's
+/// committed split merely NAMES the same id — its child-half was never in that union and can never
+/// be recovered from it. Terminal there is data loss, so the arm HOLDS: the blob stays staged,
+/// diagnosably wedged, and every unit the split moved is still accounted for.
+#[test]
+fn an_unrelated_parents_fork_for_a_consumed_id_holds_rather_than_dropping_its_half() {
+  let (mut m, mut stores) = fork_and_park_on_same_child(200, Some(crate::EntryKind::Empty));
+  // Q: a DIFFERENT parent whose own committed split gives a NONZERO half to the same child id.
+  let (mut qlog, mut qstable) = split_survivor_log(200);
+  m.restore_group(
+    9,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    11,
+    SplitSm::default(),
+    1,
+    &mut qlog,
+    &mut qstable,
+  )
+  .unwrap();
+  stores.0.insert(9, (qlog, qstable));
+  let q_half = m
+    .group(&9)
+    .unwrap()
+    .peek_pending_fork()
+    .expect("Q staged its own fork")
+    .blob
+    .clone();
+  assert_eq!(q_half, fork_blob(2), "Q's half carries two units");
+  let q_units = m.group(&9).unwrap().state_machine().units;
+
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty()
+  );
+  assert!(
+    m.group(&7)
+      .unwrap()
+      .pending_merge()
+      .unwrap()
+      .window_closed()
+  );
+
+  // Group 7 IS the absorbing target and its fork predates the park: subsumed, so abandoned.
+  // Group 9 is not, so its fork is HELD — the union cannot contain what Q split away.
+  assert!(m.poll_pending_fork_with(&NoHold).is_none());
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the target's own fork was subsumed and abandoned"
+  );
+  assert_eq!(m.poll_split_refusal(), Some((7, 200)));
+  assert_eq!(
+    m.poll_split_refusal(),
+    None,
+    "and ONLY that one — Q's fork was not refused"
+  );
+  let held = m
+    .group(&9)
+    .unwrap()
+    .peek_pending_fork()
+    .expect("Q's fork is still staged, blob intact");
+  assert_eq!(held.blob, q_half, "with every unit it split away");
+  assert_eq!(
+    m.group(&9).unwrap().state_machine().units + 2,
+    q_units + 2,
+    "conservation across the verdict: Q kept its remainder and its half is still held"
+  );
+  assert!(
+    m.group(&9).unwrap().fork_obligations_standing(),
+    "the hold is diagnosable — Q still owes its staged fork"
+  );
+}
+
 /// THE M1 NEGATIVE. A park whose window is still OPEN is UNDECIDED: rollback deliberately races a
 /// parked commit, and an abort resurrects the source. Nothing may be abandoned on that evidence.
 /// Composed with the abort actually landing at `k + 1`: the fork is still staged when the source
@@ -3140,7 +3402,7 @@ fn an_open_park_abandons_nothing_and_the_abort_leaves_the_fork_staged() {
     "an open window resolves nothing"
   );
   assert!(
-    !m.group(&1)
+    !m.group(&7)
       .unwrap()
       .pending_merge()
       .unwrap()
@@ -3168,7 +3430,7 @@ fn an_open_park_abandons_nothing_and_the_abort_leaves_the_fork_staged() {
   let _ = m2.service_merge_applies(Instant::ORIGIN, &mut stores2);
   assert!(
     !m2
-      .group(&1)
+      .group(&7)
       .unwrap()
       .pending_merge()
       .is_some_and(|p| p.window_closed()),
@@ -3296,7 +3558,7 @@ fn a_matching_token_still_resolves_redundant_while_the_absorb_leg_stands() {
       .is_empty()
   );
   assert!(
-    m.group(&1)
+    m.group(&7)
       .unwrap()
       .pending_merge()
       .unwrap()
@@ -3327,7 +3589,7 @@ fn a_matching_token_still_resolves_redundant_while_the_absorb_leg_stands() {
 fn a_restored_park_comes_back_undecided() {
   let (mut m, mut stores) = fork_and_park_on_same_child(200, Some(crate::EntryKind::Empty));
   assert!(
-    !m.group(&1)
+    !m.group(&7)
       .unwrap()
       .pending_merge()
       .unwrap()
@@ -3341,7 +3603,7 @@ fn a_restored_park_comes_back_undecided() {
       .is_empty()
   );
   assert!(
-    m.group(&1)
+    m.group(&7)
       .unwrap()
       .pending_merge()
       .unwrap()
@@ -3557,19 +3819,20 @@ fn hosted_child_fork_parks_and_materializes_after_removal() {
   let fork = m
     .poll_pending_fork()
     .expect("removal unparks the fork for materialization");
-  assert_eq!((fork.parent, fork.child), (7, 200));
-  assert_eq!(fork.split_index, idx);
-  assert_eq!(fork.parent_gen_after, 1);
-  assert_eq!(fork.fsm.units, 2, "the parked half materializes intact");
-  assert_eq!(fork.blob, fork_blob(2));
+  assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
+  assert_eq!(fork.split_index(), idx);
+  assert_eq!(fork.parent_gen_after(), 1);
+  assert_eq!(fork.fsm().units, 2, "the parked half materializes intact");
+  assert_eq!(*fork.blob(), fork_blob(2));
   assert!(
-    !m.split_reserved(&200),
-    "the yield releases the reservation — this fork is now the id's one admitted writer"
+    m.split_reserved(&200),
+    "the yield ends the STAGED leg and starts the yielded one — this fork is the id's one \
+     admitted writer until it installs"
   );
   // Conservation across the resolution: every unit is in exactly one of parent / child — the
   // pre-split 3 plus the one the fence probe committed while parked.
   assert_eq!(
-    m.group(&7).unwrap().state_machine().units + fork.fsm.units,
+    m.group(&7).unwrap().state_machine().units + fork.fsm().units,
     4
   );
 
@@ -3725,7 +3988,7 @@ fn squatter_removal_purges_an_undelivered_conflict() {
   let fork = m
     .poll_pending_fork()
     .expect("removal unparks the fork for materialization");
-  assert_eq!((fork.parent, fork.child), (7, 200));
+  assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
   assert_eq!(
     m.peek_split_conflict(),
     None,
@@ -4391,10 +4654,13 @@ fn split_admission_race_parks_instead_of_dropping() {
   // No silent drop: removing the squatter materializes the full half — conservation exact.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survives the race");
-  assert_eq!((fork.parent, fork.child, fork.split_index), (7, 200, idx));
-  assert_eq!(fork.fsm.units, 2);
   assert_eq!(
-    m.group(&7).unwrap().state_machine().units + fork.fsm.units,
+    ((*fork.parent()), (*fork.child()), fork.split_index()),
+    (7, 200, idx)
+  );
+  assert_eq!(fork.fsm().units, 2);
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().units + fork.fsm().units,
     3
   );
 }
@@ -4436,7 +4702,7 @@ fn restore_seeds_the_replay_guard_from_durable_lineage() {
   let fork = m
     .poll_pending_fork()
     .expect("a replayed, never-relayed fork relays again");
-  assert_eq!((fork.child, fork.parent_gen_after), (200, 1));
+  assert_eq!(((*fork.child()), fork.parent_gen_after()), (200, 1));
 
   // Crash shape B (row 4): the durable snapshot ALREADY CARRIES the split's bump (shape_gen 1
   // at a boundary past it), and the tail replays a stale same-gen retry duplicate. The
@@ -4499,7 +4765,6 @@ fn fork_baseline_meta_carries_lineage_and_read_mode() {
     preloaded_sm(5),
     fork_blob(5),
     Some(crate::ReadOnlyOption::Safe),
-    None,
     1,
     &mut log,
     &mut stable,
@@ -4738,7 +5003,7 @@ fn recreated_squatter_at_higher_lineage_stays_parked() {
   let fork = m
     .poll_pending_fork()
     .expect("the squatter's own fork still yields");
-  assert_eq!((fork.parent, fork.child), (200, 300));
+  assert_eq!(((*fork.parent()), (*fork.child())), (200, 300));
   assert!(m.poll_pending_fork().is_none());
   assert!(
     m.group(&7).unwrap().peek_pending_fork().is_some(),
@@ -4827,9 +5092,9 @@ fn below_lineage_squatter_stays_parked() {
   let fork = m
     .poll_pending_fork()
     .expect("removal unparks the fork for materialization");
-  assert_eq!((fork.parent, fork.child), (7, 200));
-  assert_eq!(fork.child_gen, 1, "the minted lineage rides the yield");
-  assert_eq!(fork.fsm.units, 2, "the held half materializes intact");
+  assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
+  assert_eq!(fork.child_gen(), 1, "the minted lineage rides the yield");
+  assert_eq!(fork.fsm().units, 2, "the held half materializes intact");
 }
 
 #[test]
@@ -5313,7 +5578,7 @@ fn commit_merge_defers_a_target_reshaping_by_a_split() {
   }
   assert!(!m.group(&1).unwrap().split_in_flight(), "the split applied");
   let fork = m.poll_pending_fork().expect("the fork relays out");
-  assert_eq!(fork.child, 3);
+  assert_eq!((*fork.child()), 3);
   m.lift_fork_barrier(&1, split_idx);
   while m.poll_event().is_some() {}
 
@@ -5389,7 +5654,7 @@ fn prepare_merge_defers_a_source_reshaping_by_a_split() {
   }
   assert!(!m.group(&2).unwrap().split_in_flight());
   let fork = m.poll_pending_fork().expect("the fork relays out");
-  assert_eq!(fork.child, 3);
+  assert_eq!((*fork.child()), 3);
   // THE BARRIER HALF, between the fork's materialization and its baseline's durability: the
   // source's log is still the child's only local recovery derivation, and the absorb behind this
   // freeze would consume it. Same refusal — the source's split machinery is not finished.
@@ -5667,7 +5932,7 @@ fn rollback_merge_defers_a_target_reshaping_by_a_split() {
   }
   assert!(!m.group(&1).unwrap().split_in_flight(), "the split applied");
   let fork = m.poll_pending_fork().expect("the fork relays out");
-  assert_eq!(fork.child, 3);
+  assert_eq!((*fork.child()), 3);
   m.lift_fork_barrier(&1, split_idx);
   while m.poll_event().is_some() {}
 
@@ -11742,7 +12007,7 @@ fn a_foreign_led_absorb_of_a_debtor_discharges_the_inherited_debt() {
   // fork yields, and the driver's flush report lifts the barrier.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
   assert!(
     m.group(&1).unwrap().capture_debt().is_some(),
     "the debt is still live at the consumption: the resolver runs ahead of the debt pass"
@@ -11804,7 +12069,7 @@ fn a_husked_debtor_retires_with_its_inherited_debt_discharged() {
   // log is that child's only local recovery derivation. Release it as the driver would.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
   assert!(
     m.group(&1).unwrap().capture_debt().is_some(),
     "the debt is still live at the retirement: the husk dissolve runs ahead of the debt pass"
@@ -11906,8 +12171,8 @@ fn a_sources_standing_fork_barrier_holds_its_consumption() {
   // releases it — the very next crank consumes the source.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  assert_eq!(fork.split_index, split_idx);
-  m.lift_fork_barrier(&1, fork.split_index);
+  assert_eq!(fork.split_index(), split_idx);
+  m.lift_fork_barrier(&1, fork.split_index());
   let resolutions = m.service_merge_applies(d3, &mut stores);
   assert_eq!(
     resolutions,
@@ -11955,8 +12220,8 @@ fn a_husks_standing_fork_barrier_holds_its_retirement() {
 
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  assert_eq!(fork.split_index, split_idx);
-  m.lift_fork_barrier(&1, fork.split_index);
+  assert_eq!(fork.split_index(), split_idx);
+  m.lift_fork_barrier(&1, fork.split_index());
   assert_eq!(
     m.service_merge_applies(d, &mut stores),
     std::vec![MergeResolution::Retired { source: 1 }],
@@ -12090,7 +12355,7 @@ fn a_rebaselined_queued_fork_still_holds_its_parents_consumption() {
   // crank consumes the source.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  assert_eq!(fork.split_index, split_idx);
+  assert_eq!(fork.split_index(), split_idx);
   assert!(
     !m.group(&1).unwrap().fork_obligations_standing(),
     "the relay emptied the queue"
@@ -12283,7 +12548,7 @@ fn a_deferred_absorb_chains_the_consumed_debtors_debts() {
   // release it so the abort fence on the TARGET is the only fence this arm still classifies on.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
   assert!(
     m.group(&1).unwrap().capture_debt().is_some(),
     "the debt is still live at the consumption: the resolver runs ahead of the debt pass"
@@ -12604,7 +12869,7 @@ fn a_parked_fork_defers_the_absorb_capture_as_a_debt() {
   // releases the barrier — the very next crank stages the capture and surfaces `Merged`.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the wait");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
   let resolutions = m.service_merge_applies(d, &mut stores);
   assert_eq!(
     resolutions,
@@ -12710,7 +12975,7 @@ fn a_crash_inside_the_debt_window_re_parks_and_converges() {
   // The fork yields in this incarnation; the flush report lifts the barrier and the debt
   // discharges — the crashed and uncrashed runs converge on the same end state.
   let fork = m2.poll_pending_fork().expect("the replayed fork yields");
-  m2.lift_fork_barrier(&1, fork.split_index);
+  m2.lift_fork_barrier(&1, fork.split_index());
   let resolutions = m2.service_merge_applies(now, &mut stores);
   assert_eq!(
     resolutions,
@@ -12734,7 +12999,7 @@ fn a_debt_holding_target_refuses_further_reshape_verbs() {
   // probe below must reach the DEBT's refusal.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the wait");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
 
   // Named counterparts for the refused verbs: 3 as a would-be source into 1, and 0 as a
   // would-be target of 1 (merges run higher-id into lower-id, so the source-side probe needs
@@ -12786,7 +13051,7 @@ fn an_ordinary_staged_capture_discharges_the_debt() {
 
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the wait");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
 
   // One storage crank after the lift: the threshold capture stages (threshold 1, applied >= k)
   // and its completion is still pending when the service runs.
@@ -12874,7 +13139,7 @@ fn a_debt_names_its_source_at_every_lifecycle_surface() {
   // The discharge releases every surface.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived the wait");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
   assert_eq!(
     m.service_merge_applies(d, &mut stores),
     std::vec![MergeResolution::Merged {
@@ -13466,7 +13731,7 @@ fn a_same_crank_debt_discharge_purges_the_queued_signal() {
 
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
   let resolutions = m.service_merge_applies(d, &mut stores);
   assert!(
     resolutions.iter().any(|r| matches!(
@@ -13972,7 +14237,7 @@ fn a_second_committed_absorb_holds_behind_a_standing_debt() {
   // The first debt's discharge releases the hold; the second park then takes its own course.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survived");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
   let resolutions = m.service_merge_applies(d, &mut stores);
   assert!(
     resolutions.iter().any(|r| matches!(
@@ -14011,7 +14276,7 @@ fn a_split_inside_the_debt_window_fences_the_discharge() {
   // The ORIGINAL fence lifts; the in-window fork's barrier must keep fencing the discharge.
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m.poll_pending_fork().expect("the original fork");
-  m.lift_fork_barrier(&1, fork.split_index);
+  m.lift_fork_barrier(&1, fork.split_index());
   assert!(
     m.service_merge_applies(d, &mut stores).is_empty(),
     "the in-window fork's replay entry sits above the boundary; a boundary-keyed fence would \

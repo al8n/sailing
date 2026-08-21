@@ -350,7 +350,6 @@ where
     fsm: F,
     snapshot: bytes::Bytes,
     read_only: Option<crate::ReadOnlyOption>,
-    fork_id: Option<crate::ForkId>,
     boot_epoch: u64,
     generation: u64,
     floors: &impl FloorStore<G>,
@@ -376,9 +375,10 @@ where
       return Err(CreateGroupError::SplitReserved);
     }
     let key = gid.cheap_clone();
+    // Token-less by construction: the core door no longer accepts caller provenance, so nothing a
+    // caller supplies can wear a genuine fork's identity (see `MultiRaft::create_group_from_fork`).
     self.multi.create_group_from_fork(
-      gid, generation, config, now, seed, fsm, snapshot, read_only, fork_id, boot_epoch, log,
-      stable,
+      gid, generation, config, now, seed, fsm, snapshot, read_only, boot_epoch, log, stable,
     )?;
     self.purge_unknown_signal(&key);
     // Same cap-raise as `create_group`: the forked group widens the tracked-peer union.
@@ -400,13 +400,14 @@ where
   /// partition. Two committed forks racing one child need no fence between them either — the first
   /// installs, and the second parks on the hosted child under provenance.
   ///
-  /// `config` is the child's boot config after the caller's reshape-birth transform; every other
-  /// input is taken from the fork itself, so no caller-supplied token can reach the baseline.
+  /// EVERY input is taken from the fork itself, the boot config included: membership comes from the
+  /// committed split, never from the caller, so two hosts cannot install one child id under
+  /// disjoint voter sets. The reshape-born knob forcing is applied inside the container, so it is
+  /// applied identically on every replica.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_relayed_fork<L, S>(
     &mut self,
     fork: crate::GroupFork<G, I, F>,
-    config: Config<I>,
     now: impl Into<Now>,
     seed: u64,
     boot_epoch: u64,
@@ -419,25 +420,16 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
-    validate_floor(floors.floor(&fork.child), fork.child_gen)?;
-    if self.retired.contains(&fork.child) {
+    validate_floor(floors.floor(fork.child()), fork.child_gen())?;
+    if self.retired.contains(fork.child()) {
       return Err(CreateGroupError::Retired);
     }
-    let key = fork.child.cheap_clone();
-    self.multi.create_group_from_fork_unreserved(
-      fork.child,
-      fork.child_gen,
-      config,
-      now,
-      seed,
-      fork.fsm,
-      fork.blob,
-      fork.read_only,
-      Some(fork.fork_id),
-      boot_epoch,
-      log,
-      stable,
-    )?;
+    let key = fork.child().cheap_clone();
+    // The fork is handed on WHOLE: the core door destructures it, so nothing between the yield and
+    // the baseline can substitute a field.
+    self
+      .multi
+      .create_group_from_relayed_fork(fork, now, seed, boot_epoch, log, stable)?;
     self.purge_unknown_signal(&key);
     // Same cap-raise as the public door: the forked group widens the tracked-peer union.
     self.bridge.raise_max_connections(self.effective_cap());
@@ -513,28 +505,6 @@ where
   #[must_use]
   pub fn is_retired(&self, gid: &G) -> bool {
     self.retired.contains(gid)
-  }
-
-  /// Every gate [`create_group_from_fork`](Self::create_group_from_fork) applies BEFORE it
-  /// consumes the child's state machine and blob — floor, tombstone, split reservation, then the
-  /// container's own — run against the same state in the same order. A relay asks this FIRST so a
-  /// refusal reaches it while the fork is still whole: `Ok`, with nothing mutated in between,
-  /// means the admission cannot refuse.
-  pub fn fork_admission_check(
-    &self,
-    gid: &G,
-    generation: u64,
-    config: &Config<I>,
-    floors: &impl FloorStore<G>,
-  ) -> Result<(), CreateGroupError> {
-    validate_floor(floors.floor(gid), generation)?;
-    if self.retired.contains(gid) {
-      return Err(CreateGroupError::Retired);
-    }
-    if self.multi.split_reserved(gid) {
-      return Err(CreateGroupError::SplitReserved);
-    }
-    self.multi.fork_admission_check(gid, generation, config)
   }
 
   /// Fail-stop the addressed group because a user QUERY closure panicked mid-read against its state
@@ -1089,6 +1059,13 @@ where
   /// only source; mirror it beside the removal's floor write.
   pub fn poll_relay_guard_advance(&mut self) -> Option<(G, u64)> {
     self.multi.poll_relay_guard_advance()
+  }
+
+  /// Release a YIELDED fork's reservation without installing it (see
+  /// [`MultiRaft::release_yielded_fork`]) — for a caller that received a fork and then abandoned
+  /// it. The install releases the entry itself, so this is only for the abandon path.
+  pub fn release_yielded_fork(&mut self, child: &G) {
+    self.multi.release_yielded_fork(child);
   }
 
   /// Whether `gid`'s fork relay still owes something — a held head fork or an undelivered

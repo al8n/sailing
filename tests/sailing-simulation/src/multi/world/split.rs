@@ -185,11 +185,11 @@ impl MultiWorld {
         // FIRST confirmation only. The purge is idempotent by itself, but a merge into the parent
         // between two hosts' drains can legitimately anchor a key at or above the point — a
         // reacquisition — and a second pass would strip that new anchor away.
-        if !self.partitioned_splits.contains(&fork.child)
-          && let Some(point) = self.pending_splits.get(&fork.child).map(|p| p.point)
+        if !self.partitioned_splits.contains(&fork.child())
+          && let Some(point) = self.pending_splits.get(&fork.child()).map(|p| p.point)
         {
-          self.partitioned_splits.insert(fork.child);
-          if let Some(meta) = self.groups.get_mut(&fork.parent) {
+          self.partitioned_splits.insert(*fork.child());
+          if let Some(meta) = self.groups.get_mut(fork.parent()) {
             for (_, values) in &mut meta.fold_baselines {
               values.retain(|key, _| *key < point);
             }
@@ -200,7 +200,7 @@ impl MultiWorld {
         // catalog gate: a retired id holds the fork, a below-floor generation abandons it. What
         // reaches here has passed both, so this is the MATERIALIZE arm — it wires the child HERE — exact knowledge that the fork resolved, no
         // inference: clear its fence right at the wire (#110).
-        let (materialized_parent, materialized_child) = (fork.parent, fork.child);
+        let (materialized_parent, materialized_child) = (*fork.parent(), *fork.child());
         self.register_split_child(&fork);
         self.wire_fork_replica(node, fork);
         self.clear_fork_fence(node, materialized_parent, materialized_child);
@@ -292,15 +292,15 @@ impl MultiWorld {
   /// floored at the fork baseline, and the conservation pair. Later materializations of the
   /// same fork on other nodes find the child registered and only wire their replica.
   fn register_split_child(&mut self, fork: &sailing_proto::GroupFork<u64, u64, LogSm>) {
-    if self.groups.contains_key(&fork.child) {
+    if self.groups.contains_key(&fork.child()) {
       return;
     }
     let pending = self
       .pending_splits
-      .remove(&fork.child)
-      .unwrap_or_else(|| panic!("fork for child {} without a proposed split", fork.child));
+      .remove(&fork.child())
+      .unwrap_or_else(|| panic!("fork for child {} without a proposed split", fork.child()));
     let parent_led = Self::ledger_id(self.generation_of(pending.parent), pending.parent);
-    let child_led = Self::ledger_id(fork.child_gen, fork.child);
+    let child_led = Self::ledger_id(fork.child_gen(), *fork.child());
     // The conservation ASSIGNMENT follows the instruction rule, not the population snapshot:
     // `LogSm::split` moves EXACTLY the at-or-above-point cells of the parent's record, which
     // can include keys the propose-time population no longer carried — an earlier
@@ -312,12 +312,12 @@ impl MultiWorld {
     // the population slice keeps assigned-but-never-written keys judged. The WRITABLE
     // population stays the propose-time slice: parked keys remain unroutable.
     let mut assigned = pending.child_keys.clone();
-    assigned.extend(fork.fsm.applied().iter().filter_map(|(_, cmd)| {
+    assigned.extend(fork.fsm().applied().iter().filter_map(|(_, cmd)| {
       super::super::decode_gkv(cmd)
         .map(|(_, key, _)| key)
         .filter(|key| *key >= pending.point)
     }));
-    let voters: BTreeSet<u64> = fork.config.voters().iter().copied().collect();
+    let voters: BTreeSet<u64> = fork.config().voters().iter().copied().collect();
     // The child's GENESIS fold anchor (see [`lifecycle::GroupMeta::fold_baselines`]): the
     // inherited cells keep the PARENT's log indices and the PARENT's tag, so neither the child's
     // index-bounded reconstruction nor its tag filter can reach them — yet they are the child's
@@ -327,7 +327,7 @@ impl MultiWorld {
     // anchor uses — and, symmetrically with it, over the SPLICED content itself, so the map's
     // keys are exactly what physically arrived here and nothing wider.
     let mut genesis: BTreeMap<u16, u64> = BTreeMap::new();
-    for (_, cmd) in fork.fsm.applied() {
+    for (_, cmd) in fork.fsm().applied() {
       if let Some((_, key, value)) = super::super::decode_gkv(cmd) {
         let slot = genesis.entry(key).or_default();
         *slot = (*slot).max(value);
@@ -348,10 +348,10 @@ impl MultiWorld {
       })
       .unwrap_or_default();
     self.groups.insert(
-      fork.child,
+      *fork.child(),
       lifecycle::GroupMeta {
         voters,
-        generation: fork.child_gen,
+        generation: fork.child_gen(),
         carried_tags,
         keys: pending.child_keys.clone(),
         // Every replica of this incarnation opens with the same inherited record, whichever
@@ -361,7 +361,7 @@ impl MultiWorld {
         // snapshot-wired latecomer. Group-level here is what keeps the cross-talk floor
         // independent of HOW a replica arrived (see `cross_talk_sweep` for why the count
         // stays sound once onward splits shrink the inherited prefix).
-        fork_baseline: fork.fsm.applied().len(),
+        fork_baseline: fork.fsm().applied().len(),
         fold_baselines: if genesis.is_empty() {
           Vec::new()
         } else {
@@ -378,13 +378,13 @@ impl MultiWorld {
     let mut checker = Checker::new();
     checker.register_fork_baseline(sailing_proto::FORK_BASE_INDEX.get());
     assert!(
-      self.checkers.insert(fork.child, checker).is_none(),
+      self.checkers.insert(*fork.child(), checker).is_none(),
       "register_split_child: child {} already had a checker",
-      fork.child
+      fork.child()
     );
     self.splits_applied += 1;
     self.splits.insert(
-      fork.child,
+      *fork.child(),
       SplitRecord {
         parent_led,
         child_led,
@@ -402,20 +402,23 @@ impl MultiWorld {
   /// opening history — a snapshot-wired latecomer gets the identical treatment without ever
   /// passing through this path.
   fn wire_fork_replica(&mut self, node: u64, fork: sailing_proto::GroupFork<u64, u64, LogSm>) {
-    let child = fork.child;
+    let child = *fork.child();
     // Record the parent's DURABLE relay lineage on this node — mirroring a real driver's
-    // `engine.set_group_gen(&parent, fork.parent_gen_after)` in its fork drain — so a later restart
+    // `engine.set_group_gen(&parent, fork.parent_gen_after())` in its fork drain — so a later restart
     // restores the container's relay guard past this now-materialized fork (see `relayed_lineage`).
     {
-      let e = self.relayed_lineage.entry((node, fork.parent)).or_insert(0);
-      *e = (*e).max(fork.parent_gen_after);
+      let e = self
+        .relayed_lineage
+        .entry((node, *fork.parent()))
+        .or_insert(0);
+      *e = (*e).max(fork.parent_gen_after());
     }
     // Fresh stores in the world's configured mode (async under the merge profiles), so a fork-born
     // child's stores match every other replica's rather than silently reverting to synchronous.
     let (fresh_log, fresh_stable) = self.fresh_stores(node, child);
     self.logs.insert((node, child), fresh_log);
     self.stables.insert((node, child), fresh_stable);
-    self.configs.insert((node, child), fork.config.clone());
+    self.configs.insert((node, child), fork.config().clone());
     self.member_view.insert((node, child), true);
     *self.restarts.entry((node, child)).or_insert(0) += 1;
     // The fork boots at the node's next boot epoch (strictly above every prior incarnation on
@@ -425,34 +428,23 @@ impl MultiWorld {
       *e += 1;
       *e
     };
+    // THE SEALED DOOR, handed the fork WHOLE: the container destructures it internally, so the
+    // child id, the half, the blob and the provenance token that reach the baseline are exactly
+    // the ones it minted. The bookkeeping this host still needs is read off accessors first.
+    let (parent, split_at) = (*fork.parent(), fork.split_index());
     let log = self.logs.get_mut(&(node, child)).expect("fresh log");
     let stable = self.stables.get_mut(&(node, child)).expect("fresh stable");
     self
       .hosts
       .get_mut(&node)
       .expect("host exists")
-      .create_group_from_fork(
-        child,
-        fork.child_gen,
-        fork.config,
-        self.now,
-        self.seed ^ node,
-        fork.fsm,
-        fork.blob,
-        fork.read_only,
-        // The child's provenance token rides its manufactured baseline, so every replica — this
-        // one and any snapshot-wired latecomer — reports the same origin.
-        Some(fork.fork_id),
-        epoch,
-        log,
-        stable,
-      )
+      .create_group_from_relayed_fork(fork, self.now, self.seed ^ node, epoch, log, stable)
       .unwrap_or_else(|e| panic!("fork of group {child} on node {node}: {e:?}"));
     self
       .hosts
       .get_mut(&node)
       .expect("host exists")
-      .lift_fork_barrier(&fork.parent, fork.split_index);
+      .lift_fork_barrier(&parent, split_at);
   }
 
   /// The ORACLE-ALIGNED applied record for `(node, gid)`:

@@ -379,7 +379,7 @@ impl Mini {
         };
         forked = true;
         produced = true;
-        let (parent, child, split_index) = (fork.parent, fork.child, fork.split_index);
+        let (parent, child, split_index) = (*fork.parent(), *fork.child(), fork.split_index());
         self
           .stores
           .insert((node, child), (MemLog::new(), MemStable::new()));
@@ -388,27 +388,13 @@ impl Mini {
           *e += 1;
           *e
         };
-        let cfg = self.chunked(fork.config);
         let seed = self.seed_for(node);
         let (log, stable) = self.stores.get_mut(&(node, child)).unwrap();
         self
           .hosts
           .get_mut(&node)
           .unwrap()
-          .create_group_from_fork(
-            child,
-            fork.child_gen,
-            cfg,
-            now,
-            seed,
-            fork.fsm,
-            fork.blob,
-            fork.read_only,
-            Some(fork.fork_id),
-            epoch,
-            log,
-            stable,
-          )
+          .create_group_from_relayed_fork(fork, now, seed, epoch, log, stable)
           .expect("fork materialization");
         self
           .hosts

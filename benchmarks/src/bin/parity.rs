@@ -1013,25 +1013,12 @@ impl ReshapeHost {
         progressed = true;
         self.boot_epoch += 1;
         let epoch = self.boot_epoch;
-        let (parent, child, split_index) = (fork.parent, fork.child, fork.split_index);
+        let (parent, child, split_index) = (*fork.parent(), *fork.child(), fork.split_index());
         self.stores.insert(child, (MemLog::new(), MemStable::new()));
         let (log, stable) = self.stores.get_mut(&child).expect("child stores");
         self
           .host
-          .create_group_from_fork(
-            child,
-            fork.child_gen,
-            fork.config,
-            now,
-            RESHAPE_SEED,
-            fork.fsm,
-            fork.blob,
-            fork.read_only,
-            Some(fork.fork_id),
-            epoch,
-            log,
-            stable,
-          )
+          .create_group_from_relayed_fork(fork, now, RESHAPE_SEED, epoch, log, stable)
           .expect("fork materialization");
         self.host.lift_fork_barrier(&parent, split_index);
       }
