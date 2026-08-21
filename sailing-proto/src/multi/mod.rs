@@ -1311,6 +1311,26 @@ where
     gid.encode(&mut bytes);
     self.groups.values().any(|ep| ep.split_reserves(&bytes))
   }
+
+  /// Every admission gate [`create_group_from_fork`](Self::create_group_from_fork) applies
+  /// BEFORE it consumes the child's state machine and blob, run against the same state and in the
+  /// same order — so a relay can learn its verdict while it can still HOLD the fork. `Ok` here and
+  /// an unchanged container means that call cannot refuse.
+  ///
+  /// The store-shape gate is deliberately absent: a fork installs into stores the caller just
+  /// created, and a caller that finds them occupied has already stopped.
+  pub fn fork_admission_check(
+    &self,
+    gid: &G,
+    generation: u64,
+    config: &Config<I>,
+  ) -> Result<(), CreateGroupError>
+  where
+    I: NodeId,
+  {
+    validate_working_generation(generation)?;
+    validate_new_group(&self.groups, &self.host_id, gid, config)
+  }
 }
 
 // The aggregate scheduling surface, split from the block above because `Endpoint::poll_timeout`

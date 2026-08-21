@@ -11,7 +11,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
-use common::{CountSm, TestCa, TrapSm};
+use common::{CountSm, DelegatingEngine, EngineWatch, TestCa, TrapSm};
 use sailing_proto::{ClusterId, ConfChange, ConfChangeType, Config, Data, Index, Role};
 use sailing_reactor::{
   DriverConfig, DriverError, GroupBlueprint, GroupHandle, LifecycleEvent, MultiHandle,
@@ -1930,4 +1930,30 @@ async fn a_courtesy_snapshot_cures_a_removed_peer_at_default_flags_over_quic() {
     Role::Leader,
     "the cured peer never leads the group it was removed from"
   );
+}
+
+/// Compile-level proof that the ENGINE SEAM is publicly reachable on THIS surface: from a crate
+/// that can see only `sailing-reactor`'s public API, a foreign `MultiEngine` binds this host. The
+/// loopback suites above already prove the host runs, so this is never invoked — what it pins is
+/// that `bind_with_engine` exists, is public, and accepts an engine this crate built itself.
+#[allow(dead_code)]
+async fn a_foreign_engine_binds_this_host(
+  ca: &TestCa,
+  id: u64,
+  addr: SocketAddr,
+  watch: std::sync::Arc<EngineWatch>,
+) -> (
+  MultiReactorQuicDriver<TokioRuntime, u64, u64, CountSm, DelegatingEngine>,
+  MultiHandle<u64, u64, CountSm>,
+) {
+  MultiReactorQuicDriver::bind_with_engine(
+    addr,
+    ca.options(id, &cluster()),
+    cluster(),
+    Vec::new(),
+    DriverConfig::default(),
+    DelegatingEngine::new(watch),
+  )
+  .await
+  .expect("the host binds over a foreign engine")
 }

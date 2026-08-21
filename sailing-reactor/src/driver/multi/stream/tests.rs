@@ -1063,7 +1063,7 @@ async fn a_capture_failed_merge_fails_the_source_routing_instead_of_hanging() {
     "the source's stores must be preserved, not dropped"
   );
   assert_ne!(
-    driver.engine.group_floor(&2),
+    sailing_proto::FloorStore::floor(&driver.engine, &2),
     sailing_proto::MERGED_FLOOR,
     "the source must NOT be terminally floored — that would bury the union"
   );
@@ -1575,5 +1575,79 @@ async fn a_harvest_of_one_latched_routing_fail_stops_every_hosted_group() {
     survived.is_empty(),
     "the harvest left a latch standing on {survived:?}: it must drain EVERY routing, not stop at the \
      first to fire — no Routing may outlive its verdict"
+  );
+}
+
+/// ONE FLOOR AUTHORITY, pinned where the command batch makes it observable.
+///
+/// The run loop drains SEVERAL commands per storage crank, so a removal's floor is STAGED and not
+/// yet durable when the next command in the same batch is handled. Queue remove → clear_tombstone →
+/// create at the incarnation the removal just ended, hand all three to the driver before any flush,
+/// and the create must REFUSE: every admission door reads [`sailing_proto::FloorStore`], whose
+/// contract is the FRESHEST value, so it sees the staged fence.
+///
+/// A durable-only read admits instead, and the flush then persists the fence beside a live endpoint
+/// already standing below it. That divergence was reachable while `MultiEngine` carried its own
+/// floor reader beside the `FloorStore` supertrait with nothing requiring the two to agree — the
+/// doors are split across both readers. With the seam reduced to one accessor the pair cannot
+/// disagree; this pins the doors on it.
+///
+/// Red-proof: give the create door a durable-only read (drop `lineage_staged` from
+/// `GroupEngine::group_floor`, which is what `FloorStore::floor` composes) and the create is
+/// ADMITTED into a group id its own removal has already fenced.
+#[tokio::test]
+async fn a_staged_removal_floor_fences_a_create_in_the_same_command_batch() {
+  let (mut driver, handle) = bind_host().await;
+  let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+  let fut = handle.create_group(1u64, cfg.clone(), 7, MergeSm::default(), 3);
+  drive(&mut driver, fut).await.expect("group admission");
+  // A RESHAPED id: only a reshape leaves a removal ceiling, and the floor is that opt-in's fence.
+  // Seeded directly rather than driven through a split, so the test pins the FLOOR READ and not
+  // the shape machinery that produces one.
+  driver.engine.set_group_gen(&1u64, 3);
+  assert_eq!(
+    driver.engine.removal_floor(&1u64),
+    4,
+    "the removal must have a fence to stage, or this pins nothing"
+  );
+
+  // THE BATCH. Three commands queued before the driver sees any of them, then handled with NO
+  // storage crank between — the window a durable-only reader answers stale in.
+  let waker = futures_util::task::noop_waker();
+  let mut cx = Context::from_waker(&waker);
+  let mut remove = std::pin::pin!(handle.remove_group(1u64));
+  let mut clear = std::pin::pin!(handle.clear_tombstone(1u64));
+  let mut create = std::pin::pin!(handle.create_group(1u64, cfg, 7, MergeSm::default(), 3));
+  assert!(remove.as_mut().poll(&mut cx).is_pending());
+  let _ = clear.as_mut().poll(&mut cx);
+  let _ = create.as_mut().poll(&mut cx);
+
+  let now = driver.clock.now();
+  let mut drained = 0;
+  while let Ok(cmd) = driver.commands.try_recv() {
+    driver.handle_command(now, cmd);
+    drained += 1;
+  }
+  assert_eq!(
+    drained, 3,
+    "all three commands must reach the driver in ONE batch, before any flush"
+  );
+  assert_eq!(
+    sailing_proto::FloorStore::floor(&driver.engine, &1u64),
+    4,
+    "the removal's floor is staged and readable — durability is still owed"
+  );
+
+  // The verdict rides the engine-write ack, so crank once to release it.
+  let verdict = drive(&mut driver, create).await;
+  let err = verdict.expect_err("the create must be REFUSED off the staged floor");
+  let text = err.to_string();
+  assert!(
+    text.contains("floor"),
+    "the refusal must be the admission floor's, not an incidental one: {text}"
+  );
+  assert!(
+    !hosts(&driver, 1),
+    "a refused create must leave the id unhosted"
   );
 }

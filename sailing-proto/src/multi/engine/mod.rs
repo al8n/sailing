@@ -196,6 +196,12 @@ where
   /// exists precisely to outlive the group it fences. `false` if no such group.
   fn remove_group(&mut self, gid: &G) -> bool;
 
+  /// Whether storage for `gid` is hosted. A host asks this BEFORE committing a group's state to
+  /// stores it may not own: occupied stores mean the id is spoken for, and the answer decides
+  /// between proceeding and HOLDING — never between proceeding and overwriting.
+  #[must_use]
+  fn contains_group(&self, gid: &G) -> bool;
+
   /// The next boot epoch for `gid` — a per-group monotonic counter (first call returns 1) that
   /// makes each incarnation's [`OpId`]s strictly exceed every prior incarnation's. `None` if no
   /// such group is hosted, or if the counter is exhausted; the increment must never wrap, since a
@@ -645,6 +651,10 @@ where
 
   fn remove_group(&mut self, gid: &G) -> bool {
     Self::remove_group(self, gid)
+  }
+
+  fn contains_group(&self, gid: &G) -> bool {
+    Self::contains_group(self, gid)
   }
 
   fn next_boot_epoch(&mut self, gid: &G) -> Option<u64> {

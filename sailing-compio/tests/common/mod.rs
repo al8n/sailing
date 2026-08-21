@@ -5,12 +5,16 @@
 
 use std::{
   collections::VecDeque,
-  sync::{Arc, Mutex},
+  sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+  },
 };
 
 use bytes::Bytes;
 use sailing_proto::{
-  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotChunkRead,
+  EngineLog, EngineStable, EntriesRead, Entry, EntryKind, FloorStore, GroupEngine, GroupStores,
+  HardState, Index, LogDone, LogStore, MaybeOwned, MultiEngine, OpId, SnapshotChunkRead,
   SnapshotMeta, StableDone, StableStore, StateMachine, Term,
 };
 
@@ -631,4 +635,170 @@ impl StableStore for SharedStable {
   fn has_pending(&self) -> bool {
     self.0.lock().unwrap().has_pending()
   }
+}
+
+/// A genuinely FOREIGN multi-group engine: a newtype satisfying the whole [`MultiEngine`] seam by
+/// forwarding to a [`GroupEngine`] it owns. Not an alias and not a re-export — this is the shape a
+/// downstream durable engine has, written from the crate's PUBLIC API alone (an integration test
+/// cannot reach a `pub(crate)` item even by accident), so it compiles only while a host can really
+/// be driven over an engine it did not build itself.
+///
+/// The [`EngineWatch`] it reports through is how a test tells "the host accepted my engine" apart
+/// from "the host quietly built its own and mine went nowhere".
+#[allow(dead_code)]
+pub struct DelegatingEngine {
+  inner: GroupEngine<u64, u64>,
+  watch: Arc<EngineWatch>,
+}
+
+/// What a [`DelegatingEngine`] reports back to the test that handed it in. Shared, because the
+/// engine itself MOVES into the driver and is never seen again from the outside — by design: a
+/// host owns its engine so it can lend a group's `(log, stable)` pair mutably.
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct EngineWatch {
+  /// Barriers this engine ran.
+  pub barriers: AtomicUsize,
+  /// Whether the engine still held STAGED work when the driver dropped it. A teardown that
+  /// skipped its final barrier leaves this TRUE — on a durable engine that is acked work rolled
+  /// back, a retired incarnation free to return.
+  pub staged_at_drop: AtomicBool,
+}
+
+#[allow(dead_code)]
+impl DelegatingEngine {
+  /// An EMPTY foreign engine.
+  pub fn new(watch: Arc<EngineWatch>) -> Self {
+    Self {
+      inner: GroupEngine::new(),
+      watch,
+    }
+  }
+
+  /// A foreign engine that ALREADY holds stores — the shape a durable engine has after a restart,
+  /// which no host could be handed before the engine seam went public.
+  pub fn preloaded(inner: GroupEngine<u64, u64>, watch: Arc<EngineWatch>) -> Self {
+    Self { inner, watch }
+  }
+}
+
+impl Drop for DelegatingEngine {
+  fn drop(&mut self) {
+    self
+      .watch
+      .staged_at_drop
+      .store(self.inner.has_staged(), Ordering::SeqCst);
+  }
+}
+
+impl GroupStores<u64, EngineLog, EngineStable<u64>> for DelegatingEngine {
+  fn stores(&mut self, group: &u64) -> Option<(&mut EngineLog, &mut EngineStable<u64>)> {
+    self.inner.stores(group)
+  }
+}
+
+impl FloorStore<u64> for DelegatingEngine {
+  fn floor(&self, gid: &u64) -> u64 {
+    self.inner.group_floor(gid)
+  }
+
+  fn lineage(&self, gid: &u64) -> u64 {
+    self.inner.group_gen(gid)
+  }
+}
+
+impl MultiEngine<u64, u64> for DelegatingEngine {
+  type Log = EngineLog;
+  type Stable = EngineStable<u64>;
+
+  fn set_snapshot_staging_cap(&mut self, cap: usize) {
+    self.inner.set_snapshot_staging_cap(cap);
+  }
+
+  fn group_ids(&self) -> impl Iterator<Item = &u64> {
+    self.inner.group_ids()
+  }
+
+  fn barriers(&self) -> u64 {
+    self.inner.barriers()
+  }
+
+  fn ops_batched(&self) -> u64 {
+    self.inner.ops_batched()
+  }
+
+  fn has_staged(&self) -> bool {
+    self.inner.has_staged()
+  }
+
+  fn flush(&mut self) -> usize {
+    self.watch.barriers.fetch_add(1, Ordering::SeqCst);
+    self.inner.flush()
+  }
+
+  fn add_group(&mut self, gid: u64) -> bool {
+    self.inner.add_group(gid)
+  }
+
+  fn remove_group(&mut self, gid: &u64) -> bool {
+    self.inner.remove_group(gid)
+  }
+
+  fn contains_group(&self, gid: &u64) -> bool {
+    self.inner.contains_group(gid)
+  }
+
+  fn next_boot_epoch(&mut self, gid: &u64) -> Option<u64> {
+    self.inner.next_boot_epoch(gid)
+  }
+
+  fn set_group_floor(&mut self, gid: &u64, floor: u64) {
+    self.inner.set_group_floor(gid, floor);
+  }
+
+  fn set_group_gen(&mut self, gid: &u64, generation: u64) {
+    self.inner.set_group_gen(gid, generation);
+  }
+
+  fn removal_floor(&self, gid: &u64) -> u64 {
+    self.inner.removal_floor(gid)
+  }
+}
+
+/// The term a [`preloaded_engine`]'s stores carry. Absurdly high on purpose: a FRESH term-0
+/// endpoint built over the same stores could not campaign its way here inside a test, so a
+/// recovered term at or above this is decisive evidence the preloaded state survived untouched.
+#[allow(dead_code)]
+pub const PRELOAD_TERM: u64 = 4242;
+
+/// An engine that ALREADY holds stores for every id in `gids`, each carrying a non-trivial hard
+/// state and log — the state a durable engine hands a host after a restart, and a state no host
+/// could be given before the engine seam went public. Built from the PUBLIC store API alone.
+#[allow(dead_code)]
+pub fn preloaded_engine(gids: &[u64]) -> GroupEngine<u64, u64> {
+  let mut engine = GroupEngine::<u64, u64>::new();
+  for (n, gid) in gids.iter().enumerate() {
+    assert!(engine.add_group(*gid));
+    let (log, stable) = engine.stores(gid).expect("just admitted");
+    let term = Term::new(PRELOAD_TERM);
+    // Distinct op ids per group: completions are per-store, but keeping them apart makes a
+    // mixed-up store obvious rather than plausible.
+    let op = (n as u64 + 1) * 100;
+    log.submit_append(
+      OpId::new(op),
+      &[
+        Entry::new(term, Index::new(1), EntryKind::Empty, Bytes::new()),
+        Entry::new(term, Index::new(2), EntryKind::Empty, Bytes::new()),
+      ],
+    );
+    stable.submit_write(
+      OpId::new(op + 1),
+      HardState::initial()
+        .with_term(term)
+        .with_commit(Index::new(2)),
+    );
+  }
+  // Durable before the host ever sees it — the restart shape.
+  engine.flush();
+  engine
 }

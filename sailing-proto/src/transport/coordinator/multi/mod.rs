@@ -405,6 +405,28 @@ where
     self.retired.contains(gid)
   }
 
+  /// Every gate [`create_group_from_fork`](Self::create_group_from_fork) applies BEFORE it
+  /// consumes the child's state machine and blob — floor, tombstone, split reservation, then the
+  /// container's own — run against the same state in the same order. A relay asks this FIRST so a
+  /// refusal reaches it while the fork is still whole: `Ok`, with nothing mutated in between,
+  /// means the admission cannot refuse.
+  pub fn fork_admission_check(
+    &self,
+    gid: &G,
+    generation: u64,
+    config: &Config<I>,
+    floors: &impl FloorStore<G>,
+  ) -> Result<(), CreateGroupError> {
+    validate_floor(floors.floor(gid), generation)?;
+    if self.retired.contains(gid) {
+      return Err(CreateGroupError::Retired);
+    }
+    if self.multi.split_reserved(gid) {
+      return Err(CreateGroupError::SplitReserved);
+    }
+    self.multi.fork_admission_check(gid, generation, config)
+  }
+
   /// Fail-stop the addressed group because a user QUERY closure panicked mid-read against its state
   /// machine, LATCHING the poison for the lifecycle tail (see
   /// [`MultiRaft::fail_stop_query_panicked`]). A driver caught the unwind to keep its plane and every

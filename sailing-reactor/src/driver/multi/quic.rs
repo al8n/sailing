@@ -25,15 +25,17 @@ use agnostic::{
 };
 use bytes::Bytes;
 use sailing_proto::{
-  ClusterId, Config, Endpoint, Event, FloorStore, ForkId, GroupControl, GroupEngine, GroupId,
-  Index, Instant, MultiQuicCoordinator, Now, ReadOnlyOption, StateMachine, StorageProgress,
-  floor_admits, quic::QuicOptions,
+  ClusterId, Config, CreateGroupError, Endpoint, Event, ForkId, GroupControl, GroupEngine,
+  GroupFork, GroupId, Index, Instant, MultiEngine, MultiQuicCoordinator, Now, ReadOnlyOption,
+  StateMachine, StorageProgress, floor_admits, quic::QuicOptions,
 };
 
 use sailing_driver::{
   BoxedGroupFactory, GroupFactory, LifecycleEvent, MultiCommand, MultiHandle, Node, Status,
   jittered,
-  shared::{CompletionOutcome, InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
+  shared::{
+    CompletionOutcome, InflightBudget, ParkedFailover, ParkedQuery, Pending, PendingAck, Routing,
+  },
   validate_and_capture_eps,
 };
 
@@ -70,20 +72,20 @@ struct Redial {
 ///
 /// # Storage is in-memory — NOT crash-durable
 ///
-/// Like its stream sibling, this host OWNS its [`GroupEngine`] (`GroupEngine::new`): the shared
-/// IN-MEMORY reference engine, with no store-injection seam in v1, so a PROCESS CRASH loses ALL
-/// consensus state — for tests, single-process deployments, and as the reference a persistent engine
-/// is validated against, NOT for crash recovery. `restore_group` reconnects a group within the SAME
+/// Like its stream sibling, every constructor here builds a [`GroupEngine`]: the shared IN-MEMORY
+/// reference engine. No constructor ACCEPTS an engine yet, so a PROCESS CRASH loses ALL consensus
+/// state — for tests, single-process deployments, and as the reference a persistent engine is
+/// validated against, NOT for crash recovery. `restore_group` reconnects a group within the SAME
 /// live process, not a recover-from-disk path. The lifecycle and event tails are best-effort
 /// TELEMETRY for observability, never a correctness feed.
-pub struct MultiReactorQuicDriver<R, G, I, F>
+pub struct MultiReactorQuicDriver<R, G, I, F, E = GroupEngine<G, I>>
 where
   R: Runtime,
   I: sailing_proto::NodeId,
   F: StateMachine,
 {
   coord: MultiQuicCoordinator<G, I, F>,
-  engine: GroupEngine<G, I>,
+  engine: E,
   socket: Arc<<R::Net as Net>::UdpSocket>,
   clock: Clock,
   /// Byte cap on each group's failover inherited-read limbo scan.
@@ -114,6 +116,25 @@ where
   /// union a crash still loses (recovery re-parks the merge). Queuing arms `flush_pending`,
   /// so the next crank's `engine.flush()` covers those writes before any queued event drains.
   merges_pending_flush: Vec<(G, Event<I, F::Response>)>,
+  /// Conflict cues for HELD forks, awaiting acceptance by the bounded lifecycle tail. Queued once
+  /// when a fork first blocks and delivered once — the held path never re-signals, so a cue lost
+  /// to a full tail would erase the embedder's ONLY prompt to clear a standing wedge. Purged if
+  /// its fork resolves before the cue lands.
+  ///
+  /// Keyed by [`ForkId`], not by child id: two forks can name the SAME child, and when one lands
+  /// the other re-blocks on the stores it just filled. Purging by child would take the survivor's
+  /// cue with the winner's and leave that second wedge standing in silence.
+  fork_cues_pending: Vec<(ForkId, G, G)>,
+  /// Relayed forks HELD because their child id's engine stores are occupied: re-offered every
+  /// crank, with the parent's fence standing until one lands (see
+  /// [`materialize_fork`](Self::materialize_fork)). A fork here still owns its blob — the
+  /// partition's only local copy — which is why it is held rather than refused.
+  forks_blocked: Vec<GroupFork<G, I, F>>,
+  /// Lifecycle replies withheld until the barrier that covers their commands' engine writes —
+  /// the persist-before-reply queue stated on [`Self::handle_command`]. Drained by the storage
+  /// crank immediately after `engine.flush()`, and again at teardown behind the final barrier,
+  /// on the fork/merge queues' idiom.
+  acks_pending_flush: Vec<PendingAck<I>>,
   storage_ready: flume::Receiver<()>,
   _storage_ready_keepalive: Option<flume::Sender<()>>,
   peers: Vec<Node<I, SocketAddr>>,
@@ -159,7 +180,10 @@ where
   teardown_tx: Option<futures_channel::oneshot::Sender<()>>,
 }
 
-impl<R, G, I, F> MultiReactorQuicDriver<R, G, I, F>
+/// The constructors, which name the engine CONCRETELY: a defaulted type parameter does not infer
+/// in expression position, so binding these to [`GroupEngine`] is what keeps every call site
+/// turbofish-free. Everything a bound host does lives on the generic block below.
+impl<R, G, I, F> MultiReactorQuicDriver<R, G, I, F, GroupEngine<G, I>>
 where
   R: Runtime,
   G: GroupId + Send,
@@ -188,7 +212,47 @@ where
     driver_cfg.validate()?;
     let socket = Arc::new(<R::Net as Net>::UdpSocket::bind(addr).await?);
     let coord = MultiQuicCoordinator::with_identity(opts, None, cluster);
-    Ok(Self::from_parts(coord, socket, peers, driver_cfg))
+    Ok(Self::from_parts(
+      coord,
+      socket,
+      peers,
+      driver_cfg,
+      GroupEngine::new(),
+    ))
+  }
+}
+
+/// Everything a bound host does, over ANY engine behind the [`MultiEngine`] seam.
+impl<R, G, I, F, E> MultiReactorQuicDriver<R, G, I, F, E>
+where
+  R: Runtime,
+  G: GroupId + Send,
+  I: sailing_proto::NodeId + Send,
+  F: StateMachine + Send,
+  F::Command: sailing_proto::Data + Send,
+  F::Snapshot: sailing_proto::Data,
+  F::Response: Clone + Send,
+  F::Error: core::error::Error,
+  E: MultiEngine<G, I>,
+{
+  /// [`bind`](Self::bind) over a CALLER-SUPPLIED engine — the seam a durable engine enters this
+  /// host through. Identical in every other respect: the host binds EMPTY, groups arrive by
+  /// lifecycle command, and each crank runs one barrier over the engine handed in here. The
+  /// engine MOVES into the driver and is never shared — this host drives it from its own single
+  /// task, which is what lets a group's `(log, stable)` pair be lent mutably across a whole
+  /// drive call.
+  pub async fn bind_with_engine(
+    addr: SocketAddr,
+    opts: QuicOptions,
+    cluster: ClusterId,
+    peers: Vec<Node<I, SocketAddr>>,
+    driver_cfg: DriverConfig,
+    engine: E,
+  ) -> Result<(Self, MultiHandle<G, I, F>), BindError> {
+    driver_cfg.validate()?;
+    let socket = Arc::new(<R::Net as Net>::UdpSocket::bind(addr).await?);
+    let coord = MultiQuicCoordinator::with_identity(opts, None, cluster);
+    Ok(Self::from_parts(coord, socket, peers, driver_cfg, engine))
   }
 
   /// Assemble the driver + [`MultiHandle`] from the bound socket.
@@ -197,6 +261,7 @@ where
     socket: Arc<<R::Net as Net>::UdpSocket>,
     peers: Vec<Node<I, SocketAddr>>,
     driver_cfg: DriverConfig,
+    engine: E,
   ) -> (Self, MultiHandle<G, I, F>) {
     let (cmd_tx, cmd_rx) = flume::unbounded();
     let (event_tx, event_rx) = flume::bounded(driver_cfg.events_cap);
@@ -220,7 +285,7 @@ where
     (
       Self {
         coord,
-        engine: GroupEngine::new(),
+        engine,
         socket,
         clock: Clock::new(None, Monotonic),
         max_failover_limbo_bytes: driver_cfg.max_failover_limbo_bytes,
@@ -232,6 +297,9 @@ where
         factory: None,
         forks_pending_flush: Vec::new(),
         merges_pending_flush: Vec::new(),
+        fork_cues_pending: Vec::new(),
+        forks_blocked: Vec::new(),
+        acks_pending_flush: Vec::new(),
         storage_ready,
         _storage_ready_keepalive: keepalive,
         peers,
@@ -263,8 +331,8 @@ where
     self.metrics.clone()
   }
 
-  /// Cap the engine's chunked-snapshot staging buffers (the [`GroupEngine`] knob, applied to
-  /// this host's engine). Set between `bind` and `run()`.
+  /// Cap the engine's chunked-snapshot staging buffers (the engine-wide knob, applied to this
+  /// host's engine). Set between `bind` and `run()`.
   #[must_use]
   pub fn with_snapshot_staging_cap(mut self, cap: usize) -> Self {
     self.engine.set_snapshot_staging_cap(cap);
@@ -438,6 +506,20 @@ where
       self.pump(now).await;
     }
 
+    // THE TEARDOWN BARRIER. Every exit path lands here — a `Shutdown`, a disconnected command
+    // channel, the last handle dropped — and any of them can be reached with engine writes still
+    // STAGED: a removal's floor above all, whose loss lets a retired incarnation return on a
+    // durable engine's next boot. The bounded command drain makes that ordinary, not exotic: a
+    // removal and the `Shutdown` behind it are handled in the SAME pass, and the loop exits before
+    // the crank that would have flushed. One final barrier makes those writes durable; only then
+    // do the verdicts they gate become observable. Nothing past this point stages engine work.
+    if self.engine.has_staged() {
+      self.engine.flush();
+    }
+    for ack in self.acks_pending_flush.drain(..) {
+      ack.send();
+    }
+
     // Teardown. Classify each group's fail-stop FIRST, then the ShuttingDown sweep; then stop the
     // recv task and AWAIT its join so the final socket drop is the fd-release barrier (see the
     // single-group driver's teardown notes).
@@ -506,56 +588,63 @@ where
   /// barrier below, so the SAME crank's `engine.flush()` covers every staged baseline before
   /// `pump` can transmit anything for the child (a child that can solicit peers is therefore
   /// always locally blob-durable first; the drain also front-runs the factory drain, so a
-  /// local fork wins any same-id solicitation race). A refused materialization — a floored or
-  /// tombstoned child id, an invalid config, used child storage (which a fork never
-  /// overwrites) — abandons THIS fork: its barrier resolves (the parent must not stay fenced
-  /// for a fork that will never land here), the refusal surfaces as
+  /// local fork wins any same-id solicitation race). A refused materialization — a floored child
+  /// id, an invalid config — abandons THIS fork: its barrier resolves (the parent must not stay
+  /// fenced for a fork that will never land here), the refusal surfaces as
   /// [`LifecycleEvent::SplitRefused`] for the placement brain, and the driver survives; the
   /// child still reaches this host by the ordinary lifecycle paths (restore over its own
   /// storage, solicitation → factory/embedder → snapshot from a live member, whose own blob
-  /// went durable before it could transmit). A fork whose child id is ALREADY HOSTED is
+  /// went durable before it could transmit). A fork whose child id is merely SPOKEN FOR — occupied
+  /// engine stores, a tombstone mid-rejoin, an absorb debt — is held instead, un-consumed and with
+  /// the parent's fence standing (see [`materialize_fork`](Self::materialize_fork)), because none
+  /// of those is a verdict about the fork. A fork whose child id is ALREADY HOSTED is
   /// neither yielded nor abandoned: the container PARKS it (blob held, the parent's fence
   /// standing, re-examined every crank) and the conflict pump below relays the one-shot
   /// [`LifecycleEvent::SplitConflict`] to the embedder — consumed from the coordinator only
   /// once the bounded lifecycle tail accepts it, so backpressure defers the cue instead of
   /// erasing it — whose removal/catch-up resolves the park.
   fn fork_drain(&mut self, now: Now) {
-    while let Some(fork) = self.coord.poll_pending_fork() {
-      let parent = fork.parent;
-      let split_index = fork.split_index;
-      let child = fork.child.cheap_clone();
-      let seed = host_seed(self.coord.host_id());
-      // Reshape-born prevention: a split child is a reshaping participant, so it is FORCED
-      // to run pre-vote + check-quorum — an ignorant removed voter must not depose a live leader
-      // while reshaping keeps membership churn steady-state. Embedder `with_group` groups keep their
-      // configured (etcd-parity) defaults; this force applies at reshape birth only.
-      let child_config = reshape_born_prevention(fork.config);
-      match self.create_group_from_fork(
-        now,
-        fork.child,
-        child_config,
-        seed,
-        fork.fsm,
-        fork.blob,
-        fork.read_only,
-        // The child's provenance token rides its manufactured baseline so every replica reports
-        // the same origin and the parent's parked fork resolves redundant only against a match.
-        Some(fork.fork_id),
-        fork.child_gen,
-      ) {
-        Ok(()) => {
-          // The parent's lineage record advances with the child's registration, all behind the
-          // ONE barrier the pending-flush entry below waits on.
-          self.engine.set_group_gen(&parent, fork.parent_gen_after);
-          self.forks_pending_flush.push((parent, split_index, child));
-        }
-        Err(_) => {
-          self.coord.lift_fork_barrier(&parent, split_index);
-          let _ = self
-            .lifecycle_tx
-            .try_send(LifecycleEvent::SplitRefused { parent, child });
-        }
+    // HELD FORKS FIRST, ahead of anything newly relayed. A still-blocked fork stays held and stays
+    // SILENT: its cue was queued when it first blocked, and the pump below delivers it exactly
+    // once.
+    for fork in core::mem::take(&mut self.forks_blocked) {
+      let fork_id = fork.fork_id.clone();
+      match self.materialize_fork(now, fork) {
+        Some(held) => self.forks_blocked.push(held),
+        // RESOLVED while its cue was still queued: purge exactly THIS fork's cue — the container
+        // pump's own "a park that resolves first purges it there" rule, so nothing stale ever
+        // surfaces, and nothing else's cue goes with it.
+        None => self.fork_cues_pending.retain(|(id, _, _)| *id != fork_id),
       }
+    }
+    while let Some(fork) = self.coord.poll_pending_fork() {
+      if let Some(held) = self.materialize_fork(now, fork) {
+        // A FIRST block: QUEUE the one-shot cue for the pump below, then hold the fork.
+        self.fork_cues_pending.push((
+          held.fork_id.clone(),
+          held.parent.cheap_clone(),
+          held.child.cheap_clone(),
+        ));
+        self.forks_blocked.push(held);
+      }
+    }
+    // DELIVERED-BEFORE-CONSUMED, the container pump's discipline applied to the wedge's own cue.
+    // The held path never re-signals, so this ONE prompt is all the embedder gets: a
+    // momentarily-full tail must DEFER it, never erase it, or the wedge stands with its fence up
+    // and nothing to act on. Consume only on acceptance; the next crank retries what was refused.
+    while !self.fork_cues_pending.is_empty() {
+      let (parent, child) = {
+        let (_, parent, child) = &self.fork_cues_pending[0];
+        (parent.cheap_clone(), child.cheap_clone())
+      };
+      if self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::SplitConflict { parent, child })
+        .is_err()
+      {
+        break;
+      }
+      self.fork_cues_pending.remove(0);
     }
     // DELIVERED-BEFORE-CONSUMED: unlike its best-effort siblings, the conflict signal is
     // one-shot per park episode, so popping it ahead of a refusable send would let a
@@ -587,6 +676,133 @@ where
     // strictly after that retirement, is the ONLY publication point.
   }
 
+  /// Materialize ONE relayed fork, or hand it BACK un-consumed when the child's stores are
+  /// occupied.
+  ///
+  /// # A refusal reaches this WITH THE FORK STILL WHOLE
+  ///
+  /// By relay time the parent's `fsm.split` has already run — the parent SHRANK — so the blob in
+  /// hand is the partition's only local copy. Consuming the fork lifts the parent's fence, and the
+  /// parent then compacts past the split entry, taking the replay source with it. Abandonment is
+  /// therefore only ever sound as a verdict about THE FORK — one no host state can change.
+  ///
+  /// So nothing is consumed until the verdict is known. The engine answers first (it holds the one
+  /// blocker the coordinator cannot see), then
+  /// [`fork_admission_check`](sailing_proto::MultiQuicCoordinator::fork_admission_check) runs
+  /// every gate the install itself would apply, against state nothing touches in between. A
+  /// refusal therefore arrives with the fork still whole — blob, state machine, and token intact —
+  /// and holding costs a few map lookups: no endpoint is built and nothing is staged. Held, the
+  /// fence stays up, so the split entry stays uncompactable and the replay source survives
+  /// indefinitely, however late the embedder acts.
+  ///
+  /// # Enumeration is the fast path, never the safety boundary
+  ///
+  /// The refusals that clear are the ones about HOST STATE: occupied stores (occupancy is not
+  /// provenance — which is why the container discards its own parked forks only against a matching
+  /// [`ForkId`]), a tombstone mid-rejoin, a self-clearing absorb debt, a split reservation this
+  /// host's own in-flight split holds over the same child id. Naming them is useful; relying on
+  /// having named them ALL is not. That list has been wrong twice — first missing the tombstone
+  /// and the absorb debt, then missing the reservation, which only a second node minting the same
+  /// child id exposes.
+  ///
+  /// So the classification is inverted: the TERMINAL set is the closed one, and everything else
+  /// HOLDS. [`CreateGroupError`](sailing_proto::CreateGroupError) is `#[non_exhaustive]`, so the
+  /// compiler itself demands that default arm — a refusal nobody anticipated wedges diagnosably
+  /// instead of dropping a partition, and a `debug_assert` names it so the debt surfaces in a test
+  /// run rather than in silence.
+  ///
+  /// The embedder's own [`MultiHandle::create_group_from_fork`](sailing_driver::MultiHandle) keeps
+  /// its typed refusals — there the caller holds the blob and can act on a `no`. Here nobody does.
+  fn materialize_fork(&mut self, now: Now, fork: GroupFork<G, I, F>) -> Option<GroupFork<G, I, F>> {
+    // The engine's own answer first: the coordinator cannot see storage, and occupied stores are
+    // the one blocker its admission check knows nothing about.
+    if self.engine.contains_group(&fork.child) || self.coord.debt_names(&fork.child) {
+      return Some(fork);
+    }
+    // Then EVERY gate the admission itself would apply, asked while the fork is still whole. A
+    // refusal is classified here, with something left to hold.
+    let child_config = reshape_born_prevention(fork.config.clone());
+    if validate_and_capture_eps::<I, Monotonic>(&child_config).is_err() {
+      // A config that cannot validate is a verdict about the fork: no host state will fix it.
+      return self.abandon_fork(fork);
+    }
+    if let Err(refusal) =
+      self
+        .coord
+        .fork_admission_check(&fork.child, fork.child_gen, &child_config, &self.engine)
+    {
+      return match refusal {
+        // TERMINAL — verdicts about the FORK ITSELF, fixed at the split and true forever here.
+        CreateGroupError::ReservedGeneration
+        | CreateGroupError::BelowFloor { .. }
+        | CreateGroupError::InvalidGroupId
+        | CreateGroupError::NodeIdMismatch => self.abandon_fork(fork),
+        // EVERYTHING ELSE HOLDS. `CreateGroupError` is `#[non_exhaustive]`, so this arm is not a
+        // courtesy — the compiler requires it, and it is where the safety lives.
+        _ => {
+          debug_assert!(
+            matches!(
+              refusal,
+              CreateGroupError::Exists
+                | CreateGroupError::Retired
+                | CreateGroupError::SplitReserved
+                | CreateGroupError::AbsorbPending
+            ),
+            "unclassified fork refusal held rather than abandoned: {refusal:?}"
+          );
+          Some(fork)
+        }
+      };
+    }
+    let parent = fork.parent;
+    let split_index = fork.split_index;
+    let child = fork.child.cheap_clone();
+    let seed = host_seed(self.coord.host_id());
+    match self.create_group_from_fork(
+      now,
+      fork.child,
+      child_config,
+      seed,
+      fork.fsm,
+      fork.blob,
+      fork.read_only,
+      // The child's provenance token rides its manufactured baseline so every replica reports
+      // the same origin and the parent's parked fork resolves redundant only against a match.
+      Some(fork.fork_id),
+      fork.child_gen,
+    ) {
+      Ok(()) => {
+        // The parent's lineage record advances with the child's registration, all behind the
+        // ONE barrier the pending-flush entry below waits on.
+        self.engine.set_group_gen(&parent, fork.parent_gen_after);
+        self.forks_pending_flush.push((parent, split_index, child));
+      }
+      Err(e) => {
+        // Unreachable: the check above ran every gate this call applies, against state nothing
+        // has touched since. Kept as a fail-closed floor, and loud in tests.
+        debug_assert!(false, "a checked fork admission refused anyway: {e:?}");
+        self.coord.lift_fork_barrier(&parent, split_index);
+        let _ = self
+          .lifecycle_tx
+          .try_send(LifecycleEvent::SplitRefused { parent, child });
+      }
+    }
+    None
+  }
+
+  /// Give up on `fork` DELIBERATELY: resolve the parent's fence — it must not stay up for a fork
+  /// that can never land here — and surface the refusal for the placement brain. The blob is
+  /// dropped knowingly, which is only ever sound for a verdict about the fork itself.
+  fn abandon_fork(&mut self, fork: GroupFork<G, I, F>) -> Option<GroupFork<G, I, F>> {
+    let parent = fork.parent;
+    let child = fork.child;
+    self.coord.lift_fork_barrier(&parent, fork.split_index);
+    let _ = self
+      .lifecycle_tx
+      .try_send(LifecycleEvent::SplitRefused { parent, child });
+    None
+  }
+
   fn storage_crank(&mut self, now: Now) {
     self.fork_drain(now);
     let flushed = self.flush_pending;
@@ -606,6 +822,14 @@ where
     // capture, the terminal floor, and the source's removal are covered before the application
     // can act on the union. `route_event` moves no waiter or watermark for `Merged`; both the
     // per-group copy and the stamped tail copy are the deferred app-visible surfaces.
+    // PERSIST-BEFORE-REPLY: a lifecycle verdict whose command staged engine state becomes
+    // observable only behind the barrier that made that state durable. Queuing armed
+    // `flush_pending`, so a non-empty queue always finds a barrier here.
+    if flushed {
+      for ack in self.acks_pending_flush.drain(..) {
+        ack.send();
+      }
+    }
     if flushed {
       for (g, ev) in self.merges_pending_flush.drain(..) {
         if let Some(routing) = self.routing.get_mut(&g) {
@@ -837,7 +1061,15 @@ where
   ) -> Result<(), DriverError<I>> {
     validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
     let election = config.election_timeout();
+    // OCCUPIED STORES ARE RECOVERED STATE. A caller-supplied engine can arrive holding a
+    // previous process's stores; a fresh term-0 endpoint built over them would ack success and
+    // then truncate that durable history on its first append. Refuse, touching nothing — the
+    // restart path is how existing state re-enters. A live SAME-PROCESS duplicate is a different
+    // fact and keeps its own verdict: the container's `Exists` refusal answers below.
     let added = self.engine.add_group(gid.cheap_clone());
+    if !added && self.coord.group(&gid).is_none() {
+      return Err(DriverError::StoredStateExists);
+    }
     match self.coord.create_group(
       gid.cheap_clone(),
       config,
@@ -885,8 +1117,8 @@ where
     validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
     let election = config.election_timeout();
     let lineage = FloorSnapshot {
-      floor: self.engine.group_floor(&gid),
-      lineage: self.engine.group_gen(&gid),
+      floor: sailing_proto::FloorStore::floor(&self.engine, &gid),
+      lineage: sailing_proto::FloorStore::lineage(&self.engine, &gid),
     };
     if self.engine.add_group(gid.cheap_clone()) {
       // `add_group` CREATED the store: the host has no stored state for this group (it was never
@@ -956,10 +1188,17 @@ where
     validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
     let election = config.election_timeout();
     let lineage = FloorSnapshot {
-      floor: self.engine.group_floor(&gid),
-      lineage: self.engine.group_gen(&gid),
+      floor: sailing_proto::FloorStore::floor(&self.engine, &gid),
+      lineage: sailing_proto::FloorStore::lineage(&self.engine, &gid),
     };
+    // Occupied child stores mean this child's baseline is ALREADY durable, so re-installing the
+    // manufactured snapshot over them would overwrite a group that exists. Refusing is the
+    // correct answer and costs the parent nothing: its fork fence releases off that durable
+    // baseline, not off this install. Same live-duplicate carve-out as `create_group`.
     let added = self.engine.add_group(gid.cheap_clone());
+    if !added && self.coord.group(&gid).is_none() {
+      return Err(DriverError::StoredStateExists);
+    }
     let epoch = match self.engine.next_boot_epoch(&gid) {
       Some(epoch) => epoch,
       // Storage was admitted just above, so `None` here means the per-group boot-epoch counter is
@@ -1056,8 +1295,26 @@ where
     Ok(existed || had_storage)
   }
 
+  /// Reply to a lifecycle command that WROTE to the engine, honoring persist-before-reply: while
+  /// the write is still staged the verdict waits for the barrier that makes it durable; when the
+  /// engine staged nothing the verdict is already covered and goes now. Queuing arms the barrier,
+  /// so a queued reply always has one coming.
+  fn ack_engine_write(&mut self, ack: PendingAck<I>) {
+    if self.engine.has_staged() {
+      self.flush_pending = true;
+      self.acks_pending_flush.push(ack);
+    } else {
+      ack.send();
+    }
+  }
+
   /// Handle one command (the stream sibling's dispatch verbatim over the QUIC coordinator).
   /// Returns `true` when the loop should exit (a `Shutdown`).
+  ///
+  /// The stream sibling's PERSIST-BEFORE-REPLY rule holds here unchanged: a lifecycle verdict
+  /// whose command wrote engine state is released through
+  /// [`ack_engine_write`](Self::ack_engine_write), behind the barrier that made the write
+  /// durable.
   fn handle_command(&mut self, now: Now, cmd: MultiCommand<G, I, F>) -> bool {
     // Any group-addressed CLIENT operation un-quiesces its group BEFORE dispatch (see the stream
     // sibling); pure observability (`Status`) and the lifecycle commands do not wake.
@@ -1312,8 +1569,8 @@ where
         // engine is lent to the propose as `(log, stable)`); the drain above keeps the
         // authoritative materialization-edge recheck.
         let floors = FloorSnapshot {
-          floor: self.engine.group_floor(&child),
-          lineage: self.engine.group_gen(&child),
+          floor: sailing_proto::FloorStore::floor(&self.engine, &child),
+          lineage: sailing_proto::FloorStore::lineage(&self.engine, &child),
         };
         let verdict = match self.engine.stores(&group) {
           None => Err(no_such_group()),
@@ -1444,8 +1701,12 @@ where
         reply,
         reservation,
       } => {
-        let _ = reply.send(self.create_group(now, gid, config, seed, fsm, generation));
-        drop(reservation);
+        let verdict = self.create_group(now, gid, config, seed, fsm, generation);
+        self.ack_engine_write(PendingAck::Admission {
+          reply,
+          verdict,
+          reservation,
+        });
       }
       MultiCommand::CreateGroupFromFork {
         gid,
@@ -1457,15 +1718,19 @@ where
         reply,
         reservation,
       } => {
-        let _ = reply.send(self.create_group_from_fork(
+        let verdict = self.create_group_from_fork(
           now, gid, config, seed, fsm, snapshot,
           // An embedder-driven fork inherits no parent mode: the child's config supplies
           // it, which is exactly the absent-provenance meaning of `None`.
           None,
           // ...and it carries no split provenance token — only a committed split's fork does.
           None, generation,
-        ));
-        drop(reservation);
+        );
+        self.ack_engine_write(PendingAck::Admission {
+          reply,
+          verdict,
+          reservation,
+        });
       }
       MultiCommand::RestoreGroup {
         gid,
@@ -1476,16 +1741,24 @@ where
         reply,
         reservation,
       } => {
-        let _ = reply.send(self.restore_group(now, gid, config, seed, fsm, generation));
-        drop(reservation);
+        let verdict = self.restore_group(now, gid, config, seed, fsm, generation);
+        self.ack_engine_write(PendingAck::Admission {
+          reply,
+          verdict,
+          reservation,
+        });
       }
       MultiCommand::RemoveGroup {
         gid,
         reply,
         reservation,
       } => {
-        let _ = reply.send(self.remove_group(&gid));
-        drop(reservation);
+        let verdict = self.remove_group(&gid);
+        self.ack_engine_write(PendingAck::Removal {
+          reply,
+          verdict,
+          reservation,
+        });
       }
       MultiCommand::ClearTombstone {
         gid,

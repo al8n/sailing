@@ -18,7 +18,7 @@ use std::{
 
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
-use common::{CountSm, TrapSm};
+use common::{CountSm, DelegatingEngine, EngineWatch, PRELOAD_TERM, TrapSm, preloaded_engine};
 use sailing_proto::{
   ClusterId, ConfChange, ConfChangeType, Config, Data, Event, Index, LabelOptions, Labeled,
   Passthrough, ReadOnlyOption, Role,
@@ -81,6 +81,9 @@ fn plain_factories(
 }
 
 type MDriver<F> = MultiReactorStreamDriver<TokioRuntime, u64, u64, F, Labeled<Passthrough>>;
+
+/// [`MDriver`]'s twin over a caller-supplied engine — the engine-accepting seam's type.
+type MForeign<F, E> = MultiReactorStreamDriver<TokioRuntime, u64, u64, F, Labeled<Passthrough>, E>;
 
 /// Bind one EMPTY multi-group host (groups arrive via commands).
 async fn bind_node<F>(
@@ -5155,4 +5158,493 @@ async fn a_courtesy_snapshot_cures_a_removed_peer_at_default_flags_over_tcp() {
     );
     tokio::time::sleep(Duration::from_millis(50)).await;
   }
+}
+
+/// The engine seam reaching THIS surface, and the contract a public seam brings with it. A host
+/// handed an engine that already holds a group's stores must never build a FRESH endpoint over
+/// them — a term-0 endpoint would ack success and then truncate that durable history on its first
+/// append — so both creation flavors refuse typed, and a different id is unaffected. The compio
+/// parity suite carries the fuller matrix (the stores' survival and the teardown barrier); what
+/// this pins is that the guard and the public constructor are BOTH here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_preloaded_engine_refuses_fresh_creation() {
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let gid = 100u64;
+  let watch = std::sync::Arc::new(EngineWatch::default());
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle): (
+    MForeign<CountSm, DelegatingEngine>,
+    MultiHandle<u64, u64, CountSm>,
+  ) = MultiReactorStreamDriver::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+    DelegatingEngine::preloaded(preloaded_engine(&[gid]), watch.clone()),
+  )
+  .await
+  .expect("the host binds over a preloaded engine");
+  tokio::spawn(driver.run());
+
+  let err = handle
+    .create_group(gid, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect_err("a fresh create over recovered stores must refuse");
+  assert!(
+    matches!(err, DriverError::StoredStateExists),
+    "the typed occupied-stores refusal, got {err:?}"
+  );
+
+  let err = handle
+    .create_group_from_fork(
+      gid,
+      config(1, vec![1]),
+      1,
+      CountSm::default(),
+      Bytes::from_static(b"child-baseline"),
+      0,
+    )
+    .await
+    .expect_err("a fork install over occupied child stores must refuse");
+  assert!(
+    matches!(err, DriverError::StoredStateExists),
+    "the typed occupied-stores refusal, got {err:?}"
+  );
+
+  handle
+    .create_group(200, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("a fresh id is unaffected");
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// OCCUPANCY IS NOT PROVENANCE — the engine-store sibling of the hosted-child conflict park.
+///
+/// A host is handed an engine already holding UNRELATED stores under the id a later split names
+/// as its child. The parent's `fsm.split` has run by relay time — the parent has SHRUNK — so the
+/// manufactured blob is the partition's only local copy. Treating the occupied id as grounds to
+/// abandon the fork would consume it, lift the parent's fence, drop that blob, and let the parent
+/// compact past the split: the partition would simply be gone. The host WEDGES instead: the fork
+/// is held un-consumed, the fence stands, and the existing conflict cue says so. Clearing the
+/// squatter releases it, and the child then serves exactly the units the parent gave away.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fork_wedges_on_occupied_child_stores_and_lands_once_they_clear() {
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let parent = 100u64;
+  let child = 300u64;
+  let watch = std::sync::Arc::new(EngineWatch::default());
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle): (
+    MForeign<CountSm, DelegatingEngine>,
+    MultiHandle<u64, u64, CountSm>,
+  ) = MultiReactorStreamDriver::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+    // The squatter: unrelated stores under the CHILD id, carrying content of their own.
+    DelegatingEngine::preloaded(preloaded_engine(&[child]), watch.clone()),
+  )
+  .await
+  .expect("the host binds over a preloaded engine");
+  let lifecycle = handle.lifecycle().clone();
+  tokio::spawn(driver.run());
+
+  // A sole-voter parent with real content: no network in the commit path.
+  handle
+    .create_group(parent, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("parent admission");
+  let p = vec![handle.group(parent)];
+  for i in 0..5u64 {
+    assert_eq!(submit_anywhere(&p, b"unit").await, i + 1);
+  }
+
+  // A NON-EMPTY split: two of the parent's five units go to the child.
+  p[0]
+    .propose_split(child, 7, Bytes::from_static(&[2]))
+    .await
+    .expect("the split commits on the parent");
+
+  // THE WEDGE. Wait for the fork's verdict and insist it is a HOLD. A `SplitRefused` here is not
+  // a weaker outcome, it IS the loss: the fence lifts, and the blob — the partition's only local
+  // copy, since the parent already shrank — goes with it.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the fork reached no verdict in time"
+    );
+    let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(2), lifecycle.recv_async()).await
+    else {
+      continue;
+    };
+    assert!(
+      !matches!(&ev, LifecycleEvent::SplitRefused { parent: pp, child: cc } if *pp == parent && *cc == child),
+      "THE LOSS: the fork was ABANDONED over an occupied id — the parent's fence lifted and the \
+       partition blob went with it"
+    );
+    if matches!(&ev, LifecycleEvent::SplitConflict { parent: pp, child: cc } if *pp == parent && *cc == child)
+    {
+      break;
+    }
+  }
+  assert!(
+    handle.group(child).status().await.is_err(),
+    "no child endpoint was built over the squatter's stores"
+  );
+
+  // THE SQUATTER'S STORES ARE UNTOUCHED — they still restore, carrying their own term, which a
+  // fork baseline written over them could not have left behind.
+  handle
+    .restore_group(child, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("the wedged fork left the occupying stores recoverable");
+  let status = handle
+    .group(child)
+    .status()
+    .await
+    .expect("the restored squatter answers");
+  assert!(
+    status.term.get() >= PRELOAD_TERM,
+    "the squatter's own state survived the wedge, got {:?}",
+    status.term
+  );
+
+  // Nothing was abandoned while all that happened.
+  while let Ok(ev) = lifecycle.try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::SplitRefused { .. }),
+      "the fork must never be abandoned over an occupied id, got {ev:?}"
+    );
+    assert!(
+      !matches!(ev, LifecycleEvent::SplitApplied { .. }),
+      "no fork may land while the id is occupied, got {ev:?}"
+    );
+  }
+
+  // THE RELEASE. Removing the squatter frees the id; the removal tombstones it, so the deliberate
+  // two-act rejoin applies here exactly as it does to any re-admission.
+  assert!(
+    handle.remove_group(child).await.expect("remove resolves"),
+    "the squatter was hosted"
+  );
+  assert!(
+    handle.clear_tombstone(child).await.expect("clear resolves"),
+    "the removal left a tombstone to clear"
+  );
+
+  // The held fork lands on a later crank, with no further prompting.
+  await_lifecycle(&lifecycle, "the released fork", |ev| {
+    matches!(ev, LifecycleEvent::SplitApplied { parent: pp, child: cc, .. } if *pp == parent && *cc == child)
+  })
+  .await;
+
+  // And it carries the partition: the units conserve across the pair.
+  let c = vec![handle.group(child)];
+  assert_eq!(query_anywhere(&c).await, 2, "the child serves its half");
+  assert_eq!(query_anywhere(&p).await, 3, "the parent kept the rest");
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// Wedge TWO forks on a host whose lifecycle tail holds exactly ONE slot: the second cue finds the
+/// tail full at the instant it is raised. Returns the host, its tail, and the two `(parent, child)`
+/// pairs — `.1` is the pair whose cue had to defer.
+async fn wedge_two_forks_on_a_one_slot_tail() -> (
+  MultiHandle<u64, u64, CountSm>,
+  flume::Receiver<LifecycleEvent<u64, u64>>,
+  (u64, u64),
+  (u64, u64),
+) {
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let (p1, c1) = (100u64, 300u64);
+  let (p2, c2) = (200u64, 400u64);
+  let watch = std::sync::Arc::new(EngineWatch::default());
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle): (
+    MForeign<CountSm, DelegatingEngine>,
+    MultiHandle<u64, u64, CountSm>,
+  ) = MultiReactorStreamDriver::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    // ONE lifecycle slot, so a single undelivered event is a full tail at the next raise.
+    DriverConfig {
+      events_cap: 1,
+      ..DriverConfig::default()
+    },
+    // Squatters under BOTH child ids.
+    DelegatingEngine::preloaded(preloaded_engine(&[c1, c2]), watch.clone()),
+  )
+  .await
+  .expect("the host binds over a preloaded engine");
+  let lifecycle = handle.lifecycle().clone();
+  tokio::spawn(driver.run());
+
+  for (parent, child) in [(p1, c1), (p2, c2)] {
+    handle
+      .create_group(parent, config(1, vec![1]), parent, CountSm::default(), 0)
+      .await
+      .expect("parent admission");
+    let p = vec![handle.group(parent)];
+    for i in 0..5u64 {
+      assert_eq!(submit_anywhere(&p, b"unit").await, i + 1);
+    }
+    p[0]
+      .propose_split(child, 7, Bytes::from_static(&[2]))
+      .await
+      .expect("the split commits on the parent");
+    // Let the drain raise this pair's cue before the next split queues its own, so the ORDER of
+    // the two cues is the order of the splits and the second is the one that finds no slot.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+  }
+  (handle, lifecycle, (p1, c1), (p2, c2))
+}
+
+/// A wedge's conflict cue is the embedder's ONLY prompt to clear it — the held fork deliberately
+/// never re-signals — so a momentarily-full lifecycle tail must DEFER that cue, never drop it.
+/// Dropping is not a lost notification here: it strands the embedder with a standing fence, a held
+/// fork, and nothing to act on. Once the tail drains, the deferred cue arrives, exactly once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wedge_cue_defers_on_a_full_tail_instead_of_vanishing() {
+  let (handle, lifecycle, first, second) = wedge_two_forks_on_a_one_slot_tail().await;
+
+  // The one slot holds the FIRST pair's cue; draining it is what frees the tail.
+  await_lifecycle(&lifecycle, "the first wedge's cue", |ev| {
+    matches!(ev, LifecycleEvent::SplitConflict { parent, child } if (*parent, *child) == first)
+  })
+  .await;
+
+  // THE DEFERRED CUE. It was raised against a full tail and must still arrive.
+  await_lifecycle(&lifecycle, "the deferred wedge's cue", |ev| {
+    matches!(ev, LifecycleEvent::SplitConflict { parent, child } if (*parent, *child) == second)
+  })
+  .await;
+
+  // Exactly once, and both forks are still held throughout.
+  tokio::time::sleep(Duration::from_millis(300)).await;
+  while let Ok(ev) = lifecycle.try_recv() {
+    assert!(
+      !matches!(&ev, LifecycleEvent::SplitConflict { parent, child } if (*parent, *child) == second),
+      "the one-shot cue was delivered twice"
+    );
+  }
+  for (_, child) in [first, second] {
+    assert!(
+      handle.group(child).status().await.is_err(),
+      "both forks stay held: no child endpoint exists"
+    );
+  }
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// The purge half, the container pump's "a park that resolves first purges it there" parity: a cue
+/// still queued behind a full tail when its fork RESOLVES must never surface afterwards, or the
+/// embedder is sent to clear a wedge that is already gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_queued_cue_is_purged_when_its_fork_lands_first() {
+  let (handle, lifecycle, first, second) = wedge_two_forks_on_a_one_slot_tail().await;
+  let (_, c2) = second;
+
+  // Clear the SECOND wedge's blocker while its cue is still stuck behind the full tail.
+  assert!(
+    handle.remove_group(c2).await.expect("remove resolves"),
+    "the squatter's stores were hosted"
+  );
+  assert!(
+    handle.clear_tombstone(c2).await.expect("clear resolves"),
+    "the removal left a tombstone to clear"
+  );
+
+  // The fork lands — proven by the child serving its half of the partition, which needs no
+  // lifecycle event and so is immune to the full tail dropping the best-effort `SplitApplied`.
+  let c = vec![handle.group(c2)];
+  assert_eq!(query_anywhere(&c).await, 2, "the released fork landed");
+
+  // Now drain: the FIRST pair's cue is still owed, the second's must be gone for good.
+  await_lifecycle(&lifecycle, "the first wedge's cue", |ev| {
+    matches!(ev, LifecycleEvent::SplitConflict { parent, child } if (*parent, *child) == first)
+  })
+  .await;
+  tokio::time::sleep(Duration::from_millis(300)).await;
+  while let Ok(ev) = lifecycle.try_recv() {
+    assert!(
+      !matches!(&ev, LifecycleEvent::SplitConflict { parent, child } if (*parent, *child) == second),
+      "a STALE cue surfaced for a wedge that had already resolved"
+    );
+  }
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// TWO PARENTS MINTING THE SAME CHILD ID — the shape a second node produces when its own parent
+/// splits into an id this host's parent is already splitting into, reduced to one host because the
+/// coordinator states that matter are identical: two committed forks naming one child, each facing
+/// the other's live split reservation and then the stores the winner fills. (What the reduction
+/// drops is the wire — nothing in this path reads it; a relayed fork is a relayed fork.)
+///
+/// NEITHER blob may be lost. The reservation is not a verdict about either fork — it clears when
+/// the other split resolves — and occupancy is not one either. One child installs; the loser holds
+/// with its fence up, and the units conserve across whichever landed.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_forks_naming_one_child_both_survive_the_race() {
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let (p1, p2, child) = (100u64, 200u64, 300u64);
+  let watch = std::sync::Arc::new(EngineWatch::default());
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle): (
+    MForeign<CountSm, DelegatingEngine>,
+    MultiHandle<u64, u64, CountSm>,
+  ) = MultiReactorStreamDriver::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+    // No squatter: the id is FREE, so the only thing between a relayed fork and its install is
+    // the OTHER parent's live split reservation over the same child id.
+    DelegatingEngine::new(watch.clone()),
+  )
+  .await
+  .expect("the host binds over a foreign engine");
+  let lifecycle = handle.lifecycle().clone();
+  tokio::spawn(driver.run());
+
+  for parent in [p1, p2] {
+    handle
+      .create_group(parent, config(1, vec![1]), parent, CountSm::default(), 0)
+      .await
+      .expect("parent admission");
+    let g = vec![handle.group(parent)];
+    for i in 0..5u64 {
+      assert_eq!(submit_anywhere(&g, b"unit").await, i + 1);
+    }
+  }
+  // Both parents give away a DIFFERENT number of units, so whichever fork lands is identifiable.
+  handle
+    .group(p1)
+    .propose_split(child, 7, Bytes::from_static(&[2]))
+    .await
+    .expect("the first split commits");
+  // BACK TO BACK, deliberately: the second split must be proposed while the first fork is still
+  // unrelayed, which is the only way both reservations are live at once. A first fork destroyed on
+  // contact with the reservation releases the id early and this second propose then refuses — so
+  // its success is itself evidence the first fork was HELD.
+  let second = handle
+    .group(p2)
+    .propose_split(child, 8, Bytes::from_static(&[3]))
+    .await;
+  assert!(
+    second.is_ok(),
+    "THE LOSS: the second split could not commit ({second:?}) — the first fork was abandoned on \
+     contact with the reservation instead of held, releasing its child id early"
+  );
+  tokio::time::sleep(Duration::from_millis(400)).await;
+  let assert_no_loss = |what: &str| {
+    while let Ok(ev) = lifecycle.try_recv() {
+      assert!(
+        !matches!(&ev, LifecycleEvent::SplitRefused { child: cc, .. } if *cc == child),
+        "THE LOSS ({what}): a contested fork was abandoned — its blob is gone, got {ev:?}"
+      );
+    }
+  };
+  assert_no_loss("with both forks in flight");
+
+  // One fork installs; the other meets first the reservation, then the stores the winner filled.
+  // Neither is a verdict about a fork — both clear — so neither may be abandoned.
+  let c = vec![handle.group(child)];
+  let landed = query_anywhere(&c).await;
+  assert!(
+    landed == 2 || landed == 3,
+    "the child serves exactly one fork's partition, got {landed}"
+  );
+  // Both parents shrank by what they gave away — the units are conserved whichever fork won, and
+  // the loser's half is still held, not lost.
+  assert_eq!(query_anywhere(&[handle.group(p1)]).await, 3);
+  assert_eq!(query_anywhere(&[handle.group(p2)]).await, 2);
+  tokio::time::sleep(Duration::from_millis(300)).await;
+  assert_no_loss("after one fork landed");
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// Two forks naming ONE child, both held, on a one-slot tail: the first cue delivers and fills the
+/// slot, the second defers. When the first fork RESOLVES, only ITS cue may be purged — a purge
+/// keyed by child id would take the second's with it, and since held forks stay deliberately
+/// silent, that second wedge would then stand forever with no prompt ever delivered.
+#[tokio::test(flavor = "multi_thread")]
+async fn purging_a_resolved_forks_cue_spares_its_same_child_sibling() {
+  let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+  let (p1, p2, child) = (100u64, 200u64, 300u64);
+  let watch = std::sync::Arc::new(EngineWatch::default());
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle): (
+    MForeign<CountSm, DelegatingEngine>,
+    MultiHandle<u64, u64, CountSm>,
+  ) = MultiReactorStreamDriver::bind_with_engine(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    // ONE lifecycle slot: the second cue is raised against a full tail.
+    DriverConfig {
+      events_cap: 1,
+      ..DriverConfig::default()
+    },
+    DelegatingEngine::preloaded(preloaded_engine(&[child]), watch.clone()),
+  )
+  .await
+  .expect("the host binds over a preloaded engine");
+  let lifecycle = handle.lifecycle().clone();
+  tokio::spawn(driver.run());
+
+  for parent in [p1, p2] {
+    handle
+      .create_group(parent, config(1, vec![1]), parent, CountSm::default(), 0)
+      .await
+      .expect("parent admission");
+    let g = vec![handle.group(parent)];
+    for i in 0..5u64 {
+      assert_eq!(submit_anywhere(&g, b"unit").await, i + 1);
+    }
+    handle
+      .group(parent)
+      .propose_split(child, parent, Bytes::from_static(&[2]))
+      .await
+      .expect("the split commits");
+    // Let this fork raise its own cue before the next one queues, so the first fills the slot.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+  }
+
+  // Release the id: the first fork installs and its cue purges. The SECOND fork's cue was queued
+  // behind the full tail and must survive that purge — it is the only prompt that wedge will get.
+  assert!(handle.remove_group(child).await.expect("remove resolves"));
+  assert!(handle.clear_tombstone(child).await.expect("clear resolves"));
+  let c = vec![handle.group(child)];
+  assert_eq!(query_anywhere(&c).await, 2, "one fork landed");
+
+  // Drain the tail. Two cues must arrive across the run: the delivered one and the survivor.
+  let mut cues = 0;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while cues < 2 {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the surviving cue never arrived: the purge took its sibling's"
+    );
+    let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_secs(2), lifecycle.recv_async()).await
+    else {
+      continue;
+    };
+    if matches!(&ev, LifecycleEvent::SplitConflict { child: cc, .. } if *cc == child) {
+      cues += 1;
+    }
+  }
+
+  handle.shutdown().await.expect("the multi host tears down");
 }

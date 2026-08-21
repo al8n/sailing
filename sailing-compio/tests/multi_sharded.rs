@@ -24,7 +24,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use common::{CountSm, TrapSm};
+use common::{CountSm, DelegatingEngine, EngineWatch, TrapSm};
 use sailing_compio::{
   BoxedGroupFactory, DriverConfig, DriverError, EngineMetrics, GroupBlueprint, GroupHandle,
   LifecycleEvent, Node, ShardMap, ShardedCompioHost, ShardedMultiHandle, SpawnError, factory_fn,
@@ -1677,4 +1677,83 @@ fn reshape_cycle_under_continuous_load() {
   for h in [&node1, &node2] {
     bo(h.shutdown()).expect("the sharded host tears down");
   }
+}
+
+/// THE ENGINE SEAM, from outside the crate. This file is an integration test: it can name only
+/// `sailing-compio`'s PUBLIC API, so a host built here over [`DelegatingEngine`] — a foreign
+/// `MultiEngine` that is neither a re-export nor an alias of the built-in one — is proof the seam
+/// is reachable by a downstream crate, which a `pub(crate)` constructor would not be.
+///
+/// The factory contract is pinned too: invoked ONCE per plane index, on the spawning thread,
+/// its product moving into that plane. Then both planes are driven for real — a sole-voter group
+/// on each elects and commits with no network in the path — and the engines' own barrier counter
+/// proves the planes ran on the engines handed in, not on ones the host quietly built itself.
+#[test]
+fn a_foreign_engine_reaches_every_plane_through_the_public_seam() {
+  let base: SocketAddr = "127.0.0.1:45370".parse().unwrap();
+  let map = ShardMap::<u64>::uniform(2);
+  let (g_a, g_b) = distinct_shard_gids(&map);
+
+  let built = Arc::new(AtomicUsize::new(0));
+  let planes = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+  let watch = Arc::new(EngineWatch::default());
+
+  let node = {
+    let built = built.clone();
+    let planes = planes.clone();
+    let watch = watch.clone();
+    ShardedCompioHost::<u64, u64, CountSm, Labeled<Passthrough>>::new(
+      map.clone(),
+      base,
+      Vec::new(),
+      plain_records(1),
+      DriverConfig::default(),
+    )
+    .with_engine_factory(move |shard: usize| {
+      built.fetch_add(1, Ordering::SeqCst);
+      planes.lock().unwrap().push(shard);
+      DelegatingEngine::new(watch.clone())
+    })
+    .spawn()
+    .expect("the sharded host spawns over a foreign engine")
+  };
+
+  // `spawn` returns only once every plane is bound, so every factory call has already happened.
+  assert_eq!(
+    built.load(Ordering::SeqCst),
+    2,
+    "one engine per plane — no more, and none shared"
+  );
+  let mut seen = planes.lock().unwrap().clone();
+  seen.sort_unstable();
+  assert_eq!(
+    seen,
+    vec![0, 1],
+    "the factory saw every plane index exactly once"
+  );
+
+  // Both planes run for real on their foreign engines: a sole-voter group needs no network to
+  // elect or commit, so a failure here is the engine, not the loopback.
+  for gid in [g_a, g_b] {
+    bo(node.create_group(gid, config(1, vec![1]), gid, CountSm::default(), 0))
+      .expect("group admission through the foreign engine");
+  }
+  for gid in [g_a, g_b] {
+    let handle = node.group(gid);
+    assert_eq!(
+      submit_anywhere(std::slice::from_ref(&handle), b"foreign"),
+      1,
+      "the group commits through the foreign engine"
+    );
+  }
+  assert!(
+    watch.barriers.load(Ordering::SeqCst) > 0,
+    "the cranks ran the FOREIGN engine's barrier — the host did not substitute its own"
+  );
+
+  bo(node.shutdown()).expect("the sharded host tears down");
+  assert!(
+    !watch.staged_at_drop.load(Ordering::SeqCst),
+    "every plane's teardown ran its final barrier: no staged work died with the engine"
+  );
 }
