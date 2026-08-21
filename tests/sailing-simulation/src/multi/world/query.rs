@@ -276,6 +276,55 @@ impl MultiWorld {
     self.groups.get(&gid).is_some_and(|m| m.keys.contains(&key))
   }
 
+  /// How many times `gid`'s tenure of `key` has been broken — `0` for an unbroken original
+  /// tenure, and for an unknown gid (see [`lifecycle::GroupMeta::key_epochs`]). A deferred read
+  /// check compares this against the value captured at its invocation: equal means the group has
+  /// owned the key continuously across the read's whole life, which is exactly what
+  /// [`group_holds_key`](Self::group_holds_key) alone cannot tell.
+  pub(crate) fn key_epoch_of(&self, gid: u64, key: u16) -> u64 {
+    self
+      .groups
+      .get(&gid)
+      .and_then(|m| m.key_epochs.get(&key).copied())
+      .unwrap_or(0)
+  }
+
+  /// The value floor `key` inherits from content `gid` FOLDED IN — absorbed at a merge, or
+  /// inherited at a fork — at a fold coordinate `<= upto`, `0` when no fold in range carries the
+  /// key. The value reconstruction's second leg: the folded cells keep their source-log indices
+  /// (and, for a fork baseline, the parent's tag), so an index-bounded, tag-filtered scan of
+  /// `gid`'s record cannot place them; this anchors them at the coordinate where they became
+  /// visible in `gid`'s own index space (see [`lifecycle::GroupMeta::fold_baselines`]).
+  pub(crate) fn fold_baseline_of(&self, gid: u64, key: u16, upto: u64) -> u64 {
+    self
+      .groups
+      .get(&gid)
+      .and_then(|m| {
+        m.fold_baselines
+          .iter()
+          .filter(|(at, _)| *at <= upto)
+          .filter_map(|(_, values)| values.get(&key).copied())
+          .max()
+      })
+      .unwrap_or(0)
+  }
+
+  /// Whether any fold ABOVE `upto` in `gid`'s own index space carried `key` — a fold whose
+  /// spliced cells an index-bounded reconstruction at `upto` cannot classify, since their
+  /// preserved foreign indices say nothing about that coordinate yet the anchor is not in range
+  /// either. Membership is EXACTLY "this fold spliced that key": an anchor is built from the
+  /// folded-in record alone, so it names every key that record carried — parked ones included —
+  /// and no key the receiving group merely already held, which would otherwise retire judgeable
+  /// checks over folds that touched nothing of theirs (see
+  /// [`lifecycle::GroupMeta::fold_baselines`]).
+  pub(crate) fn fold_after(&self, gid: u64, key: u16, upto: u64) -> bool {
+    self.groups.get(&gid).is_some_and(|m| {
+      m.fold_baselines
+        .iter()
+        .any(|(at, values)| *at > upto && values.contains_key(&key))
+    })
+  }
+
   /// Committed splits the world REGISTERED (child materialized) — the report's split witness.
   pub(crate) fn splits_applied(&self) -> u64 {
     self.splits_applied

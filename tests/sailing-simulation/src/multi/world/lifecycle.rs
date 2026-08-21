@@ -79,6 +79,30 @@ pub(crate) struct GroupMeta {
   /// an inherited cell (see `MultiWorld::cross_talk_sweep`). Reset at recreation: a fresh
   /// incarnation inherits nothing.
   pub(crate) fork_baseline: usize,
+  /// Value-reconstruction anchors for record content this incarnation did not write itself:
+  /// `(fold index in THIS group's own log-index space, per-key value of the folded-in content at
+  /// that fold)`, in fold order. `LogSm::absorb` grafts the source's cells KEEPING their
+  /// source-log indices (the conservation walk's contract) and a fork's manufactured baseline
+  /// keeps the parent's, so an index-bounded reconstruction over this group's record cannot place
+  /// those cells — their indices name a foreign space. The baseline carries their value at the
+  /// coordinate where it became visible HERE, the only coordinate this group's index space
+  /// defines for them: a merge records the absorbed source at the absorb boundary, a fork child
+  /// records its inherited genesis at index 0. Each map is built from the FOLDED-IN record alone,
+  /// so its key set is exactly what that fold physically spliced — which is what lets membership
+  /// answer [`MultiWorld::fold_after`] while the values answer
+  /// [`MultiWorld::fold_baseline_of`]. Reset at recreation, so a fresh incarnation never inherits
+  /// an earlier one's anchors.
+  pub(crate) fold_baselines: Vec<(u64, BTreeMap<u16, u64>)>,
+  /// Per-key OWNERSHIP EPOCH: how many times this group's tenure of the key has been broken
+  /// (absent = 0, the key's original tenure). Bumped where the population transitions, both
+  /// directions: a split ends the tenure of every instruction-matched key, and a merge that hands
+  /// a key the group does NOT currently hold starts a new one. Reacquisition IS a new epoch — the
+  /// point of the counter is that "holds the key" cannot distinguish held from held-AGAIN, so a
+  /// deferred read check compares epochs to tell whether the record it is about to be judged
+  /// against is the one its invocation described (see [`MultiWorld::key_epoch_of`]). Reset at
+  /// recreation alongside the population itself; the incarnation generation is the second leg
+  /// that covers the boundary.
+  pub(crate) key_epochs: BTreeMap<u16, u64>,
 }
 
 impl MultiWorld {
@@ -279,6 +303,13 @@ impl MultiWorld {
     meta.keys = (0..super::super::NUM_KEYS).collect();
     meta.fork_baseline = 0;
     meta.carried_tags.clear();
+    // The fresh incarnation's log-index space restarts, so the old one's fold coordinates name
+    // nothing here — and its record is empty, so it has folded in no content of its own yet.
+    meta.fold_baselines.clear();
+    // Key tenure restarts with the population: this incarnation owns its whole domain from
+    // nothing. A deferred check captured under the old incarnation is retired by the GENERATION
+    // leg, which is why resetting the counters here cannot let one slip through matching.
+    meta.key_epochs.clear();
     let voters = meta.voters.clone();
     assert!(
       self.checkers.insert(gid, Checker::new()).is_none(),

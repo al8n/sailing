@@ -165,6 +165,24 @@ impl MultiWorld {
     for node in self.node_ids.clone() {
       let now = self.now;
       let husk_floors = self.embedder_husk_floors(node);
+      // The absorb CONSUMES the source endpoint, so the source's own record is gone by the time a
+      // resolution is folded below. Snapshot it here, while it still exists on this very host —
+      // the replica that is about to be absorbed, so no other replica's lag can enter the
+      // picture. FROZEN groups only: a merge source is frozen from the freeze until consumption,
+      // which makes this both precise and nearly always empty.
+      let frozen: Vec<u64> = self.hosts[&node]
+        .group_ids()
+        .copied()
+        .filter(|g| {
+          self.hosts[&node]
+            .group(g)
+            .is_some_and(sailing_proto::Endpoint::is_frozen)
+        })
+        .collect();
+      let pre_absorb: BTreeMap<u64, AppliedLog> = frozen
+        .into_iter()
+        .map(|g| (g, self.applied_of(node, g)))
+        .collect();
       let resolutions = {
         let host = self.hosts.get_mut(&node).expect("host exists");
         let mut stores = NodeStores {
@@ -193,7 +211,7 @@ impl MultiWorld {
             // against the fold-point records of one-crank resolvers — a false divergence. The
             // teardown registration below still rides this discharge.
             if !self.absorbed_pending.remove(&(node, source, target)) {
-              self.register_or_check_merge(node, source, target, boundary);
+              self.register_or_check_merge(node, source, target, boundary, &pre_absorb);
             }
             // The driver's teardown half — DEFERRED behind the capture's durability, modeling
             // the engine's one-barrier batch: floor, teardown, and the absorb capture land
@@ -226,7 +244,7 @@ impl MultiWorld {
               .get(&node)
               .and_then(|h| h.group(&target))
               .map_or(sailing_proto::Index::ZERO, |ep| ep.applied_index());
-            self.register_or_check_merge(node, source, target, boundary);
+            self.register_or_check_merge(node, source, target, boundary, &pre_absorb);
             self.absorbed_pending.insert((node, source, target));
           }
           sailing_proto::MergeResolution::CaptureFailed { .. } => {
@@ -306,6 +324,7 @@ impl MultiWorld {
     source: u64,
     target: u64,
     boundary: sailing_proto::Index,
+    pre_absorb: &BTreeMap<u64, AppliedLog>,
   ) {
     let record = self.applied_of(node, target);
     // Multiset form, like the equal-applied agreement: a crash-restored replica resolving the
@@ -360,14 +379,72 @@ impl MultiWorld {
       )
     };
     let absorbed_keys = source_keys.clone();
+    // The value oracle's fold ANCHOR (see [`lifecycle::GroupMeta::fold_baselines`]): absorbed
+    // cells arrive keeping their SOURCE-log indices, so the target's index-bounded value
+    // reconstruction cannot place them — pin their value at the absorb boundary, the target's own
+    // coordinate where they became visible. Tag-agnostic per-key max, since per-key values ride
+    // one global monotone counter, so the max over every tag that ever wrote the key is its
+    // latest value.
+    //
+    // Built from the SOURCE's record, so the map's keys are exactly the PHYSICALLY SPLICED set —
+    // which is what both readers need. [`MultiWorld::fold_after`] asks "did this fold splice that
+    // key", so a key the source never carried must not appear: taken from the post-fold UNION
+    // instead, every key the target ALREADY held would answer yes, and an unrelated merge landing
+    // above a pending read would retire a judgeable check. Every key with a source cell does
+    // appear, PARKED keys included — `LogSm::absorb` appends the source's whole record whatever
+    // its live population says, and a lost split leaves cells behind for keys the population
+    // dropped. Narrowing does not change the VALUES either: for a spliced key the target's own
+    // cells all sit at or below `boundary` in its own index space, so any read that can see this
+    // fold can index-classify them, and max(record scan, source-max anchor) is the union max on
+    // both oracle legs. The split side derives its genesis anchor the same way, from the fork's
+    // own record.
+    //
+    // The snapshot is the union's TAIL by the append contract, asserted here: had it missed
+    // source applies the service made before extracting, the anchor would under-cover the splice
+    // and reopen the very index-space gap it exists to close.
+    let spliced = pre_absorb.get(&source).unwrap_or_else(|| {
+      panic!(
+        "node {node} folded g{source} into g{target} with no pre-absorb snapshot of the source — \
+         the anchor has nothing to describe the splice with"
+      )
+    });
+    assert!(
+      record.ends_with(spliced),
+      "ABSORB TAIL: node {node} folded g{source} into g{target} but the union does not end with \
+       the source record captured before the service ran\n  source={:?}\n  union={:?}\n  \
+       seed={} tick={}",
+      spliced,
+      record,
+      self.seed,
+      self.tick_count,
+    );
+    let mut fold_values: BTreeMap<u16, u64> = BTreeMap::new();
+    for (_, cmd) in spliced {
+      if let Some((_, key, value)) = super::super::decode_gkv(cmd) {
+        let slot = fold_values.entry(key).or_default();
+        *slot = (*slot).max(value);
+      }
+    }
     {
       let meta = self
         .groups
         .get_mut(&target)
         .unwrap_or_else(|| panic!("merge target {target} is registered"));
+      // A key the target does NOT currently hold STARTS a new tenure here (see
+      // [`lifecycle::GroupMeta::key_epochs`]): reacquisition after a split is exactly the
+      // discontinuity a deferred read check must not be judged across. A key already held is
+      // untouched — the union only adds cells to a tenure that never lapsed.
+      for key in &source_keys {
+        if !meta.keys.contains(key) {
+          *meta.key_epochs.entry(*key).or_default() += 1;
+        }
+      }
       meta.keys.extend(source_keys);
       meta.carried_tags.insert(source);
       meta.carried_tags.extend(source_carried);
+      if !fold_values.is_empty() {
+        meta.fold_baselines.push((boundary.get(), fold_values));
+      }
     }
     // Freeze the source's checker into the retired archive: a group being dismantled
     // host-by-host must not be live-judged against a shrinking replica view (the durable-quorum

@@ -122,6 +122,22 @@ impl MultiWorld {
     if let Ok(idx) = &result {
       let meta = self.groups.get_mut(&parent).expect("registered group");
       let child_keys = meta.keys.split_off(&point);
+      // OWNERSHIP moves at acceptance; the fold ANCHORS do not. Everything here is a ROUTING
+      // fact: the population shrink above and the tenure bump below hold whether or not the split
+      // ever lands, because a proposed-away key is unroutable from this instant either way, and a
+      // reacquisition bumps the tenure again regardless. The anchors describe CELLS, a RECORD
+      // fact that changes only when `LogSm::split` actually runs — an accepted split can still be
+      // deposed and truncated with its cells never leaving, so their retirement waits for the
+      // parent-side partition (see [`MultiWorld::pump_forks`]).
+      //
+      // The same transition ENDS this group's tenure of every instruction-matched key (see
+      // [`lifecycle::GroupMeta::key_epochs`]). Over the whole domain slice, not the live set, for
+      // the reason the anchor purge just used: the instruction moves cells by key alone, so a
+      // parked key's tenure ends here too — and a read invoked before this point must never be
+      // judged against a record where the key was handed away and later handed back.
+      for key in point..super::super::NUM_KEYS {
+        *meta.key_epochs.entry(key).or_default() += 1;
+      }
       // Record the fence coordinate (the split entry's parent-log index) so a later parked-fork
       // conflict on this child can be attributed to the index its standing capture fence sits at.
       self.split_fence_index.insert(child, *idx);
@@ -150,6 +166,30 @@ impl MultiWorld {
           break;
         };
         progressed = true;
+        // The parent's record has PARTITIONED on this host: the split applied there and this fork
+        // is the half it yielded. That — not the proposal — is when the moved keys' fold ANCHORS
+        // retire (see [`lifecycle::GroupMeta::fold_baselines`]), because anchors describe cells,
+        // and an accepted-but-deposed split is truncated away with its cells never leaving the
+        // parent (the lost-split shape the parked-key tests build). Retiring at proposal would
+        // strip the anchor off content the record still holds, and a later reacquisition of that
+        // key then floors the serve leg below what the invocation legitimately saw. A lost split
+        // simply never reaches here, which is exactly right. Both arms below follow the apply, so
+        // this sits ahead of the materialize/refuse split: the cells left either way.
+        //
+        // FIRST confirmation only. The purge is idempotent by itself, but a merge into the parent
+        // between two hosts' drains can legitimately anchor a key at or above the point — a
+        // reacquisition — and a second pass would strip that new anchor away.
+        if !self.partitioned_splits.contains(&fork.child)
+          && let Some(point) = self.pending_splits.get(&fork.child).map(|p| p.point)
+        {
+          self.partitioned_splits.insert(fork.child);
+          if let Some(meta) = self.groups.get_mut(&fork.parent) {
+            for (_, values) in &mut meta.fold_baselines {
+              values.retain(|key, _| *key < point);
+            }
+            meta.fold_baselines.retain(|(_, values)| !values.is_empty());
+          }
+        }
         // The pure container cannot see retirement — the coordinators own that refusal, and
         // this catalog check models it. A lagging parent replica can apply the split AFTER the
         // child's registered incarnation was retired (or recreated past the fork's
@@ -283,6 +323,21 @@ impl MultiWorld {
         .filter(|key| *key >= pending.point)
     }));
     let voters: BTreeSet<u64> = fork.config.voters().iter().copied().collect();
+    // The child's GENESIS fold anchor (see [`lifecycle::GroupMeta::fold_baselines`]): the
+    // inherited cells keep the PARENT's log indices and the PARENT's tag, so neither the child's
+    // index-bounded reconstruction nor its tag filter can reach them — yet they are the child's
+    // committed value for every key it inherited. Fold index 0: the baseline is visible from the
+    // child's first instant, so no read of it can predate the anchor. Tag-agnostic per-key max
+    // over the fork's own manufactured record, for the same monotone-counter reason the merge
+    // anchor uses — and, symmetrically with it, over the SPLICED content itself, so the map's
+    // keys are exactly what physically arrived here and nothing wider.
+    let mut genesis: BTreeMap<u16, u64> = BTreeMap::new();
+    for (_, cmd) in fork.fsm.applied() {
+      if let Some((_, key, value)) = super::super::decode_gkv(cmd) {
+        let slot = genesis.entry(key).or_default();
+        *slot = (*slot).max(value);
+      }
+    }
     // The child's TAG LINEAGE: its inherited baseline carries the parent's tag — and whatever
     // foreign tags the parent itself legitimately carried (its own ancestry and absorbs). The
     // baseline floor covers these cells positionally for the child's own sweep; the carried
@@ -312,6 +367,11 @@ impl MultiWorld {
         // independent of HOW a replica arrived (see `cross_talk_sweep` for why the count
         // stays sound once onward splits shrink the inherited prefix).
         fork_baseline: fork.fsm.applied().len(),
+        fold_baselines: if genesis.is_empty() {
+          Vec::new()
+        } else {
+          Vec::from([(0, genesis)])
+        },
         ..lifecycle::GroupMeta::default()
       },
     );

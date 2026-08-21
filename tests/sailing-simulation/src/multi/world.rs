@@ -199,6 +199,14 @@ pub struct MultiWorld {
   /// `(parent, child)` conflict can be attributed to the index its standing capture fence sits at.
   /// Persistent (a split's fence index never changes); bounded by the run's split count.
   split_fence_index: BTreeMap<u64, sailing_proto::Index>,
+  /// Children whose split the world has seen the PARENT's record actually partition for — the
+  /// first drained fork on any host, materialized or refused, since either way the parent's
+  /// `LogSm::split` already ran there. Keyed like every other split record, by child id. The fold
+  /// anchors for the moved keys retire against this, not against proposal (see
+  /// [`MultiWorld::pump_forks`]); recording the event keeps that retirement to the FIRST
+  /// confirmation, so a reacquisition anchored between two hosts' drains is not stripped by the
+  /// second. Bounded by the run's split count.
+  partitioned_splits: BTreeSet<u64>,
   /// Standing fork-conflict fences observed per `(node, parent)`: `split index -> conflicting CHILD`
   /// for each parked-fork squatter the fork pump drained on that node (see
   /// [`MultiWorld::pump_forks`]). A parked fork holds the parent's capture fence at its split index; a
@@ -361,6 +369,7 @@ impl MultiWorld {
       split_stale: 0,
       split_conflicts: 0,
       split_fence_index: BTreeMap::new(),
+      partitioned_splits: BTreeSet::new(),
       fork_conflicts: BTreeMap::new(),
       split_refused: 0,
       merges: Vec::new(),
