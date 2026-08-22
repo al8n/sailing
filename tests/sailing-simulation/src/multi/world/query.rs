@@ -31,6 +31,14 @@ impl MultiWorld {
       .collect()
   }
 
+  /// The `(gid, generation)` incarnations a LIVE safety-oracle suite is currently judging. Two
+  /// entries for one id mean an older incarnation survives beside its successor — each judged
+  /// against its own expectations.
+  #[cfg(test)]
+  pub(crate) fn judged_incarnations(&self) -> Vec<(u64, u64)> {
+    self.checkers.keys().copied().collect()
+  }
+
   /// Whether node `node` currently hosts a replica of `gid`.
   pub(crate) fn hosts_group(&self, node: u64, gid: u64) -> bool {
     self
