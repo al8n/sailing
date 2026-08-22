@@ -34,6 +34,10 @@ struct GInFlight {
   message: Message<u64>,
 }
 
+/// Membership observations awaiting their checker, keyed by the OBSERVING replica's incarnation
+/// and carrying `(boundary index, term, config)` per observation.
+type ObservationQueue = BTreeMap<(u64, u64), Vec<(u64, u64, checker::ConfSnapshot)>>;
+
 /// A deterministic world of [`MultiRaft`] container hosts. Nodes are empty containers until
 /// [`create_group`](Self::create_group) wires a group onto its member nodes; each `(node, group)`
 /// replica owns its own [`MemLog`]/[`MemStable`] pair, mirroring per-group stores in production.
@@ -58,9 +62,12 @@ pub struct MultiWorld {
   isolated: BTreeSet<u64>,
   /// Completed [`tick`](Self::tick)s (threaded into oracle panics for replay).
   tick_count: u64,
-  /// One safety-oracle suite PER GROUP — unchanged oracle code, parameterized by the per-group
-  /// [`ClusterView`](crate::ClusterView) assembled from the group's hosting nodes.
-  checkers: BTreeMap<u64, Checker>,
+  /// One safety-oracle suite per LIVE INCARNATION `(gid, generation)` — unchanged oracle code,
+  /// parameterized by the per-incarnation [`ClusterView`](crate::ClusterView) assembled from the
+  /// replicas bound to that incarnation. Keyed by incarnation rather than by id because two
+  /// incarnations of one id can be hosted at once (a late fork beside a recreation), and a frozen
+  /// archive judges nothing — an island must have a LIVE checker or it goes unjudged.
+  checkers: BTreeMap<(u64, u64), Checker>,
   /// The one-identity tripwire: `(granter, gid, gen, term) → grantee` over every REAL-vote grant
   /// any replica ever sends (see [`oracles::note_grant`]).
   grants: BTreeMap<GrantKey, u64>,
@@ -76,13 +83,24 @@ pub struct MultiWorld {
   /// installed) — sticky, mirroring the single-group lineage flag.
   snapshot_lineage: BTreeSet<(u64, u64)>,
   /// Per-group committed conf-change transitions observed since the last check (fed to the
-  /// membership oracle exactly as `Cluster::pending_transitions` is, then cleared).
-  pending_transitions: BTreeMap<u64, Vec<(u64, u64, checker::ConfSnapshot)>>,
+  /// membership oracle exactly as `Cluster::pending_transitions` is, then cleared). Keyed by
+  /// INCARNATION, like the checkers that consume it: a gid-keyed queue is drained by whichever
+  /// incarnation the checker loop reaches first, starving every other one of its own observations.
+  pending_transitions: ObservationQueue,
   /// Per-group new transfer-snapshot installs observed since the last check (then cleared).
-  pending_new_installs: BTreeMap<u64, Vec<(u64, u64, checker::ConfSnapshot)>>,
-  /// The harness-side group registry: one [`lifecycle::GroupMeta`] per logical group id, across
-  /// incarnations (retirement flips `retired`; recreation bumps `generation`).
+  pending_new_installs: ObservationQueue,
+  /// The harness-side group registry: one [`lifecycle::GroupMeta`] per logical group id, holding
+  /// the CURRENT incarnation's expectations (retirement flips `retired`; recreation bumps
+  /// `generation` and archives what it replaces).
   groups: BTreeMap<u64, lifecycle::GroupMeta>,
+  /// Expectation meta for incarnations the registry no longer holds, keyed `(gid, generation)`.
+  /// A recreation ARCHIVES what it supersedes rather than destroying it, because a replica of the
+  /// superseded incarnation can still be hosted somewhere — a fork that materializes after the
+  /// ceremony lands as its own older incarnation — and it must be judged against ITS expectations
+  /// (its inherited baseline, its tag lineage, its key population), not against the successor's.
+  /// Judging it against the successor is the single-meta misattribution: legal inherited cells read
+  /// as a cross-group leak.
+  meta_archive: BTreeMap<(u64, u64), lifecycle::GroupMeta>,
   /// Frozen checker archive for retired incarnations, keyed `(gid, generation)` — each ran one
   /// final check at removal and keeps its cross-tick history inspectable.
   retired: BTreeMap<(u64, u64), Checker>,
@@ -125,6 +143,20 @@ pub struct MultiWorld {
   /// this back so a replayed split folds to a duplicate no-op instead of re-materializing (or, now,
   /// PARKING against) an already-relayed child.
   relayed_lineage: BTreeMap<(u64, u64), u64>,
+  /// Per-`(node, gid)` PER-HOST TOMBSTONE — the coordinator's own volatile `retired` set, which is
+  /// per-host in production because each host removes its own replica. Set when a host's endpoint
+  /// removal commits, lifted by that host's re-admission (a re-wire, or a teardown rolled back) and
+  /// by the embedder's explicit consent. The fork relay's gate reads it: a tombstoned id is spoken
+  /// for, so a fork naming it HOLDS rather than landing.
+  host_tombstones: BTreeSet<(u64, u64)>,
+  /// Per-`(node, gid)` REPLICA INCARNATION, bound when the replica is wired and never moved
+  /// afterwards — the generation THIS replica object speaks for, which is what production stamps
+  /// outbound frames with (a host stamps its own committed generation, never a cluster-wide
+  /// registry's). A fork-born replica binds the fork's `child_gen`; every other path binds the
+  /// registry generation live at the wire. Two incarnations of one id can therefore coexist on
+  /// different nodes with DIFFERENT stamps, which is precisely what a shared-registry stamp cannot
+  /// express.
+  replica_gen: BTreeMap<(u64, u64), u64>,
   /// Per-`(node, gid)` confirmed `ReadState`s in confirmation order. Monotone and NEVER removed
   /// on replica teardown, so the read ledger's scan offsets stay valid across re-wiring.
   read_states: BTreeMap<(u64, u64), Vec<ReadState>>,
@@ -340,6 +372,7 @@ impl MultiWorld {
       pending_transitions: BTreeMap::new(),
       pending_new_installs: BTreeMap::new(),
       groups: BTreeMap::new(),
+      meta_archive: BTreeMap::new(),
       retired: BTreeMap::new(),
       muted: BTreeSet::new(),
       net_faults: NetworkFaults::none(),
@@ -353,6 +386,8 @@ impl MultiWorld {
       configs: BTreeMap::new(),
       restarts: BTreeMap::new(),
       relayed_lineage: BTreeMap::new(),
+      host_tombstones: BTreeSet::new(),
+      replica_gen: BTreeMap::new(),
       boot_epochs: BTreeMap::new(),
       read_states: BTreeMap::new(),
       member_view: BTreeMap::new(),
@@ -461,7 +496,7 @@ impl MultiWorld {
        logical group rejoins via recreate_group)"
     );
     assert!(
-      self.checkers.insert(gid, Checker::new()).is_none(),
+      self.checkers.insert((gid, 0), Checker::new()).is_none(),
       "create_group: group {gid} already exists"
     );
     self.groups.insert(
@@ -507,6 +542,11 @@ impl MultiWorld {
     // Fresh stores in the world's configured mode (async for the merge profiles' fsync-loss
     // window). Built before the host borrow so it never straddles the `&self` `fresh_stores` read.
     let (log, stable) = self.fresh_stores(node, gid);
+    // This replica's incarnation, bound ONCE here: every non-fork path wires the registry's live
+    // generation, which is the generation this replica object will speak for until it is torn
+    // down. A re-wire rebinds because it IS a new object. Read before the host borrow, like the
+    // stores above.
+    let bound = self.generation_of(gid);
     let host = self
       .hosts
       .get_mut(&node)
@@ -515,6 +555,9 @@ impl MultiWorld {
     self.stables.insert((node, gid), stable);
     self.configs.insert((node, gid), config.clone());
     self.member_view.insert((node, gid), is_member);
+    self.replica_gen.insert((node, gid), bound);
+    // A hosted replica is not tombstoned: admitting one is the re-admission the tombstone gates.
+    self.host_tombstones.remove(&(node, gid));
     // Bump the replica incarnation on EVERY (re)wire: a member re-added after a teardown starts
     // a fresh endpoint at commit 0, and the group checker must reset that node's monotonicity
     // baseline rather than flag the legitimate drop.
@@ -770,18 +813,28 @@ impl MultiWorld {
   /// current state, panicking with the oracle name + seed + tick on a violation. Called at the
   /// end of every [`tick`](Self::tick); exposed so tests can also invoke it at a chosen point.
   pub fn check_now(&mut self) {
-    let gids: Vec<u64> = self.checkers.keys().copied().collect();
-    for gid in gids {
-      let view = self.group_view(gid);
+    let keys: Vec<(u64, u64)> = self.checkers.keys().copied().collect();
+    for (gid, generation) in keys {
+      let view = self.group_view(gid, generation);
       self
         .checkers
-        .get_mut(&gid)
+        .get_mut(&(gid, generation))
         .expect("checker exists")
         .check_or_panic(&view);
       // The checker folded this view's transitions/installs; clear so the next batch is fresh.
-      self.pending_transitions.entry(gid).or_default().clear();
-      self.pending_new_installs.entry(gid).or_default().clear();
-      self.cross_talk_sweep(gid);
+      // Clear THIS incarnation's observations only: another incarnation of the same id has its own
+      // queue and its own checker still to run.
+      self
+        .pending_transitions
+        .entry((gid, generation))
+        .or_default()
+        .clear();
+      self
+        .pending_new_installs
+        .entry((gid, generation))
+        .or_default()
+        .clear();
+      self.cross_talk_sweep(gid, generation);
       self.conserve_sweep(gid);
       self.lineage_sweep(gid);
     }
@@ -918,15 +971,17 @@ impl MultiWorld {
   /// attribution. Kind-unobservable declines are tolerated, exactly as the single-group policy
   /// tolerates them (see [`kind_unobservable_installs`](Self::kind_unobservable_installs)).
   pub fn finalize_membership_or_panic(&mut self, seed: u64) {
-    let gids: Vec<u64> = self.checkers.keys().copied().collect();
-    for gid in gids {
-      let generation = self.generation_of(gid);
-      let ck = self.checkers.get_mut(&gid).expect("checker exists");
+    let keys: Vec<(u64, u64)> = self.checkers.keys().copied().collect();
+    for (gid, generation) in keys {
+      let ck = self
+        .checkers
+        .get_mut(&(gid, generation))
+        .expect("checker exists");
       if let Err(v) = checker::finalize_membership(ck) {
         panic!(
-          "SAFETY ORACLE VIOLATION (run-end final pass): {v}\n  group={gid} seed={seed}\n  \
-           (replay: run_multi_vopr for this seed and inspect the snapshot install at the \
-           reported boundary)",
+          "SAFETY ORACLE VIOLATION (run-end final pass): {v}\n  group={gid} gen={generation} \
+           seed={seed}\n  (replay: run_multi_vopr for this seed and inspect the snapshot install \
+           at the reported boundary)",
         );
       }
       Self::assert_installs_accounted(gid, generation, false, ck, seed);
@@ -1014,7 +1069,7 @@ impl MultiWorld {
 
   /// Assert every NEWLY applied entry on every replica of `gid` decodes (when gid-tagged) to
   /// `gid` itself — the O(1)-per-apply cross-group isolation oracle.
-  fn cross_talk_sweep(&mut self, gid: u64) {
+  fn cross_talk_sweep(&mut self, gid: u64, generation: u64) {
     // The floor derives from the GROUP record, never the replica's wiring path: a fork-born
     // group's inherited baseline cells carry an ANCESTOR's tag legitimately (the handover), and
     // every arrival path — fork materialization, a transferred snapshot into a fresh observer,
@@ -1023,14 +1078,18 @@ impl MultiWorld {
     // (`LogSm::split` removes moved-key cells record-wide), so flooring at the full count never
     // judges an inherited cell; the few own-tagged cells the floor may skip on a shrunk record
     // would pass the tag assert anyway — under-coverage there, never a false positive.
-    let baseline = self.groups.get(&gid).map_or(0, |m| m.fork_baseline);
+    // ...and from THIS INCARNATION's record: an island's inherited prefix and tag lineage are its
+    // own, and the successor's (empty) ones would read every inherited cell as a leak.
+    let baseline = self.meta_at(gid, generation).map_or(0, |m| m.fork_baseline);
     let carried = self
-      .groups
-      .get(&gid)
+      .meta_at(gid, generation)
       .map(|m| m.carried_tags.clone())
       .unwrap_or_default();
     for node in self.node_ids.clone() {
       if !self.hosts[&node].contains_group(&gid) {
+        continue;
+      }
+      if self.replica_gen_of(node, gid) != generation {
         continue;
       }
       let applied = self.applied_of(node, gid);
@@ -1051,10 +1110,24 @@ impl MultiWorld {
     }
   }
 
-  /// The group's incarnation (gen) for the one-identity grant key, from the lifecycle registry
-  /// (recreation is what moves it).
-  fn gen_of(&self, gid: u64) -> u64 {
-    self.generation_of(gid)
+  /// The incarnation `node`'s `gid` replica speaks for — its wire stamp and its judging identity.
+  /// Falls back to the registry for a replica whose binding predates its stores (nothing in the
+  /// world sends for an unwired replica, so the fallback is a total-function convenience).
+  pub(crate) fn replica_gen_of(&self, node: u64, gid: u64) -> u64 {
+    self
+      .replica_gen
+      .get(&(node, gid))
+      .copied()
+      .unwrap_or_else(|| self.generation_of(gid))
+  }
+
+  /// The expectation meta for ONE incarnation of `gid`: the live registry entry when `generation`
+  /// is the current one, else the archived entry the recreation that superseded it left behind.
+  pub(crate) fn meta_at(&self, gid: u64, generation: u64) -> Option<&lifecycle::GroupMeta> {
+    match self.groups.get(&gid) {
+      Some(meta) if meta.generation == generation => Some(meta),
+      _ => self.meta_archive.get(&(gid, generation)),
+    }
   }
 
   /// `node`'s admission floor for `gid` on the INCARNATION scale the stamp uses: one past the
@@ -1077,12 +1150,19 @@ impl MultiWorld {
   /// Assemble the per-group [`ClusterView`](crate::ClusterView) from `gid`'s hosting nodes —
   /// field-for-field the shape `Cluster::view` builds, scoped to one group's replicas and their
   /// `(node, gid)` stores, so the UNCHANGED oracle suite judges each group independently.
-  fn group_view(&self, gid: u64) -> checker::ClusterView {
+  fn group_view(&self, gid: u64, generation: u64) -> checker::ClusterView {
     let mut nodes = Vec::new();
     for &node in &self.node_ids {
       let Some(ep) = self.hosts[&node].group(&gid) else {
         continue;
       };
+      // PARTITION BY INCARNATION: a replica bound to a different incarnation of this id is a
+      // different group as far as every safety oracle is concerned — its terms restart, its log
+      // index space restarts, and its record descends from a different history. Judging the two
+      // together manufactures divergence out of two individually-correct replicas.
+      if self.replica_gen_of(node, gid) != generation {
+        continue;
+      }
       let log = &self.logs[&(node, gid)];
       let stable = &self.stables[&(node, gid)];
       let durable_first = log.durable_first_index().get();
@@ -1152,12 +1232,12 @@ impl MultiWorld {
       },
       committed_transitions: self
         .pending_transitions
-        .get(&gid)
+        .get(&(gid, generation))
         .cloned()
         .unwrap_or_default(),
       new_installs: self
         .pending_new_installs
-        .get(&gid)
+        .get(&(gid, generation))
         .cloned()
         .unwrap_or_default(),
       nodes,
@@ -1265,7 +1345,8 @@ impl MultiWorld {
           // lineage is the cross-lineage fusion the door gate refuses. A pristine adopter or a
           // same-token retransfer is legitimate and does not trip.
           let (seed, tick) = (self.seed, self.tick_count);
-          let generation = self.generation_of(gid);
+          // The INSTALLING replica's own incarnation — the identity its ledger entries key on.
+          let generation = self.replica_gen_of(node, gid);
           self.lineage.observe_install(
             seed,
             tick,
@@ -1273,11 +1354,15 @@ impl MultiWorld {
             meta.fork_id(),
             meta.last_index().get(),
           );
-          self.pending_new_installs.entry(gid).or_default().push((
-            node,
-            meta.last_index().get(),
-            checker::ConfSnapshot::from_conf_state(meta.conf()),
-          ));
+          self
+            .pending_new_installs
+            .entry((gid, generation))
+            .or_default()
+            .push((
+              node,
+              meta.last_index().get(),
+              checker::ConfSnapshot::from_conf_state(meta.conf()),
+            ));
         }
         Event::ConfChanged(cc) => {
           *self.conf_changed.entry((node, gid)).or_insert(0) += 1;
@@ -1311,11 +1396,18 @@ impl MultiWorld {
                 .map(|e| e.term().get())
                 .unwrap_or(0)
             };
-            self.pending_transitions.entry(gid).or_default().push((
-              idx.get(),
-              entry_term,
-              checker::ConfSnapshot::from_conf_state(cc.conf()),
-            ));
+            // The OBSERVING replica's incarnation, read at event time — the identity whose
+            // checker is owed this observation.
+            let observed_gen = self.replica_gen_of(node, gid);
+            self
+              .pending_transitions
+              .entry((gid, observed_gen))
+              .or_default()
+              .push((
+                idx.get(),
+                entry_term,
+                checker::ConfSnapshot::from_conf_state(cc.conf()),
+              ));
           }
         }
         Event::ReadState(rs) => {
@@ -1359,12 +1451,14 @@ impl MultiWorld {
   ///   (b) one-identity — a REAL-vote grant binds `(granter, gid, gen, term)` to one candidate
   ///       across every replica object this node ever hosts for the group.
   fn schedule_send(&mut self, from: u64, gid: u64, to: u64, message: Message<u64>) {
-    // The wire's incarnation stamp. The product reads the sender's committed generation for the
-    // gid; the world's truthful per-id incarnation is its lifecycle registry counter — the SAME
-    // value the one-identity grant key below uses, and the one `remove_group` retires. (The
-    // container's own lineage counter is NOT it here: the world re-admits every recreation at
-    // container generation 0, so that scale cannot order incarnations across a retirement.)
-    let generation = self.generation_of(gid);
+    // The wire's incarnation stamp: the SENDING REPLICA's own bound incarnation, exactly as
+    // production stamps a host's own committed generation. Reading the registry here instead would
+    // make two coexisting incarnations of one id stamp IDENTICALLY — the shared-meta infidelity
+    // that hides an island behind its successor's generation. Registry-scale still (the same scale
+    // the one-identity grant key uses and the one `remove_group` retires); the container's own
+    // lineage counter is NOT it, since the world re-admits every recreation at container
+    // generation 0, so that scale cannot order incarnations across a retirement.
+    let generation = self.replica_gen_of(from, gid);
     if let Message::AppendResponse(a) = &message
       && !a.reject()
     {
@@ -1385,7 +1479,9 @@ impl MultiWorld {
       && !vr.reject()
       && !vr.pre_vote()
     {
-      let generation = self.gen_of(gid);
+      // The GRANTER's own incarnation: two incarnations restart terms independently, so a
+      // registry-wide key would fuse two legitimate grants at the same term into a double vote.
+      let generation = self.replica_gen_of(from, gid);
       oracles::note_grant(
         &mut self.grants,
         self.seed,
@@ -1475,6 +1571,19 @@ impl MultiWorld {
       // demux: a frame whose sender stamp is below the RECEIVER's durable admission floor speaks
       // for a retired incarnation and is dropped, counted, never delivered. Equal admits. Ordered
       // with the product's ordering — after the transport-level drops, before store resolution.
+      //
+      // WHAT THIS DOES AND DOES NOT ISOLATE. Once the stamp is the sending replica's own bound
+      // incarnation, a surviving OLDER incarnation of an id (a stale fork landed on a host the
+      // successor never reached) is receive-live but send-fenced: inbound frames from the live
+      // incarnation clear the floor and are delivered, while everything it sends back is below the
+      // floor and dropped. It therefore cannot commit, cannot be elected, and cannot move — a
+      // STATIC island, which is why its content stays judgeable rather than racing.
+      //
+      // That isolation is REAL here and an INFIDELITY at the same time: it rests on
+      // `incarnation_floors` being world-wide, whereas production's floor is per-host and is never
+      // written at all for a never-reshaped gen-0 id. Production has no such fence for that shape,
+      // so the island must be JUDGED on its own incarnation's terms rather than assumed inert —
+      // see the incarnation-keyed checkers.
       let admits = sailing_proto::floor_admits(self.admission_floor(m.to, m.gid), m.generation);
       let Some(host) = self.hosts.get_mut(&m.to) else {
         continue; // unknown node id — drop safely

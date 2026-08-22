@@ -449,13 +449,12 @@ impl MultiWorld {
     // Freeze the source's checker into the retired archive: a group being dismantled
     // host-by-host must not be live-judged against a shrinking replica view (the durable-quorum
     // axiom's witnesses leave with each teardown — the fork-transient lesson's class).
-    if let Some(checker) = self.checkers.remove(&source) {
-      self
-        .retired
-        .insert((source, self.generation_of(source)), checker);
+    let source_gen = self.generation_of(source);
+    if let Some(checker) = self.checkers.remove(&(source, source_gen)) {
+      self.retired.insert((source, source_gen), checker);
     }
-    self.pending_transitions.remove(&source);
-    self.pending_new_installs.remove(&source);
+    self.pending_transitions.remove(&(source, source_gen));
+    self.pending_new_installs.remove(&(source, source_gen));
     self.merges.push(MergeRecord {
       source_led,
       target_led,
@@ -658,7 +657,7 @@ impl MultiWorld {
   /// manufactures the absent/duplicate abort arm and skips the union: committed divergence
   /// against every host that absorbed. Eligible only when this node's target replica is gone,
   /// or is past the boundary with no park naming the source.
-  fn embedder_husk_floors(&self, node: u64) -> BTreeSet<u64> {
+  pub(super) fn embedder_husk_floors(&self, node: u64) -> BTreeSet<u64> {
     let mut out = BTreeSet::new();
     let host = &self.hosts[&node];
     for (gid, meta) in &self.groups {
@@ -813,6 +812,13 @@ impl MultiWorld {
   /// A world with no under-hosted merge participant yields the EMPTY set — every merge is then
   /// obliged to converge, and any that does not still trips the gate.
   pub(crate) fn tracked_merge_wedge_set(&self) -> BTreeSet<u64> {
+    self.tracked_merge_wedge_set_excluding(&BTreeSet::new())
+  }
+
+  /// [`tracked_merge_wedge_set`](Self::tracked_merge_wedge_set) with `ignore`'s groups struck from
+  /// the ROOT set before the cascade — the same counterfactual leg
+  /// [`fork_fence_wedge_set_excluding`](Self::fork_fence_wedge_set_excluding) provides.
+  pub(crate) fn tracked_merge_wedge_set_excluding(&self, ignore: &BTreeSet<u64>) -> BTreeSet<u64> {
     let participant =
       |g: u64| self.group_frozen(g) || self.group_freeze_seen(g) || self.group_merge_parked(g);
     // Base: merge participants with no live host quorum (the under-hosted husk roots).
@@ -820,7 +826,7 @@ impl MultiWorld {
       .groups
       .keys()
       .copied()
-      .filter(|&g| participant(g) && !self.has_live_host_quorum(g))
+      .filter(|&g| !ignore.contains(&g) && participant(g) && !self.has_live_host_quorum(g))
       .collect();
     // A parked target whose NAMED source has no live host quorum is the same under-hosted root
     // even when the source's surviving husk predates its own freeze: a pre-freeze replica is not
@@ -836,7 +842,11 @@ impl MultiWorld {
         self.group_merge_parked(g)
           && self
             .parked_source_of(g)
-            .is_some_and(|s| !self.has_live_host_quorum(s))
+            // The counterfactual reaches this leg too: an ignored source is one whose missing
+            // quorum the strike-out is hypothesising away, so a park on it is not an under-hosted
+            // root either. Filtering only the first leg would let the same root back in wearing its
+            // target's name, and the difference would read as zero.
+            .is_some_and(|s| !ignore.contains(&s) && !self.has_live_host_quorum(s))
       })
       .collect();
     base.extend(parked_on_quorumless);
@@ -901,17 +911,9 @@ impl MultiWorld {
   /// there, and this absorb cannot proceed above it — the composition deadlock of two individually
   /// sound designs, safety intact. The park being LIVE is a co-condition read from world state, so an
   /// accumulated record never certifies a group whose merge is no longer parked.
+  #[cfg(test)]
   pub(crate) fn fork_fence_coupled_park(&self, gid: u64) -> bool {
-    self.node_ids.iter().any(|&n| {
-      self.hosts[&n]
-        .group(&gid)
-        .is_some_and(|ep| ep.pending_merge().is_some())
-        && self.has_fork_fence_below(
-          n,
-          gid,
-          sailing_proto::Index::new(self.applied_index_of(n, gid).get() + 1),
-        )
-    })
+    self.fork_fence_coupled_park_excluding(gid, &BTreeSet::new())
   }
 
   /// The full set of groups wedged in the fork-fence coupling (#110): every merge participant
@@ -921,38 +923,161 @@ impl MultiWorld {
   /// held behind a coupled target's stalled park. EMPTY when no coupling stands — every merge is
   /// then obliged to converge.
   pub(crate) fn fork_fence_wedge_set(&self) -> BTreeSet<u64> {
+    self.fork_fence_wedge_set_excluding(&BTreeSet::new())
+  }
+
+  /// The `(node, gid)` fence-coupling EDGES a held fork explains: this node's own recorded conflict
+  /// cue names a child tombstoned on this same node. Node-local on both sides, like every other leg
+  /// of the classifier.
+  pub(crate) fn held_fork_fence_edges(&self, gids: &BTreeSet<u64>) -> BTreeSet<(u64, u64)> {
+    let mut out = BTreeSet::new();
+    for &g in gids {
+      for &n in &self.node_ids {
+        if self.retired_hold_on(n, g) {
+          out.insert((n, g));
+        }
+      }
+    }
+    out
+  }
+
+  /// [`fork_fence_wedge_set`](Self::fork_fence_wedge_set) with `ignore`'s groups struck from the
+  /// ROOT set before the cascade — the counterfactual leg of the exemption accounting: what this
+  /// class would still wedge if those roots were not blocked. The difference against the real set
+  /// is exactly what the ignored cause explains, which a raw set intersection cannot tell apart
+  /// from coincidence.
+  pub(crate) fn fork_fence_wedge_set_excluding(
+    &self,
+    ignore: &BTreeSet<(u64, u64)>,
+  ) -> BTreeSet<u64> {
     let base: BTreeSet<u64> = self
       .groups
       .keys()
       .copied()
-      .filter(|&g| self.fork_fence_coupled_park(g))
+      .filter(|&g| self.fork_fence_coupled_park_excluding(g, ignore))
       .collect();
     self.propagate_merge_block(base)
   }
 
-  /// Whether `gid` is a merge participant whose progress is blocked by a HELD fork — one the relay
-  /// parked because its child id is TOMBSTONED in this world's catalog. Both legs are verified from
-  /// MODEL state, never inferred from the symptom: a conflict cue this world RECORDED for
-  /// `(node, gid)` naming the child, and that child's `retired` flag in the catalog. A merely
-  /// merge-waiting group with no such record is not in the class and still trips every gate.
+  /// [`fork_fence_coupled_park`](Self::fork_fence_coupled_park) with specific `(node, gid)` EDGES
+  /// struck out. The coupling is a per-NODE fact — one replica's fence sitting at or below its own
+  /// park boundary — so the counterfactual has to strike edges, not whole ids: a group coupled on
+  /// node A by a held fork and independently coupled on node B is still a root through B, and
+  /// removing the whole group would cancel a real regression along with the attributable one.
+  pub(crate) fn fork_fence_coupled_park_excluding(
+    &self,
+    gid: u64,
+    ignore: &BTreeSet<(u64, u64)>,
+  ) -> bool {
+    self.node_ids.iter().any(|&n| {
+      !ignore.contains(&(n, gid))
+        && self.hosts[&n]
+          .group(&gid)
+          .is_some_and(|ep| ep.pending_merge().is_some())
+        && self.has_fork_fence_below(
+          n,
+          gid,
+          sailing_proto::Index::new(self.applied_index_of(n, gid).get() + 1),
+        )
+    })
+  }
+
+  /// A RESURRECTED HUSK: an id the embedder retired that is nonetheless hosted, on a node carrying
+  /// no tombstone for it. Only one thing puts a replica of a retired id on an untombstoned host —
+  /// a fork the relay held through the teardown, landing on a member the removal never reached —
+  /// so this is the LANDED outcome of the same held-fork class whose other outcome is a standing
+  /// hold. Its replicas cannot reach a quorum (the rest of the members are torn down), which is
+  /// why it reads as an under-hosted merge participant while nothing about the merge machinery is
+  /// wrong.
   ///
-  /// Unlike the #106 and #110 classes this is NOT a filed liveness gap awaiting a cure, which is
-  /// why it is certified UNCONDITIONALLY rather than only under a storm profile: it belongs with
-  /// `group_frozen` among the BY-DESIGN refusals. The embedder tombstoned the child, the relay is
-  /// refusing to drop the partition that tombstone stranded, and `clear_tombstone` releases both —
-  /// which `a_retired_hold_releases_its_merge_on_consent` drives end to end. Without that release
-  /// test this predicate would be silence rather than certification.
+  /// Deliberately excludes a MERGED-away source: its host-by-host dissolve leaves husks by design,
+  /// and those are the merge resolver's business, not this class's.
+  /// A MERGED-AWAY husk whose dissolve is blocked by a held fork — the second way this class
+  /// removes a group's hosts, and the one a symptom-level reading mistakes for an under-hosted
+  /// absorb. The diligent-embedder feed only surfaces a husk once its merge TARGET on that host has
+  /// applied past the boundary and is not parked on it; a target parked behind a held fork never
+  /// gets there, so the husk keeps its lone replica indefinitely and reads as a merge participant
+  /// with no quorum. The chain is read end to end from model state — this husk's own merge record
+  /// names the target, and the target answers the held-fork predicate — never inferred from the
+  /// shared symptom.
+  pub(crate) fn husk_dissolve_blocked_by_hold(&self, gid: u64) -> bool {
+    let Some(meta) = self.groups.get(&gid) else {
+      return false;
+    };
+    if !meta.merged {
+      return false;
+    }
+    let led = Self::ledger_id(self.generation_of(gid), gid);
+    let Some(rec) = self.merges.iter().find(|m| m.source_led == led) else {
+      return false;
+    };
+    self.retired_hold_park(rec.target)
+  }
+
+  pub(crate) fn resurrected_husk(&self, gid: u64) -> bool {
+    let Some(meta) = self.groups.get(&gid) else {
+      return false;
+    };
+    if !meta.retired || meta.merged {
+      return false;
+    }
+    self
+      .node_ids
+      .iter()
+      .any(|&n| self.hosts_group(n, gid) && !self.host_tombstones.contains(&(n, gid)))
+  }
+
+  /// Whether `gid` is a merge participant whose progress is blocked by a HELD fork — one the relay
+  /// parked because its child id is TOMBSTONED in this world's catalog — with CAUSALITY established
+  /// on the same node, the way the #106 and #110 classifiers establish theirs. Both legs are read
+  /// from MODEL state, never inferred from the symptom.
+  ///
+  /// Whether `node`'s `gid` replica owes a fork the relay is holding for a TOMBSTONED child id —
+  /// the single-node fact both causal legs below are built from. Node-local on both sides: this
+  /// node's own recorded conflict cue, and this node's own tombstone.
+  pub(crate) fn retired_hold_on(&self, node: u64, gid: u64) -> bool {
+    self.fork_conflicts.get(&(node, gid)).is_some_and(|idxs| {
+      idxs
+        .values()
+        .any(|c| self.host_tombstones.contains(&(node, *c)))
+    })
+  }
+
+  /// Two causal shapes, mirroring [`fork_fence_coupled_park`](Self::fork_fence_coupled_park):
+  ///
+  /// - `gid` is a merge TARGET parked on a source, and THAT SOURCE holds a retired-child fork on a
+  ///   node hosting it — the source cannot be consumed, so this park cannot resolve.
+  /// - `gid` itself holds a retired-child fork on a node where a fence sits AT OR BELOW that
+  ///   replica's park boundary — its own obligation is what stalls it.
+  ///
+  /// A coincidental retired-child conflict on some unrelated node certifies NOTHING: without one of
+  /// these two chains the wedge is somebody else's and must still trip the liveness gates.
   pub(crate) fn retired_hold_park(&self, gid: u64) -> bool {
     let participant =
       self.group_frozen(gid) || self.group_freeze_seen(gid) || self.group_merge_parked(gid);
-    participant
-      && self.node_ids.iter().any(|&n| {
-        self.fork_conflicts.get(&(n, gid)).is_some_and(|idxs| {
-          idxs
-            .values()
-            .any(|c| self.groups.get(c).is_some_and(|m| m.retired))
-        })
-      })
+    if !participant {
+      return false;
+    }
+    // Leg one: the source this target is parked on cannot be consumed, because a node hosting it
+    // owes a retired-child fork.
+    if let Some(source) = self.parked_source_of(gid)
+      && self
+        .node_ids
+        .iter()
+        .any(|&n| self.hosts_group(n, source) && self.retired_hold_on(n, source))
+    {
+      return true;
+    }
+    // Leg two: this group's OWN held fork stalls it, on a node whose fence sits at or below the
+    // replica's park boundary.
+    self.node_ids.iter().any(|&n| {
+      self.retired_hold_on(n, gid)
+        && self.has_fork_fence_below(
+          n,
+          gid,
+          sailing_proto::Index::new(self.applied_index_of(n, gid).get() + 1),
+        )
+    })
   }
 
   /// The full set of groups wedged behind a tombstone-held fork, built exactly as the other two
@@ -964,7 +1089,11 @@ impl MultiWorld {
       .groups
       .keys()
       .copied()
-      .filter(|&g| self.retired_hold_park(g))
+      .filter(|&g| {
+        self.retired_hold_park(g)
+          || self.resurrected_husk(g)
+          || self.husk_dissolve_blocked_by_hold(g)
+      })
       .collect();
     if base.is_empty() {
       return BTreeSet::new();

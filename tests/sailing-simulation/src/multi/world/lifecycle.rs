@@ -21,7 +21,7 @@ const DEPARTED_GRACE_PASSES: u32 = 3;
 pub(crate) const TEARDOWN_TIE_BUDGET: usize = 128;
 
 /// Harness-side registry entry for one logical group (one per group id, across incarnations).
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct GroupMeta {
   /// The group's committed VOTER set, reconciled from the group leader's runtime `conf_state()`.
   pub(crate) voters: BTreeSet<u64>,
@@ -147,11 +147,11 @@ impl MultiWorld {
     // so they run BEFORE teardown and on the FULL view; the checker stays LIVE (not yet archived)
     // until the teardown lands, so a fault-burned attempt re-runs them harmlessly (`check_or_panic`
     // is the per-tick check and `certify_retiring_history` is a monotone, idempotent observer).
-    let view = self.group_view(gid);
+    let view = self.group_view(gid, generation);
     {
       let checker = self
         .checkers
-        .get_mut(&gid)
+        .get_mut(&(gid, generation))
         .expect("a live group has a checker");
       checker.check_or_panic(&view);
       crate::checker::certify_retiring_history(checker, &view);
@@ -244,6 +244,21 @@ impl MultiWorld {
     for &node in &torn_down {
       self.purge_group_stores(gid, node);
     }
+    // The embedder's catalog removal reaches every MEMBER, not merely the hosts holding a replica
+    // at this instant: a coordinator's tombstone insert is unconditional, so a member that is
+    // partitioned, lagging, or has not yet materialized its replica is tombstoned by the same call.
+    // That is what makes CONSENT the gate for a fork still in flight toward this id — without it,
+    // whether a late fork lands would turn on the accident of which member happened to be hosting.
+    let members: Vec<u64> = self
+      .groups
+      .get(&gid)
+      .map(|m| m.voters.iter().chain(m.learners.iter()).copied().collect())
+      .unwrap_or_default();
+    for node in members {
+      if self.node_ids.contains(&node) {
+        self.host_tombstones.insert((node, gid));
+      }
+    }
     if ceiling > 0 {
       let floor = self.removal_floors.entry(gid).or_insert(0);
       *floor = (*floor).max(ceiling.saturating_add(1));
@@ -269,13 +284,42 @@ impl MultiWorld {
     // suite stops judging the gid).
     let checker = self
       .checkers
-      .remove(&gid)
+      .remove(&(gid, generation))
       .expect("a live group has a checker");
     self.retired.insert((gid, generation), checker);
-    self.pending_transitions.remove(&gid);
-    self.pending_new_installs.remove(&gid);
+    self.pending_transitions.remove(&(gid, generation));
+    self.pending_new_installs.remove(&(gid, generation));
     self.bus.retain(|m| m.gid != gid);
     true
+  }
+
+  /// Lift `gid`'s tombstone, returning whether one existed — the world's mirror of the
+  /// coordinators' `clear_tombstone`. It takes no view on whether the id is hosted or reshaped, and
+  /// it lifts ONLY the volatile consent gate: no generation bump, no replicas created, and the
+  /// persisted admission floors (`removal_floors`, `incarnation_floors`) untouched, so no consent
+  /// call ever re-admits an under-floor incarnation.
+  ///
+  /// This is the production release for a fork the relay HOLDS on a tombstone: consent alone lets
+  /// the child id go free, and the held fork then LANDS. A REMOVAL that floors the id is the other
+  /// valve and a different one — it raises the admission floor, so the same held fork is abandoned
+  /// terminally instead of released.
+  ///
+  /// ONE refusal, and it is not a fidelity break: a MERGED-away id is floored at the reserved
+  /// terminal, so consent could never re-admit it anyway — but the world's tombstone doubles as the
+  /// relay gate's occupancy answer, and lifting it there would invite a fork to materialize a child
+  /// that no longer exists in any lineage. The embedder that owns a terminal id has nothing to
+  /// consent to.
+  pub fn clear_tombstone(&mut self, gid: u64) -> bool {
+    match self.groups.get_mut(&gid) {
+      Some(meta) if meta.retired && !meta.merged => {
+        meta.retired = false;
+        // The per-host consent gates lift with it: the embedder consents to the ID, and every host
+        // holding a fork for it is released at its next relay drain.
+        self.host_tombstones.retain(|(_, g)| *g != gid);
+        true
+      }
+      _ => false,
+    }
   }
 
   /// Recreate a retired `gid` as the SAME logical group at `generation + 1`: fresh stores, fresh
@@ -293,6 +337,17 @@ impl MultiWorld {
        the catalog never re-admits it"
     );
     assert!(meta.retired, "recreate_group: group {gid} is not retired");
+    // ARCHIVE, never destroy: a replica of the outgoing incarnation can still be hosted (or can
+    // still ARRIVE — a fork held through this ceremony materializes as its own older incarnation),
+    // and it must keep being judged against the expectations it was built under. The reset below
+    // is what makes the live entry the successor's alone.
+    let outgoing = meta.generation;
+    let archived = meta.clone();
+    self.meta_archive.insert((gid, outgoing), archived);
+    let meta = self
+      .groups
+      .get_mut(&gid)
+      .expect("recreate_group: the group was live above");
     meta.retired = false;
     meta.generation += 1;
     meta.learners.clear();
@@ -311,8 +366,12 @@ impl MultiWorld {
     // leg, which is why resetting the counters here cannot let one slip through matching.
     meta.key_epochs.clear();
     let voters = meta.voters.clone();
+    let generation = meta.generation;
     assert!(
-      self.checkers.insert(gid, Checker::new()).is_none(),
+      self
+        .checkers
+        .insert((gid, generation), Checker::new())
+        .is_none(),
       "recreate_group: a retired group has no live checker"
     );
     let voter_vec: Vec<u64> = voters.iter().copied().collect();
@@ -633,6 +692,21 @@ impl MultiWorld {
       husk_floors: &no_husks,
     };
     host.remove_group(&gid, &mut stores)?;
+    // The coordinator tombstoned this id on THIS host (its `retired` insert): re-admission here
+    // now needs the embedder's explicit consent. Set only on a committed removal — a refusal
+    // returns above with the endpoint fully intact.
+    self.host_tombstones.insert((node, gid));
+    // The removal-time fork abandonment's guard advance, mirrored into this host's DURABLE relay
+    // lineage exactly as every real driver mirrors it beside its removal-floor write. Without it a
+    // later crash-replay of the parent would re-stage the very fork the removal killed.
+    let advances: Vec<(u64, u64)> = {
+      let host = self.hosts.get_mut(&node).expect("host exists");
+      core::iter::from_fn(|| host.poll_relay_guard_advance()).collect()
+    };
+    for (parent, generation) in advances {
+      let e = self.relayed_lineage.entry((node, parent)).or_insert(0);
+      *e = (*e).max(generation);
+    }
     Ok(())
   }
 
@@ -647,6 +721,9 @@ impl MultiWorld {
     self.snapshot_lineage.remove(&(node, gid));
     self.member_view.remove(&(node, gid));
     self.parked.remove(&(node, gid));
+    // The replica object is gone, so its incarnation binding goes with it: the next replica of this
+    // id here binds afresh at whatever incarnation actually wires it.
+    self.replica_gen.remove(&(node, gid));
     // A fork-fence record on `(node, gid)` — `gid` in the PARENT role — is a live coupling fact, not
     // history: tearing this node's `gid` replica down lifts any standing capture fence it held, so the
     // record must go with it (#110). This is the shared teardown chokepoint for both
@@ -668,6 +745,9 @@ impl MultiWorld {
   /// [`crash`](Self::crash) restores a rebooted node. The boot epoch is REUSED (the rollback is not
   /// a reboot; no in-flight message was ever sent to distinguish from).
   fn restore_group_replica(&mut self, gid: u64, node: u64) {
+    // The probe's endpoint removal tombstoned the id here; rolling it back re-admits the same
+    // replica, which in production is the embedder clearing its own consent gate first.
+    self.host_tombstones.remove(&(node, gid));
     let epoch = self.boot_epochs.get(&node).copied().unwrap_or(0);
     let config = self.configs[&(node, gid)].clone();
     let now = self.now;
@@ -763,7 +843,9 @@ impl MultiWorld {
 
   /// Test-only: place `gid`'s live incarnation at `generation`, so a fence test can stand a live
   /// group above a floor without driving a whole retire/recreate cycle (which purges the very
-  /// stragglers the fence exists for).
+  /// stragglers the fence exists for). Its already-wired replicas are REBOUND to that incarnation:
+  /// they are the ones being declared to speak for it, and a replica still bound to the generation
+  /// it was wired at would stamp below the floor and fence its own live group's traffic.
   #[cfg(test)]
   pub(crate) fn set_generation_for_test(&mut self, gid: u64, generation: u64) {
     self
@@ -771,6 +853,11 @@ impl MultiWorld {
       .get_mut(&gid)
       .expect("set_generation_for_test: unknown group")
       .generation = generation;
+    for node in self.node_ids.clone() {
+      if self.replica_gen.contains_key(&(node, gid)) {
+        self.replica_gen.insert((node, gid), generation);
+      }
+    }
   }
 
   /// Group `gid`'s reconciled committed voter set (the registry view).

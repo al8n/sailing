@@ -67,17 +67,29 @@ fn assert_membership_band_bounds(band: &str, reports: &[MultiVoprReport]) {
 /// The one residual the cure's design leaves open — a covering blob past the one-frame bound, which
 /// the leader must decline to send — is unreachable at the sim's tiny FSM blob sizes, so nothing
 /// here needs softening to an inequality; it stays tracked on #106.
+///
+/// The gate reads the UNATTRIBUTED remainder, not the raw counts. A fork the relay holds for a
+/// tombstoned child id keeps its parent unconsumable, and a merge parked behind that parent
+/// satisfies both cured classes' SHAPE predicates while its actual cause is the held fork — a
+/// by-design behavior with an embedder-held valve, not a regression of either cure. Subtracting the
+/// attribution overlap keeps the teeth exactly where they were: a #106 or #110 shape with no held
+/// fork behind it still trips, per class, with the same attribution in the message.
 fn assert_no_tracked_exemption(band: &str, seed: u64, r: &MultiVoprReport) {
   assert_eq!(
-    r.fork_fence_couplings_exempted, 0,
-    "{band} seed {seed} reached a FORK-FENCE coupling (#110), the class the fence-deferred absorb \
-     retired — overlap with #106 = {}, under-hosted = {}: {r:?}",
-    r.exemption_overlap, r.tracked_merge_wedges_exempted,
+    r.fork_fence_couplings_exempted - r.fork_fence_retired_hold_overlap,
+    0,
+    "{band} seed {seed} reached a FORK-FENCE coupling (#110) NOT attributable to a tombstone-held \
+     fork — the class the fence-deferred absorb retired — overlap with #106 = {}, under-hosted = \
+     {}: {r:?}",
+    r.exemption_overlap,
+    r.tracked_merge_wedges_exempted,
   );
   assert_eq!(
-    r.tracked_merge_wedges_exempted, 0,
-    "{band} seed {seed} reached an UNDER-HOSTED parked absorb (#106), the class the advertised \
-     boundary and its covering snapshot retired: {r:?}",
+    r.tracked_merge_wedges_exempted - r.under_hosted_retired_hold_overlap,
+    0,
+    "{band} seed {seed} reached an UNDER-HOSTED parked absorb (#106) NOT attributable to a \
+     tombstone-held fork — the class the advertised boundary and its covering snapshot retired: \
+     {r:?}",
   );
 }
 
@@ -91,6 +103,44 @@ fn the_retired_exemption_fires_on_a_fork_fence_coupling() {
     5,
     &MultiVoprReport {
       fork_fence_couplings_exempted: 2,
+      ..MultiVoprReport::default()
+    },
+  );
+}
+
+/// THE DUAL-ROOT CASE, kept as an assertion because it is what a raw set intersection gets wrong.
+/// A group can be independently under-hosted AND sit inside the held-fork cascade at the same
+/// time; intersecting the two sets cancels it and a REAL #106 regression rides a green band. Only
+/// the wedges the held-fork class actually EXPLAINS are subtracted, so a partial attribution leaves
+/// a remainder — and the remainder still trips, per class.
+#[test]
+#[should_panic(expected = "UNDER-HOSTED parked absorb (#106) NOT attributable")]
+fn a_partially_attributable_under_hosted_wedge_still_trips() {
+  assert_no_tracked_exemption(
+    "fabricated",
+    5,
+    &MultiVoprReport {
+      // Three under-hosted wedges, all three inside the held-fork cascade — but only two of them
+      // are there BECAUSE of a held fork. The third is a genuine regression.
+      tracked_merge_wedges_exempted: 3,
+      retired_hold_wedges_exempted: 3,
+      under_hosted_retired_hold_overlap: 2,
+      ..MultiVoprReport::default()
+    },
+  );
+}
+
+/// The same shape on the #110 arm.
+#[test]
+#[should_panic(expected = "FORK-FENCE coupling (#110) NOT attributable")]
+fn a_partially_attributable_fork_fence_wedge_still_trips() {
+  assert_no_tracked_exemption(
+    "fabricated",
+    5,
+    &MultiVoprReport {
+      fork_fence_couplings_exempted: 3,
+      retired_hold_wedges_exempted: 3,
+      fork_fence_retired_hold_overlap: 2,
       ..MultiVoprReport::default()
     },
   );

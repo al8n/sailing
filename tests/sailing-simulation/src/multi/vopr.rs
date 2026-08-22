@@ -582,6 +582,12 @@ pub struct MultiVoprReport {
   /// still owes a fork the relay holds for a retired child id. Counted on EVERY profile, because
   /// unlike the two filed classes this one is by-design behavior with an embedder-held valve.
   pub retired_hold_wedges_exempted: u64,
+  /// Of the #106 under-hosted wedges, how many are ALSO tombstone-held-fork wedges — the
+  /// ATTRIBUTION leg. A cured-class shape whose actual cause is the held fork is not a regression
+  /// of that cure; an UNATTRIBUTED one still is, which is what the band gate reads.
+  pub under_hosted_retired_hold_overlap: u64,
+  /// The same attribution leg for the #110 fork-fence couplings.
+  pub fork_fence_retired_hold_overlap: u64,
   /// HOSTED RETIRED HUSKS the run-end quiesce safety pass visited — gids with a lingering replica
   /// (a merged-away source frozen on a lagging host) that are NOT in `live_groups`. The witness that
   /// the unconditional safety worklist reaches beyond the live set; nonzero only when a husk survived
@@ -1226,6 +1232,27 @@ fn quiesce(
   report.fork_fence_couplings_exempted += forkfence.len() as u64;
   report.exemption_overlap += underhosted.intersection(&forkfence).count() as u64;
   report.retired_hold_wedges_exempted += retired_hold.len() as u64;
+  // ATTRIBUTION BY COUNTERFACTUAL, PER CLASS, because a set intersection cannot tell a cause from a
+  // coincidence: a group independently under-hosted that merely happens to sit in the held-fork
+  // cascade would cancel a real regression. Each cured class is re-derived with ONLY the roots the
+  // held-fork class actually EXPLAINS struck out, and the difference is what it is owed:
+  //   - #106's root is a missing host quorum, which a standing hold cannot cause and a RESURRECTED
+  //     HUSK can — the landed fork is why a torn-down id is hosted at all, on one member;
+  //   - #110's root is a fork-fence-coupled park, which is exactly what a standing HOLD causes.
+  // A root that survives its own class's strike-out stays counted, and still trips.
+  let resurrected: BTreeSet<u64> = underhosted
+    .iter()
+    .copied()
+    .filter(|&g| w.resurrected_husk(g) || w.husk_dissolve_blocked_by_hold(g))
+    .collect();
+  // EDGE-level, not id-level: strike only the (node, gid) couplings a held fork explains, so a
+  // group also coupled independently on another node keeps that root and still counts.
+  let held_edges = w.held_fork_fence_edges(&forkfence);
+  let underhosted_cf = w.tracked_merge_wedge_set_excluding(&resurrected);
+  let forkfence_cf = w.fork_fence_wedge_set_excluding(&held_edges);
+  report.under_hosted_retired_hold_overlap +=
+    underhosted.difference(&underhosted_cf).count() as u64;
+  report.fork_fence_retired_hold_overlap += forkfence.difference(&forkfence_cf).count() as u64;
   if !converged {
     // Only a NON-exempt group that failed to converge is a wedge worth panicking on; if every
     // straggler is the tracked class the loop already certified and we never reach here.

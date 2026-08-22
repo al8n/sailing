@@ -102,10 +102,144 @@ fn world_with_corrupt_install() -> MultiWorld {
   // Boundary 1 predates the conf-change entry, so the committed config in effect there is the
   // genesis {0,1,2}; an install claiming {0,1} at that boundary is a corrupt ConfState.
   w.pending_new_installs
-    .entry(100)
+    .entry((100, 0))
     .or_default()
     .push((1, 1, post_removal));
   w
+}
+
+/// A world holding TWO live incarnations of one id: the successor the registry knows about, and a
+/// lone replica still bound to the incarnation before it — the island shape. The binding is
+/// declared directly because the organic path needs a recreation that EXCLUDES the island's host,
+/// which the world's registry-driven recreate cannot express; everything downstream of the binding
+/// (routing, views, judging) is the real machinery.
+fn world_with_two_live_incarnations() -> (MultiWorld, (u64, u64, checker::ConfSnapshot)) {
+  let mut w = MultiWorld::new(2);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(600, |w| w.leader_of(100).is_some()));
+  // The corrupt observation, built exactly as [`world_with_corrupt_install`] builds its own:
+  // commit a removal, then claim the POST-removal config at a boundary that predates the entry
+  // carrying it. Captured BEFORE the ceremony below, because once the replicas are rebound the
+  // delivery fence stops their frames and nothing can commit.
+  propose_conf_change_until_accepted(&mut w, 100, sailing_proto::ConfChangeType::RemoveNode, 1);
+  assert!(
+    w.run_until(2_000, |w| {
+      w.hosts[&0]
+        .group(&100)
+        .is_some_and(|ep| !ep.conf_state().voters().contains(&1))
+    }),
+    "the removal never applied"
+  );
+  let obs = (
+    1,
+    1,
+    checker::ConfSnapshot::from_conf_state(&w.hosts[&0].group(&100).expect("hosted").conf_state()),
+  );
+
+  assert!(w.remove_group(100));
+  w.recreate_group(100);
+  assert!(w.run_until(600, |w| w.leader_of(100).is_some()));
+  assert_eq!(w.generation_of(100), 1);
+  // Every replica still speaks for the incarnation BEFORE the recreation — the shape the island
+  // ceremony leaves behind, where the successor exists in the registry and is hosted nowhere yet.
+  // Whole-set rather than one node because an incarnation hosting less than a quorum trips the
+  // durability axiom on its own, which would mask the routing property under test.
+  for n in 0..3 {
+    w.replica_gen.insert((n, 100), 0);
+  }
+  w.checkers.entry((100, 0)).or_default();
+  (w, obs)
+}
+
+/// THE STRIKE IS PER `(node, cause)`, NOT PER ID. A group can be fence-coupled on two nodes for
+/// two different reasons — a held fork for a tombstoned child on one, an ordinary fence with no
+/// tombstone behind it on the other. Cancelling the whole id would hand a clean bill to a wedge
+/// only half of which is attributable, so the counterfactual strikes individual edges and the
+/// independent one keeps the group a root.
+///
+/// SCOPE: this pins the strike SET, which is what the granularity change owns — the closure
+/// recomputation over the surviving roots is exercised by the band runs. A fully end-to-end
+/// dual-cause fixture is not constructible in this harness: no organic shape here leaves a
+/// `pending_merge` park standing on two replicas, and fabricating one needs the committed
+/// `CommitMerge` encoder, which is crate-private to `sailing-proto`.
+#[test]
+fn the_held_fork_strike_names_edges_not_whole_ids() {
+  let mut w = MultiWorld::new(5);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(2_000, |w| w.leader_of(100).is_some()));
+
+  // Two nodes record a fence naming the same child; only ONE of them has that child tombstoned.
+  for n in [0u64, 1] {
+    w.fork_conflicts
+      .entry((n, 100))
+      .or_default()
+      .insert(sailing_proto::Index::new(1), 9_999);
+  }
+  w.host_tombstones.insert((0, 9_999));
+
+  assert!(
+    w.retired_hold_on(0, 100),
+    "node 0's fence is explained by a held fork for a tombstoned child"
+  );
+  assert!(
+    !w.retired_hold_on(1, 100),
+    "node 1's is not — same id, different cause"
+  );
+
+  let edges = w.held_fork_fence_edges(&[100u64].into_iter().collect());
+  assert!(
+    edges.contains(&(0, 100)),
+    "the explained edge is struck: {edges:?}"
+  );
+  assert!(
+    !edges.contains(&(1, 100)),
+    "and the independent one is NOT — an id-level strike would have taken both, cancelling a \
+     root no held fork explains: {edges:?}"
+  );
+  assert!(
+    !edges.contains(&(2, 100)),
+    "nor an uninvolved node's: {edges:?}"
+  );
+}
+
+/// OBSERVATION ROUTING, SUCCESSOR SIDE. Two incarnations are judged by two checkers, so the
+/// observations that feed them must be keyed by incarnation too. A gid-keyed queue is drained by
+/// whichever checker the loop reaches FIRST — BTree order, so the oldest — and clears it; every
+/// later incarnation is then starved, and a corrupt install on the successor is judged against the
+/// island's history or vanishes entirely. It must trip in the SUCCESSOR's checker, named as such.
+#[test]
+#[should_panic(expected = "group=100 gen=1")]
+fn a_corrupt_successor_install_trips_the_successors_own_checker() {
+  let (mut w, obs) = world_with_two_live_incarnations();
+  w.pending_new_installs
+    .entry((100, 1))
+    .or_default()
+    .push(obs);
+  w.check_now();
+  w.finalize_membership_or_panic(2);
+}
+
+/// OBSERVATION ROUTING, ISLAND SIDE — the control. The same corrupt install recorded against the
+/// OLDER incarnation trips under generation 0, proving the routing is directional rather than one
+/// checker quietly swallowing both queues.
+#[test]
+#[should_panic(expected = "group=100 gen=0")]
+fn a_corrupt_island_install_trips_under_its_own_incarnation() {
+  let (mut w, obs) = world_with_two_live_incarnations();
+  w.pending_new_installs
+    .entry((100, 0))
+    .or_default()
+    .push(obs);
+  w.check_now();
+  w.finalize_membership_or_panic(2);
 }
 
 /// The per-tick suite only RECORDS membership observations (`check_or_panic` defers the
@@ -152,7 +286,7 @@ fn world_with_unjudgeable_install() -> MultiWorld {
   // No log-built replica is anywhere near applied 1_000_000, so the history is never certified
   // at that boundary and the observation can never be judged.
   w.pending_new_installs
-    .entry(100)
+    .entry((100, 0))
     .or_default()
     .push((1, 1_000_000, conf));
   w
@@ -1631,22 +1765,70 @@ fn alignment_never_masks_a_genuine_value_divergence() {
   assert_eq!(v.oracle, "agreement");
 }
 
-/// THE RELEASE COMPOSITION — what makes certifying a tombstone-held wedge honest rather than
-/// silent. A held fork keeps its parent unconsumable (`fork_obligations_standing`), so a merge
-/// naming that parent as SOURCE parks on the replica holding it. The embedder's own consent
-/// releases both.
-///
-/// The valve here is `recreate_group`, and it RAISES THE ID'S FLOOR — so the release runs through
-/// the TERMINAL arm, not a landing: the gen-0 fork can never clear a gen-1 floor, which is a
-/// verdict about the fork, so its blob is dropped DELIBERATELY. That is sound precisely because
-/// recreation is the embedder declaring the old incarnation gone; it is the same consent that
-/// authorizes the tombstone. What must then be true is that the obligation discharges and the
-/// merge the hold was blocking completes, with the conservation ledger green over what remains.
+/// NEGATIVE — COINCIDENCE IS NOT CAUSALITY. A retired-child fork conflict sitting on a node that
+/// has nothing to do with a parked merge must not certify that merge past the liveness gates. The
+/// classifier is what stands between a filed residual and a silenced fresh find, so it establishes
+/// causality the way the #106/#110 classifiers do — through the parked source, or through this
+/// group's own fence at its park boundary — and a bare coincidence satisfies neither.
 #[test]
-fn a_retired_hold_releases_its_merge_on_consent() {
-  // Source encodes ABOVE target under the LE-byte-string direction rule.
+fn a_coincidental_retired_child_conflict_does_not_certify_an_unrelated_wedge() {
+  let (mut w, source, target, child) = wedge_a_retired_hold_behind_a_merge(31);
+  assert!(
+    w.retired_hold_park(target) || w.retired_hold_park(source),
+    "the genuine wedge certifies through its causal chain"
+  );
+
+  // A SECOND, UNRELATED group with its own retired-child conflict recorded on a node — no merge,
+  // no park, no chain to the wedge above.
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(77, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(77).is_some()));
+  w.inject_fork_conflict_for_child(0, 77, sailing_proto::Index::new(1), child);
+  assert!(
+    !w.retired_hold_park(77),
+    "a retired-child conflict on a group that is no merge participant certifies nothing"
+  );
+
+  // And the conflict does not leak into the certified set for anyone else either.
+  let certified = w.retired_hold_wedge_set();
+  assert!(
+    !certified.contains(&77),
+    "the unrelated group stayed out of the certified set: {certified:?}"
+  );
+}
+
+/// NEGATIVE — A MERGED-AWAY CHILD DOES NOT PARK. Production reads the id's floor off the engine,
+/// where a merged-away id carries the reserved terminal; the relay therefore ABANDONS its fork
+/// rather than holding it. The world's gate must answer the same, or every such fork would park as
+/// a retired-hold and manufacture exemptions out of a class that is really terminal.
+#[test]
+fn a_merged_away_child_terminal_refuses_rather_than_parking() {
+  let (mut w, _source, _target, child) = wedge_a_retired_hold_behind_a_merge(37);
+  assert_eq!(
+    w.split_refused_observed(),
+    0,
+    "the fork is HELD while the id is merely tombstoned"
+  );
+
+  // The id is merged away on the holding node: its floor is the reserved terminal.
+  w.merge_floors.insert((2, child));
+  assert!(
+    w.run_until(6_000, |w| w.split_refused_observed() == 1),
+    "a terminal floor abandons the fork instead of parking it"
+  );
+  assert!(
+    !w.retired_hold_park(2),
+    "and nothing is left parked to certify"
+  );
+}
+
+/// Wedge a retired-hold BEHIND A MERGE: a fork held for a tombstoned child keeps its parent
+/// unconsumable (`fork_obligations_standing`), so a merge naming that parent as SOURCE parks on the
+/// replica holding it. Returns the world with the wedge standing and PROVEN STABLE. `source`
+/// encodes above `target` under the LE-byte-string direction rule.
+fn wedge_a_retired_hold_behind_a_merge(seed: u64) -> (MultiWorld, u64, u64, u64) {
   let (source, target, child) = (11u64, 10u64, 300u64);
-  let mut w = MultiWorld::new(23);
+  let mut w = MultiWorld::new(seed);
   for n in 0..3 {
     w.add_node(n);
   }
@@ -1683,9 +1865,9 @@ fn a_retired_hold_releases_its_merge_on_consent() {
     "a tombstone holds the fork, it does not abandon it"
   );
 
-  // Now merge the held fork's PARENT away as the source. The freeze is proposed at the leader,
-  // whose own fork resolved at materialization, so it commits — and then node 2, which still owes
-  // its held fork, cannot let its replica be consumed.
+  // Merge the held fork's PARENT away as the source. The freeze is proposed at the leader, whose
+  // own fork resolved at materialization, so it commits — and then node 2, which still owes its
+  // held fork, cannot let its replica be consumed.
   colocate_source_onto_target(&mut w, source, target);
   merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
     w.propose_prepare_merge(source, target)
@@ -1697,8 +1879,7 @@ fn a_retired_hold_releases_its_merge_on_consent() {
     w.run_until(6_000, |w| w.merges_resolved() >= 2),
     "the hosts without a held fork resolve the absorb"
   );
-  // The wedge must be STABLE, not merely slow: with the hold standing, a long quiet window buys
-  // no further progress and node 2 keeps its source replica.
+  // STABLE, not merely slow: a long quiet window buys no further progress.
   w.run_until(8_000, |_| false);
   assert_eq!(
     w.merges_resolved(),
@@ -1710,36 +1891,141 @@ fn a_retired_hold_releases_its_merge_on_consent() {
     "node 2 still holds the un-consumable source replica: {:?}",
     w.hosting_nodes(source)
   );
+  (w, source, target, child)
+}
 
-  // THE CONSENT, in two acts, and the second is not ceremony. Recreation raises the id's floor
-  // past the fork's generation — the embedder declaring the old incarnation gone, which is what
-  // finally makes the fork refusable. But a HOSTED child is examined before any gate (a hosted
-  // child always has stores, so a gate consulted first would swallow every conflict into a
-  // stores-hold and make the provenance exit unreachable), so while the new incarnation occupies
-  // the id the fork simply parks on it instead. Freeing the id lets the relay reach the floor it
-  // can never clear, and the fork resolves TERMINALLY: blob dropped, obligation discharged.
+/// THE ISLAND, BUILT DELIBERATELY. A fork held through its child's ENTIRE removal-and-recreation
+/// ceremony, then released onto an id that has moved on: what lands is the DEAD incarnation's
+/// baseline — inherited parent cells and all — beside a registry reading generation 1.
+///
+/// This is the shape the single-meta oracle misread. Judged against the successor's expectations
+/// (no inherited prefix, no tag lineage) every inherited cell reads as a cross-group leak; judged
+/// against its OWN, they are exactly what a fork child legitimately opens with. The cure is neither
+/// exclusion nor an assert that coexistence cannot happen — it remains reachable through paths this
+/// branch does not close — but INCARNATION-BOUND JUDGING: the island gets its own live checker and
+/// its own expectations, and the successor's checker never sees it.
+#[test]
+fn a_late_fork_lands_as_its_own_incarnation_and_is_judged_there() {
+  let (source, child) = (11u64, 300u64);
+  let mut w = MultiWorld::new(41);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(source, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(source).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(source, key, u64::from(key));
+    propose_until_accepted(&mut w, source, &payload);
+  }
+  assert!(w.run_until(2_000, |w| {
+    (0..3).all(|n| w.applied_of(n, source).len() >= 8)
+  }));
+
+  // Node 2 lags the split: {0,1} materialize the child while node 2 never even sees the entry.
+  w.isolate(2);
+  assert!(w.run_until(3_000, |w| w.leader_of(source).is_some_and(|l| l != 2)));
+  propose_split_until_accepted(&mut w, source, child, 4);
+  assert!(w.run_until(3_000, |w| w.splits_applied() == 1));
+
+  // THE WHOLE CEREMONY while node 2 is away: retire gen 0, bring the id back as gen 1, retire that
+  // too. Node 2 is a MEMBER throughout, so each removal tombstones it — and the gen-1 replica it
+  // briefly held carries no fork token, so that teardown SPARES the fork rather than abandoning it.
+  assert!(w.remove_group(child));
   w.recreate_group(child);
-  assert!(w.run_until(3_000, |w| w.generation_of(child) == 1));
+  assert!(w.remove_group(child));
+  assert_eq!(
+    w.generation_of(child),
+    1,
+    "the id moved on while node 2 was away"
+  );
+
+  w.heal(2);
+  assert!(
+    w.run_until(4_000, |w| w.split_conflicts_observed() >= 1),
+    "node 2 replays the split and HOLDS its fork on the tombstone"
+  );
   assert_eq!(
     w.split_refused_observed(),
     0,
-    "while the new incarnation holds the id, the fork parks on it rather than resolving"
+    "a token-less removal spares the fork — it is held, not abandoned"
   );
-  w.remove_group(child);
+
+  // Consent releases it onto an id whose registry incarnation is now 1.
   assert!(
-    w.run_until(6_000, |w| w.split_refused_observed() == 1),
-    "the raised floor never settled the held fork once the id was free"
+    w.clear_tombstone(child),
+    "a tombstone was standing to clear"
   );
-  // The merge now COMPLETES on the last host: the source leaves every replica and the target is
-  // no longer parked on it. (`merges_resolved` counts absorb resolutions and does not tick for a
-  // replica released this way, so the completion is asserted on the state, not the counter.)
+  assert!(
+    w.run_until(6_000, |w| w.hosts_group(2, child)),
+    "the held fork lands"
+  );
+  assert_eq!(
+    w.replica_gen_of(2, child),
+    0,
+    "it lands as the incarnation the SPLIT named, not as whatever the id has become"
+  );
+
+  // JUDGED, in isolation. The island has a checker of its own; the successor's was archived at its
+  // removal and never sees these replicas.
+  let judged = w.judged_incarnations();
+  assert!(
+    judged.contains(&(child, 0)),
+    "the island is judged under its own incarnation: {judged:?}"
+  );
+  assert!(
+    !judged.contains(&(child, 1)),
+    "and not folded into the successor's suite: {judged:?}"
+  );
+  // Its expectations are its own: an inherited prefix, and the parent's tag as a LEGAL carrier.
+  let island = w
+    .meta_at(child, 0)
+    .expect("the superseded incarnation's expectations were archived, not destroyed");
+  assert!(
+    island.fork_baseline > 0,
+    "the island opens on the fork's inherited baseline"
+  );
+  assert!(
+    island.carried_tags.contains(&source),
+    "and carries the parent's tag legitimately: {:?}",
+    island.carried_tags
+  );
+  // Non-vacuous: the inherited cells really are on the island's replica, and the full oracle suite
+  // sweeps them without tripping.
+  assert!(
+    w.applied_of(2, child).len() >= island.fork_baseline,
+    "the inherited cells are present to be judged"
+  );
+  w.check_now();
+  w.finalize_conservation_or_panic(41);
+}
+
+/// VALVE ONE — CONSENT. `clear_tombstone` is the production release for a fork held on a tombstone,
+/// and it is the gentle one: it lifts only the volatile consent gate, leaving the id's floor alone.
+/// The relay's gate stops reporting the child spoken-for, so the held fork LANDS — blob intact, the
+/// partition delivered — the parent's obligation discharges, and the merge that was parked behind
+/// it completes. Nothing is dropped anywhere on this path.
+#[test]
+fn a_retired_hold_releases_its_merge_when_the_tombstone_clears() {
+  let (mut w, source, target, child) = wedge_a_retired_hold_behind_a_merge(23);
+
+  assert!(
+    w.clear_tombstone(child),
+    "a tombstone was standing to clear"
+  );
+  assert!(
+    w.run_until(6_000, |w| w.hosts_group(2, child)),
+    "consent alone lets the held fork LAND: the child materializes where it was held"
+  );
+  assert_eq!(
+    w.split_refused_observed(),
+    0,
+    "nothing was abandoned — this valve delivers the partition, it does not drop it"
+  );
   assert!(
     w.run_until(8_000, |w| w.hosting_nodes(source).is_empty()),
-    "the released obligation never let the last host give up its source replica: \
-     resolved={} target={} hosting_source={:?}",
-    w.merges_resolved(),
-    w.merge_block_dbg(target),
-    w.hosting_nodes(source),
+    "the discharged obligation lets the last host give up its source replica: {:?}",
+    w.hosting_nodes(source)
   );
   assert!(
     !w.group_merge_parked(target),
@@ -1747,6 +2033,41 @@ fn a_retired_hold_releases_its_merge_on_consent() {
     w.merge_block_dbg(target)
   );
   w.finalize_conservation_or_panic(23);
+}
+
+/// VALVE TWO — a TERMINAL floor. The other real product path: once the child id carries a floor the
+/// fork's generation can never clear, the relay abandons it deliberately and the blob is dropped as
+/// the embedder's own declaration. The merge behind it completes either way, which is the point of
+/// covering both valves — the wedge is releasable, and by more than one act.
+///
+/// The floor used here is the merged-away sentinel, modelled the way the husk-dissolve suite models
+/// it: a completed merge floors the id terminally on this node. (Under the node-local gate a plain
+/// `recreate_group` no longer reaches this arm — it bumps the incarnation counter, which is not a
+/// floor; a never-reshaped child's teardown writes none.)
+#[test]
+fn a_retired_hold_is_abandoned_when_its_child_id_is_floored_terminally() {
+  let (mut w, source, target, child) = wedge_a_retired_hold_behind_a_merge(29);
+
+  // MODEL THE TERMINAL FLOOR on the node holding the fork: the id was merged away there.
+  w.merge_floors.insert((2, child));
+  assert!(
+    w.run_until(6_000, |w| w.split_refused_observed() == 1),
+    "a floor the fork can never clear settles it terminally"
+  );
+  assert!(
+    !w.hosts_group(2, child),
+    "a terminally-refused fork materializes nothing"
+  );
+  assert!(
+    w.run_until(8_000, |w| w.hosting_nodes(source).is_empty()),
+    "the discharged obligation lets the last host give up its source replica: {:?}",
+    w.hosting_nodes(source)
+  );
+  assert!(
+    !w.group_merge_parked(target),
+    "the target is no longer parked on the absorbed source: {}",
+    w.merge_block_dbg(target)
+  );
 }
 
 /// A LATE fork — a lagging parent replica applying the committed split after the child's
@@ -3864,15 +4185,14 @@ fn fork_fence_clears_on_the_refuse_arm_so_a_later_park_is_not_exempted() {
     w.run_until(4_000, |w| w.split_conflicts_observed() >= 1),
     "the late fork never signalled its hold"
   );
-  // Recreate, then retire again: what the recreation leaves behind is a FLOOR at generation 1,
-  // and a gen-0 fork can never clear it. That is a verdict about the fork rather than about the
-  // id, so this is the arm that abandons — and the arm that resolves the fence.
-  w.recreate_group(200);
-  assert!(w.run_until(2_000, |w| w.generation_of(200) == 1));
-  w.remove_group(200);
+  // Now floor the child TERMINALLY on this node — the state a completed merge of that id leaves,
+  // modelled as the husk-dissolve suite models it. A floor the fork's generation can never clear
+  // is a verdict about the fork rather than about the id, so this is the arm that abandons — and
+  // the arm that resolves the fence.
+  w.merge_floors.insert((2, 200));
   assert!(
     w.run_until(4_000, |w| w.split_refused_observed() == 1),
-    "the floor left by the recreation never refused the stale fork"
+    "the terminal floor never refused the stale fork"
   );
   assert!(
     !w.hosts_group(2, 200),
