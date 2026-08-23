@@ -510,7 +510,8 @@ impl ForkId {
   /// nothing, because every path that could act on a token is fenced on its own. The admission
   /// DOORS are the fence — the caller-driven fork installs refuse a reserved child id in both
   /// windows, so a chosen token can never reach a baseline at an id a split owns — and the relay's
-  /// own door takes every input from the container-minted `GroupFork` instead of from a caller.
+  /// own materialization never leaves the container, so it takes every input from the staged fork
+  /// rather than from a caller.
   /// Out-of-crate harnesses need to fabricate tokens precisely to test the provenance checks that
   /// reject them, which restricting this would prevent while closing nothing. `parent`/`child` are the
   /// group ids' canonical `Data` encodings; `parent_incarnation` is the parent's lineage AFTER the

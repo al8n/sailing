@@ -99,11 +99,10 @@ impl<G> FloorStore<G> for NoFloors {
 
 /// The facts a fork RELAY needs that the container cannot see for itself: whether the caller's
 /// storage already holds the child id, and that id's admission floor. The container asks at the
-/// moment it would hand a committed fork out, and maps the answers to a verdict itself
-/// ([`MultiRaft::poll_pending_fork_with`]) — the gate reports, it does not decide.
+/// moment it would install a committed fork, and maps the answers to a verdict itself
+/// ([`MultiRaft::peek_yieldable_fork`]) — the gate reports, it does not decide.
 ///
-/// [`NoHold`] is the answer of a caller with no storage to consult, and the default the
-/// no-argument [`poll_pending_fork`](MultiRaft::poll_pending_fork) supplies.
+/// [`NoHold`] is the answer of a caller with no storage to consult.
 ///
 /// # Cost contract
 ///
@@ -122,9 +121,41 @@ pub trait ForkGate<G> {
   fn floor(&self, gid: &G) -> u64;
 }
 
+/// The install's gate: the ENGINE's own facts, widened by whatever the engine cannot answer.
+///
+/// The install cannot take a live `ForkGate` from the caller — the gate would hold `&E` while the
+/// install needs `&mut E` to mint an epoch and resolve stores, and both borrows are live across the
+/// call. So the container composes the gate itself from the engine seam it is already given, and
+/// `extra` carries only the facts outside the engine: the coordinators' volatile tombstone set,
+/// `NoHold` everywhere else. The composition is exactly the coordinators': occupancy is either
+/// source saying yes, and the floor is the higher of the two.
+struct EngineForkGate<'a, E, X, I> {
+  engine: &'a E,
+  extra: &'a X,
+  _node: core::marker::PhantomData<I>,
+}
+
+impl<G, I, E, X> ForkGate<G> for EngineForkGate<'_, E, X, I>
+where
+  G: GroupId,
+  I: NodeId,
+  E: MultiEngine<G, I>,
+  X: ForkGate<G>,
+{
+  fn contains_group(&self, gid: &G) -> bool {
+    self.engine.contains_group(gid) || self.extra.contains_group(gid)
+  }
+
+  fn floor(&self, gid: &G) -> u64 {
+    // Through `FloorStore` — the one canonical accessor — so this internal re-check answers to the
+    // same fence, at the same freshness, as the create and factory doors outside.
+    FloorStore::floor(self.engine, gid).max(self.extra.floor(gid))
+  }
+}
+
 /// The gate of a caller holding no storage of its own: nothing is occupied and nothing is
-/// floored, which is [`poll_pending_fork`](MultiRaft::poll_pending_fork)'s behavior before the
-/// gate existed. The [`NoFloors`] idiom, for the relay.
+/// floored, which is the relay drain's behavior before the gate existed. The [`NoFloors`] idiom,
+/// for the relay.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct NoHold;
 
@@ -345,8 +376,8 @@ pub fn reshape_born_prevention<I>(config: Config<I>) -> Config<I> {
 }
 
 /// Mint a child's [`ForkId`] from one committed split's coordinates — the single source of the
-/// provenance token, minted identically at the relay YIELD (into the [`GroupFork`] the driver
-/// installs) and at the parked-fork REDUNDANT check. Every input is a property of the committed
+/// provenance token, minted identically at the in-container fork INSTALL (into the manufactured
+/// baseline's meta) and at the parked-fork REDUNDANT check. Every input is a property of the committed
 /// split entry, so the token is replica-identical: the parent id (its canonical `Data` encoding),
 /// the parent's lineage after the split (`parent_gen_after`), the split entry's `(index, term)`,
 /// and the child's already-canonical id bytes and incarnation.
@@ -668,18 +699,156 @@ pub struct MergeBlocked<G> {
   pub cause: MergeBlockedCause,
 }
 
-/// The outcome of one head-fork examination (see `MultiRaft::poll_pending_fork`): the parent's
+/// The outcome of one head-fork examination (see `MultiRaft::drain_to_yieldable`): the parent's
 /// queue was empty (or the parent gone / poisoned on a corrupt child id), the head fork was
-/// consumed by a resolution arm, it parked on a hosted-child conflict, or it yielded for
-/// materialization.
-// Transient: matched and consumed on the stack within one drain step, never stored — the
-// unit-vs-`GroupFork` size spread costs nothing, and boxing would allocate per relayed fork.
+/// consumed by a resolution arm, it parked on a hosted-child conflict, or it is yieldable — still
+/// staged, with the install's plan decided.
+// Transient: matched and consumed on the stack within one drain step, never stored — and the
+// relay path's cost contract is allocation-free, so boxing the plan to even the variants out would
+// put a heap allocation on every relayed fork.
 #[allow(clippy::large_enum_variant)]
-enum HeadFork<G, I, F> {
+enum HeadFork<G, I> {
   Empty,
   Resolved,
   Parked,
-  Yield(GroupFork<G, I, F>),
+  Yield(YieldPlan<G, I>),
+}
+
+/// Everything the container needs to install a head fork, decided by the examine and carrying NO
+/// part of the forked half: the partition stays in the staged queue until the install pops it.
+/// This is what makes the yield atomic — the decision travels, the data never does.
+struct YieldPlan<G, I> {
+  child: G,
+  child_gen: u64,
+  parent_gen_after: u64,
+  split_index: Index,
+  split_term: Term,
+  child_bytes: Bytes,
+  config: Config<I>,
+}
+
+/// A BORROWED look at the head fork the relay would install right now — the pair it names, the
+/// split coordinates, and the boot config the container derived for it. It carries no forked state
+/// and no capability: possessing one authorizes nothing, because the install is a separate call
+/// that re-decides everything from the named parent's own staged queue.
+///
+/// [`parent`](Self::parent) and [`child`](Self::child) are the install's two arguments. Reading
+/// them out and passing them back is not ceremony: it is what makes the install decide on the pair
+/// the caller was shown rather than on whatever a second global drain would reach, so a caller that
+/// substituted either id gets `NotYieldable` instead of somebody else's fork.
+///
+/// It borrows the container, so a caller must drop it before installing — which is the point. The
+/// old design handed the partition itself across that boundary and every layer it crossed had to
+/// re-implement the container's bookkeeping; this hands over a decision to look at, and the fork
+/// never leaves home.
+pub struct ForkView<'a, G, I> {
+  parent: G,
+  plan: YieldPlan<G, I>,
+  /// The view keeps the container borrowed for as long as it lives. That is the whole mechanism:
+  /// a caller must DROP the view before it can call the install, so there is no window in which a
+  /// decision is held while the container moves on beneath it.
+  _borrow: core::marker::PhantomData<&'a ()>,
+}
+
+impl<G, I> ForkView<'_, G, I> {
+  /// The parent group whose committed split produced this fork — the install's first argument.
+  #[must_use]
+  pub const fn parent(&self) -> &G {
+    &self.parent
+  }
+
+  /// The child group id this fork would materialize — the install's second argument.
+  #[must_use]
+  pub const fn child(&self) -> &G {
+    &self.plan.child
+  }
+
+  /// The child's incarnation under the unified lineage counter.
+  #[must_use]
+  pub const fn child_gen(&self) -> u64 {
+    self.plan.child_gen
+  }
+
+  /// The parent's lineage counter after this split.
+  #[must_use]
+  pub const fn parent_gen_after(&self) -> u64 {
+    self.plan.parent_gen_after
+  }
+
+  /// The split entry's index in the parent's log — the fork durability barrier's anchor.
+  #[must_use]
+  pub const fn split_index(&self) -> Index {
+    self.plan.split_index
+  }
+
+  /// The child's boot config as the container derived it: the parent's local tuning under the
+  /// voter set the committed split fixed. The container applies
+  /// [`reshape_born_prevention`] to this at install, so a caller validating it should validate the
+  /// same transform.
+  #[must_use]
+  pub const fn config(&self) -> &Config<I> {
+    &self.plan.config
+  }
+}
+
+/// The install's front half: either everything the write needs, or the outcome to return.
+#[allow(clippy::large_enum_variant)]
+enum PrepareOutcome<G, I> {
+  Ready {
+    parent: G,
+    plan: YieldPlan<G, I>,
+    epoch: u64,
+    config: Config<I>,
+  },
+  Done(InstallOutcome<G, I>),
+}
+
+/// Where one relay drain ended.
+#[allow(clippy::large_enum_variant)]
+enum DrainOutcome<G, I> {
+  /// A head fork is ready to install, staged and un-consumed.
+  Yieldable { parent: G, plan: YieldPlan<G, I> },
+  /// Nothing yieldable, but the drain ABANDONED a head fork on the way: a barrier resolved and a
+  /// refusal queued, so the caller should come round again.
+  Refused,
+  /// Nothing yieldable and a parent is parked — the child id is spoken for.
+  Held,
+  /// Nothing staged anywhere.
+  Empty,
+}
+
+/// What one [`install_yieldable_fork`](MultiRaft::install_yieldable_fork) attempt did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallOutcome<G, I> {
+  /// The child was materialized here. The caller mirrors the two lineage records and arms its
+  /// durability barrier; `config` is the boot config the container actually installed.
+  Installed {
+    /// The parent group whose split this was.
+    parent: G,
+    /// The child group now hosted here.
+    child: G,
+    /// The child's incarnation.
+    child_gen: u64,
+    /// The parent's lineage after the split — the caller's durable relay-guard mirror.
+    parent_gen_after: u64,
+    /// The split entry's index in the parent's log — the barrier anchor to lift when durable.
+    split_index: Index,
+    /// The boot config the child was installed with.
+    config: Config<I>,
+  },
+  /// The named parent's head fork took a RESOLUTION arm during this attempt: abandoned deliberately
+  /// (its barrier resolved and the refusal queued for
+  /// [`poll_split_refusal`](MultiRaft::poll_split_refusal)), or folded as redundant. Nothing
+  /// installed this time, but the queue moved — a drain should come round again.
+  Refused,
+  /// The child id is spoken for right now (occupied stores, a tombstone, a hosted twin). The fork
+  /// stays STAGED with its blob, its fence and its reservation intact.
+  Held,
+  /// The named parent's head fork names a DIFFERENT child: a caller that substituted an id, or a
+  /// pair the container is not about to install. The fork stays staged.
+  NotYieldable,
+  /// The named parent has no staged fork to examine.
+  Empty,
 }
 
 /// The create/restore admission check shared by every group constructor: group-id uniqueness, the
@@ -772,12 +941,12 @@ where
   /// Membership mirror of `dirty_events`, kept exact with it at every push and pop.
   dirty_events_set: BTreeSet<G>,
   /// Groups that may have a staged pending fork to relay (see
-  /// [`poll_pending_fork`](Self::poll_pending_fork)).
+  /// [`peek_yieldable_fork`](Self::peek_yieldable_fork)).
   dirty_forks: VecDeque<G>,
   /// Membership mirror of `dirty_forks`, kept exact with it at every push and pop.
   dirty_forks_set: BTreeSet<G>,
   /// Parents whose HEAD fork is PARKED on a hosted-child conflict (see
-  /// [`poll_pending_fork`](Self::poll_pending_fork)): the fork stays staged (blob retained, the
+  /// [`peek_yieldable_fork`](Self::peek_yieldable_fork)): the fork stays staged (blob retained, the
   /// snapshot fence armed, the relay guard unmoved) and is re-examined at the top of every relay
   /// drain — the resolution triggers are CHILD-side (removal, catch-up), so no parent dispatch
   /// re-marks these. Membership doubles as the conflict-signal dedupe: one
@@ -1198,6 +1367,29 @@ where
       // Condemned in place. Nothing else moves: the fork keeps its blob, its barrier and its
       // position, and the guard stays put — advancing it now would fold the forks staged AHEAD of
       // this one into duplicates and drop them.
+      //
+      // THE MARK IS VOLATILE, and the crash window it leaves is real and unbounded: a restart
+      // replays the split entry, re-stages the fork with no memory of the condemnation, and the
+      // fork can then materialize a child the embedder had removed. Nothing here narrows that —
+      // the window closes only when the fork reaches the head and is consumed.
+      //
+      // IT IS ALSO NOT LOSS. The marked fork's OWN barrier keeps the parent from snapshotting past
+      // its split, so the replay derivation survives indefinitely however long the mark waits; the
+      // hazard is a resurrection, never a missing partition.
+      //
+      // WHY NO DURABLE MIRROR. Every CONSUMPTION persists its advance
+      // ([`advance_relay_guard`](Self::advance_relay_guard)), but this is not a consumption: the
+      // guard is a single monotone scalar and the queue is strictly FIFO, so recording this fork's
+      // bump would claim the forks staged in front of it as well and fold them to duplicates on
+      // replay. Contiguity is what forbids the mirror, not an oversight. A per-fork durable record
+      // would carry it — that is the declined schema, and a condemnation floor was declined too
+      // (it would repeal a gen-0 id's rejoin entitlement and kill the two-forks-one-child sibling
+      // release).
+      //
+      // WHO IS EXPOSED. A FLOORED embedder is immune by construction: removing a child at
+      // generation n > 0 writes floor n + 1 under the ack's own barrier, so the replayed fork dies
+      // `BelowFloor` at the gate. The residual is exactly the gen-0/unfloored case, and it belongs
+      // to the incarnation-epoch work tracked in #125, which owns every replay-resurrection path.
       if let Some(ep) = self.groups.get_mut(&parent) {
         ep.mark_fork_abandoned(split_index);
       }
@@ -1214,10 +1406,10 @@ where
     // with, so a replayed split entry re-staging it must fold to a resolved no-op instead of
     // resurrecting it. Legal precisely BECAUSE it is the head — no earlier staged fork of this
     // parent is left behind for the advance to skip over.
-    self.lineage.insert(parent.cheap_clone(), parent_gen_after);
-    self
-      .guard_advances
-      .push_back((parent.cheap_clone(), parent_gen_after));
+    //
+    // Volatile and durable together, monotone — see
+    // [`advance_relay_guard`](Self::advance_relay_guard) for why a consumption owes both halves.
+    self.advance_relay_guard(&parent, parent_gen_after);
     // The sweep's Resolved arm, mirrored: leaving the parent parked would strand it (its
     // resolution triggers are child-side), and leaving the stale conflict signal queued would
     // suppress the cue its NEXT child is owed.
@@ -1228,12 +1420,43 @@ where
     self.refusals.push_back((parent, gid.cheap_clone()));
   }
 
+  /// Advance `gid`'s relay guard past a fork this call CONSUMED — the volatile record and the
+  /// caller's durable mirror together, because a consumption owes both.
+  ///
+  /// The in-memory record folds a replayed fork to a no-op for this process's lifetime; the queued
+  /// advance ([`poll_relay_guard_advance`](Self::poll_relay_guard_advance)) is what carries the same
+  /// verdict across a CRASH, because the caller mirrors it into its durable lineage record beside
+  /// the writes it was already making. A consumption that moved only the volatile half re-stages its
+  /// fork on the next restart and acts on it again — reinstalling a baseline the embedder's removal
+  /// had ended.
+  ///
+  /// MONOTONE, like every other writer of this record: the guard legitimately runs AHEAD of the
+  /// staged forks (a restore raises it from the durable mirror), so a consumption may only raise it.
+  ///
+  /// THE BOUNDARY LINE, for anyone adding an arm to the relay. Every CONSUMPTION that moves the
+  /// guard persists its advance — that is this function, and it is uniform. A verdict that is
+  /// RE-DERIVABLE from a durable fact needs no mirror at all: `Resolve` re-derives from the guard
+  /// itself, `Terminal` from the floor, and a replay simply reaches the same answer again. The
+  /// below-head condemnation mark is the unique arm that is NEITHER — not a consumption, and not
+  /// re-derivable — and it is deliberately volatile, tracked in #125 (see the `!at_head` arm in
+  /// `abandon_fork_this_removal_descends_from` for why contiguity forbids the mirror there).
+  fn advance_relay_guard(&mut self, gid: &G, parent_gen_after: u64) {
+    let guard = self
+      .lineage
+      .entry(gid.cheap_clone())
+      .or_insert(parent_gen_after);
+    *guard = (*guard).max(parent_gen_after);
+    self
+      .guard_advances
+      .push_back((gid.cheap_clone(), parent_gen_after));
+  }
+
   /// Consume `gid`'s condemned HEAD fork — the deferred half of the removal-time abandonment,
   /// performing there what a head hit performs at the removal itself: the fork is popped, its
   /// durability barrier resolved, the guard advanced past it (legal now, and only now, because it
   /// is the head), and the refusal surfaced. Reported as `Resolved`, so the caller re-examines this
   /// same parent and the next staged fork takes its turn.
-  fn consume_abandoned_head_fork(&mut self, gid: &G) -> HeadFork<G, I, F> {
+  fn consume_abandoned_head_fork(&mut self, gid: &G) -> HeadFork<G, I> {
     let Some(ep) = self.groups.get_mut(gid) else {
       return HeadFork::Empty;
     };
@@ -1241,12 +1464,7 @@ where
       return HeadFork::Empty;
     };
     ep.resolve_fork(fork.index);
-    self
-      .lineage
-      .insert(gid.cheap_clone(), fork.parent_gen_after);
-    self
-      .guard_advances
-      .push_back((gid.cheap_clone(), fork.parent_gen_after));
+    self.advance_relay_guard(gid, fork.parent_gen_after);
     // The child id the mark named. Undecodable is unreachable — the mark was set by matching this
     // very encoding against a removed group's id — so the refusal is simply skipped rather than
     // guessed at.
@@ -1659,6 +1877,33 @@ where
   pub fn release_yielded_fork(&mut self, child: &G) {
     self.yielded.remove(child);
   }
+
+  /// Whether `gid` holds a staged fork whose replay derivation a covering install already retired:
+  /// the blob is the child's only local copy AND is process-lifetime-only — act before restarting
+  /// this node.
+  ///
+  /// The observability seam for the held-fork durability window. A fork the relay HOLDS (its child
+  /// id spoken for) stays queued, and a peer's covering snapshot install crosses this host's fences
+  /// by doctrine: the restore has already discarded the split entry, so
+  /// `Endpoint::note_fork_barrier_rebaselined` clears the queued fork's barrier while keeping the
+  /// entry. What remains is an in-memory blob that does not survive a crash. Pair this with the
+  /// [`poll_split_conflict`](Self::poll_split_conflict) cue: the cue says a fork is held, this says
+  /// its last crash-surviving derivation is gone.
+  ///
+  /// DERIVED, zero new state: `fork_obligations_standing() && !fork_barrier_standing()`. The
+  /// conjunction is sound because exactly ONE code path clears a still-QUEUED fork's barrier —
+  /// `note_fork_barrier_rebaselined`, which retains the entry on purpose. Every other site that
+  /// releases a barrier POPS the fork first (`resolve_fork` lifts the barrier for a fork already
+  /// out of the queue), so it moves both predicates together and can never leave this gap open.
+  /// The state is self-clearing: the hold's resolution consumes the fork and drops obligations, and
+  /// a fresh capture re-arms the barrier.
+  #[must_use]
+  pub fn fork_derivation_volatile(&self, gid: &G) -> bool {
+    self
+      .groups
+      .get(gid)
+      .is_some_and(|ep| ep.fork_obligations_standing() && !ep.fork_barrier_standing())
+  }
 }
 
 // The aggregate scheduling surface, split from the block above because `Endpoint::poll_timeout`
@@ -1690,48 +1935,9 @@ where
       .filter_map(|(gid, ep)| ep.poll_timeout().map(|d| (gid.cheap_clone(), d)))
   }
 
-  /// The next committed, relay-ready fork from any group — the driver drains this every crank
-  /// (BEFORE its storage crank, so the same crank's engine flush covers the materialization).
-  /// Decodes the typed child id, applies the replay guard, rebuilds the child's config from the
-  /// parent's local tuning, and yields a [`GroupFork`]. Folded to a RESOLVED no-op (the fork's
-  /// barrier contribution is released, nothing yielded) when: the bump is at-or-below the relay
-  /// guard (a retry duplicate / an already-covered replay), or this host is not in the fork's
-  /// voter set (a parent LEARNER applies the split — its parent half shrinks identically — but
-  /// does not place the child; the embedder adds it by conf change later if wanted). A committed
-  /// child id that does not decode as `G` poisons the parent (`SplitDecode` — committed-corrupt,
-  /// the apply-arm's own decode class) and drops its remaining staged forks.
-  ///
-  /// A fork whose child id is ALREADY HOSTED here is PARKED, never dropped: the parent's
-  /// `fsm.split` already ran at apply — the parent SHRANK — so the staged blob is the
-  /// partition's only local copy, and the pre-park behavior (resolve as a no-op) silently lost
-  /// it whenever the child was admitted between the propose-time `ChildExists` gate and this
-  /// relay (the coordinators' reservation narrows that window, but a child admitted BEFORE the
-  /// split applied remains reachable). Parked means: the fork stays queued at the head (its
-  /// parent's later forks wait behind it — relaying past it would advance the replay guard over
-  /// it and fold it to a duplicate), the relay guard does not advance, the snapshot fence does
-  /// not lift, and one `(parent, child)` conflict signal surfaces via
-  /// [`poll_split_conflict`](Self::poll_split_conflict). Every drain re-examines parked forks
-  /// first and resolves by exactly one of: (a) the hosted child is REMOVED — the fork
-  /// materializes normally; (b) the hosted child carries THIS split's exact [`ForkId`] — the
-  /// provenance token a sibling replica's manufactured baseline (or the child's own later
-  /// snapshot) installed here, so the child IS this fork already materialized: it resolves as
-  /// redundant (fence lifts, guard advances, blob discarded — now safe); (c) the hosted child
-  /// carries a DIFFERENT token or none — an independently-created group, a squatter, or a
-  /// recreation that merely occupies the id — so it stays PARKED, however far its own commits
-  /// pushed applied-index or lineage. The ForkId match is what makes the discard safe: progress
-  /// alone cannot distinguish the real fork from an unrelated child, and treating a threshold
-  /// crossing as proof of materialization discarded the fork blob for an unrelated child and lost
-  /// the child partition. Parking is a conservative HOLD whose exits are (a) and (b): the conflict
-  /// signal is the embedder's cue, and the standing fence means the parent cannot compact past the
-  /// split entry while parked — the fork's replay source survives indefinitely, however late the
-  /// embedder acts, and a genuinely-reshaped twin still resolves the moment its token arrives here
-  /// (the token is fixed at the split, so later reshaping never changes it).
-  pub fn poll_pending_fork(&mut self) -> Option<GroupFork<G, I, F>> {
-    self.poll_pending_fork_with(&NoHold)
-  }
-
-  /// [`poll_pending_fork`](Self::poll_pending_fork) over a caller-supplied [`ForkGate`] — the
-  /// facts about the CALLER's storage that decide whether a fork can be handed out at all.
+  /// The relay drain shared by [`peek_yieldable_fork`](Self::peek_yieldable_fork) and the install,
+  /// over a caller-supplied [`ForkGate`] — the facts about the CALLER's storage that decide
+  /// whether a fork can be installed at all.
   ///
   /// The gate is consulted at the would-be yield and its answers are mapped HERE: a child id
   /// below its admission floor (or at the reserved terminal) is a verdict about the fork, which
@@ -1745,7 +1951,13 @@ where
   /// machinery a hosted-child conflict parks on. The distinction is load-bearing — a consumed
   /// source's stores are RETAINED, so treating that as occupancy would hold the fork on the very
   /// state the absorb is waiting to release.
-  pub fn poll_pending_fork_with(&mut self, gate: &impl ForkGate<G>) -> Option<GroupFork<G, I, F>> {
+  ///
+  /// A yieldable head fork is reported, never consumed: the install pops it, and only after every
+  /// remaining check has passed. `Refused` outranks `Held` on the way out because the queue MOVED —
+  /// a caller that stopped there would sit on a drain that has more to give.
+  fn drain_to_yieldable(&mut self, gate: &impl ForkGate<G>) -> DrainOutcome<G, I> {
+    let refusals_before = self.refusals.len();
+    let mut held = false;
     // Parked parents first: their resolution triggers are child-side, so the dirty queue —
     // marked only by parent dispatches — cannot be relied on to revisit them. Skip the scan and
     // its allocation entirely when nothing is parked (the overwhelmingly common case).
@@ -1764,14 +1976,14 @@ where
               self.dirty_forks.push_back(gid);
             }
           }
-          HeadFork::Parked => {}
-          HeadFork::Yield(fork) => {
-            // Arm (a): the squatter is gone and the fork materializes normally.
+          HeadFork::Parked => held = true,
+          HeadFork::Yield(plan) => {
+            // Arm (a): the squatter is gone and the fork is ready to install normally.
             self.unpark(&gid);
             if self.dirty_forks_set.insert(gid.cheap_clone()) {
-              self.dirty_forks.push_back(gid);
+              self.dirty_forks.push_back(gid.cheap_clone());
             }
-            return Some(fork);
+            return DrainOutcome::Yieldable { parent: gid, plan };
           }
         }
       }
@@ -1784,22 +1996,248 @@ where
         continue;
       }
       match self.examine_head_fork(&gid, gate) {
-        HeadFork::Empty | HeadFork::Parked => {
+        HeadFork::Empty => {
+          self.dirty_forks.pop_front();
+          self.dirty_forks_set.remove(&gid);
+        }
+        HeadFork::Parked => {
+          held = true;
           self.dirty_forks.pop_front();
           self.dirty_forks_set.remove(&gid);
         }
         // Re-examine the same parent: its next staged fork (if any) is now at the head.
         HeadFork::Resolved => {}
-        HeadFork::Yield(fork) => return Some(fork),
+        HeadFork::Yield(plan) => return DrainOutcome::Yieldable { parent: gid, plan },
       }
     }
-    None
+    // Nothing to install. A refusal queued on the way outranks a park: the queue MOVED, so the
+    // caller should come round again rather than stop.
+    if self.refusals.len() != refusals_before {
+      DrainOutcome::Refused
+    } else if held {
+      DrainOutcome::Held
+    } else {
+      DrainOutcome::Empty
+    }
   }
 
-  /// Examine (and where possible resolve or yield) `gid`'s HEAD staged fork — the one shared
-  /// arm evaluation both [`poll_pending_fork`](Self::poll_pending_fork) phases run. The head
-  /// fork is consumed only on a resolution or a yield; a park leaves it staged untouched.
-  fn examine_head_fork(&mut self, gid: &G, gate: &impl ForkGate<G>) -> HeadFork<G, I, F> {
+  /// The install's shared front half — module-private because both terminal arms live in this
+  /// module: decide, then make room. Everything up to — but not
+  /// including — the pop lives here, because the pop is the point of no return and the two RNG
+  /// arms must each own it.
+  ///
+  /// THE ORDERING IS LOAD-BEARING (and was the design's second blocking defect). Occupancy is a
+  /// PEEK-TIME fact: the examine reads it from the engine BEFORE anything is created, because
+  /// minting a boot epoch requires the child's storage to exist already, and re-reading occupancy
+  /// afterwards would find the storage this very install just made and hold the fork against
+  /// itself, forever. So: examine on the pristine engine, then `add_group` + `next_boot_epoch`
+  /// only once the verdict is Yield, then stores, then the pre-checks. The install's own occupancy
+  /// leg is `validate_virgin_stores` and nothing else.
+  ///
+  /// Every failure rolls back the storage it created; a caller can retry without accumulating
+  /// half-made groups.
+  fn prepare_fork_install<E, X>(
+    &mut self,
+    parent: &G,
+    child: &G,
+    engine: &mut E,
+    extra: &X,
+  ) -> PrepareOutcome<G, I>
+  where
+    E: MultiEngine<G, I>,
+    X: ForkGate<G>,
+    I: Data,
+  {
+    let plan = {
+      let gate = EngineForkGate {
+        engine: &*engine,
+        extra,
+        _node: core::marker::PhantomData,
+      };
+      // THE PAIR PIN, and it is why this examines ONE parent instead of re-running the drain. The
+      // drain walks the parked sweep and then the dirty queue, and its own arms MUTATE that walk —
+      // the sweep's yieldable arm unparks and re-dirties the parent it found before handing it
+      // back. So a second drain starts from a different place than the first, and with two parks
+      // releasing on one crank it legitimately reaches the OTHER parent: the peek advises
+      // `(7, 200)` and a re-draining install for 200 answers `NotYieldable` on a perfectly legal
+      // state. Examining the named parent directly removes the disagreement by construction — the
+      // peek's effectful drain already consumed everything ahead of this head, so the named
+      // parent's head IS the fork the peek described, and a head that changed underneath is
+      // re-examined honestly here (a condemned or resolved head takes its ordinary arm; a head
+      // that does not yield THIS child is not this call's business).
+      match self.examine_head_fork(parent, &gate) {
+        HeadFork::Yield(plan) => plan,
+        // The named parent has nothing staged at all — the ordinary end of a driver's loop, and
+        // what a second install for an already-consumed fork sees.
+        HeadFork::Empty => return PrepareOutcome::Done(InstallOutcome::Empty),
+        // Its head took a RESOLUTION arm instead of yielding: deliberately abandoned, or folded as
+        // redundant. Unreachable in practice — the peek's own drain would have consumed it and
+        // moved on rather than describing it — but the queue MOVED, so the honest answer is the
+        // one that sends a draining caller round again.
+        HeadFork::Resolved => return PrepareOutcome::Done(InstallOutcome::Refused),
+        HeadFork::Parked => return PrepareOutcome::Done(InstallOutcome::Held),
+      }
+    };
+    // The child leg of the same pin: nothing downstream would catch a mismatch, because virgin
+    // stores are virgin whoever owns them, so an unpinned install would write a manufactured
+    // baseline into another group's storage. The fork stays staged either way.
+    if plan.child != *child {
+      return PrepareOutcome::Done(InstallOutcome::NotYieldable);
+    }
+    let parent = parent.cheap_clone();
+    let added = engine.add_group(child.cheap_clone());
+    let Some(epoch) = engine.next_boot_epoch(child) else {
+      if added {
+        engine.remove_group(child);
+      }
+      return PrepareOutcome::Done(InstallOutcome::Held);
+    };
+    let config = reshape_born_prevention(plan.config.clone());
+    let refusal = validate_fork_boot_epoch(epoch)
+      .and_then(|()| validate_working_generation(plan.child_gen))
+      .and_then(|()| validate_new_group(&self.groups, &self.host_id, child, &config))
+      .and_then(|()| match engine.stores(child) {
+        Some((log, stable)) => validate_virgin_stores(log, stable),
+        None => Err(CreateGroupError::StorageInUse),
+      });
+    if let Err(e) = refusal {
+      // EVERY refusal here HOLDS, and the important one is `StorageInUse`: a squatting incarnation
+      // can be removed, so the fact can change — and abandoning on it would destroy the child
+      // partition's only local copy, which is precisely the loss the hold arm exists to prevent.
+      // The others are unreachable (the examine just decided this same state and said Yield), so
+      // they are loud in a test run and conservative in release.
+      debug_assert!(
+        matches!(e, CreateGroupError::StorageInUse),
+        "a fork install pre-check refused what the examine had just admitted: {e:?}"
+      );
+      if added {
+        engine.remove_group(child);
+      }
+      return PrepareOutcome::Done(InstallOutcome::Held);
+    }
+    PrepareOutcome::Ready {
+      parent,
+      plan,
+      epoch,
+      config,
+    }
+  }
+
+  /// The next committed, relay-ready fork from any group, yielded BY VALUE — the surface the
+  /// transport drivers and the simulation world still drain. Every arm is
+  /// [`peek_yieldable_fork`](Self::peek_yieldable_fork)'s, which documents the relay doctrine in
+  /// full; the difference is the yield itself, which pops the fork and reserves its child id until
+  /// [`create_group_from_relayed_fork`](Self::create_group_from_relayed_fork) installs it or
+  /// [`release_yielded_fork`](Self::release_yielded_fork) gives it up.
+  pub fn poll_pending_fork(&mut self) -> Option<GroupFork<G, I, F>> {
+    self.poll_pending_fork_with(&NoHold)
+  }
+
+  /// [`poll_pending_fork`](Self::poll_pending_fork) over a caller-supplied [`ForkGate`] — the same
+  /// gate, mapped by the same drain.
+  pub fn poll_pending_fork_with(&mut self, gate: &impl ForkGate<G>) -> Option<GroupFork<G, I, F>> {
+    let DrainOutcome::Yieldable { parent, plan } = self.drain_to_yieldable(gate) else {
+      return None;
+    };
+    let (fork, fsm) = self.groups.get_mut(&parent)?.pop_pending_fork()?;
+    self
+      .lineage
+      .insert(parent.cheap_clone(), plan.parent_gen_after);
+    let fork_id = mint_fork_id(
+      &parent,
+      plan.parent_gen_after,
+      plan.split_index,
+      plan.split_term,
+      plan.child_bytes.clone(),
+      plan.child_gen,
+    );
+    // THE RESERVATION CARRIES ON PAST THE POP. The staged leg just ended, and the install has not
+    // begun; between them the id is this fork's and no other door may take it.
+    self.yielded.insert(plan.child.cheap_clone());
+    Some(GroupFork {
+      parent,
+      child: plan.child,
+      child_gen: plan.child_gen,
+      parent_gen_after: plan.parent_gen_after,
+      config: plan.config,
+      fsm,
+      blob: fork.blob,
+      read_only: fork.read_only,
+      split_index: plan.split_index,
+      fork_id,
+    })
+  }
+
+  /// LOOK at the head fork the relay would install right now, without consuming it.
+  ///
+  /// This is the whole relay drain — the driver runs it every crank, BEFORE its storage crank, so
+  /// the same crank's engine flush covers the materialization. It decodes the typed child id,
+  /// applies the replay guard, and rebuilds the child's config from the parent's local tuning under
+  /// the fork's voter set. A fork folds to a RESOLVED no-op (its barrier contribution released,
+  /// nothing to install) when: the bump is at-or-below the relay guard (a retry duplicate / an
+  /// already-covered replay), or this host is not in the fork's voter set (a parent LEARNER applies
+  /// the split — its parent half shrinks identically — but does not place the child; the embedder
+  /// adds it by conf change later if wanted). A committed child id that does not decode as `G`
+  /// poisons the parent (`SplitDecode` — committed-corrupt, the apply-arm's own decode class) and
+  /// drops its remaining staged forks.
+  ///
+  /// A fork whose child id is ALREADY HOSTED here is PARKED, never dropped: the parent's
+  /// `fsm.split` already ran at apply — the parent SHRANK — so the staged blob is the partition's
+  /// only local copy, and the pre-park behavior (resolve as a no-op) silently lost it whenever the
+  /// child was admitted between the propose-time `ChildExists` gate and this relay (the
+  /// coordinators' reservation narrows that window, but a child admitted BEFORE the split applied
+  /// remains reachable). Parked means: the fork stays queued at the head (its parent's later forks
+  /// wait behind it — relaying past it would advance the replay guard over it and fold it to a
+  /// duplicate), the relay guard does not advance, the snapshot fence does not lift, and one
+  /// `(parent, child)` conflict signal surfaces via
+  /// [`poll_split_conflict`](Self::poll_split_conflict). Every drain re-examines parked forks first
+  /// and resolves by exactly one of: (a) the hosted child is REMOVED — the fork materializes
+  /// normally; (b) the hosted child carries THIS split's exact [`ForkId`] — the provenance token a
+  /// sibling replica's manufactured baseline (or the child's own later snapshot) installed here, so
+  /// the child IS this fork already materialized: it resolves as redundant (fence lifts, guard
+  /// advances, blob discarded — now safe); (c) the hosted child carries a DIFFERENT token or none —
+  /// an independently-created group, a squatter, or a recreation that merely occupies the id — so
+  /// it stays PARKED, however far its own commits pushed applied-index or lineage. The ForkId match
+  /// is what makes the discard safe: progress alone cannot distinguish the real fork from an
+  /// unrelated child, and treating a threshold crossing as proof of materialization discarded the
+  /// fork blob for an unrelated child and lost the child partition. Parking is a conservative HOLD
+  /// whose exits are (a) and (b): the conflict signal is the embedder's cue, and a genuinely-reshaped
+  /// twin still resolves the moment its token arrives here (the token is fixed at the split, so
+  /// later reshaping never changes it).
+  ///
+  /// WHAT THE FENCE ACTUALLY HOLDS, because the difference decides how long the embedder has. The
+  /// standing fork barrier holds this host's OWN capture: while it stands, nothing local compacts
+  /// past the split entry, so the fork's LOG replay derivation survives a restart. It does not hold
+  /// a PEER. An install crosses every local fence by doctrine — `log.restore` has already discarded
+  /// the split entry, so a barrier below the boundary protects nothing and could only wedge every
+  /// later capture (`Endpoint::note_fork_barrier_rebaselined`, driven from the install path in
+  /// `endpoint/snapshot.rs`) — and a covering install therefore clears the parked fork's barrier
+  /// while KEEPING its queue entry. Past that point the staged blob is the child's only local
+  /// derivation and is PROCESS-LIFETIME-ONLY: it survives any wait, but not a restart of this node.
+  /// [`fork_derivation_volatile`](MultiRaft::fork_derivation_volatile) reports exactly that state.
+  ///
+  /// EVERY ONE OF THOSE ARMS RUNS HERE, because they are how the queue reaches a yieldable fork at
+  /// all. The single thing this call does not do is the yield: the fork stays STAGED, with its
+  /// blob, its durability barrier and its reservation intact, and what comes back is a borrowed
+  /// [`ForkView`] — a decision to look at, not a capability to hold. Pair it with
+  /// [`install_yieldable_fork`](MultiRaft::install_yieldable_fork), which re-decides from the same
+  /// staged queue on the same crank. Nothing between the two can lose the partition, because the
+  /// partition never moved.
+  pub fn peek_yieldable_fork(&mut self, gate: &impl ForkGate<G>) -> Option<ForkView<'_, G, I>> {
+    match self.drain_to_yieldable(gate) {
+      DrainOutcome::Yieldable { parent, plan } => Some(ForkView {
+        parent,
+        plan,
+        _borrow: core::marker::PhantomData,
+      }),
+      _ => None,
+    }
+  }
+
+  /// Examine (and where possible resolve or plan the install of) `gid`'s HEAD staged fork — the
+  /// one shared arm evaluation both relay-drain phases run. The head fork is consumed only on a
+  /// resolution; a park and a yieldable verdict both leave it staged.
+  fn examine_head_fork(&mut self, gid: &G, gate: &impl ForkGate<G>) -> HeadFork<G, I> {
     // TAKE BEFORE EXAMINE. A fork a removal condemned below the head is consumed the moment it
     // reaches the head, ahead of any verdict: it was already judged, by the teardown of the very
     // incarnation it produced, and the gate can only re-decide it wrongly — the id it names is
@@ -2002,13 +2440,19 @@ where
         HeadFork::Resolved
       }
       Verdict::Redundant => {
-        if let Some(ep) = self.groups.get_mut(gid)
-          && let Some((fork, _fsm)) = ep.pop_pending_fork()
-        {
+        // REDUNDANT IS A CONSUMPTION, and every consumption that moves the guard persists its
+        // advance. The blob is discarded here because the child already carries this split's
+        // baseline; if only the volatile guard moved, a crash before a parent snapshot covered the
+        // split would replay the fork against a stale durable guard, and after the embedder removed
+        // the child and consented to its re-admission the fork would install that very baseline
+        // again. The queued advance is what makes the discard survive the restart that follows it.
+        let consumed = self.groups.get_mut(gid).and_then(|ep| {
+          let (fork, _fsm) = ep.pop_pending_fork()?;
           ep.resolve_fork(fork.index);
-          self
-            .lineage
-            .insert(gid.cheap_clone(), fork.parent_gen_after);
+          Some(fork.parent_gen_after)
+        });
+        if let Some(parent_gen_after) = consumed {
+          self.advance_relay_guard(gid, parent_gen_after);
         }
         HeadFork::Resolved
       }
@@ -2052,58 +2496,47 @@ where
         HeadFork::Resolved
       }
       Verdict::Yield(child) => {
-        // Rebuild the child's boot config: the parent's local tuning under the fork's voter
-        // set. The voter-membership check above makes `IdNotAVoter` unreachable; the arm is
-        // defensive (resolve rather than wedge the queue).
+        // THE YIELD ARM CONSUMES NOTHING. It decides, and the decision is all that travels: the
+        // fork stays STAGED at the head with its blob, its barrier and its reservation, and the
+        // install pops it only once every check has passed. Everything a caller could act on is
+        // derived here so the install can re-decide identically a moment later, on the same crank.
+        //
+        // Rebuild the child's boot config: the parent's local tuning under the fork's voter set.
+        // The voter-membership check above makes `IdNotAVoter` unreachable; the arm is defensive
+        // (resolve rather than wedge the queue).
         let config = self.groups.get(gid).and_then(|ep| {
           let voters = ep.peek_pending_fork()?.voters.clone();
           ep.config().with_voter_set(voters).ok()
         });
-        let Some(ep) = self.groups.get_mut(gid) else {
-          return HeadFork::Empty;
-        };
-        let Some((fork, fsm)) = ep.pop_pending_fork() else {
-          return HeadFork::Empty;
-        };
-        let Some(config) = config else {
-          // Unreachable: the verdict above rebuilt this same config and turned a failure into
-          // `Terminal`. Kept as the defensive resolve it always was, now also telling the
-          // embedder rather than swallowing the fork silently.
+        let Some(plan) = self.groups.get(gid).and_then(|ep| {
+          let fork = ep.peek_pending_fork()?;
+          Some(YieldPlan {
+            child: child.cheap_clone(),
+            child_gen: fork.child_gen,
+            parent_gen_after: fork.parent_gen_after,
+            split_index: fork.index,
+            split_term: fork.split_term,
+            child_bytes: fork.child_bytes.clone(),
+            config: config.clone()?,
+          })
+        }) else {
+          // The config rebuild failed — unreachable, since the verdict above rebuilt this same
+          // config and turned a failure into `Terminal`. Kept as the defensive resolve it always
+          // was: consume the fork rather than wedge the queue, and tell the embedder. It is a
+          // consumption that moves the guard, so it persists the advance like every other one.
+          let Some(ep) = self.groups.get_mut(gid) else {
+            return HeadFork::Empty;
+          };
+          let Some((fork, _fsm)) = ep.pop_pending_fork() else {
+            return HeadFork::Empty;
+          };
           ep.resolve_fork(fork.index);
-          self
-            .lineage
-            .insert(gid.cheap_clone(), fork.parent_gen_after);
+          let parent_gen_after = fork.parent_gen_after;
+          self.advance_relay_guard(gid, parent_gen_after);
           self.refusals.push_back((gid.cheap_clone(), child));
           return HeadFork::Resolved;
         };
-        self
-          .lineage
-          .insert(gid.cheap_clone(), fork.parent_gen_after);
-        // Mint the child's provenance token from this committed split's coordinates; the driver
-        // hands it to `create_group_from_fork` so the manufactured baseline persists it.
-        let fork_id = mint_fork_id(
-          gid,
-          fork.parent_gen_after,
-          fork.index,
-          fork.split_term,
-          fork.child_bytes.clone(),
-          fork.child_gen,
-        );
-        // THE RESERVATION CARRIES ON PAST THE POP. The staged leg just ended, and the install has
-        // not begun; between them the id is this fork's and no other door may take it.
-        self.yielded.insert(child.cheap_clone());
-        HeadFork::Yield(GroupFork {
-          parent: gid.cheap_clone(),
-          child,
-          child_gen: fork.child_gen,
-          parent_gen_after: fork.parent_gen_after,
-          config,
-          fsm,
-          blob: fork.blob,
-          read_only: fork.read_only,
-          split_index: fork.index,
-          fork_id,
-        })
+        HeadFork::Yield(plan)
       }
     }
   }
@@ -2123,7 +2556,8 @@ where
   }
 
   /// Drain the next `(parent, child)` SPLIT-CONFLICT signal: a committed fork PARKED because
-  /// its child id is already hosted here (see [`poll_pending_fork`](Self::poll_pending_fork)).
+  /// its child id is already hosted here (see
+  /// [`peek_yieldable_fork`](Self::peek_yieldable_fork)).
   /// One signal per park episode, held until consumed HERE. A synchronous embedder (the sim
   /// worlds) consumes directly — its consumption IS delivery; a driver publishing on a BOUNDED
   /// tail must [`peek_split_conflict`](Self::peek_split_conflict) first and consume only after
@@ -2252,7 +2686,7 @@ where
   /// Resolve the fork staged at exactly `split_index` on `parent`: the driver reports the
   /// child's baseline flush-durable behind its engine barrier (or a relayed fork it abandoned),
   /// and the parent's snapshot fence over that index releases. Exact-index semantics — see
-  /// [`GroupFork::split_index`]; resolving one fork never frees an older, still-pending one.
+  /// [`ForkView::split_index`]; resolving one fork never frees an older, still-pending one.
   pub fn lift_fork_barrier(&mut self, parent: &G, split_index: Index) {
     if let Some(ep) = self.groups.get_mut(parent) {
       ep.resolve_fork(split_index);
@@ -2482,8 +2916,10 @@ where
   /// it a caller could install a group of its own making at a reserved child id; the genuine fork
   /// then finds the id hosted, and resolves REDUNDANT against a token the caller supplied, which
   /// discards the child partition's only local copy. The relay's own materialization is not this
-  /// door — it goes through the crate-private form below, whose ticket is a container-minted
-  /// [`GroupFork`] nobody outside this crate can construct.
+  /// door at all — it never leaves the container: the pair
+  /// [`peek_yieldable_fork`](Self::peek_yieldable_fork) /
+  /// [`install_yieldable_fork`](Self::install_yieldable_fork) installs the child in place, from the
+  /// staged queue, and so has nothing to reserve against.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_fork<L, S>(
     &mut self,
@@ -2514,11 +2950,140 @@ where
     // public split coordinates, so accepting one here would let a caller stamp its own content
     // with a genuine fork's identity — and the relay's redundant-fork exit, seeing an exact match,
     // would then discard the real partition as already-materialized. Provenance enters through the
-    // sealed [`create_group_from_relayed_fork`] door or a wire snapshot install, both of which take
-    // it from the container's own record rather than a caller's.
+    // in-container install or a wire snapshot install, both of which take it from the container's
+    // own record rather than a caller's.
     self.create_group_from_fork_unreserved(
       gid, generation, config, now, seed, fsm, snapshot, read_only, None, boot_epoch, log, stable,
     )
+  }
+
+  /// INSTALL `parent`'s head fork for `child`, here, without it ever leaving the container.
+  ///
+  /// The caller names the PAIR and lends its engine; the container re-decides everything from that
+  /// parent's own staged queue, makes the storage, and — only once every check has passed — pops
+  /// the partition straight into the manufactured baseline. Pair with
+  /// [`peek_yieldable_fork`](Self::peek_yieldable_fork), whose [`ForkView`] carries exactly the two
+  /// ids this call wants: the peek ADVISES, the install DECIDES, and it decides on the named pair
+  /// rather than on whatever a second global drain would happen to reach.
+  ///
+  /// THE FORK NEVER LEAVES HOME, and that is the security argument. The earlier design handed the
+  /// forked half out as a capability object and asked every layer it crossed to keep the
+  /// container's books: the value had to be unforgeable, immutable, un-retargetable, reserved
+  /// across the hand-out window, released if the holder gave up, and impossible to present twice —
+  /// six obligations, each of which failed at least once under review. Here there is no window in
+  /// which the forked half exists outside the container, so there is nothing to forge, mutate,
+  /// mis-target, race, double-present, drop in a caller's precheck, or leak. The whole class is
+  /// gone rather than guarded.
+  ///
+  /// MEMBERSHIP COMES FROM THE COMMITTED SPLIT, never from a caller: the config installed here is
+  /// the parent's local tuning under the parent's voter set AT THE SPLIT ENTRY, identical on every
+  /// replica because the split rode the parent's totally-ordered log — the only divergence is
+  /// [`reshape_born_prevention`], applied here so it is applied identically everywhere. A
+  /// caller-supplied config would let two hosts install the same child id, blob and token under
+  /// DISJOINT sole-voter sets and then commit conflicting histories under one identity, and no
+  /// gate downstream could catch it, because every other input matches.
+  ///
+  /// THIS DOOR SKIPS THE SPLIT RESERVATION, and only this one may: the reservation fences the
+  /// OTHER admission doors from squatting an id a split owns, and this call IS that split claiming
+  /// its own id — the fork's own parent reserves the child while it is staged, so consulting the
+  /// predicate here would refuse the very admission it exists to protect.
+  ///
+  /// `extra` carries the facts the engine cannot answer — a coordinator's volatile tombstone set;
+  /// [`NoHold`] for a caller with none.
+  pub fn install_yieldable_fork<E, X>(
+    &mut self,
+    parent: &G,
+    child: &G,
+    engine: &mut E,
+    extra: &X,
+    now: impl Into<Now>,
+    seed: u64,
+  ) -> InstallOutcome<G, I>
+  where
+    E: MultiEngine<G, I>,
+    X: ForkGate<G>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    let (parent, plan, epoch, config) =
+      match self.prepare_fork_install(parent, child, engine, extra) {
+        PrepareOutcome::Ready {
+          parent,
+          plan,
+          epoch,
+          config,
+        } => (parent, plan, epoch, config),
+        PrepareOutcome::Done(outcome) => return outcome,
+      };
+    // BOTH ARMS ROLL THE STORAGE BACK. `prepare_fork_install` created the child's group, so an
+    // exit here must undo it exactly as its own refusal paths do — a leaked half-made group would
+    // read as occupancy at the next drain and hold this very fork against itself.
+    let Some((log, stable)) = engine.stores(child) else {
+      engine.remove_group(child);
+      return InstallOutcome::Held;
+    };
+    // THE POP is the point of no return: the forked half is obtainable only by consuming it, so
+    // from here on there is no rollback — which is exactly why every check ran first. The only
+    // steps that may stand between it and the baseline write are the two below: a token mint that
+    // is a pure function of data already in hand, and the infallible host-id latch. Nothing that
+    // can fail, and nothing whose verdict could have changed since the examine, may join them.
+    let popped = self
+      .groups
+      .get_mut(&parent)
+      .and_then(Endpoint::pop_pending_fork);
+    let Some((fork, fsm)) = popped else {
+      engine.remove_group(child);
+      return InstallOutcome::Empty;
+    };
+    let fork_id = mint_fork_id(
+      &parent,
+      plan.parent_gen_after,
+      plan.split_index,
+      plan.split_term,
+      plan.child_bytes.clone(),
+      plan.child_gen,
+    );
+    self.host_id.get_or_insert(config.id());
+    write_fork_baseline(
+      &config,
+      fork.blob,
+      plan.child_gen,
+      fork.read_only,
+      Some(fork_id),
+      epoch,
+      log,
+      stable,
+    );
+    let ep = Endpoint::restart(
+      config.clone(),
+      now,
+      group_seed(seed, child),
+      fsm,
+      epoch,
+      log,
+      stable,
+    );
+    // The parent's relay guard advances past this fork, and the child's opens at its restored
+    // lineage — the same two records the yield used to make before the install could fail.
+    self
+      .lineage
+      .insert(parent.cheap_clone(), plan.parent_gen_after);
+    self
+      .lineage
+      .insert(child.cheap_clone(), ep.restored_lineage());
+    self.clear_unresolvable_hints_naming(child);
+    self.groups.insert(child.cheap_clone(), ep);
+    self.mark_dirty(child);
+    InstallOutcome::Installed {
+      parent,
+      child: child.cheap_clone(),
+      child_gen: plan.child_gen,
+      parent_gen_after: plan.parent_gen_after,
+      split_index: plan.split_index,
+      config,
+    }
   }
 
   /// Materialize a child from a fork the CONTAINER yielded — the relay's door, and the only public
@@ -2590,10 +3155,10 @@ where
     )
   }
 
-  /// The reservation-free fork install, reachable only from inside this crate — the relay's
-  /// materialization, whose ticket is a [`GroupFork`] the container minted for a committed split it
-  /// verified. Consulting the reservation here would refuse the very admission it protects: the
-  /// fork's own parent reserves the id while it is staged, so the split could never claim it.
+  /// The reservation-free fork install, reachable only from inside this crate — the shared write
+  /// half of the public token-less door and of the wire relay's own materialization. Consulting the
+  /// reservation here would refuse the very admission it protects: a committed fork's own parent
+  /// reserves the child id while the fork is staged, so the split could never claim it.
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn create_group_from_fork_unreserved<L, S>(
     &mut self,
@@ -2811,6 +3376,89 @@ where
     self.create_group_from_fork_with_rng_unreserved(
       gid, generation, config, now, rng, fsm, snapshot, read_only, None, boot_epoch, log, stable,
     )
+  }
+
+  /// The RNG-carrying twin of
+  /// [`install_yieldable_fork`](MultiRaft::install_yieldable_fork) — same contract, same atomicity,
+  /// same pair pin, the caller's RNG in place of the seed fold.
+  pub fn install_yieldable_fork_with_rng<E, X>(
+    &mut self,
+    parent: &G,
+    child: &G,
+    engine: &mut E,
+    extra: &X,
+    now: impl Into<Now>,
+    rng: R,
+  ) -> InstallOutcome<G, I>
+  where
+    E: MultiEngine<G, I>,
+    X: ForkGate<G>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    let (parent, plan, epoch, config) =
+      match self.prepare_fork_install(parent, child, engine, extra) {
+        PrepareOutcome::Ready {
+          parent,
+          plan,
+          epoch,
+          config,
+        } => (parent, plan, epoch, config),
+        PrepareOutcome::Done(outcome) => return outcome,
+      };
+    let Some((log, stable)) = engine.stores(child) else {
+      engine.remove_group(child);
+      return InstallOutcome::Held;
+    };
+    // THE POP is the point of no return here too — see the seed-taking twin for the ordering rule,
+    // for what may stand between it and the baseline write, and for the storage rollback.
+    let popped = self
+      .groups
+      .get_mut(&parent)
+      .and_then(Endpoint::pop_pending_fork);
+    let Some((fork, fsm)) = popped else {
+      engine.remove_group(child);
+      return InstallOutcome::Empty;
+    };
+    let fork_id = mint_fork_id(
+      &parent,
+      plan.parent_gen_after,
+      plan.split_index,
+      plan.split_term,
+      plan.child_bytes.clone(),
+      plan.child_gen,
+    );
+    self.host_id.get_or_insert(config.id());
+    write_fork_baseline(
+      &config,
+      fork.blob,
+      plan.child_gen,
+      fork.read_only,
+      Some(fork_id),
+      epoch,
+      log,
+      stable,
+    );
+    let ep = Endpoint::restart_with_rng(config.clone(), now, rng, fsm, epoch, log, stable);
+    self
+      .lineage
+      .insert(parent.cheap_clone(), plan.parent_gen_after);
+    self
+      .lineage
+      .insert(child.cheap_clone(), ep.restored_lineage());
+    self.clear_unresolvable_hints_naming(child);
+    self.groups.insert(child.cheap_clone(), ep);
+    self.mark_dirty(child);
+    InstallOutcome::Installed {
+      parent,
+      child: child.cheap_clone(),
+      child_gen: plan.child_gen,
+      parent_gen_after: plan.parent_gen_after,
+      split_index: plan.split_index,
+      config,
+    }
   }
 
   /// The RNG-carrying twin of

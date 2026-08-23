@@ -656,7 +656,7 @@ fn fork_with_a_corrupt_blob_poisons_only_that_group() {
 }
 
 /// A committed `Split` entry whose CHILD id bytes will NOT decode as `G` — the committed-corrupt
-/// shape `poll_pending_fork` fail-stops as `SplitDecode` (`[0xFF; 3]` is not a valid `u64`).
+/// shape the relay drain fail-stops as `SplitDecode` (`[0xFF; 3]` is not a valid `u64`).
 fn corrupt_child_split_entry() -> Bytes {
   let payload = crate::SplitPayload::new(
     Bytes::from_static(&[0xFF, 0xFF, 0xFF]),
@@ -670,7 +670,7 @@ fn corrupt_child_split_entry() -> Bytes {
 }
 
 /// Drive follower group `gid` (leader `2`) to apply one committed corrupt-child split, then relay
-/// it: the relay decode fail-stops the parent via `poll_pending_fork` (which does NOT route through
+/// it: the relay decode fail-stops the parent inside the drain (which does NOT route through
 /// `mark_dirty`, so the poison signal is latched at that site). Leaves the group hosted-and-poisoned
 /// with its signal pending.
 fn poison_via_corrupt_fork(
@@ -715,7 +715,7 @@ fn poison_via_corrupt_fork(
     Some(StorageProgress::MorePending)
   ) {}
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "the corrupt child yields no fork"
   );
   assert!(
@@ -1946,8 +1946,9 @@ fn committed_split_relays_a_group_fork() {
   }
   assert!(saw, "Event::SplitApplied surfaced through poll_event");
 
-  // The relay: a typed GroupFork with the parent's voters remapped and the apply-derived blob.
-  let fork = m.poll_pending_fork().expect("one fork relayed");
+  // The relay: a borrowed view of the head fork, carrying the split coordinates and the derived
+  // boot config. The fork itself has not moved — it is still staged behind this decision.
+  let fork = m.peek_yieldable_fork(&NoHold).expect("one fork relayed");
   assert_eq!((*fork.parent()), 7);
   assert_eq!((*fork.child()), 200);
   assert_eq!(fork.child_gen(), 0);
@@ -1957,12 +1958,6 @@ fn committed_split_relays_a_group_fork() {
     "first split bumps the lineage to 1"
   );
   assert_eq!(fork.split_index(), idx);
-  assert_eq!(fork.fsm().units, 2, "the forked half");
-  assert_eq!(
-    *fork.blob(),
-    fork_blob(2),
-    "the apply-derived blob matches the half"
-  );
   assert_eq!(fork.config().id(), 1);
   assert_eq!(fork.config().voters(), &[1u64]);
   assert_eq!(
@@ -1971,12 +1966,38 @@ fn committed_split_relays_a_group_fork() {
     "the child inherits the parent's local knobs"
   );
   assert!(fork.config().pre_vote());
+
+  // The forked half never leaves the container, so it is observable exactly where it lands: the
+  // installed child's state machine and its manufactured baseline.
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, d, 43),
+    InstallOutcome::Installed {
+      parent: 7,
+      child: 200,
+      child_gen: 0,
+      parent_gen_after: 1,
+      ..
+    }
+  ));
   assert_eq!(
-    fork.read_only(),
+    m.group(&200).unwrap().state_machine().units,
+    2,
+    "the forked half"
+  );
+  let (_, fstable) = engine.stores(&200).expect("the child's stores");
+  let (meta, blob) = fstable.snapshot().expect("the manufactured baseline");
+  assert_eq!(
+    blob,
+    fork_blob(2),
+    "the apply-derived blob matches the half"
+  );
+  assert_eq!(
+    meta.read_only(),
     None,
     "a never-migrated parent hands the child no explicit mode"
   );
-  assert!(m.poll_pending_fork().is_none(), "exactly one fork");
+  assert!(m.peek_yieldable_fork(&NoHold).is_none(), "exactly one fork");
   assert_eq!(m.group_gen(&7), 1, "the container's lineage view bumped");
 
   // THE FORK DURABILITY BARRIER, container-to-endpoint: the threshold (1) is long crossed and a
@@ -2090,20 +2111,29 @@ fn same_mint_split_noops_at_apply_and_conserves_state() {
     1,
     "3 - 2: the parent shrank ONCE (the stale mint must not shrink it again)"
   );
-  let fork = m.poll_pending_fork().expect("the first fork relays");
-  assert_eq!(((*fork.child()), fork.parent_gen_after()), (200, 1));
+  {
+    let fork = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the first fork relays");
+    assert_eq!(((*fork.child()), fork.parent_gen_after()), (200, 1));
+  }
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 43),
+    InstallOutcome::Installed { .. }
+  ));
   assert_eq!(
-    fork.fsm().units,
+    m.group(&200).unwrap().state_machine().units,
     2,
     "child 1 holds the single given-up half"
   );
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "the stale mint staged NO fork"
   );
   // Conservation: every unit is in exactly one of parent / child 1.
   assert_eq!(
-    m.group(&7).unwrap().state_machine().units + fork.fsm().units,
+    m.group(&7).unwrap().state_machine().units + m.group(&200).unwrap().state_machine().units,
     3
   );
 
@@ -2215,10 +2245,19 @@ fn back_to_back_split_proposals_are_gated_until_apply() {
     m.handle_storage(&7, d, &mut log, &mut stable),
     Some(StorageProgress::MorePending)
   ) {}
-  let fork1 = m.poll_pending_fork().expect("the first fork relays");
-  assert_eq!((fork1.child, fork1.parent_gen_after), (200, 1));
-  assert_eq!(fork1.fsm.units, 2);
-  assert_eq!(fork1.split_index, idx1);
+  {
+    let fork1 = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the first fork relays");
+    assert_eq!(((*fork1.child()), fork1.parent_gen_after()), (200, 1));
+    assert_eq!(fork1.split_index(), idx1);
+  }
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, d, 43),
+    InstallOutcome::Installed { .. }
+  ));
+  assert_eq!(m.group(&200).unwrap().state_machine().units, 2);
 
   // The retry now chains onto the bumped lineage instead of duplicating the first mint.
   let idx2 = m
@@ -2238,15 +2277,24 @@ fn back_to_back_split_proposals_are_gated_until_apply() {
     m.handle_storage(&7, d, &mut log, &mut stable),
     Some(StorageProgress::MorePending)
   ) {}
-  let fork2 = m.poll_pending_fork().expect("the second fork relays");
-  assert_eq!((fork2.child, fork2.parent_gen_after), (201, 2));
-  assert_eq!(fork2.fsm.units, 2);
-  assert_eq!(fork2.split_index, idx2);
+  {
+    let fork2 = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the second fork relays");
+    assert_eq!(((*fork2.child()), fork2.parent_gen_after()), (201, 2));
+    assert_eq!(fork2.split_index(), idx2);
+  }
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &201, &mut engine, &NoHold, d, 44),
+    InstallOutcome::Installed { .. }
+  ));
 
   // Conservation across the chained pair: every unit lives in exactly one of the three.
   assert_eq!(m.group(&7).unwrap().state_machine().units, 1);
   assert_eq!(
-    m.group(&7).unwrap().state_machine().units + fork1.fsm.units + fork2.fsm.units,
+    m.group(&7).unwrap().state_machine().units
+      + m.group(&200).unwrap().state_machine().units
+      + m.group(&201).unwrap().state_machine().units,
     5
   );
   assert_eq!(m.group_gen(&7), 2, "the lineage chained 0 → 1 → 2");
@@ -2320,6 +2368,24 @@ fn host_with_staged_fork(child: u64) -> (MultiRaft<u64, u64, SplitSm>, VecLog, A
   (m, log, stable)
 }
 
+/// The driver's install seam in one line: install the head fork for `child` through a scratch
+/// engine and hand back the split index the driver then reports flush-durable. The fixtures that
+/// use this exercise the PARENT's barrier and obligations, so the child's own storage is
+/// incidental — what matters is that the install CONSUMES the staged fork, exactly as a driver's
+/// `fork_drain` does, before the barrier is lifted.
+fn install_head_fork(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  parent: u64,
+  child: u64,
+  now: Instant,
+) -> Index {
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  match m.install_yieldable_fork(&parent, &child, &mut engine, &NoHold, now, 43) {
+    InstallOutcome::Installed { split_index, .. } => split_index,
+    other => panic!("the staged fork {parent}->{child} must install, got {other:?}"),
+  }
+}
+
 /// OCCUPIED CALLER STORAGE HOLDS. Occupancy says the id is spoken for, never that the stores ARE
 /// this fork's child — so the fork stays staged with its blob, its fence, and its reservation,
 /// and lands the moment the gate stops answering yes. The parent's guard never moves meanwhile.
@@ -2329,7 +2395,7 @@ fn an_occupied_child_id_holds_the_fork_until_the_gate_clears() {
   let gate = TestGate::occupying(200);
 
   assert!(
-    m.poll_pending_fork_with(&gate).is_none(),
+    m.peek_yieldable_fork(&gate).is_none(),
     "occupied stores hold the fork instead of yielding it"
   );
   assert!(
@@ -2347,26 +2413,34 @@ fn an_occupied_child_id_holds_the_fork_until_the_gate_clears() {
   );
   assert_eq!(m.poll_split_conflict(), None, "one cue per episode");
   assert!(
-    m.poll_pending_fork_with(&gate).is_none(),
+    m.peek_yieldable_fork(&gate).is_none(),
     "still held, and re-examination does not re-cue"
   );
   assert_eq!(m.poll_split_conflict(), None);
 
-  // The gate stops answering yes and the very same fork lands.
-  let fork = m
-    .poll_pending_fork_with(&NoHold)
-    .expect("the released fork materializes");
-  assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
-  assert!(
-    !fork.blob().is_empty(),
+  // The gate stops answering yes and the very same fork lands, half and all.
+  {
+    let fork = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the released fork materializes");
+    assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
+  }
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 43),
+    InstallOutcome::Installed { .. }
+  ));
+  assert_eq!(
+    m.group(&200).unwrap().state_machine().units,
+    2,
     "the partition rode the hold intact"
   );
 }
 
-/// MEMBERSHIP COMES FROM THE COMMITTED SPLIT. The sealed door takes no config, so two replicas
+/// MEMBERSHIP COMES FROM THE COMMITTED SPLIT. The install takes no config, so two replicas
 /// installing the same fork cannot land the child under different voter sets — the shape that would
 /// let one id carry two conflicting committed histories with every other input matching. Both
-/// containers derive the same config from the fork itself, and the only divergence from the
+/// containers derive the same config from the staged fork, and the only divergence from the
 /// committed one is the reshape-born knob forcing, applied inside the container on both.
 #[test]
 fn two_replicas_install_one_fork_under_identical_voter_sets() {
@@ -2382,13 +2456,19 @@ fn two_replicas_install_one_fork_under_identical_voter_sets() {
   let mut installed = Vec::new();
   for seed in [43u64, 99] {
     let (mut m, _log, _stable) = host_with_staged_fork(200);
-    let fork = m.poll_pending_fork_with(&NoHold).expect("relays");
     // What the committed split says the child's membership is — identical on both replicas
     // because the split rode the parent's totally-ordered log.
-    let committed: Vec<u64> = fork.config().voters().to_vec();
-    let (mut flog, mut fstable) = (VecLog::default(), AsyncStable::default());
-    m.create_group_from_relayed_fork(fork, Instant::ORIGIN, seed, 1, &mut flog, &mut fstable)
-      .expect("the sealed door installs");
+    let committed: Vec<u64> = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("relays")
+      .config()
+      .voters()
+      .to_vec();
+    let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+    assert!(matches!(
+      m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, seed),
+      InstallOutcome::Installed { .. }
+    ));
     assert_eq!(
       voters(&m),
       committed,
@@ -2406,21 +2486,33 @@ fn two_replicas_install_one_fork_under_identical_voter_sets() {
   );
 }
 
-/// THE POST-YIELD WINDOW. The pop ends the STAGED leg of the reservation, not the reservation:
-/// between the yield and the sealed install the child id still belongs to this committed split, and
-/// the caller-driven door must refuse it. Without that leg the id is briefly unclaimed, and a
-/// caller can install its own content there — which the genuine fork then finds hosted.
+/// THE RESERVATION IS CONTIGUOUS, because the fork never leaves home. The staged leg runs from the
+/// committed split right up to the pop inside the install, and the pop is followed by the child's
+/// own admission with nothing in between — so there is no window to leak through and no second
+/// bookkeeping leg to keep. A peek does not shorten it (nothing is consumed), and a HOLD does not
+/// either: the fork stays staged, reserving, until it lands.
 #[test]
-fn a_yielded_but_uninstalled_forks_child_is_still_reserved() {
+fn a_staged_forks_child_stays_reserved_right_through_the_install() {
   let (mut m, _log, _stable) = host_with_staged_fork(200);
-  let fork = m
-    .poll_pending_fork_with(&NoHold)
-    .expect("the committed split relays");
+  assert!(m.split_reserved(&200), "staged, so reserved");
+
+  // Peeked but not installed: still staged, still reserving, and the public door still refuses.
+  let peeked = m
+    .peek_yieldable_fork(&NoHold)
+    .expect("the committed split is yieldable")
+    .split_index();
   assert!(
-    m.group(&7).unwrap().peek_pending_fork().is_none(),
-    "the staged leg ended at the pop — the reservation must not have ended with it"
+    m.group(&7).unwrap().peek_pending_fork().is_some(),
+    "a peek consumes nothing — the staged leg never ends early"
   );
-  assert!(m.split_reserved(&200), "the yielded leg holds the id");
+  assert!(m.split_reserved(&200));
+
+  // Held on the gate: same answer, for as long as the hold stands.
+  assert!(
+    m.peek_yieldable_fork(&TestGate::occupying(200)).is_none(),
+    "held"
+  );
+  assert!(m.split_reserved(&200), "a held fork reserves its child too");
 
   let (mut clog, mut cstable) = (VecLog::default(), AsyncStable::default());
   assert_eq!(
@@ -2438,7 +2530,7 @@ fn a_yielded_but_uninstalled_forks_child_is_still_reserved() {
       &mut cstable,
     ),
     Err(CreateGroupError::SplitReserved),
-    "the public door refuses the id a yielded fork is on its way to install"
+    "the public door refuses the id the staged fork owns"
   );
   assert_eq!(
     <VecLog as crate::LogStore>::last_index(&clog),
@@ -2446,42 +2538,93 @@ fn a_yielded_but_uninstalled_forks_child_is_still_reserved() {
     "and refuses before any store write"
   );
 
-  // The SEALED install still succeeds — the door that holds the container's own record is not
-  // fenced by the entry it is about to drop.
-  let (mut flog, mut fstable) = (VecLog::default(), AsyncStable::default());
-  m.create_group_from_relayed_fork(fork, Instant::ORIGIN, 44, 1, &mut flog, &mut fstable)
-    .expect("the sealed door installs the fork it was handed");
+  // The install is the split claiming its own id, so it is the one door the reservation does not
+  // fence — and the reservation ends with the pop it makes, not before it.
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 44),
+    InstallOutcome::Installed { split_index, .. } if split_index == peeked
+  ));
   assert!(
     !m.split_reserved(&200),
-    "and the entry is gone with it — a leaked one would squat the id for good"
+    "consumed, so released — a leaked leg would squat the id for good"
   );
   assert!(m.contains_group(&200), "the child is hosted");
 }
 
-/// The other completion path releases the entry too: a fork abandoned TERMINALLY was never yielded,
-/// so nothing is left standing for it, and a caller that receives a fork and then abandons it
-/// releases explicitly. Either way the id ends up claimed by nothing.
+/// THE DOUBLE-YIELD DIES AS A CLASS. When the forked half left the container as a value, one
+/// (parent, child) could be presented twice — a second yield minting a second ticket for the same
+/// partition, or a second install replaying the first over the child's own progress. Neither
+/// surface survives: a peek CONSUMES NOTHING, so peeking twice describes the SAME staged fork and
+/// mints nothing either time; and the install consumes it, so a second install finds no head fork
+/// for that child at all. Nothing doubles, and the child's own state is what proves it.
+#[test]
+fn one_committed_fork_cannot_be_yielded_or_installed_twice() {
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  let coords = |m: &mut MultiRaft<u64, u64, SplitSm>| {
+    let v = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the committed split is yieldable");
+    (
+      (*v.parent()),
+      (*v.child()),
+      v.child_gen(),
+      v.parent_gen_after(),
+      v.split_index(),
+    )
+  };
+  assert_eq!(
+    coords(&mut m),
+    coords(&mut m),
+    "two peeks, one fork: a peek describes the head, it does not take it"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_some(),
+    "and the fork is still exactly where it was"
+  );
+
+  // The install names its child, so a peek for one id can never install another.
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert_eq!(
+    m.install_yieldable_fork(&7, &201, &mut engine, &NoHold, Instant::ORIGIN, 43),
+    InstallOutcome::NotYieldable,
+    "7's head fork names 200; an install for 201 is not this call's business"
+  );
+  assert!(
+    !engine.contains_group(&201),
+    "and it made no storage for it"
+  );
+
+  // ONE install lands the partition …
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 43),
+    InstallOutcome::Installed { child: 200, .. }
+  ));
+  let units = m.group(&200).unwrap().state_machine().units;
+  assert_eq!(units, 2, "the forked half, once");
+
+  // … and the second install has nothing to take: the staged queue is empty, so there is no head
+  // fork for this child or any other, and the child that landed is untouched.
+  assert_eq!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 44),
+    InstallOutcome::Empty,
+    "the first install consumed the fork; nothing replays it over the child's own progress"
+  );
+  assert_eq!(m.group(&200).unwrap().state_machine().units, units);
+  assert_eq!(m.group_gen(&7), 1, "one install, one relay-guard advance");
+}
+
+/// A fork abandoned TERMINALLY was never installed, and nothing is left standing for it: the
+/// container consumed it inside its own drain, so the id ends up claimed by nothing.
 #[test]
 fn an_abandoned_fork_leaves_no_reservation_behind() {
-  // Terminal at the gate: the fork is consumed inside the container, never yielded.
   let (mut m, _log, _stable) = host_with_staged_fork(200);
   let floored = TestGate::flooring(200, crate::MERGED_FLOOR);
-  assert!(m.poll_pending_fork_with(&floored).is_none());
+  assert!(m.peek_yieldable_fork(&floored).is_none());
   assert_eq!(m.poll_split_refusal(), Some((7, 200)));
   assert!(
     !m.split_reserved(&200),
-    "a terminally abandoned fork holds nothing: neither leg stands"
-  );
-
-  // Yielded and then abandoned by the caller: the explicit release is what clears it.
-  let (mut m2, _l2, _s2) = host_with_staged_fork(201);
-  let fork = m2.poll_pending_fork_with(&NoHold).expect("relays");
-  assert!(m2.split_reserved(&201), "yielded, so reserved");
-  drop(fork);
-  m2.release_yielded_fork(&201);
-  assert!(
-    !m2.split_reserved(&201),
-    "the caller released what it will never install"
+    "a terminally abandoned fork holds nothing"
   );
 }
 
@@ -2496,7 +2639,7 @@ fn a_held_fork_terminalizes_when_its_floor_rises() {
 
   // HELD: the caller's stores are occupied, which says the id is spoken for and nothing more.
   let occupied = TestGate::occupying(200);
-  assert!(m.poll_pending_fork_with(&occupied).is_none(), "held");
+  assert!(m.peek_yieldable_fork(&occupied).is_none(), "held");
   assert!(
     m.group(&7).unwrap().peek_pending_fork().is_some(),
     "the blob, the fence and the reservation all stand through a hold"
@@ -2512,7 +2655,7 @@ fn a_held_fork_terminalizes_when_its_floor_rises() {
   // The SAME child id now answers at the reserved terminal — a floor that can never lift.
   let floored = TestGate::flooring(200, crate::MERGED_FLOOR);
   assert!(
-    m.poll_pending_fork_with(&floored).is_none(),
+    m.peek_yieldable_fork(&floored).is_none(),
     "a terminal floor yields nothing"
   );
   assert!(
@@ -2545,7 +2688,7 @@ fn a_child_below_its_floor_is_abandoned_deliberately() {
   let gate = TestGate::flooring(200, 9);
 
   assert!(
-    m.poll_pending_fork_with(&gate).is_none(),
+    m.peek_yieldable_fork(&gate).is_none(),
     "a below-floor child yields nothing"
   );
   assert!(
@@ -2591,7 +2734,7 @@ fn a_hosted_child_still_resolves_redundant_with_the_gate_active() {
   let gate = TestGate::occupying(200);
 
   assert!(
-    m.poll_pending_fork_with(&gate).is_none(),
+    m.peek_yieldable_fork(&gate).is_none(),
     "a redundant fork yields nothing"
   );
   assert!(
@@ -2612,7 +2755,7 @@ fn a_hosted_child_still_resolves_redundant_with_the_gate_active() {
 fn removing_the_parent_purges_a_held_fork_and_its_cue() {
   let (mut m, _log, _stable) = host_with_staged_fork(200);
   let gate = TestGate::occupying(200);
-  assert!(m.poll_pending_fork_with(&gate).is_none(), "held");
+  assert!(m.peek_yieldable_fork(&gate).is_none(), "held");
   // The cue is queued but NOT yet consumed — a driver's bounded tail deferred it.
   m.remove_group(&7, &mut empty_stores()).unwrap();
   assert_eq!(
@@ -2621,7 +2764,7 @@ fn removing_the_parent_purges_a_held_fork_and_its_cue() {
     "the parent's removal purged its undelivered cue"
   );
   assert!(
-    m.poll_pending_fork_with(&gate).is_none(),
+    m.peek_yieldable_fork(&gate).is_none(),
     "and left no fork behind to re-examine"
   );
 }
@@ -2711,7 +2854,7 @@ fn removing_a_child_descended_from_a_held_fork_abandons_it() {
   // baseline landed there), so the parent parks with one cue outstanding and undelivered.
   let gate = TestGate::occupying(200);
   assert!(
-    m.poll_pending_fork_with(&gate).is_none(),
+    m.peek_yieldable_fork(&gate).is_none(),
     "occupied stores hold the fork"
   );
   // That transferred baseline registers in the container carrying THIS split's token — the
@@ -2754,7 +2897,7 @@ fn removing_a_child_descended_from_a_held_fork_abandons_it() {
     "the park ended with the fork: its undelivered cue died with the episode"
   );
   assert!(
-    m.poll_pending_fork_with(&NoHold).is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "the id is free now and nothing is left to take it"
   );
   assert_eq!(
@@ -2770,7 +2913,7 @@ fn removing_a_child_descended_from_a_held_fork_abandons_it() {
   follower_split_next(&mut m, &mut log, &mut stable, 6, 201, 2, 1);
   let gate = TestGate::occupying(201);
   assert!(
-    m.poll_pending_fork_with(&gate).is_none(),
+    m.peek_yieldable_fork(&gate).is_none(),
     "the parent's next fork holds on its own occupied child id"
   );
   assert_eq!(
@@ -2808,7 +2951,7 @@ fn the_mirrored_guard_folds_a_replayed_abandoned_fork() {
   m.raise_relay_guard(&7, 1);
 
   assert!(
-    m.poll_pending_fork_with(&NoHold).is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "the guard folds the replayed fork instead of relaying it a second time"
   );
   assert!(
@@ -2846,12 +2989,19 @@ fn a_replayed_abandoned_fork_resurrects_without_the_mirrored_guard() {
   )
   .unwrap();
 
-  let fork = m
-    .poll_pending_fork_with(&NoHold)
-    .expect("no guard, no defense: the dead fork relays again");
-  assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
+  {
+    let fork = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("no guard, no defense: the dead fork relays again");
+    assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
+  }
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 43),
+    InstallOutcome::Installed { .. }
+  ));
   assert_eq!(
-    fork.fsm().units,
+    m.group(&200).unwrap().state_machine().units,
     2,
     "carrying the dead incarnation's half onto the id's clean slate"
   );
@@ -2942,7 +3092,7 @@ fn a_removal_condemns_a_fork_below_the_head_and_the_drain_takes_it_in_order() {
 
   // The FIRST fork parks: its child id is occupied by caller storage.
   let gate = TestGate::occupying(200);
-  assert!(m.poll_pending_fork_with(&gate).is_none(), "the head parks");
+  assert!(m.peek_yieldable_fork(&gate).is_none(), "the head parks");
   // The SECOND fork's child arrived here by transfer, carrying that split's own token, and the
   // embedder then tore it down.
   let token = staged_fork_id_at(&m, 7, 6);
@@ -2982,14 +3132,21 @@ fn a_removal_condemns_a_fork_below_the_head_and_the_drain_takes_it_in_order() {
   );
 
   // The first fork's conflict clears and it materializes normally.
-  let first = m
-    .poll_pending_fork_with(&NoHold)
-    .expect("the head fork lands once its id frees");
-  assert_eq!((first.parent, first.child), (7, 200));
+  {
+    let first = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the head fork lands once its id frees");
+    assert_eq!(((*first.parent()), (*first.child())), (7, 200));
+  }
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 43),
+    InstallOutcome::Installed { .. }
+  ));
 
   // NOW the mark is at the head, and the very next drain takes it — before any verdict.
   assert!(
-    m.poll_pending_fork_with(&NoHold).is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "the condemned fork is consumed, never yielded onto the id it would resurrect"
   );
   assert!(
@@ -3035,7 +3192,7 @@ fn the_mirrored_guard_folds_both_replayed_forks_after_an_ordered_abandonment() {
   m.raise_relay_guard(&7, 2);
 
   assert!(
-    m.poll_pending_fork_with(&NoHold).is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "the guard folds both replayed forks"
   );
   assert!(
@@ -3044,6 +3201,244 @@ fn the_mirrored_guard_folds_both_replayed_forks_after_an_ordered_abandonment() {
   );
   assert!(!m.split_reserved(&200));
   assert!(!m.split_reserved(&201));
+}
+
+/// A REDUNDANT RESOLUTION IS A CONSUMPTION, so it persists its guard advance. The fork's blob is
+/// discarded because the transferred twin already carries this split's baseline — but if only the
+/// VOLATILE guard moved, the discard would not survive the restart that follows it. Crash after the
+/// redundant fold and the child's removal, before a parent snapshot covers the split: the replayed
+/// split re-stages the fork against a durable guard that never learned of the fold, and once the
+/// embedder consents to re-admitting the id the fork reinstalls the very baseline the removal ended.
+/// The queued advance is what the caller mirrors durably, and it is what folds the replay.
+#[test]
+fn a_redundant_resolution_persists_its_guard_advance_across_a_crash() {
+  let (mut m, mut log, mut stable) = host_with_staged_fork(200);
+
+  // The transferred twin: a sibling replica's manufactured baseline arrived here carrying THIS
+  // split's exact token, which is what authorizes the redundant discard.
+  let token = staged_fork_id(&m, 7);
+  let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
+  m.create_group_from_fork_unreserved(
+    200,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+    fork_blob(2),
+    None,
+    Some(token),
+    1,
+    &mut log200,
+    &mut stable200,
+  )
+  .unwrap();
+
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "the twin's token resolves the fork as redundant"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "and CONSUMES it — the blob is gone"
+  );
+
+  // THE DURABLE HALF the consumption owes. A driver mirrors this into its lineage record beside
+  // the writes it was already making; here the test plays that mirror.
+  let durable_guard = m
+    .poll_relay_guard_advance()
+    .expect("a redundant consumption owes its caller a durable guard advance");
+  assert_eq!(durable_guard, (7, 1));
+
+  // The embedder ends the child's local story. Nothing about the parent's log changed, and no
+  // parent snapshot has covered the split yet — this is exactly the crash window.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  drop(m);
+
+  // CRASH + REPLAY. The restored parent replays its split entry and re-stages the fork; the guard
+  // is seeded from the DURABLE mirror, which is the only place the fold was recorded.
+  let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m2.restore_group(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    2,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(
+    m2.group(&7).unwrap().staged_forks().count(),
+    1,
+    "the replay re-staged the fork"
+  );
+  m2.raise_relay_guard(&durable_guard.0, durable_guard.1);
+
+  // The re-admission consent the embedder would give next: nothing occupies 200 any more.
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(
+    m2.peek_yieldable_fork(&NoHold).is_none(),
+    "the mirrored advance folds the replayed fork to a duplicate"
+  );
+  assert_eq!(
+    m2.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 44),
+    InstallOutcome::Empty,
+    "so nothing reinstalls the baseline the removal ended"
+  );
+  assert!(!m2.contains_group(&200), "the child stays gone");
+  assert!(
+    !engine.contains_group(&200),
+    "and no storage was made for it"
+  );
+}
+
+/// THE RELAY GUARD IS MONOTONE, and the removal-time abandonment is the site that proved it has to
+/// be. The guard legitimately runs AHEAD of the staged forks: a restore raises it from the caller's
+/// DURABLE lineage mirror ([`MultiRaft::raise_relay_guard`]), which is what folds a replayed tail's
+/// forks to resolved no-ops. Writing the abandoned fork's own bump over that higher guard REGRESSED
+/// it, and the next replayed fork — minted between the abandoned one and the true guard — stopped
+/// reading as a duplicate and installed a dead incarnation's baseline over the child's real durable
+/// progress. The ordered-abandonment test cannot see this: it condemns BOTH forks, so nothing is
+/// left behind to be let through.
+#[test]
+fn abandoning_a_below_guard_fork_never_regresses_the_relay_guard() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = two_split_survivor_log(200, 201);
+  m.restore_group(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(
+    m.group(&7).unwrap().staged_forks().count(),
+    2,
+    "the crash-replay re-staged both forks"
+  );
+  // The durable mirror already covers BOTH: fork 1 bumps the lineage to 1, fork 2 to 2.
+  m.raise_relay_guard(&7, 2);
+
+  // The FIRST fork's child is hosted here carrying that split's own token — it arrived by transfer
+  // before the crash — and the embedder tears it down. The (d) abandonment fires on the HEAD fork,
+  // whose own bump (1) is BELOW the guard the restore raised.
+  let token = staged_fork_id_at(&m, 7, 4);
+  m.create_group(
+    200,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    44,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.group_mut(&200).unwrap().seed_fork_id_for_test(token);
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+
+  // THE SECOND FORK IS STILL A DUPLICATE. Under a regressed guard it yields instead, and the
+  // install manufactures a baseline for an incarnation the durable record says is long past.
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "the guard still covers the second replayed fork — the abandonment raised it, never lowered it"
+  );
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert_eq!(
+    m.install_yieldable_fork(&7, &201, &mut engine, &NoHold, Instant::ORIGIN, 45),
+    InstallOutcome::Empty,
+    "the guard consumed both forks, so nothing installs the dead incarnation's half"
+  );
+  assert!(!m.contains_group(&201), "child 201 was never materialized");
+  assert!(
+    !engine.contains_group(&201),
+    "and no storage was made for it"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "both forks are finished with: one abandoned, one folded"
+  );
+}
+
+/// PEEK AND INSTALL AGREE, because the install decides on the PAIR the peek named rather than on
+/// whatever a second global drain would reach. The drain's own arms MUTATE its walk — the parked
+/// sweep unparks and re-dirties the parent it hands back before returning it — so a re-draining
+/// install starts from a different place than the peek did. With two parents' forks releasing on
+/// one crank the second drain legitimately reached the OTHER parent, and the install for the
+/// peeked child answered `NotYieldable` on a perfectly legal state; the three simulation harnesses
+/// and the parity bench turn that answer into a panic.
+#[test]
+fn two_parks_releasing_together_install_the_pair_the_peek_named() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log7, mut stable7) = (VecLog::default(), AsyncStable::default());
+  let (mut log8, mut stable8) = (VecLog::default(), AsyncStable::default());
+  let cfg = || {
+    Config::try_new(
+      1u64,
+      std::vec![1u64, 2],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_snapshot_threshold(1)
+  };
+  m.create_group(7, 0, cfg(), Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  m.create_group(8, 0, cfg(), Instant::ORIGIN, 43, SplitSm::default())
+    .unwrap();
+  follower_load_and_split_on(&mut m, 7, &mut log7, &mut stable7, 200);
+  follower_load_and_split_on(&mut m, 8, &mut log8, &mut stable8, 201);
+
+  // BOTH PARK, on their own children's occupied storage, and both release on the same crank.
+  let occupied = TestGate {
+    occupied: [200u64, 201].into_iter().collect(),
+    floors: BTreeMap::new(),
+  };
+  assert!(m.peek_yieldable_fork(&occupied).is_none(), "both hold");
+  assert_eq!(
+    core::iter::from_fn(|| m.poll_split_conflict()).count(),
+    2,
+    "two parents parked, one cue each"
+  );
+
+  // The peek names one pair; the install must land THAT pair, not the one a second sweep reaches.
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let (parent, child) = {
+    let view = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the gate cleared, so a fork is yieldable");
+    ((*view.parent()), (*view.child()))
+  };
+  assert!(
+    matches!(
+      m.install_yieldable_fork(&parent, &child, &mut engine, &NoHold, Instant::ORIGIN, 44),
+      InstallOutcome::Installed { .. }
+    ),
+    "the install landed the pair the peek named ({parent} -> {child})"
+  );
+  assert!(m.contains_group(&child));
+
+  // And the OTHER parent's fork lands on the next turn of the same loop.
+  let (parent2, child2) = {
+    let view = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the second parent's fork is yieldable too");
+    ((*view.parent()), (*view.child()))
+  };
+  assert_ne!((parent, child), (parent2, child2), "a different pair");
+  assert!(matches!(
+    m.install_yieldable_fork(&parent2, &child2, &mut engine, &NoHold, Instant::ORIGIN, 45),
+    InstallOutcome::Installed { .. }
+  ));
+  assert!(m.contains_group(&child2));
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "both partitions landed; nothing is left staged"
+  );
 }
 
 /// THE CORE API'S OWN DOOR. Reached directly — no coordinator anywhere — a caller-driven fork
@@ -3132,7 +3527,7 @@ fn the_exported_containers_public_fork_door_is_fenced_and_token_less() {
 
   // The genuine fork then lands, its blob intact — nothing was discarded against a forged twin.
   let fork = m
-    .poll_pending_fork_with(&NoHold)
+    .peek_yieldable_fork(&NoHold)
     .expect("the real fork materializes");
   assert_eq!((*fork.parent(), *fork.child()), (7, 200));
   assert!(
@@ -3296,7 +3691,7 @@ fn a_fork_for_a_latched_closed_parks_source_is_abandoned() {
   // refusal must win over them — that is why it is an Err-arm verdict.
   let gate = TestGate::occupying(200);
   assert!(
-    m.poll_pending_fork_with(&gate).is_none(),
+    m.peek_yieldable_fork(&gate).is_none(),
     "the fork is abandoned, not yielded"
   );
   assert!(
@@ -3361,7 +3756,7 @@ fn an_unrelated_parents_fork_for_a_consumed_id_holds_rather_than_dropping_its_ha
 
   // Group 7 IS the absorbing target and its fork predates the park: subsumed, so abandoned.
   // Group 9 is not, so its fork is HELD — the union cannot contain what Q split away.
-  assert!(m.poll_pending_fork_with(&NoHold).is_none());
+  assert!(m.peek_yieldable_fork(&NoHold).is_none());
   assert!(
     m.group(&7).unwrap().peek_pending_fork().is_none(),
     "the target's own fork was subsumed and abandoned"
@@ -3415,7 +3810,7 @@ fn an_open_park_abandons_nothing_and_the_abort_leaves_the_fork_staged() {
   // and not closed here — the absorb-pending leg deliberately does not fire on an undecided park.)
   let gate = TestGate::occupying(200);
   assert!(
-    m.poll_pending_fork_with(&gate).is_none(),
+    m.peek_yieldable_fork(&gate).is_none(),
     "the child id is spoken for by an undecided park, so the fork holds"
   );
   assert!(
@@ -3567,7 +3962,7 @@ fn a_matching_token_still_resolves_redundant_while_the_absorb_leg_stands() {
   );
 
   assert!(
-    m.poll_pending_fork_with(&NoHold).is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "a redundant fork yields nothing"
   );
   assert!(
@@ -3641,6 +4036,17 @@ fn follower_load_and_split(
   stable: &mut AsyncStable,
   child: u64,
 ) -> Index {
+  follower_load_and_split_on(m, 7, log, stable, child)
+}
+
+/// [`follower_load_and_split`] on a named parent — the two-parent fixtures' entry point.
+fn follower_load_and_split_on(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  parent: u64,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  child: u64,
+) -> Index {
   let cmd = {
     let mut buf = Vec::new();
     Bytes::from_static(b"c").encode(&mut buf);
@@ -3668,7 +4074,7 @@ fn follower_load_and_split(
     ),
   ];
   m.handle_message(
-    &7,
+    &parent,
     Instant::ORIGIN,
     log,
     stable,
@@ -3684,7 +4090,7 @@ fn follower_load_and_split(
   )
   .unwrap();
   while matches!(
-    m.handle_storage(&7, Instant::ORIGIN, log, stable),
+    m.handle_storage(&parent, Instant::ORIGIN, log, stable),
     Some(StorageProgress::MorePending)
   ) {}
   Index::new(4)
@@ -3763,7 +4169,7 @@ fn hosted_child_fork_parks_and_materializes_after_removal() {
 
   // PARKED: nothing yields, nothing resolves — and the conflict surfaces exactly once.
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "a hosted child id parks the fork instead of yielding it"
   );
   assert_eq!(
@@ -3776,7 +4182,7 @@ fn hosted_child_fork_parks_and_materializes_after_removal() {
     None,
     "the signal is deduped until the park resolves"
   );
-  assert!(m.poll_pending_fork().is_none(), "still parked");
+  assert!(m.peek_yieldable_fork(&NoHold).is_none(), "still parked");
   assert_eq!(
     m.poll_split_conflict(),
     None,
@@ -3816,23 +4222,34 @@ fn hosted_child_fork_parks_and_materializes_after_removal() {
 
   // Arm (a): the squatter is removed — the fork now materializes NORMALLY, with the full half.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m
-    .poll_pending_fork()
-    .expect("removal unparks the fork for materialization");
-  assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
-  assert_eq!(fork.split_index(), idx);
-  assert_eq!(fork.parent_gen_after(), 1);
-  assert_eq!(fork.fsm().units, 2, "the parked half materializes intact");
-  assert_eq!(*fork.blob(), fork_blob(2));
+  {
+    let fork = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("removal unparks the fork for materialization");
+    assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
+    assert_eq!(fork.split_index(), idx);
+    assert_eq!(fork.parent_gen_after(), 1);
+  }
   assert!(
     m.split_reserved(&200),
-    "the yield ends the STAGED leg and starts the yielded one — this fork is the id's one \
-     admitted writer until it installs"
+    "un-parked but still STAGED: this fork is the id's one admitted writer until it installs"
   );
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 43),
+    InstallOutcome::Installed { .. }
+  ));
+  assert_eq!(
+    m.group(&200).unwrap().state_machine().units,
+    2,
+    "the parked half materializes intact"
+  );
+  let (_, fstable) = engine.stores(&200).expect("the child's stores");
+  assert_eq!(fstable.snapshot().expect("the baseline").1, fork_blob(2));
   // Conservation across the resolution: every unit is in exactly one of parent / child — the
   // pre-split 3 plus the one the fence probe committed while parked.
   assert_eq!(
-    m.group(&7).unwrap().state_machine().units + fork.fsm().units,
+    m.group(&7).unwrap().state_machine().units + m.group(&200).unwrap().state_machine().units,
     4
   );
 
@@ -3878,7 +4295,10 @@ fn parked_fork_stays_parked_when_an_independent_twin_catches_up() {
   )
   .unwrap();
   let _idx = follower_load_and_split(&mut m, &mut log, &mut stable, 200);
-  assert!(m.poll_pending_fork().is_none(), "parked on the conflict");
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "parked on the conflict"
+  );
   assert_eq!(m.poll_split_conflict(), Some((7, 200)));
 
   // The independent child advances well past the fork baseline and past the fork's lineage.
@@ -3890,7 +4310,7 @@ fn parked_fork_stays_parked_when_an_independent_twin_catches_up() {
   // The next drain leaves the fork PARKED: no ForkId match, so progress alone cannot authorize
   // the discard. The blob is retained and the fence stands.
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "an independent child's progress must not yield or discard the fork"
   );
   let staged = m
@@ -3937,7 +4357,10 @@ fn park_with_queued_conflict(
   )
   .unwrap();
   follower_load_and_split(&mut m, log, stable, 200);
-  assert!(m.poll_pending_fork().is_none(), "parked on the conflict");
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "parked on the conflict"
+  );
   m
 }
 
@@ -3962,7 +4385,7 @@ fn peek_split_conflict_leaves_the_signal_queued() {
     "consumption empties the queue"
   );
   assert_eq!(m.poll_split_conflict(), None, "one signal per park episode");
-  assert!(m.poll_pending_fork().is_none(), "still parked");
+  assert!(m.peek_yieldable_fork(&NoHold).is_none(), "still parked");
   assert_eq!(
     m.peek_split_conflict(),
     None,
@@ -3986,7 +4409,7 @@ fn squatter_removal_purges_an_undelivered_conflict() {
 
   m.remove_group(&200, &mut empty_stores()).unwrap();
   let fork = m
-    .poll_pending_fork()
+    .peek_yieldable_fork(&NoHold)
     .expect("removal unparks the fork for materialization");
   assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
   assert_eq!(
@@ -4014,7 +4437,7 @@ fn twin_catch_up_purges_an_undelivered_conflict() {
   let f = staged_fork_id(&m, 7);
   m.group_mut(&200).unwrap().seed_fork_id_for_test(f);
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "a twin carrying the fork's token resolves the park without yielding"
   );
   assert!(
@@ -4308,7 +4731,7 @@ fn a_destructive_install_refuses_foreign_fork_provenance() {
 
   // The park resolves redundant against the COHERENT twin — never against foreign state.
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "the twin resolves the park without yielding"
   );
   assert!(
@@ -4568,7 +4991,7 @@ fn pre_hosted_twin_resolves_redundant_without_parking() {
   .unwrap();
 
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "the redundant fork never yields"
   );
   assert_eq!(
@@ -4635,7 +5058,10 @@ fn split_admission_race_parks_instead_of_dropping() {
     m.handle_storage(&7, d, &mut log, &mut stable),
     Some(StorageProgress::MorePending)
   ) {}
-  assert!(m.poll_pending_fork().is_none(), "parked, not dropped");
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "parked, not dropped"
+  );
   assert_eq!(m.poll_split_conflict(), Some((7, 200)));
   assert_eq!(
     m.group(&7).unwrap().state_machine().units,
@@ -4653,14 +5079,23 @@ fn split_admission_race_parks_instead_of_dropping() {
 
   // No silent drop: removing the squatter materializes the full half — conservation exact.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survives the race");
+  {
+    let fork = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the fork survives the race");
+    assert_eq!(
+      ((*fork.parent()), (*fork.child()), fork.split_index()),
+      (7, 200, idx)
+    );
+  }
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 43),
+    InstallOutcome::Installed { .. }
+  ));
+  assert_eq!(m.group(&200).unwrap().state_machine().units, 2);
   assert_eq!(
-    ((*fork.parent()), (*fork.child()), fork.split_index()),
-    (7, 200, idx)
-  );
-  assert_eq!(fork.fsm().units, 2);
-  assert_eq!(
-    m.group(&7).unwrap().state_machine().units + fork.fsm().units,
+    m.group(&7).unwrap().state_machine().units + m.group(&200).unwrap().state_machine().units,
     3
   );
 }
@@ -4700,7 +5135,7 @@ fn restore_seeds_the_replay_guard_from_durable_lineage() {
   )
   .unwrap();
   let fork = m
-    .poll_pending_fork()
+    .peek_yieldable_fork(&NoHold)
     .expect("a replayed, never-relayed fork relays again");
   assert_eq!(((*fork.child()), fork.parent_gen_after()), (200, 1));
 
@@ -4740,7 +5175,7 @@ fn restore_seeds_the_replay_guard_from_durable_lineage() {
   .unwrap();
   assert_eq!(m.group_gen(&7), 1);
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "a replayed duplicate below the durable lineage is dropped"
   );
   assert_eq!(
@@ -4883,7 +5318,7 @@ fn reshaped_twin_breaks_the_fork_merge_capture_cycle() {
   // The reshaped twin resolves the fork as redundant at FIRST examination: no park, no
   // conflict signal, the staged blob discarded, the fence gone.
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "a reshaped twin resolves the fork without yielding"
   );
   assert!(
@@ -5000,11 +5435,14 @@ fn recreated_squatter_at_higher_lineage_stays_parked() {
 
   // The drain PARKS the parent's fork (no ForkId match) and flows on to the squatter's own
   // staged fork — a parked fork wedges only its OWN parent's later forks, never another group's.
-  let fork = m
-    .poll_pending_fork()
-    .expect("the squatter's own fork still yields");
-  assert_eq!(((*fork.parent()), (*fork.child())), (200, 300));
-  assert!(m.poll_pending_fork().is_none());
+  {
+    let fork = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the squatter's own fork still yields");
+    assert_eq!(((*fork.parent()), (*fork.child())), (200, 300));
+  }
+  install_head_fork(&mut m, 200, 300, d);
+  assert!(m.peek_yieldable_fork(&NoHold).is_none());
   assert!(
     m.group(&7).unwrap().peek_pending_fork().is_some(),
     "the parent's fork stays parked — a higher lineage is not this fork's provenance"
@@ -5071,7 +5509,10 @@ fn below_lineage_squatter_stays_parked() {
     Some(StorageProgress::MorePending)
   ) {}
 
-  assert!(m.poll_pending_fork().is_none(), "parked, not resolved");
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "parked, not resolved"
+  );
   assert_eq!(m.poll_split_conflict(), Some((7, 200)));
   assert!(
     m.group(&7).unwrap().peek_pending_fork().is_some(),
@@ -5089,12 +5530,23 @@ fn below_lineage_squatter_stays_parked() {
   // Arm (a) is the shape's designed exit: the embedder removes the stale squatter and the
   // fork materializes with its minted lineage intact.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m
-    .poll_pending_fork()
-    .expect("removal unparks the fork for materialization");
-  assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
-  assert_eq!(fork.child_gen(), 1, "the minted lineage rides the yield");
-  assert_eq!(fork.fsm().units, 2, "the held half materializes intact");
+  {
+    let fork = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("removal unparks the fork for materialization");
+    assert_eq!(((*fork.parent()), (*fork.child())), (7, 200));
+    assert_eq!(fork.child_gen(), 1, "the minted lineage rides the plan");
+  }
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    m.install_yieldable_fork(&7, &200, &mut engine, &NoHold, Instant::ORIGIN, 43),
+    InstallOutcome::Installed { child_gen: 1, .. }
+  ));
+  assert_eq!(
+    m.group(&200).unwrap().state_machine().units,
+    2,
+    "the held half materializes intact"
+  );
 }
 
 #[test]
@@ -5126,7 +5578,7 @@ fn only_matching_provenance_resolves_a_parked_fork() {
   .unwrap();
   follower_load_and_split(&mut m, &mut log, &mut stable, 200);
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "parked on the independent occupant"
   );
   assert_eq!(m.poll_split_conflict(), Some((7, 200)));
@@ -5136,7 +5588,7 @@ fn only_matching_provenance_resolves_a_parked_fork() {
   commit_one_split(&mut m, 200, d, &mut log200, &mut stable200);
   assert!(m.group(&200).unwrap().applied_index() >= FORK_BASE_INDEX);
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "progress alone never resolves the park"
   );
   assert!(
@@ -5148,7 +5600,10 @@ fn only_matching_provenance_resolves_a_parked_fork() {
   // resolves redundant, and the guard advances.
   let f = staged_fork_id(&m, 7);
   m.group_mut(&200).unwrap().seed_fork_id_for_test(f);
-  assert!(m.poll_pending_fork().is_none(), "still nothing to yield");
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "still nothing to yield"
+  );
   assert!(
     m.group(&7).unwrap().peek_pending_fork().is_none(),
     "the matching token — and only it — resolves the fork"
@@ -5231,7 +5686,7 @@ fn parked_fork_conserves_units_across_a_crash() {
 
   // The re-staged fork PARKS against the advanced occupant — no discard.
   assert!(
-    m.poll_pending_fork().is_none(),
+    m.peek_yieldable_fork(&NoHold).is_none(),
     "the advanced independent occupant parks the re-staged fork"
   );
   assert_eq!(m.poll_split_conflict(), Some((7, 200)));
@@ -5577,7 +6032,7 @@ fn commit_merge_defers_a_target_reshaping_by_a_split() {
     ) {}
   }
   assert!(!m.group(&1).unwrap().split_in_flight(), "the split applied");
-  let fork = m.poll_pending_fork().expect("the fork relays out");
+  let fork = m.peek_yieldable_fork(&NoHold).expect("the fork relays out");
   assert_eq!((*fork.child()), 3);
   m.lift_fork_barrier(&1, split_idx);
   while m.poll_event().is_some() {}
@@ -5653,8 +6108,11 @@ fn prepare_merge_defers_a_source_reshaping_by_a_split() {
     ) {}
   }
   assert!(!m.group(&2).unwrap().split_in_flight());
-  let fork = m.poll_pending_fork().expect("the fork relays out");
-  assert_eq!((*fork.child()), 3);
+  {
+    let fork = m.peek_yieldable_fork(&NoHold).expect("the fork relays out");
+    assert_eq!((*fork.child()), 3);
+  }
+  install_head_fork(&mut m, 2, 3, now);
   // THE BARRIER HALF, between the fork's materialization and its baseline's durability: the
   // source's log is still the child's only local recovery derivation, and the absorb behind this
   // freeze would consume it. Same refusal — the source's split machinery is not finished.
@@ -5931,7 +6389,7 @@ fn rollback_merge_defers_a_target_reshaping_by_a_split() {
     ) {}
   }
   assert!(!m.group(&1).unwrap().split_in_flight(), "the split applied");
-  let fork = m.poll_pending_fork().expect("the fork relays out");
+  let fork = m.peek_yieldable_fork(&NoHold).expect("the fork relays out");
   assert_eq!((*fork.child()), 3);
   m.lift_fork_barrier(&1, split_idx);
   while m.poll_event().is_some() {}
@@ -11818,7 +12276,10 @@ fn fork_fenced_source_fixture(
     m.handle_storage(&parent, d, &mut plog, &mut pstable),
     Some(StorageProgress::MorePending)
   ) {}
-  assert!(m.poll_pending_fork().is_none(), "parked on the squatter");
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "parked on the squatter"
+  );
   assert_eq!(m.poll_split_conflict(), Some((parent, child)));
   let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
   stores.0.insert(parent, (plog, pstable));
@@ -11872,7 +12333,10 @@ fn fork_fenced_park_fixture() -> (
     m.handle_storage(&1, d, &mut plog, &mut pstable),
     Some(StorageProgress::MorePending)
   ) {}
-  assert!(m.poll_pending_fork().is_none(), "parked on the squatter");
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "parked on the squatter"
+  );
   assert_eq!(m.poll_split_conflict(), Some((1, 200)));
 
   let (mut slog, mut sstable) = (VecLog::default(), AsyncStable::default());
@@ -12006,8 +12470,8 @@ fn a_foreign_led_absorb_of_a_debtor_discharges_the_inherited_debt() {
   // its log is that child's only local recovery derivation. Release it: the squatter leaves, the
   // fork yields, and the driver's flush report lifts the barrier.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d3);
+  m.lift_fork_barrier(&1, split);
   assert!(
     m.group(&1).unwrap().capture_debt().is_some(),
     "the debt is still live at the consumption: the resolver runs ahead of the debt pass"
@@ -12068,8 +12532,8 @@ fn a_husked_debtor_retires_with_its_inherited_debt_discharged() {
   // The husk's own fork barrier holds its retirement until the child's baseline is durable — its
   // log is that child's only local recovery derivation. Release it as the driver would.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d);
+  m.lift_fork_barrier(&1, split);
   assert!(
     m.group(&1).unwrap().capture_debt().is_some(),
     "the debt is still live at the retirement: the husk dissolve runs ahead of the debt pass"
@@ -12170,9 +12634,9 @@ fn a_sources_standing_fork_barrier_holds_its_consumption() {
   // The barrier lifts: the squatter leaves, the parked fork yields, and the driver's flush report
   // releases it — the very next crank consumes the source.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  assert_eq!(fork.split_index(), split_idx);
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d3);
+  assert_eq!(split, split_idx);
+  m.lift_fork_barrier(&1, split);
   let resolutions = m.service_merge_applies(d3, &mut stores);
   assert_eq!(
     resolutions,
@@ -12219,9 +12683,9 @@ fn a_husks_standing_fork_barrier_holds_its_retirement() {
   assert!(m.contains_group(&1), "the fork-fenced husk stands");
 
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  assert_eq!(fork.split_index(), split_idx);
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d);
+  assert_eq!(split, split_idx);
+  m.lift_fork_barrier(&1, split);
   assert_eq!(
     m.service_merge_applies(d, &mut stores),
     std::vec![MergeResolution::Retired { source: 1 }],
@@ -12350,12 +12814,11 @@ fn a_rebaselined_queued_fork_still_holds_its_parents_consumption() {
     "the blob was not destroyed"
   );
 
-  // The release: the squatter leaves and the relay hands the fork to the driver, emptying the
-  // queue. Nothing is left to lift — the rebaseline already took the barrier — so the very next
-  // crank consumes the source.
+  // The release: the squatter leaves and the install consumes the fork, emptying the queue.
+  // Nothing is left to lift — the rebaseline already took the barrier — so the very next crank
+  // consumes the source.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  assert_eq!(fork.split_index(), split_idx);
+  assert_eq!(install_head_fork(&mut m, 1, 200, d3), split_idx);
   assert!(
     !m.group(&1).unwrap().fork_obligations_standing(),
     "the relay emptied the queue"
@@ -12369,6 +12832,124 @@ fn a_rebaselined_queued_fork_still_holds_its_parents_consumption() {
     "the emptied queue releases the absorb"
   );
   assert!(!m.contains_group(&1), "the source was consumed");
+}
+
+/// WHAT SURVIVES WHAT, pinned. A HELD fork's retained blob is the child's only local derivation once
+/// a covering install has crossed this host's fences, and that blob is IN-MEMORY: it buys process
+/// lifetime, not durability. Every arm exercised here is intended behaviour rather than a defect
+/// awaiting a fix, so no future reader has to re-derive the durability story from the arms.
+///
+/// PHASE ONE, live process. The fork is held on an occupied child id, so its capture fence stands on
+/// its own log replay. The covering install rebaselines past the split entry and clears that fence
+/// while KEEPING the queue entry, so the consumption predicate still stands on the queue alone and
+/// [`MultiRaft::fork_derivation_volatile`] reports the window open.
+///
+/// PHASE TWO, the restart. Restoring the SAME durable stores into a fresh container replays a log
+/// the rebaseline already truncated past the split entry, so nothing re-stages: the parent owes
+/// nothing, fences nothing, and signals nothing. That is the loss composite's last term — a held
+/// fork, a holder behind the covering boundary, an unfenced voter covering it, then a crash — and it
+/// is why the predicate names a deadline rather than a condition to wait out. (TRUE loss of the
+/// partition needs the child to have materialized nowhere; a sibling that installed it holds the
+/// same content.)
+#[test]
+fn a_held_forks_derivation_is_process_lifetime_only_after_a_covering_install() {
+  let (mut m, mut stores, split_idx, d) = fork_fenced_source_fixture(1, 200);
+  assert!(
+    m.group(&1).unwrap().fork_barrier_standing(),
+    "the held fork's capture fence stands on its own log replay"
+  );
+  assert!(
+    !m.fork_derivation_volatile(&1),
+    "while that fence stands the derivation survives a restart, so no window is open"
+  );
+
+  // The covering install, then its completion: the restore rebaselines past the split entry.
+  let meta = crate::SnapshotMeta::new(
+    Index::new(40),
+    Term::new(2),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      d,
+      l,
+      s,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(2),
+        9u64,
+        meta,
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+    assert!(
+      l.first_index() > split_idx,
+      "the completion rebaselined past the split entry"
+    );
+  }
+  {
+    let ep = m.group(&1).unwrap();
+    assert!(
+      !ep.fork_barrier_standing(),
+      "the rebaseline retired the replay derivation and cleared its barrier"
+    );
+    assert!(
+      ep.peek_pending_fork().is_some(),
+      "the queue entry is KEPT: its in-memory blob still materializes the child"
+    );
+    assert!(
+      ep.fork_obligations_standing(),
+      "so the consumption predicate stands on the queued fork alone"
+    );
+  }
+  assert!(
+    m.fork_derivation_volatile(&1),
+    "obligations standing with the barrier gone IS the volatile window"
+  );
+
+  // PHASE TWO. The restart path: the same durable stores, a fresh container.
+  drop(m);
+  let (mut log, mut stable) = stores.0.remove(&1).expect("the parent's durable stores");
+  let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m2.restore_group(
+    1,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    2,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let ep = m2.group(&1).unwrap();
+  assert_eq!(
+    ep.staged_forks().count(),
+    0,
+    "the split entry left the log with the rebaseline, so the replay re-stages nothing"
+  );
+  assert!(
+    !ep.fork_obligations_standing(),
+    "the restarted parent owes no partition — the blob did not survive the process"
+  );
+  assert!(
+    !ep.fork_barrier_standing(),
+    "and fences nothing, so a later capture is free"
+  );
+  assert!(
+    !m2.fork_derivation_volatile(&1),
+    "the predicate reports no window because there is no fork left to lose"
+  );
+  assert_eq!(
+    m2.poll_split_conflict(),
+    None,
+    "and no cue survives to suggest otherwise"
+  );
 }
 
 /// The composition with NO local release: the parked fork's child id IS the merge target. The fork
@@ -12547,8 +13128,8 @@ fn a_deferred_absorb_chains_the_consumed_debtors_debts() {
   // The debtor's own fork barrier holds its consumption until the child's baseline is durable;
   // release it so the abort fence on the TARGET is the only fence this arm still classifies on.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the hold");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d3);
+  m.lift_fork_barrier(&1, split);
   assert!(
     m.group(&1).unwrap().capture_debt().is_some(),
     "the debt is still live at the consumption: the resolver runs ahead of the debt pass"
@@ -12868,8 +13449,8 @@ fn a_parked_fork_defers_the_absorb_capture_as_a_debt() {
   // The fence lifts: the squatter leaves, the fork yields, and the driver's flush report
   // releases the barrier — the very next crank stages the capture and surfaces `Merged`.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the wait");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d);
+  m.lift_fork_barrier(&1, split);
   let resolutions = m.service_merge_applies(d, &mut stores);
   assert_eq!(
     resolutions,
@@ -12974,8 +13555,8 @@ fn a_crash_inside_the_debt_window_re_parks_and_converges() {
 
   // The fork yields in this incarnation; the flush report lifts the barrier and the debt
   // discharges — the crashed and uncrashed runs converge on the same end state.
-  let fork = m2.poll_pending_fork().expect("the replayed fork yields");
-  m2.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m2, 1, 200, now);
+  m2.lift_fork_barrier(&1, split);
   let resolutions = m2.service_merge_applies(now, &mut stores);
   assert_eq!(
     resolutions,
@@ -12998,8 +13579,8 @@ fn a_debt_holding_target_refuses_further_reshape_verbs() {
   // Release the fork barrier first: it refuses a freeze on its own (`SplitInFlight`), and the
   // probe below must reach the DEBT's refusal.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the wait");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d);
+  m.lift_fork_barrier(&1, split);
 
   // Named counterparts for the refused verbs: 3 as a would-be source into 1, and 0 as a
   // would-be target of 1 (merges run higher-id into lower-id, so the source-side probe needs
@@ -13050,8 +13631,8 @@ fn an_ordinary_staged_capture_discharges_the_debt() {
   defer_to_absorbed(&mut m, &mut stores, d);
 
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the wait");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d);
+  m.lift_fork_barrier(&1, split);
 
   // One storage crank after the lift: the threshold capture stages (threshold 1, applied >= k)
   // and its completion is still pending when the service runs.
@@ -13138,8 +13719,8 @@ fn a_debt_names_its_source_at_every_lifecycle_surface() {
 
   // The discharge releases every surface.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived the wait");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d);
+  m.lift_fork_barrier(&1, split);
   assert_eq!(
     m.service_merge_applies(d, &mut stores),
     std::vec![MergeResolution::Merged {
@@ -13730,8 +14311,8 @@ fn a_same_crank_debt_discharge_purges_the_queued_signal() {
   );
 
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d);
+  m.lift_fork_barrier(&1, split);
   let resolutions = m.service_merge_applies(d, &mut stores);
   assert!(
     resolutions.iter().any(|r| matches!(
@@ -14236,8 +14817,8 @@ fn a_second_committed_absorb_holds_behind_a_standing_debt() {
 
   // The first debt's discharge releases the hold; the second park then takes its own course.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the fork survived");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let split = install_head_fork(&mut m, 1, 200, d);
+  m.lift_fork_barrier(&1, split);
   let resolutions = m.service_merge_applies(d, &mut stores);
   assert!(
     resolutions.iter().any(|r| matches!(
@@ -14275,8 +14856,13 @@ fn a_split_inside_the_debt_window_fences_the_discharge() {
   }
   // The ORIGINAL fence lifts; the in-window fork's barrier must keep fencing the discharge.
   m.remove_group(&200, &mut empty_stores()).unwrap();
-  let fork = m.poll_pending_fork().expect("the original fork");
-  m.lift_fork_barrier(&1, fork.split_index());
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let InstallOutcome::Installed { split_index, .. } =
+    m.install_yieldable_fork(&1, &200, &mut engine, &NoHold, d, 43)
+  else {
+    panic!("the original fork installs once its squatter leaves")
+  };
+  m.lift_fork_barrier(&1, split_index);
   assert!(
     m.service_merge_applies(d, &mut stores).is_empty(),
     "the in-window fork's replay entry sits above the boundary; a boundary-keyed fence would \
@@ -14285,8 +14871,11 @@ fn a_split_inside_the_debt_window_fences_the_discharge() {
   assert!(m.group(&1).unwrap().capture_debt().is_some());
 
   // The in-window fork resolves; the discharge follows.
-  let fork2 = m.poll_pending_fork().expect("the in-window fork");
-  m.lift_fork_barrier(&1, fork2.split_index);
+  let split2 = m
+    .peek_yieldable_fork(&NoHold)
+    .expect("the in-window fork")
+    .split_index();
+  m.lift_fork_barrier(&1, split2);
   assert!(
     m.service_merge_applies(d, &mut stores)
       .iter()
