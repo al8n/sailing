@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
-  Config, FloorStore, GroupEngine, MERGED_FLOOR, Message, NoFloors, SplitError, Term, TimeoutNow,
+  Config, FloorStore, GroupEngine, InstallOutcome, MERGED_FLOOR, Message, NoFloors, NoHold,
+  SplitError, Term, TimeoutNow,
   testkit::{AsyncStable, CountSm, VecLog},
   transport::{ClusterId, Labeled, Passthrough, labeled::LabelOptions},
 };
@@ -2257,19 +2258,23 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
     .expect("the leader appends the split");
   }
   settle_engine(&mut c1, &mut engine, &[100], d);
-  let fork = c1.poll_pending_fork().expect("the committed split relays");
-  assert_eq!(((*fork.child()), fork.parent_gen_after()), (300, 1));
-  engine.add_group(300);
-  let epoch = engine.next_boot_epoch(&300).unwrap();
-  let (gen_after, split_at) = (fork.parent_gen_after(), fork.split_index());
   {
-    let (l, s) = engine.stores(&300).unwrap();
-    c1.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, s)
-      .expect("the fork materializes over the fresh stores");
+    let fork = c1
+      .peek_yieldable_fork(&NoHold)
+      .expect("the committed split relays");
+    assert_eq!(((*fork.child()), fork.parent_gen_after()), (300, 1));
   }
-  engine.set_group_gen(&100, gen_after);
+  let InstallOutcome::Installed {
+    parent_gen_after,
+    split_index,
+    ..
+  } = c1.install_yieldable_fork(&100, &300, &mut engine, now, 1)
+  else {
+    panic!("the fork materializes over the fresh stores")
+  };
+  engine.set_group_gen(&100, parent_gen_after);
   engine.flush();
-  c1.lift_fork_barrier(&100, split_at);
+  c1.lift_fork_barrier(&100, split_index);
 
   // The child accrues REAL post-fork progress: it elects and commits 2 entries of its own.
   let dc = c1.group(&300).unwrap().poll_timeout().unwrap();
@@ -2326,28 +2331,28 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
     1,
     "the restored parent replays to its post-split half"
   );
-  let fork = c2
-    .poll_pending_fork()
-    .expect("a lineage-blind guard seed relays the replayed fork");
+  assert!(
+    c2.peek_yieldable_fork(&NoHold).is_some(),
+    "a lineage-blind guard seed relays the replayed fork"
+  );
   assert!(
     !engine.add_group(300),
     "the child's storage is already hosted in the engine"
   );
-  let epoch = engine.next_boot_epoch(&300).unwrap();
-  let split_at2 = fork.split_index();
-  let refusal = {
-    let (l, s) = engine.stores(&300).unwrap();
-    c2.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, s)
-  };
   assert_eq!(
-    refusal,
-    Err(CreateGroupError::StorageInUse),
-    "a fork never overwrites used storage"
+    c2.install_yieldable_fork(&100, &300, &mut engine, now, 1),
+    InstallOutcome::Held,
+    "a fork never overwrites used storage — and the answer is HOLD, not abandon: the squatting \
+     incarnation can be removed, while abandoning here would destroy the partition's only local \
+     copy"
   );
-  c2.lift_fork_barrier(&100, split_at2);
+  assert!(
+    c2.group(&100).unwrap().peek_pending_fork().is_some(),
+    "held means STAGED and still fenced — the correct fail-closed state, so nothing lifts"
+  );
   {
     let (l, _) = engine.stores(&300).unwrap();
-    assert_eq!(l.last_index(), used_last, "the refusal wrote nothing");
+    assert_eq!(l.last_index(), used_last, "the hold wrote nothing");
   }
   drop(c2);
 
@@ -2394,7 +2399,7 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
     .unwrap();
   }
   assert!(
-    c3.poll_pending_fork().is_none(),
+    c3.peek_yieldable_fork(&NoHold).is_none(),
     "the durable lineage already covers the replayed fork"
   );
 
@@ -2536,16 +2541,12 @@ fn the_public_fork_door_is_fenced_in_every_window_and_takes_no_provenance() {
     "every refusal wrote nothing"
   );
 
-  // THE GENUINE FORK STILL LANDS, through the sealed relay door that takes the container's own
-  // yielded record — the ticket no caller can forge.
-  let fork = c.poll_pending_fork().expect("the committed split relays");
-  engine.add_group(300);
-  let epoch = engine.next_boot_epoch(&300).unwrap();
-  {
-    let (l, s) = engine.stores(&300).unwrap();
-    c.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, s)
-      .expect("the relayed fork materializes through the sealed door");
-  }
+  // THE GENUINE FORK STILL LANDS, because the relay's materialization is not a door at all: the
+  // container installs the child from its own staged queue, with nothing for a caller to supply.
+  assert!(matches!(
+    c.install_yieldable_fork(&100, &300, &mut engine, now, 1),
+    InstallOutcome::Installed { child: 300, .. }
+  ));
   assert!(
     c.group(&300).is_some(),
     "the child the attacker could not squat is now the genuine fork's"
@@ -2666,24 +2667,27 @@ fn admission_refuses_an_in_flight_splits_child_id() {
     Err(CreateGroupError::SplitReserved)
   );
 
-  // YIELD hands the staged leg over to the YIELDED one: the fork is out of the queue but still
-  // owns the id until it installs, so the door stays shut across that window too.
-  let fork = c.poll_pending_fork().expect("the committed split relays");
+  // A PEEK CONSUMES NOTHING: the fork is still staged, so the id is still reserved and the door
+  // stays shut — there is no window between the decision and the install to slip through.
+  assert!(
+    c.peek_yieldable_fork(&NoHold).is_some(),
+    "the committed split relays"
+  );
   assert!(
     c.is_split_reserved(&300),
-    "yielded to the driver, and still this fork's id until the sealed install completes"
+    "still staged, so still this fork's id"
   );
-  engine.add_group(300);
-  let epoch = engine.next_boot_epoch(&300).unwrap();
-  let (gen_after, split_at) = (fork.parent_gen_after(), fork.split_index());
-  {
-    let (l, s) = engine.stores(&300).unwrap();
-    c.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, s)
-      .expect("the yielded fork materializes");
-  }
-  engine.set_group_gen(&100, gen_after);
+  let InstallOutcome::Installed {
+    parent_gen_after,
+    split_index,
+    ..
+  } = c.install_yieldable_fork(&100, &300, &mut engine, now, 1)
+  else {
+    panic!("the staged fork materializes")
+  };
+  engine.set_group_gen(&100, parent_gen_after);
   engine.flush();
-  c.lift_fork_barrier(&100, split_at);
+  c.lift_fork_barrier(&100, split_index);
 
   // Post-resolution the id is simply hosted: the refusal class hands over to `Exists`.
   assert_eq!(
@@ -2964,15 +2968,36 @@ fn a_forked_groups_hard_state_records_its_lineage_from_birth() {
     .unwrap();
   }
   settle_engine(&mut sc, &mut engine, &[100], d);
-  let fork = sc.poll_pending_fork().expect("the committed split relays");
-  let token = fork.fork_id().clone();
-  engine.add_group(300);
-  let epoch = engine.next_boot_epoch(&300).unwrap();
-  {
-    let (l, st) = engine.stores(&300).unwrap();
-    sc.create_group_from_relayed_fork(fork, now, 1, epoch, &NoFloors, l, st)
-      .expect("the sealed door installs");
-  }
+  let (gen_after, split_at) = {
+    let fork = sc
+      .peek_yieldable_fork(&NoHold)
+      .expect("the committed split relays");
+    (fork.parent_gen_after(), fork.split_index())
+  };
+  // The token is a pure function of PUBLIC split coordinates, so the expectation is RE-DERIVED
+  // here rather than taken from the container: parent id, lineage after the split, the split
+  // entry's (index, term), and the child's id and incarnation.
+  let split_term = {
+    let (l, _) = engine.stores(&100).unwrap();
+    crate::LogStore::term(l, split_at).expect("the split entry is in the parent's log")
+  };
+  let encoded = |gid: u64| {
+    let mut v = Vec::new();
+    crate::Data::encode(&gid, &mut v);
+    bytes::Bytes::from(v)
+  };
+  let token = crate::ForkId::new(
+    encoded(100),
+    gen_after,
+    split_at,
+    split_term,
+    encoded(300),
+    0,
+  );
+  assert!(matches!(
+    sc.install_yieldable_fork(&100, &300, &mut engine, now, 1),
+    InstallOutcome::Installed { child: 300, .. }
+  ));
   engine.flush();
   let (_, stable) = engine.stores(&300).unwrap();
   assert_eq!(
@@ -3278,7 +3303,7 @@ fn debt_window_coord() -> (SplitCoord, Stores, Instant) {
     .unwrap();
   settle_group(&mut c, 1, &mut st, d);
   assert!(
-    c.poll_pending_fork().is_none(),
+    c.peek_yieldable_fork(&NoHold).is_none(),
     "the fork parks on the hosted child, leaving its barrier standing"
   );
   assert_eq!(c.poll_split_conflict(), Some((1, 200)));

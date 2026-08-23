@@ -447,6 +447,15 @@ where
     self.multi.split_reserved(gid)
   }
 
+  /// Whether `gid` holds a staged fork whose replay derivation a covering install already retired
+  /// (see [`MultiRaft::fork_derivation_volatile`]): the blob is the child's only local copy AND is
+  /// process-lifetime-only — act before restarting this node. Consult it during a rolling restart,
+  /// beside the held-fork conflict cue.
+  #[must_use]
+  pub fn fork_derivation_volatile(&self, gid: &G) -> bool {
+    self.multi.fork_derivation_volatile(gid)
+  }
+
   /// Whether `gid` is TOMBSTONED: removed and not explicitly cleared since — its inbound frames
   /// dropping silently and its re-creation refusing (see [`remove_group`](Self::remove_group)).
   /// Volatile — a restart starts clean.
@@ -1091,6 +1100,56 @@ where
     })
   }
 
+  /// LOOK at the head fork the relay would install right now (see
+  /// [`MultiRaft::peek_yieldable_fork`]), over this coordinator's own gate — its tombstone set
+  /// AUGMENTS the caller's, never merely forwards it, because `retired` is state the container does
+  /// not hold. Nothing is consumed: the fork stays staged until
+  /// [`install_yieldable_fork`](Self::install_yieldable_fork) takes it.
+  pub fn peek_yieldable_fork(
+    &mut self,
+    gate: &impl crate::ForkGate<G>,
+  ) -> Option<crate::ForkView<'_, G, I>> {
+    self.multi.peek_yieldable_fork(&CoordGate {
+      retired: &self.retired,
+      outer: gate,
+    })
+  }
+
+  /// INSTALL `parent`'s head fork for `child` in place (see
+  /// [`MultiRaft::install_yieldable_fork`]). This coordinator's tombstone set rides in as the
+  /// container's `extra` gate, so the engine's facts and the coordinator's compose exactly as they
+  /// do at the peek. Both ids come off the [`ForkView`](crate::ForkView) the peek handed back.
+  ///
+  /// There is no wrapper to be redundant here any more: the arm's own gate already carries
+  /// `retired` and the floors, so the pre-checks the sealed door used to duplicate — and could
+  /// drop a consumed fork on — are gone with the door.
+  pub fn install_yieldable_fork<E>(
+    &mut self,
+    parent: &G,
+    child: &G,
+    engine: &mut E,
+    now: impl Into<crate::Now>,
+    seed: u64,
+  ) -> crate::InstallOutcome<G, I>
+  where
+    E: crate::MultiEngine<G, I>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    self.multi.install_yieldable_fork(
+      parent,
+      child,
+      engine,
+      &RetiredGate {
+        retired: &self.retired,
+      },
+      now,
+      seed,
+    )
+  }
+
   /// Resolve the fork staged at exactly `split_index` on `parent` (see
   /// [`MultiRaft::lift_fork_barrier`]): the driver reports the child's baseline flush-durable,
   /// and the parent's snapshot fence over that index releases.
@@ -1551,6 +1610,26 @@ where
 
   fn floor(&self, gid: &G) -> u64 {
     self.outer.floor(gid)
+  }
+}
+
+/// The coordinator's own facts alone — what the container cannot read off the engine. Handed to
+/// the install as its `extra` gate, where the container composes it with the engine's occupancy and
+/// floors exactly as [`CoordGate`] composes them at the peek.
+struct RetiredGate<'a, G> {
+  retired: &'a BTreeSet<G>,
+}
+
+impl<G> crate::ForkGate<G> for RetiredGate<'_, G>
+where
+  G: GroupId,
+{
+  fn contains_group(&self, gid: &G) -> bool {
+    self.retired.contains(gid)
+  }
+
+  fn floor(&self, _gid: &G) -> u64 {
+    0
   }
 }
 

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  FloorStore, MERGED_FLOOR, NoFloors, SplitError, Term,
+  FloorStore, GroupEngine, InstallOutcome, MERGED_FLOOR, NoFloors, NoHold, SplitError, Term,
   testkit::{AsyncStable, CountSm, VecLog},
   transport::quic::{QuicTuning, crypto::tests::TestClusterCa},
 };
@@ -1488,7 +1488,7 @@ fn quic_restore_seeds_the_replay_guard_from_the_floor_seam() {
   )
   .unwrap();
   assert!(
-    a.poll_pending_fork().is_none(),
+    a.peek_yieldable_fork(&NoHold).is_none(),
     "the durable lineage already covers the replayed fork"
   );
   assert_eq!(a.group(&100).unwrap().state_machine().units, 1, "2 - 1");
@@ -1511,11 +1511,22 @@ fn quic_restore_seeds_the_replay_guard_from_the_floor_seam() {
     &mut stable,
   )
   .unwrap();
-  let fork = b
-    .poll_pending_fork()
-    .expect("a lineage-blind guard seed relays the replayed fork");
-  assert_eq!(((*fork.child()), fork.parent_gen_after()), (300, 1));
-  assert_eq!(fork.fsm().units, 1, "the re-forked half");
+  {
+    let fork = b
+      .peek_yieldable_fork(&NoHold)
+      .expect("a lineage-blind guard seed relays the replayed fork");
+    assert_eq!(((*fork.child()), fork.parent_gen_after()), (300, 1));
+  }
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  assert!(matches!(
+    b.install_yieldable_fork(&100, &300, &mut engine, Instant::ORIGIN, 1),
+    InstallOutcome::Installed { child: 300, .. }
+  ));
+  assert_eq!(
+    b.group(&300).unwrap().state_machine().units,
+    1,
+    "the re-forked half"
+  );
 }
 
 /// The QUIC twin of the split-reservation admission gate (window A — the leader's

@@ -690,9 +690,15 @@ fn lineage_records_stage_read_fresh_and_survive_removal() {
 /// maintained value is checked against something other than itself, and read at the moment it is
 /// asked, which is exactly where a stale contribution would show.
 fn scanned_removal_floor(eng: &GroupEngine<u64, u64>, gid: &u64) -> u64 {
-  let mut ceiling = eng
-    .group_gen(gid)
-    .max(eng.lineage.get(gid).map_or(0, |r| r.ceiling));
+  // Staged ⊔ durable, the same read the maintained answer uses: a removal stages its inherited
+  // ceiling, so a scan that saw only the durable slot would model a fence the engine does not have.
+  let mut ceiling = eng.group_gen(gid).max(
+    eng
+      .lineage
+      .get(gid)
+      .map_or(0, |r| r.ceiling)
+      .max(eng.lineage_staged.get(gid).map_or(0, |r| r.ceiling)),
+  );
   if let Some(storage) = eng.groups.get(gid) {
     let meta_gen = storage
       .stable

@@ -56,6 +56,12 @@ pub(crate) struct SplitState<I, F> {
   /// without either reordering the queue or advancing the guard past forks still staged in front
   /// of it. Marking defers instead: the drain consumes a marked fork the moment it reaches the
   /// head, before examining it, which keeps both invariants intact.
+  ///
+  /// VOLATILE, deliberately: a restart replays the split and re-stages the fork with no memory of
+  /// the mark, so a below-head condemnation can be undone by a crash — a resurrection, never a
+  /// loss, since the fork's own barrier holds its replay derivation. See the `!at_head` arm of
+  /// `MultiRaft::abandon_fork_this_removal_descends_from` for why the guard's contiguity forbids a
+  /// durable mirror here and who owns the residual.
   pub(crate) abandoned: BTreeSet<Index>,
   /// The group's LINEAGE counter — one unified monotone per-id value for incarnation and shape
   /// (seeded from the admission generation / recovered snapshot meta; bumped to
@@ -205,6 +211,15 @@ where
   /// materializable for the process lifetime. That blob is then the child's ONLY local derivation,
   /// so a cleared barrier says nothing about whether this endpoint is safe to destroy.
   ///
+  /// SAY THE LIMIT PLAINLY: the retained blob is IN-MEMORY and does NOT survive a crash. The gap
+  /// this predicate covers is therefore a live-process one — it stops a teardown, not a restart.
+  /// The composite that reaches local loss is: a HELD fork here, AND this holder lagging the
+  /// covering install's boundary, AND an unfenced voter covering that boundary, AND a crash before
+  /// the hold releases. TRUE loss of the partition needs one more thing — that the child
+  /// materialized NOWHERE, since any sibling that installed it holds the same content.
+  /// [`MultiRaft::fork_derivation_volatile`](crate::MultiRaft::fork_derivation_volatile) reports
+  /// the first three so an embedder can act before the fourth.
+  ///
   /// A HELD fork — one the relay parked because its child id is spoken for — is a queued fork, so
   /// this predicate covers it BY CONSTRUCTION: no merge teardown can consume a parent while it
   /// still owes a partition that has nowhere to go.
@@ -217,10 +232,23 @@ where
   /// such an index the fence now protects nothing and can only wedge (the capture fence would
   /// stand forever against a coordinate no replay can ever need), so its barrier clears; the
   /// queue entry itself is KEPT — self-contained, it keeps the child materializable from the
-  /// in-memory blob for the process lifetime, strictly better than dropping it, and a later
-  /// examination still resolves it redundant against a transferred twin's token. This covers a
-  /// HELD fork too — one parked because its child id is spoken for is queued, not popped, so a
-  /// covering rebaseline clears its barrier and the retained blob keeps the child materializable.
+  /// in-memory blob for the process lifetime, and a later examination still resolves it redundant
+  /// against a transferred twin's token. This covers a HELD fork too — one parked because its child
+  /// id is spoken for is queued, not popped, so a covering rebaseline clears its barrier and the
+  /// retained blob keeps the child materializable.
+  ///
+  /// KEEPING IT IS STRICTLY BETTER THAN DROPPING IT, and the comparison is between two volatile
+  /// outcomes, not between a durable one and a lossy one. Standing the barrier instead would wedge
+  /// this host's compaction forever against a coordinate no replay can ever need, and would suppress
+  /// the cure advertisement a fork-fenced host withholds; dropping the entry would lose the
+  /// partition outright, in this process, immediately. Retaining it keeps the child materializable
+  /// for as long as this process lives — but the blob is IN-MEMORY and does NOT survive a crash, so
+  /// past this point the fork has no crash-surviving derivation on this host. The composite that
+  /// reaches local loss is: a HELD fork here, AND this holder lagging the covering boundary, AND an
+  /// unfenced voter covering it, AND a crash before the hold releases; TRUE loss of the partition
+  /// additionally requires that the child materialized NOWHERE. The window is observable —
+  /// [`MultiRaft::fork_derivation_volatile`](crate::MultiRaft::fork_derivation_volatile) is exactly
+  /// "obligations standing, barrier gone" — so an embedder can drain it before a rolling restart.
   ///
   /// A fork already POPPED keeps its barrier: `resolve_fork` lifts it when the flush (or the
   /// container's drop) completes, and freeing it early would release the fence under an in-flight

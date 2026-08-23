@@ -402,6 +402,13 @@ where
   /// boot-epoch counter (the Phase-5 teardown seam). The id's LINEAGE record (gen, floor, and the
   /// removal ceiling the departing stores had folded) is deliberately retained: a floor exists
   /// precisely to outlive the group it fences. Returns `false` if no such group.
+  ///
+  /// The inherited ceiling is STAGED, exactly as [`set_group_floor`](Self::set_group_floor) and
+  /// [`set_group_gen`](Self::set_group_gen) stage theirs. Folding it straight into the durable slot
+  /// would make this the one lineage write [`has_staged`](Self::has_staged) never reports, so a
+  /// durable engine honoring the barrier contract would be told there was nothing to persist and
+  /// would lose the fence a re-admission is checked against. Reads take staged ⊔ durable, so the
+  /// ceiling fences from the moment it is written either way.
   pub fn remove_group(&mut self, gid: &G) -> bool {
     // `remove_entry` hands back the OWNED key, so inheriting the ceiling costs no `G: Clone` —
     // and the inheritance must happen here, because the stores that hold it are about to go.
@@ -413,7 +420,7 @@ where
       .shape_ceiling()
       .max(storage.stable.meta_ceiling());
     if inherited != 0 {
-      let rec = self.lineage.entry(gid).or_default();
+      let rec = self.lineage_staged.entry(gid).or_default();
       rec.ceiling = rec.ceiling.max(inherited);
     }
     true
@@ -570,9 +577,16 @@ where
   /// rather than wrapping past the terminal to `0`.
   #[must_use]
   pub fn removal_floor(&self, gid: &G) -> u64 {
-    let mut ceiling = self
-      .group_gen(gid)
-      .max(self.lineage.get(gid).map_or(0, |r| r.ceiling));
+    // Staged ⊔ durable, the read every other lineage leg uses: a ceiling written this crank fences
+    // before its barrier lands, which is safe because the record is monotone — early visibility
+    // can only refuse what durability would refuse too.
+    let mut ceiling = self.group_gen(gid).max(
+      self
+        .lineage
+        .get(gid)
+        .map_or(0, |r| r.ceiling)
+        .max(self.lineage_staged.get(gid).map_or(0, |r| r.ceiling)),
+    );
     if let Some(storage) = self.groups.get(gid) {
       ceiling = ceiling
         .max(storage.log.shape_ceiling())
