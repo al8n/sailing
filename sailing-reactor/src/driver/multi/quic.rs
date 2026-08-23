@@ -25,7 +25,7 @@ use agnostic::{
 };
 use bytes::Bytes;
 use sailing_proto::{
-  ClusterId, Config, Endpoint, Event, GroupControl, GroupEngine, GroupFork, GroupId, Index,
+  ClusterId, Config, Endpoint, Event, GroupControl, GroupEngine, GroupId, Index, InstallOutcome,
   Instant, MultiEngine, MultiQuicCoordinator, Now, ReadOnlyOption, StateMachine, StorageProgress,
   floor_admits, quic::QuicOptions,
 };
@@ -56,6 +56,12 @@ use super::{
 /// Backstop wake cadence while configured peers exist (the link reconciler's pacing on an
 /// otherwise-idle node — see the single-group QUIC driver).
 const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long to wait before offering a refused one-shot relay cue to the lifecycle tail again (see
+/// [`MultiReactorQuicDriver::rearm_cue_retry`]). Fixed, and deliberately coarse relative to the
+/// crank: the retry is a peek and a refusable send, so a tail that stays full costs one cheap wake
+/// per interval instead of a hot loop, while a tail that drains gets the cue within one interval.
+const CUE_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 /// Per-iteration bound on each loop-top channel drain (datagrams, storage coalesce).
 const IO_BUDGET: usize = 256;
 
@@ -71,14 +77,15 @@ struct Redial {
 /// model differs. Monotonic-only in v1, exactly as the stream sibling (a walled failover-tier
 /// group config is rejected loudly at admission).
 ///
-/// # Storage is in-memory — NOT crash-durable
+/// # Durability is the ENGINE's, and the default engine is in-memory
 ///
-/// Like its stream sibling, every constructor here builds a [`GroupEngine`]: the shared IN-MEMORY
-/// reference engine. No constructor ACCEPTS an engine yet, so a PROCESS CRASH loses ALL consensus
-/// state — for tests, single-process deployments, and as the reference a persistent engine is
-/// validated against, NOT for crash recovery. `restore_group` reconnects a group within the SAME
-/// live process, not a recover-from-disk path. The lifecycle and event tails are best-effort
-/// TELEMETRY for observability, never a correctness feed.
+/// Like its stream sibling: the DEFAULT constructors build a [`GroupEngine`], the shared IN-MEMORY
+/// reference engine, so a process crash loses ALL consensus state under that default — for tests,
+/// single-process deployments, and as the reference a persistent engine is validated against.
+/// [`bind_with_engine`](Self::bind_with_engine) takes the caller's own [`MultiEngine`], which is
+/// what the seam exists for. The recovery half is what is still missing: `restore_group` reconnects
+/// a group within the SAME live process, not a recover-from-disk path. The lifecycle and event
+/// tails are best-effort TELEMETRY for observability, never a correctness feed.
 pub struct MultiReactorQuicDriver<R, G, I, F, E = GroupEngine<G, I>>
 where
   R: Runtime,
@@ -132,6 +139,9 @@ where
   /// deadline) avoids a HOT-SPIN: an unbound peer whose backoff just elapsed carries a past `at`
   /// that would fire the timer every iteration until the next pass re-arms it.
   redial_wake: Option<std::time::Instant>,
+  /// When to run the relay's cue pumps again after a bounded lifecycle tail refused a one-shot
+  /// signal (see [`rearm_cue_retry`](Self::rearm_cue_retry)). `None` when nothing is queued.
+  cue_retry_at: Option<std::time::Instant>,
   cmd_budget: usize,
   recv_cap: usize,
   redial_base: Duration,
@@ -290,6 +300,7 @@ where
         peers,
         redial: BTreeMap::new(),
         redial_wake: None,
+        cue_retry_at: None,
         cmd_budget: driver_cfg.cmd_budget.max(1),
         recv_cap: driver_cfg.recv_cap,
         redial_base: driver_cfg.redial_base,
@@ -425,6 +436,7 @@ where
         .map(|d| self.clock.to_std(d))
         .into_iter()
         .chain(self.redial_wake)
+        .chain(self.cue_retry_at)
         .chain(housekeeping)
         .chain(storage_redrive)
         .min()
@@ -567,89 +579,95 @@ where
     self.flush_pending = true;
   }
 
-  /// The per-crank storage step (the stream sibling's verbatim): one gated engine barrier, then
-  /// every hosted group's bounded completion drain.
-  /// Drain the container's committed, relay-ready forks into materializations — BEFORE the
-  /// barrier below, so the SAME crank's `engine.flush()` covers every staged baseline before
-  /// `pump` can transmit anything for the child (a child that can solicit peers is therefore
-  /// always locally blob-durable first; the drain also front-runs the factory drain, so a
-  /// local fork wins any same-id solicitation race). A refused materialization — a floored child
-  /// id, an invalid config — abandons THIS fork: its barrier resolves (the parent must not stay
-  /// fenced for a fork that will never land here), the refusal surfaces as
-  /// [`LifecycleEvent::SplitRefused`] for the placement brain, and the driver survives; the
-  /// child still reaches this host by the ordinary lifecycle paths (restore over its own
-  /// storage, solicitation → factory/embedder → snapshot from a live member, whose own blob
-  /// went durable before it could transmit). A fork whose child id is merely SPOKEN FOR — occupied
-  /// engine stores, or a tombstone mid-rejoin — is held instead, un-consumed and with
-  /// the parent's fence standing (see [`materialize_fork`](Self::materialize_fork)), because none
-  /// of those is a verdict about the fork. A fork whose child id is ALREADY HOSTED is
-  /// neither yielded nor abandoned: the container PARKS it (blob held, the parent's fence
-  /// standing, re-examined every crank) and the conflict pump below relays the one-shot
-  /// [`LifecycleEvent::SplitConflict`] to the embedder — consumed from the coordinator only
-  /// once the bounded lifecycle tail accepts it, so backpressure defers the cue instead of
-  /// erasing it — whose removal/catch-up resolves the park.
+  /// Install the container's committed, relay-ready forks — BEFORE the barrier below, so the SAME
+  /// crank's `engine.flush()` covers every staged baseline before `pump` can transmit anything for
+  /// the child (a child that can solicit peers is therefore always locally blob-durable first; the
+  /// drain also front-runs the factory drain, so a local fork wins any same-id solicitation race).
+  ///
+  /// THE FORK NEVER LEAVES THE CONTAINER. This loop peeks at a decision, validates the config the
+  /// container would boot with, and asks the container to install in place; the partition itself
+  /// stays in the staged queue until the install's own pop, so no step here can lose, mis-target
+  /// or double-present it. The driver owns only the seam: the two lineage records, the child's
+  /// election timer, its routing, and the durability barrier the pending-flush entry rides.
+  ///
+  /// The outcomes divide the way the container's verdicts do. `Refused` is a DELIBERATE
+  /// abandonment the container already resolved and queued — a floored or terminally-consumed
+  /// child id, a verdict no host state will change — so this loop does nothing and comes round
+  /// again; the child still reaches this host by the ordinary lifecycle paths (restore over its
+  /// own storage, solicitation → factory/embedder → snapshot from a live member, whose own blob
+  /// went durable before it could transmit). `Held` means the child id is merely SPOKEN FOR —
+  /// occupied engine stores, a tombstone mid-rejoin, a hosted twin — so the fork stays staged with
+  /// its blob, its fence and its reservation intact, and the conflict pump below relays the
+  /// one-shot [`LifecycleEvent::SplitConflict`] to the embedder, consumed from the coordinator only
+  /// once the bounded lifecycle tail accepts it so backpressure defers the cue instead of erasing
+  /// it. `NotYieldable` and `Empty` end the pass.
   fn fork_drain(&mut self, now: Now) {
     loop {
-      // The gate borrow ends before the install: it lends the engine, the install takes it.
-      let relayed = {
+      // The view borrows the container, so it is read out and dropped before the install: the
+      // decision travels, the partition does not.
+      let peeked = {
         let gate = EngineGate::new(&self.engine);
-        self.coord.poll_pending_fork_with(&gate)
+        self.coord.peek_yieldable_fork(&gate).map(|fork| {
+          (
+            fork.parent().cheap_clone(),
+            fork.child().cheap_clone(),
+            fork.config().clone(),
+          )
+        })
       };
-      let Some(fork) = relayed else {
+      let Some((peeked_parent, child, config)) = peeked else {
         break;
       };
-      let parent = fork.parent().cheap_clone();
-      let split_index = fork.split_index();
-      let child = fork.child().cheap_clone();
-      let parent_gen_after = fork.parent_gen_after();
-      let seed = host_seed(self.coord.host_id());
       // FAIL-CLOSED FLOOR, validating the EXACT config the container will boot the child with: the
-      // relay derives it internally from the fork's own committed config, so this reads the same
-      // derivation rather than a locally-shaped one — a driver that transformed the config here
-      // could no longer influence what installs. The assert is load-bearing rather than
-      // decorative: the relay ran this same validation before it yielded, and a fork child cannot
-      // reach the wall-clock leg at all (`Endpoint::config` has no mutation path, and the parent
-      // passed the identical check at admission on this driver). A failure means one of those two
-      // facts stopped being true, which must be loud in a test run rather than a silently dropped
-      // partition.
-      let derived = sailing_proto::reshape_born_prevention(fork.config().clone());
-      if let Err(e) = validate_and_capture_eps::<I, Monotonic>(&derived) {
-        debug_assert!(false, "a relayed fork's config failed validation: {e}");
-        // The yielded reservation is this caller's to release when it abandons a fork it will
-        // never install; leaving it standing would squat the child id for good.
-        self.coord.release_yielded_fork(&child);
-        self.coord.lift_fork_barrier(&parent, split_index);
-        let _ = self
-          .lifecycle_tx
-          .try_send(LifecycleEvent::SplitRefused { parent, child });
-        continue;
+      // container derives it internally from the fork's own committed config, so this reads the
+      // same derivation rather than a locally-shaped one — a driver that transformed the config
+      // here could no longer influence what installs. The assert is load-bearing rather than
+      // decorative: the container ran this same validation before it offered the fork, and a fork
+      // child cannot reach the wall-clock leg at all (`Endpoint::config` has no mutation path, and
+      // the parent passed the identical check at admission on this driver). A failure means one of
+      // those two facts stopped being true, which must be loud in a test run rather than a
+      // silently dropped partition.
+      //
+      // AND IT STOPS THE PASS RATHER THAN SKIPPING THE FORK. Nothing was consumed, so continuing
+      // would re-peek this identical fork forever; breaking leaves it STAGED and still fenced,
+      // which is the correct fail-closed state — the partition is held, not lost.
+      if let Err(e) =
+        validate_and_capture_eps::<I, Monotonic>(&sailing_proto::reshape_born_prevention(config))
+      {
+        debug_assert!(false, "a staged fork's config failed validation: {e}");
+        break;
       }
-      match self.install_relayed_fork(now, fork, seed) {
-        Ok(()) => {
-          // The parent's lineage record advances with the child's registration, all behind the
-          // ONE barrier the pending-flush entry below waits on.
+      let seed = host_seed(self.coord.host_id());
+      // The install decides on the PAIR the peek named — never on whatever a second drain would
+      // reach, which with two parks releasing on one crank is a different parent entirely.
+      match self
+        .coord
+        .install_yieldable_fork(&peeked_parent, &child, &mut self.engine, now, seed)
+      {
+        InstallOutcome::Installed {
+          parent,
+          child,
+          child_gen,
+          parent_gen_after,
+          split_index,
+          config,
+        } => {
+          // Both lineage records advance with the child's registration, all behind the ONE barrier
+          // the pending-flush entry below waits on.
           self.engine.set_group_gen(&parent, parent_gen_after);
+          self.engine.set_group_gen(&child, child_gen);
+          self.election.insert(
+            child.cheap_clone(),
+            <sailing_proto::Config<I>>::election_timeout(&config),
+          );
+          self.admit_group(child.cheap_clone());
+          self.flush_pending = true;
           self.forks_pending_flush.push((parent, split_index, child));
         }
-        Err(e) => {
-          // The other FAIL-CLOSED FLOOR, equally load-bearing: every gate this call applies ran
-          // at the relay against unchanged state, so the only refusal that can still surface is a
-          // boot-epoch counter exhausted between the two — kept at parity with the embedder path,
-          // and loud in tests either way.
-          //
-          // THE UNMUTATED-STATE PREMISE IS WHAT MAKES THIS AN ASSERT AND NOT A LOSS PATH. The pop
-          // and this install evaluate the SAME `validate_new_group` — consumed-source legs
-          // included — and nothing between them mutates the state those legs read. Any future
-          // interleaving here (a service pass, another group's resolution, a park latching CLOSED)
-          // breaks that premise: the refusal becomes reachable in release, where the fork has
-          // already been popped and its blob is gone. Re-derive this comment before adding
-          // anything between the two calls.
-          debug_assert!(false, "a relayed fork's install refused: {e:?}");
-          self.coord.lift_fork_barrier(&parent, split_index);
-          let _ = self
-            .lifecycle_tx
-            .try_send(LifecycleEvent::SplitRefused { parent, child });
-        }
+        // The container resolved this fork's barrier and queued the refusal itself; the pumps
+        // below deliver it. Come round for the next staged fork.
+        InstallOutcome::Refused => {}
+        InstallOutcome::Held | InstallOutcome::NotYieldable | InstallOutcome::Empty => break,
       }
     }
     // The relay's own guard advances: the removal-time abandonment defers a fork it condemned
@@ -688,13 +706,10 @@ where
       }
       let _ = self.coord.poll_split_refusal();
     }
-    // RE-ARM. A full tail leaves a one-shot cue queued and nothing else would come back for it:
-    // the container has no timer, and a quiet peerless parent generates no traffic. Set the same
-    // pending-flush bit every staging dispatch uses, which arms the immediate storage re-drive —
-    // so the next crank retries the pump on the ordinary cadence, with no new machinery.
-    if self.coord.peek_split_conflict().is_some() || self.coord.peek_split_refusal().is_some() {
-      self.flush_pending = true;
-    }
+    // RE-ARM, on the cue's own bounded schedule — never on `flush_pending`, which would couple an
+    // undelivered signal to the storage barrier and spin (see
+    // [`rearm_cue_retry`](Self::rearm_cue_retry)).
+    self.rearm_cue_retry();
     // A fail-stopped group surfaces once on the same best-effort tail; a full tail drops the
     // observation and the embedder still finds the poison by direct inspection.
     while let Some(group) = self.coord.poll_poisoned() {
@@ -707,6 +722,31 @@ where
     // receipt, an admission drifts the cause) — publishing first would ship an observation the
     // end-of-crank retirement is about to prove stale. The post-service drain, which reads
     // strictly after that retirement, is the ONLY publication point.
+  }
+
+  /// The per-crank storage step (the stream sibling's verbatim): one gated engine barrier, then
+  /// every hosted group's bounded completion drain.
+  /// Re-arm — or disarm — the relay's cue-retry deadline from what the pumps left behind.
+  ///
+  /// A one-shot cue the bounded lifecycle tail refused has no other prompt: the container has no
+  /// timer, and a quiet peerless parent generates no traffic. It gets its OWN bounded schedule
+  /// rather than riding `flush_pending`, and the distinction is the whole point — `flush_pending`
+  /// means "staged storage work is owed a barrier", so folding an undelivered cue into it would
+  /// make every crank both re-drive immediately AND run `engine.flush()`, and a permanently full
+  /// or disconnected tail would spin that loop forever: a burned core here, an fsync storm on a
+  /// durable engine. This wake runs the pumps again and nothing else; the barrier still fires only
+  /// for real staged work.
+  ///
+  /// FIXED interval, not exponential: the retry is a peek and a refusable send, and a cue's
+  /// delivery latency must stay bounded rather than growing without limit while the embedder is
+  /// briefly behind. It cannot starve the cue either — the retry re-arms for as long as the signal
+  /// is queued, and a parent holding one is quiesce-INELIGIBLE
+  /// ([`Self::owes_merge_cure_ticks`] reads `fork_relay_pending`), so the group keeps its own
+  /// timers armed and the loop keeps turning independently of this deadline.
+  fn rearm_cue_retry(&mut self) {
+    let pending =
+      self.coord.peek_split_conflict().is_some() || self.coord.peek_split_refusal().is_some();
+    self.cue_retry_at = pending.then(|| std::time::Instant::now() + CUE_RETRY_INTERVAL);
   }
 
   fn storage_crank(&mut self, now: Now) {
@@ -1072,71 +1112,6 @@ where
       // A pre-existing store is never removed on refusal (it held real state before this call); the
       // fresh-store case already failed closed above, so nothing here rolls a store back out.
       Err(e) => Err(rejected(e)),
-    }
-  }
-
-  /// Create a group from LOCALLY-FORKED state (the stream sibling's manufactured-baseline flow
-  /// verbatim over the QUIC coordinator): [`FloorSnapshot`] pre-read, engine boot epoch, the
-  /// baseline staged behind the next barrier, and create's rollback discipline on refusal.
-  #[allow(clippy::too_many_arguments)]
-  /// Install a child from a fork the CONTAINER yielded — the relay's own door, distinct from the
-  /// embedder's [`create_group_from_fork`](Self::create_group_from_fork) because the ticket is
-  /// different: possession of the fork, which only the container mints. That is what lets the
-  /// admission skip the split reservation (the fork IS the split claiming its id), and it is why
-  /// this path never takes a caller-supplied token — every input but the boot config comes off the
-  /// fork itself.
-  fn install_relayed_fork(
-    &mut self,
-    now: Now,
-    fork: GroupFork<G, I, F>,
-    seed: u64,
-  ) -> Result<(), DriverError<I>> {
-    let gid = fork.child().cheap_clone();
-    let generation = fork.child_gen();
-    // The container boots the child from the fork's OWN committed config; this driver only needs
-    // the election timeout for its local timer bookkeeping, read off that same value.
-    let election = fork.config().election_timeout();
-    let lineage = FloorSnapshot {
-      floor: sailing_proto::FloorStore::floor(&self.engine, &gid),
-      lineage: sailing_proto::FloorStore::lineage(&self.engine, &gid),
-    };
-    // The relay only yields for an id its gate reported free, so occupied stores here mean the
-    // engine changed under us; refuse rather than write over them (create's discipline).
-    let added = self.engine.add_group(gid.cheap_clone());
-    if !added && self.coord.group(&gid).is_none() {
-      return Err(DriverError::StoredStateExists);
-    }
-    let epoch = match self.engine.next_boot_epoch(&gid) {
-      Some(epoch) => epoch,
-      None => {
-        if added {
-          self.engine.remove_group(&gid);
-        }
-        return Err(rejected("boot epoch counter exhausted for this group"));
-      }
-    };
-    let result = {
-      let (log, stable) = self.engine.stores(&gid).expect("storage admitted above");
-      self
-        .coord
-        .create_group_from_relayed_fork(fork, now, seed, epoch, &lineage, log, stable)
-    };
-    match result {
-      Ok(()) => {
-        self.engine.set_group_gen(&gid, generation);
-        // The manufactured baseline is STAGED in the group's stores: barrier it, so blob and log
-        // re-baseline become flush-durable together with everything else this crank staged.
-        self.flush_pending = true;
-        self.election.insert(gid.cheap_clone(), election);
-        self.admit_group(gid);
-        Ok(())
-      }
-      Err(e) => {
-        if added {
-          self.engine.remove_group(&gid);
-        }
-        Err(rejected(e))
-      }
     }
   }
 

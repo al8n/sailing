@@ -102,9 +102,9 @@ pub(crate) fn blueprint_names<I: PartialEq>(
 pub(crate) fn reshape_born_prevention<I>(
   config: sailing_proto::Config<I>,
 ) -> sailing_proto::Config<I> {
-  // ONE derivation, in the container: the fork path applies it inside
-  // `create_group_from_relayed_fork`, and the factory gate below reuses the same function, so a
-  // reshape-born config cannot differ between the two births or between two hosts.
+  // ONE derivation, in the container: the fork path applies it inside `install_yieldable_fork`,
+  // and the factory gate below reuses the same function, so a reshape-born config cannot differ
+  // between the two births or between two hosts.
   sailing_proto::reshape_born_prevention(config)
 }
 

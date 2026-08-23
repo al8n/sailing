@@ -49,8 +49,8 @@ use bytes::Bytes;
 use clap::Parser;
 use sailing_benchmark::{CountSm, ReshapeSm};
 use sailing_proto::{
-  Config, Endpoint, Event, FloorStore, GroupStores, Index, Instant, MERGED_FLOOR, MergeResolution,
-  Message, MultiRaft, Outgoing,
+  Config, Endpoint, Event, FloorStore, GroupStores, Index, InstallOutcome, Instant, MERGED_FLOOR,
+  MergeResolution, Message, MultiEngine, MultiRaft, NoHold, Outgoing,
 };
 use sailing_simulation::{MemLog, MemStable};
 use tokio::{
@@ -892,23 +892,32 @@ const RESHAPE_CYCLES: u64 = 8;
 /// A fixed seed for group 0's container (single voter — cross-group decorrelation is moot).
 const RESHAPE_SEED: u64 = 0x5EED_0000;
 
-/// The [`GroupStores`] + [`FloorStore`] seam over group 0's per-gid stores — what the container's
-/// merge verbs (`prepare_merge`, `service_merge_applies`) resolve their logs through. The floor leg
-/// reports the terminal [`MERGED_FLOOR`] for ids this host has already merged away, `0` otherwise;
-/// the lineage leg is unused here.
-struct ContainerStores<'a> {
-  stores: &'a mut BTreeMap<u64, (MemLog, MemStable<u64>)>,
-  floored: &'a BTreeSet<u64>,
+/// The storage seam group 0's container drives through: the [`GroupStores`] + [`FloorStore`] legs
+/// the merge verbs resolve their logs with, plus the [`MultiEngine`] surface the fork install needs
+/// (it makes the child's storage and mints its boot epoch itself). The floor leg reports the
+/// terminal [`MERGED_FLOOR`] for ids this host has already merged away, `0` otherwise.
+///
+/// Deliberately over the bench's OWN `MemLog`/`MemStable` rather than a `GroupEngine`, so the
+/// reshape workload keeps measuring the same storage it always did. The batching metrics and the
+/// visibility barrier are no-ops for the same reason: these stores are synchronous, this host runs
+/// no driver, and nothing in the container reads them.
+#[derive(Default)]
+struct ContainerEngine {
+  stores: BTreeMap<u64, (MemLog, MemStable<u64>)>,
+  /// Ids this host has merged away — the terminal-floor set.
+  floored: BTreeSet<u64>,
+  /// Per-group monotone boot epochs (a fork baseline requires `>= 1`).
+  epochs: BTreeMap<u64, u64>,
 }
 
-impl GroupStores<u64, MemLog, MemStable<u64>> for ContainerStores<'_> {
+impl GroupStores<u64, MemLog, MemStable<u64>> for ContainerEngine {
   fn stores(&mut self, group: &u64) -> Option<(&mut MemLog, &mut MemStable<u64>)> {
     let (log, stable) = self.stores.get_mut(group)?;
     Some((log, stable))
   }
 }
 
-impl FloorStore<u64> for ContainerStores<'_> {
+impl FloorStore<u64> for ContainerEngine {
   fn floor(&self, gid: &u64) -> u64 {
     if self.floored.contains(gid) {
       MERGED_FLOOR
@@ -922,6 +931,72 @@ impl FloorStore<u64> for ContainerStores<'_> {
   }
 }
 
+impl MultiEngine<u64, u64> for ContainerEngine {
+  type Log = MemLog;
+  type Stable = MemStable<u64>;
+
+  fn set_snapshot_staging_cap(&mut self, _cap: usize) {}
+
+  fn group_ids(&self) -> impl Iterator<Item = &u64> {
+    self.stores.keys()
+  }
+
+  fn barriers(&self) -> u64 {
+    0
+  }
+
+  fn ops_batched(&self) -> u64 {
+    0
+  }
+
+  fn has_staged(&self) -> bool {
+    false
+  }
+
+  fn flush(&mut self) -> usize {
+    0
+  }
+
+  fn add_group(&mut self, gid: u64) -> bool {
+    if self.stores.contains_key(&gid) {
+      return false;
+    }
+    self.stores.insert(gid, (MemLog::new(), MemStable::new()));
+    true
+  }
+
+  fn remove_group(&mut self, gid: &u64) -> bool {
+    self.stores.remove(gid).is_some()
+  }
+
+  fn contains_group(&self, gid: &u64) -> bool {
+    self.stores.contains_key(gid)
+  }
+
+  fn next_boot_epoch(&mut self, gid: &u64) -> Option<u64> {
+    if !self.stores.contains_key(gid) {
+      return None;
+    }
+    let epoch = self.epochs.entry(*gid).or_default();
+    *epoch = epoch.checked_add(1)?;
+    Some(*epoch)
+  }
+
+  fn set_group_floor(&mut self, gid: &u64, floor: u64) {
+    // The reshape workload only ever floors TERMINALLY (a merged-away source), and the terminal is
+    // the type's maximum, so the set is the whole floor record this bench needs.
+    if floor == MERGED_FLOOR {
+      self.floored.insert(*gid);
+    }
+  }
+
+  fn set_group_gen(&mut self, _gid: &u64, _generation: u64) {}
+
+  fn removal_floor(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
 /// A single-host, single-voter `MultiRaft` container hosting the reshape group's parent (and, mid
 /// cycle, its child). A VIRTUAL logical clock (`vnow`, advanced manually to due deadlines) drives
 /// elections/heartbeats — decoupled from wall time so elections are instant — while wall time is
@@ -929,13 +1004,9 @@ impl FloorStore<u64> for ContainerStores<'_> {
 /// window. No peers, so there is no network to route; every crank is local storage + FSM work.
 struct ReshapeHost {
   host: MultiRaft<u64, u64, ReshapeSm>,
-  stores: BTreeMap<u64, (MemLog, MemStable<u64>)>,
-  /// Ids this host has merged away — the [`FloorStore`] terminal-floor set.
-  floored: BTreeSet<u64>,
+  engine: ContainerEngine,
   /// The virtual logical clock (monotone; advanced to due deadlines for timers).
   vnow: Instant,
-  /// Monotone per-fork boot epoch (`create_group_from_fork` requires `>= 1`).
-  boot_epoch: u64,
 }
 
 impl ReshapeHost {
@@ -959,14 +1030,12 @@ impl ReshapeHost {
         ReshapeSm::new(),
       )
       .expect("parent admission");
-    let mut stores = BTreeMap::new();
-    stores.insert(RESHAPE_PARENT, (MemLog::new(), MemStable::new()));
+    let mut engine = ContainerEngine::default();
+    engine.add_group(RESHAPE_PARENT);
     Self {
       host,
-      stores,
-      floored: BTreeSet::new(),
+      engine,
       vnow: Instant::ORIGIN,
-      boot_epoch: 0,
     }
   }
 
@@ -984,8 +1053,8 @@ impl ReshapeHost {
   }
 
   /// Drive local quiescence: storage completions for every hosted group, drain outgoing (none — no
-  /// peers) and events, materialize any committed fork (`poll_pending_fork` →
-  /// `create_group_from_fork` → `lift_fork_barrier`), and drop split-conflict signals. Merges are
+  /// peers) and events, install any committed fork (`peek_yieldable_fork` →
+  /// `install_yieldable_fork` → `lift_fork_barrier`), and drop split-conflict signals. Merges are
   /// resolved separately in [`Self::drive_until_merged`].
   fn drain(&mut self) {
     let now = self.vnow;
@@ -993,7 +1062,7 @@ impl ReshapeHost {
       let mut progressed = false;
       let gids: Vec<u64> = self.host.group_ids().copied().collect();
       for g in &gids {
-        if let Some((log, stable)) = self.stores.get_mut(g) {
+        if let Some((log, stable)) = self.engine.stores(g) {
           while self
             .host
             .handle_storage(g, now, log, stable)
@@ -1009,18 +1078,29 @@ impl ReshapeHost {
       while self.host.poll_event().is_some() {
         progressed = true;
       }
-      while let Some(fork) = self.host.poll_pending_fork() {
-        progressed = true;
-        self.boot_epoch += 1;
-        let epoch = self.boot_epoch;
-        let (parent, child, split_index) = (*fork.parent(), *fork.child(), fork.split_index());
-        self.stores.insert(child, (MemLog::new(), MemStable::new()));
-        let (log, stable) = self.stores.get_mut(&child).expect("child stores");
-        self
-          .host
-          .create_group_from_relayed_fork(fork, now, RESHAPE_SEED, epoch, log, stable)
-          .expect("fork materialization");
-        self.host.lift_fork_barrier(&parent, split_index);
+      while let Some((peeked_parent, child)) = self
+        .host
+        .peek_yieldable_fork(&NoHold)
+        .map(|fork| (*fork.parent(), *fork.child()))
+      {
+        match self.host.install_yieldable_fork(
+          &peeked_parent,
+          &child,
+          &mut self.engine,
+          &NoHold,
+          now,
+          RESHAPE_SEED,
+        ) {
+          InstallOutcome::Installed {
+            parent,
+            split_index,
+            ..
+          } => {
+            progressed = true;
+            self.host.lift_fork_barrier(&parent, split_index);
+          }
+          other => panic!("reshape fork for {child} did not install: {other:?}"),
+        }
       }
       while self.host.poll_split_conflict().is_some() {
         progressed = true;
@@ -1044,7 +1124,7 @@ impl ReshapeHost {
         self.vnow = dl;
       }
       let now = self.vnow;
-      let (log, stable) = self.stores.get_mut(&gid).expect("gid stores");
+      let (log, stable) = self.engine.stores(&gid).expect("gid stores");
       self
         .host
         .handle_timeout(&gid, now, log, stable)
@@ -1059,14 +1139,14 @@ impl ReshapeHost {
   fn propose_one(&mut self, gid: u64, payload: &Bytes) -> u64 {
     let now = self.vnow;
     let idx = {
-      let (log, stable) = self.stores.get_mut(&gid).expect("gid stores");
+      let (log, stable) = self.engine.stores(&gid).expect("gid stores");
       match self.host.propose(&gid, now, log, stable, payload) {
         Some(Ok(idx)) => idx,
         other => panic!("reshape parent {gid} rejected a client propose: {other:?}"),
       }
     };
     {
-      let (log, stable) = self.stores.get_mut(&gid).expect("gid stores");
+      let (log, stable) = self.engine.stores(&gid).expect("gid stores");
       let _ = self.host.flush_appends(&gid, now, log, stable);
     }
     self.drain();
@@ -1107,7 +1187,7 @@ impl ReshapeHost {
   fn split(&mut self, parent: u64, child: u64, instr: &Bytes) {
     let now = self.vnow;
     {
-      let (log, stable) = self.stores.get_mut(&parent).expect("parent stores");
+      let (log, stable) = self.engine.stores(&parent).expect("parent stores");
       self
         .host
         .propose_split(&parent, now, log, stable, &child, 0, instr.clone())
@@ -1121,12 +1201,10 @@ impl ReshapeHost {
   /// Propose the merge FREEZE of `source` into `target`; `true` iff accepted.
   fn prepare_merge(&mut self, source: u64, target: u64) -> bool {
     let now = self.vnow;
-    let mut cs = ContainerStores {
-      stores: &mut self.stores,
-      floored: &self.floored,
-    };
     matches!(
-      self.host.prepare_merge(&source, now, &mut cs, &target),
+      self
+        .host
+        .prepare_merge(&source, now, &mut self.engine, &target),
       Some(Ok(_))
     )
   }
@@ -1134,7 +1212,7 @@ impl ReshapeHost {
   /// Propose the merge ABSORB of `source` into `target`; `true` iff accepted.
   fn commit_merge(&mut self, target: u64, source: u64) -> bool {
     let now = self.vnow;
-    let (log, stable) = self.stores.get_mut(&target).expect("target stores");
+    let (log, stable) = self.engine.stores(&target).expect("target stores");
     matches!(
       self.host.commit_merge(&target, now, log, stable, &source),
       Some(Ok(_))
@@ -1147,18 +1225,12 @@ impl ReshapeHost {
     for _ in 0..100_000 {
       self.drain();
       let now = self.vnow;
-      let resolutions = {
-        let mut cs = ContainerStores {
-          stores: &mut self.stores,
-          floored: &self.floored,
-        };
-        self.host.service_merge_applies(now, &mut cs)
-      };
+      let resolutions = self.host.service_merge_applies(now, &mut self.engine);
       for r in resolutions {
         match r {
           MergeResolution::Merged { source: s, .. } | MergeResolution::Retired { source: s } => {
-            self.stores.remove(&s);
-            self.floored.insert(s);
+            self.engine.remove_group(&s);
+            self.engine.set_group_floor(&s, MERGED_FLOOR);
           }
           // The bench's single-group reshape never stands a fork/abort fence at the absorb, so
           // a fence-deferred `Absorbed` is as unexpected here as an abort.
