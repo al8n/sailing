@@ -5220,6 +5220,89 @@ async fn a_preloaded_engine_refuses_fresh_creation() {
   handle.shutdown().await.expect("the multi host tears down");
 }
 
+/// THE CUE RETRY IS BOUNDED — a refused relay cue must not turn the driver into a spin.
+///
+/// A one-shot cue the bounded tail refuses needs re-offering, and the obvious way to arrange that —
+/// fold "a cue is still queued" into the pending-flush bit — is wrong. That bit means "staged
+/// storage work is owed a barrier", so every crank would BOTH schedule an immediate re-drive AND
+/// run `engine.flush()`; a tail that stays full spins that loop at full speed, which is a burned
+/// core here and an fsync storm on a durable engine. The retry rides its own coarse deadline
+/// instead, and the barrier still fires only for real staged work.
+///
+/// The fixture is [`wedge_two_forks_on_a_one_slot_tail`], whose whole point is that the SECOND
+/// wedge's cue was refused and is still queued — the precondition this bound is about. Nothing
+/// here drains the tail, so that cue stays refused for the whole measurement.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_relay_cue_retries_on_a_bounded_schedule_not_a_spin() {
+  let (handle, lifecycle, first, _second, metrics) = wedge_two_forks_on_a_one_slot_tail().await;
+  // The slot is occupied by the first wedge's cue and stays that way: not draining it is what
+  // keeps the second one refused.
+  assert!(!lifecycle.is_empty(), "the one slot holds the first cue");
+  let (parent, _) = first;
+  let p = vec![handle.group(parent)];
+
+  // THE BOUND, over a window with no work of the test's own in flight. The loop still wakes on its
+  // ordinary cadences (heartbeats, housekeeping, the cue retry at CUE_RETRY_INTERVAL = 50ms, so
+  // ~20 retries per second) and measures ~32 barriers here; the rejected shape — the cue folded
+  // into the pending-flush bit — measures ~800, so the ceiling sits an order of magnitude above
+  // the real cadence and an order below the spin.
+  let before = metrics.barriers();
+  tokio::time::sleep(Duration::from_secs(1)).await;
+  let grew = metrics.barriers() - before;
+  assert!(
+    grew < 400,
+    "the refused cue spun the driver: {grew} barriers in one second of holding — the retry must \
+     ride its own bounded deadline, never the pending-flush bit"
+  );
+
+  // AND THE DRIVER IS STILL LIVE, not merely quiet: the bound was not bought with a stalled loop.
+  let live = submit_anywhere(&p, b"unit").await;
+  assert_eq!(
+    submit_anywhere(&p, b"unit").await,
+    live + 1,
+    "the parent still commits while its sibling's cue is refused"
+  );
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// The same bound with the tail never read AT ALL — the shape a live host reaches when its embedder
+/// stops consuming lifecycle events entirely.
+///
+/// A truly DISCONNECTED tail is unreachable for a running host, and that is worth stating: the
+/// handle owns the receiver, so dropping every clone a caller made still leaves the handle's, and
+/// dropping the handle ends the driver rather than orphaning the channel. The reachable form of the
+/// same hazard is this one — the tail fills and then refuses every send forever — and the bound
+/// must hold against it for as long as the host runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unread_lifecycle_tail_bounds_the_cue_retry_too() {
+  let (handle, lifecycle, first, _second, metrics) = wedge_two_forks_on_a_one_slot_tail().await;
+  drop(lifecycle);
+  let (parent, _) = first;
+  let p = vec![handle.group(parent)];
+
+  // Two consecutive windows: a spin would grow the count in BOTH, so this also catches a bound
+  // that only holds while some one-shot backlog drains.
+  for window in 0..2 {
+    let before = metrics.barriers();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let grew = metrics.barriers() - before;
+    assert!(
+      grew < 400,
+      "a tail nobody reads spun the driver: {grew} barriers in window {window}"
+    );
+  }
+
+  let live = submit_anywhere(&p, b"unit").await;
+  assert_eq!(
+    submit_anywhere(&p, b"unit").await,
+    live + 1,
+    "and the parent still commits"
+  );
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
 /// OCCUPANCY IS NOT PROVENANCE — the engine-store sibling of the hosted-child conflict park.
 ///
 /// A host is handed an engine already holding UNRELATED stores under the id a later split names

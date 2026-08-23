@@ -450,8 +450,8 @@ fn a_pending_farewell_blocks_quiescence() {
 #[test]
 fn the_factory_gate_refuses_a_debt_named_source_and_releases_at_the_discharge() {
   use sailing_proto::{
-    FloorStore, GroupEngine, Index, Instant, MergeResolution, MultiRaft, StateMachine,
-    StorageProgress, floor_admits,
+    FloorStore, GroupEngine, Index, InstallOutcome, Instant, MergeResolution, MultiRaft, NoHold,
+    StateMachine, StorageProgress, floor_admits,
   };
 
   #[derive(Default)]
@@ -572,7 +572,7 @@ fn the_factory_gate_refuses_a_debt_named_source_and_releases_at_the_discharge() 
   }
   drain!(1u64, d);
   assert!(
-    multi.poll_pending_fork().is_none(),
+    multi.peek_yieldable_fork(&NoHold).is_none(),
     "the fork parks on the hosted child, leaving its barrier standing"
   );
 
@@ -632,10 +632,15 @@ fn the_factory_gate_refuses_a_debt_named_source_and_releases_at_the_discharge() 
   // The discharge releases the gate: the conflict resolves, the fence lifts, the capture stages,
   // and the id then falls to the ordinary terminal-floor refusal instead.
   multi.remove_group(&300, &mut engine).unwrap();
-  let fork = multi
-    .poll_pending_fork()
-    .expect("the fork survived the wait");
-  multi.lift_fork_barrier(&1, fork.split_index());
+  // The driver drops the removed group's storage too; without that the engine still reports the
+  // id occupied and the relay keeps holding on it.
+  engine.remove_group(&300);
+  let InstallOutcome::Installed { split_index, .. } =
+    multi.install_yieldable_fork(&1, &300, &mut engine, &NoHold, d, 43)
+  else {
+    panic!("the fork survived the wait and installs once its squatter leaves")
+  };
+  multi.lift_fork_barrier(&1, split_index);
   assert_eq!(
     multi.service_merge_applies(d, &mut engine),
     vec![MergeResolution::Merged {
