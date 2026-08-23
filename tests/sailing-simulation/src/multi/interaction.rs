@@ -21,7 +21,7 @@ use crate::{
 use core::time::Duration;
 use sailing_proto::{Config, Index, Instant, Message, MultiRaft, Outgoing};
 use std::{
-  collections::{BTreeMap, VecDeque},
+  collections::{BTreeMap, BTreeSet, VecDeque},
   string::{String, ToString},
   vec::Vec,
 };
@@ -677,26 +677,44 @@ impl MultiInteractionEnv {
       // Materialize committed forks the drains above applied — the harness plays the driver's
       // fork drain. Sync in-memory stores make the child's baseline durable at the call, so the
       // parent's snapshot barrier lifts immediately (the one-crank engine-flush contract in its
-      // synchronous form); the env never restarts a node, so every fork is its replica's first
-      // boot (epoch 1). A materialization re-runs the loop: the child is a hosted group from
-      // this point on and drains like any other.
+      // synchronous form); the env never restarts a node, so a per-drain epoch counter gives every
+      // fork its own first boot. A materialization re-runs the loop: the child is a hosted group
+      // from this point on and drains like any other.
       let mut forked = false;
+      let mut boot_epochs = BTreeMap::new();
+      let no_floors = BTreeSet::new();
       loop {
         let host = self.hosts.get_mut(&id).expect("host exists");
-        let Some(fork) = host.poll_pending_fork() else {
+        let Some((peeked_parent, child)) = host
+          .peek_yieldable_fork(&sailing_proto::NoHold)
+          .map(|fork| (*fork.parent(), *fork.child()))
+        else {
           break;
+        };
+        let mut engine = crate::multi::PairEngine {
+          node: id,
+          stores: &mut self.stores,
+          boot_epochs: &mut boot_epochs,
+          floored: &no_floors,
+        };
+        let host = self.hosts.get_mut(&id).expect("host exists");
+        let sailing_proto::InstallOutcome::Installed {
+          parent,
+          split_index,
+          ..
+        } = host.install_yieldable_fork(
+          &peeked_parent,
+          &child,
+          &mut engine,
+          &sailing_proto::NoHold,
+          now,
+          id,
+        )
+        else {
+          panic!("fork of g{child} on n{id} did not install");
         };
         forked = true;
         produced = true;
-        let (parent, child, split_index) = (*fork.parent(), *fork.child(), fork.split_index());
-        self
-          .stores
-          .insert((id, child), (MemLog::new(), MemStable::new()));
-        let (log, stable) = self.stores.get_mut(&(id, child)).expect("fresh stores");
-        let host = self.hosts.get_mut(&id).expect("host exists");
-        host
-          .create_group_from_relayed_fork(fork, now, id, 1, log, stable)
-          .unwrap_or_else(|e| panic!("fork of g{child} on n{id}: {e:?}"));
         host.lift_fork_barrier(&parent, split_index);
         let inherited = host
           .group(&child)

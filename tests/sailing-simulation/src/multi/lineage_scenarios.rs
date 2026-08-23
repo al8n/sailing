@@ -373,29 +373,38 @@ impl Mini {
         }
       }
       let mut forked = false;
-      loop {
-        let Some(fork) = self.hosts.get_mut(&node).unwrap().poll_pending_fork() else {
-          break;
-        };
+      while let Some((peeked_parent, child)) = self
+        .hosts
+        .get_mut(&node)
+        .unwrap()
+        .peek_yieldable_fork(&sailing_proto::NoHold)
+        .map(|fork| (*fork.parent(), *fork.child()))
+      {
         forked = true;
         produced = true;
-        let (parent, child, split_index) = (*fork.parent(), *fork.child(), fork.split_index());
-        self
-          .stores
-          .insert((node, child), (MemLog::new(), MemStable::new()));
-        let epoch = {
-          let e = self.boot_epochs.entry(node).or_insert(0);
-          *e += 1;
-          *e
-        };
         let seed = self.seed_for(node);
-        let (log, stable) = self.stores.get_mut(&(node, child)).unwrap();
-        self
-          .hosts
-          .get_mut(&node)
-          .unwrap()
-          .create_group_from_relayed_fork(fork, now, seed, epoch, log, stable)
-          .expect("fork materialization");
+        let no_floors = BTreeSet::new();
+        let mut engine = crate::multi::PairEngine {
+          node,
+          stores: &mut self.stores,
+          boot_epochs: &mut self.boot_epochs,
+          floored: &no_floors,
+        };
+        let sailing_proto::InstallOutcome::Installed {
+          parent,
+          split_index,
+          ..
+        } = self.hosts.get_mut(&node).unwrap().install_yieldable_fork(
+          &peeked_parent,
+          &child,
+          &mut engine,
+          &sailing_proto::NoHold,
+          now,
+          seed,
+        )
+        else {
+          panic!("fork materialization on node {node}")
+        };
         self
           .hosts
           .get_mut(&node)

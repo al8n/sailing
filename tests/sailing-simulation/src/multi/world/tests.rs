@@ -399,12 +399,12 @@ fn parked_stale_leader_never_defines_committed_membership() {
   assert_eq!(conf_of(&w, 0, 100), (voters, BTreeSet::new()));
 
   assert_eq!(
-    w.committed_voters_of(100),
+    w.committed_voters_of(100, w.generation_of(100)),
     live_conf.0,
     "a parked stale leader must not be the authoritative committed-voter source"
   );
   assert_eq!(
-    w.committed_learners_of(100),
+    w.committed_learners_of(100, w.generation_of(100)),
     live_conf.1,
     "a parked stale leader must not be the authoritative committed-learner source"
   );
@@ -486,12 +486,12 @@ fn parked_replicas_never_vote_in_the_leaderless_plurality() {
   );
 
   assert_eq!(
-    w.committed_voters_of(100),
+    w.committed_voters_of(100, w.generation_of(100)),
     [1u64].into_iter().collect::<BTreeSet<u64>>(),
     "a parked stale config must not vote in the committed-voter plurality"
   );
   assert_eq!(
-    w.committed_learners_of(100),
+    w.committed_learners_of(100, w.generation_of(100)),
     BTreeSet::new(),
     "a parked stale config must not vote in the committed-learner plurality"
   );
@@ -1327,10 +1327,16 @@ fn snapshot_wired_child_replica_aligns_with_fork_wired_siblings() {
   // …and the aligned view discounts it by CONTENT: identical to a fork-wired sibling's,
   // baseline excluded, agreement whole. (The ticks above already cross-talk-swept node 2's
   // record — an unfloored sweep would have tripped the oracle before reaching here.)
-  assert_eq!(w.aligned_applied(2, 200), w.aligned_applied(0, 200));
-  assert!(!w.aligned_applied(2, 200).is_empty());
+  assert_eq!(
+    w.aligned_applied(2, 200, w.replica_gen_of(2, 200)),
+    w.aligned_applied(0, 200, w.replica_gen_of(0, 200))
+  );
   assert!(
-    raw.len() > w.aligned_applied(2, 200).len(),
+    !w.aligned_applied(2, 200, w.replica_gen_of(2, 200))
+      .is_empty()
+  );
+  assert!(
+    raw.len() > w.aligned_applied(2, 200, w.replica_gen_of(2, 200)).len(),
     "the raw record must exceed the aligned one by the inherited baseline"
   );
   assert!(w.agreement_holds(200));
@@ -1363,7 +1369,7 @@ fn aligned_view_is_the_raw_record_for_never_split_groups() {
     let raw = w.applied_of(n, 100);
     assert!(!raw.is_empty());
     assert_eq!(
-      w.aligned_applied(n, 100),
+      w.aligned_applied(n, 100, w.replica_gen_of(n, 100)),
       raw,
       "node {n}: alignment must be the identity for a never-split group"
     );
@@ -1447,9 +1453,9 @@ fn aligned_view_survives_a_lag_pair_straddling_an_onward_split() {
   // of the ahead view, and the full agreement predicate holds. (Every tick above already ran
   // the checker's agreement leg over these views — a positional discount panics there before
   // reaching this point.)
-  let ahead = w.aligned_applied(0, 200);
-  let lagging = w.aligned_applied(2, 200);
-  assert_eq!(w.aligned_applied(1, 200), ahead);
+  let ahead = w.aligned_applied(0, 200, w.replica_gen_of(0, 200));
+  let lagging = w.aligned_applied(2, 200, w.replica_gen_of(2, 200));
+  assert_eq!(w.aligned_applied(1, 200, w.replica_gen_of(1, 200)), ahead);
   assert!(lagging.len() < ahead.len());
   assert_eq!(&ahead[..lagging.len()], &lagging[..]);
   assert!(w.agreement_holds(200));
@@ -1460,7 +1466,10 @@ fn aligned_view_survives_a_lag_pair_straddling_an_onward_split() {
   assert!(
     w.run_until(4_000, |w| {
       w.hosts_group(2, 300)
-        && (0..3).all(|n| w.aligned_applied(n, 200) == w.aligned_applied(0, 200))
+        && (0..3).all(|n| {
+          w.aligned_applied(n, 200, w.replica_gen_of(n, 200))
+            == w.aligned_applied(0, 200, w.replica_gen_of(0, 200))
+        })
     }),
     "the healed laggard never converged: {}",
     w.dbg_group(200)
@@ -1558,7 +1567,7 @@ fn aligned_view_survives_a_double_onward_split_chain() {
   );
   for n in 0..3 {
     let cells: Vec<(u64, u16, u64)> = w
-      .aligned_applied(n, 300)
+      .aligned_applied(n, 300, w.replica_gen_of(n, 300))
       .iter()
       .filter_map(|(_, c)| crate::multi::decode_gkv(c))
       .collect();
@@ -1572,13 +1581,16 @@ fn aligned_view_survives_a_double_onward_split_chain() {
   // The doubly-shrunk parent still aligns to its one remaining live-key own cell.
   assert!(
     w.run_until(2_000, |w| {
-      (0..3).all(|n| w.aligned_applied(n, 200) == w.aligned_applied(0, 200))
+      (0..3).all(|n| {
+        w.aligned_applied(n, 200, w.replica_gen_of(n, 200))
+          == w.aligned_applied(0, 200, w.replica_gen_of(0, 200))
+      })
     }),
     "the parent replicas never converged: {}",
     w.dbg_group(200)
   );
   let parent_cells: Vec<(u64, u16, u64)> = w
-    .aligned_applied(0, 200)
+    .aligned_applied(0, 200, w.replica_gen_of(0, 200))
     .iter()
     .filter_map(|(_, c)| crate::multi::decode_gkv(c))
     .collect();
@@ -1666,8 +1678,14 @@ fn snapshot_wired_replica_born_after_an_onward_split_aligns() {
     std::vec![(100, 4, 4), (100, 5, 5)],
     "the transferred record must arrive already shrunk by the onward split"
   );
-  assert_eq!(w.aligned_applied(2, 200), w.aligned_applied(0, 200));
-  assert!(!w.aligned_applied(2, 200).is_empty());
+  assert_eq!(
+    w.aligned_applied(2, 200, w.replica_gen_of(2, 200)),
+    w.aligned_applied(0, 200, w.replica_gen_of(0, 200))
+  );
+  assert!(
+    !w.aligned_applied(2, 200, w.replica_gen_of(2, 200))
+      .is_empty()
+  );
 
   // A plain lag tail on top of the path axis: the twin misses one live-key cell and must
   // become a strict prefix.
@@ -1684,15 +1702,22 @@ fn snapshot_wired_replica_born_after_an_onward_split_aligns() {
     }),
     "the post-join load never applied on the survivors"
   );
-  let ahead = w.aligned_applied(0, 200);
-  let lagging = w.aligned_applied(2, 200);
+  let ahead = w.aligned_applied(0, 200, w.replica_gen_of(0, 200));
+  let lagging = w.aligned_applied(2, 200, w.replica_gen_of(2, 200));
   assert!(lagging.len() < ahead.len());
   assert_eq!(&ahead[..lagging.len()], &lagging[..]);
   assert!(w.agreement_holds(200));
   w.heal(2);
   assert!(
-    w.run_until(4_000, |w| w.aligned_applied(2, 200)
-      == w.aligned_applied(0, 200)),
+    w.run_until(4_000, |w| w.aligned_applied(
+      2,
+      200,
+      w.replica_gen_of(2, 200)
+    ) == w.aligned_applied(
+      0,
+      200,
+      w.replica_gen_of(0, 200)
+    )),
     "the healed twin never re-converged"
   );
   w.check_now();
@@ -1998,6 +2023,369 @@ fn a_late_fork_lands_as_its_own_incarnation_and_is_judged_there() {
   );
   w.check_now();
   w.finalize_conservation_or_panic(41);
+}
+
+/// THE COEXISTENCE, BUILT DELIBERATELY: a late gen-0 island hosted beside a LIVE gen-1 successor of
+/// the same id, the two owning DIFFERENT key populations. Returns `(world, source, child)`.
+///
+/// A FREE SLOT is what makes the shape reachable. Node 2 lags the split, so it owes a fork it never
+/// materialized; the child then sheds node 2 from its membership BEFORE it is retired, so the
+/// teardown tombstones only the members it still has and the recreation wires successor replicas
+/// over {0,1} alone. Healed, node 2 replays the split and its fork installs the DEAD incarnation on
+/// the one node the successor does not occupy — the id is hosted at two incarnations at once.
+///
+/// The populations diverge by construction: gen 0 was assigned the at-or-above-point slice {4..7}
+/// while the recreation hands gen 1 its whole domain back, and gen 0's record is the parent-tagged
+/// inherited baseline that gen 1 — carrying nothing — would read as a leak. Every gid-only read of
+/// "the group's metadata" resolves to the successor's, which is neither.
+fn island_beside_a_live_successor(seed: u64) -> (MultiWorld, u64, u64) {
+  let (source, child) = (11u64, 300u64);
+  let mut w = MultiWorld::new(seed);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(source, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(source).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(source, key, u64::from(key));
+    propose_until_accepted(&mut w, source, &payload);
+  }
+  assert!(w.run_until(2_000, |w| {
+    (0..3).all(|n| w.applied_of(n, source).len() >= 8)
+  }));
+
+  // Node 2 lags the split: {0,1} materialize the child while node 2 never even sees the entry.
+  w.isolate(2);
+  assert!(w.run_until(3_000, |w| w.leader_of(source).is_some_and(|l| l != 2)));
+  propose_split_until_accepted(&mut w, source, child, 4);
+  assert!(w.run_until(3_000, |w| w.splits_applied() == 1));
+  assert!(w.run_until(4_000, |w| w.leader_of(child).is_some()));
+
+  // FREE THE SLOT: shed node 2 from the child's membership. COMMITTED first, reconciled second —
+  // the registry's unpark/resurrect arm re-wires any committed member that is not hosting, and
+  // node 2 is exactly that until the removal commits, so reconciling early would hand it the
+  // replica whose absence this fixture is built on.
+  propose_conf_change_until_accepted(&mut w, child, sailing_proto::ConfChangeType::RemoveNode, 2);
+  assert!(
+    w.run_until(4_000, |w| w.leader_of(child).is_some()
+      && [0u64, 1]
+        .iter()
+        .all(|&n| !conf_of(w, n, child).0.contains(&2))),
+    "the child's removal of node 2 never committed"
+  );
+  w.reconcile_membership(child);
+  assert_eq!(
+    w.meta_at(child, 0).map(|m| m.voters.clone()),
+    Some([0u64, 1].into_iter().collect()),
+    "the child's registry voters never shrank"
+  );
+  assert!(
+    !w.hosts_group(2, child),
+    "node 2 must be off the child, or the teardown below tombstones it and holds the fork"
+  );
+
+  // Retire gen 0 and bring the id straight back, all while node 2 is away. Gen 1 is LIVE from here.
+  assert!(w.remove_group(child));
+  w.recreate_group(child);
+  assert_eq!(
+    w.generation_of(child),
+    1,
+    "the id moved on while node 2 was away"
+  );
+  assert!(
+    w.run_until(4_000, |w| w.leader_of(child).is_some()),
+    "the successor never elected"
+  );
+
+  w.heal(2);
+  assert!(
+    w.run_until(8_000, |w| w.hosts_group(2, child)),
+    "the late fork never landed: {}",
+    w.dbg_group(child)
+  );
+  assert_eq!(
+    w.replica_gen_of(2, child),
+    0,
+    "it lands as the incarnation the SPLIT named, not as whatever the id has become"
+  );
+  assert!(
+    !w.meta_at(child, 1).expect("the successor is live").retired,
+    "the successor must still be LIVE beside the island — that is the whole shape"
+  );
+  (w, source, child)
+}
+
+/// DIRECTION ONE — the island is judged, recorded, and conserved under ITS OWN incarnation's
+/// metadata while the successor is live at the same id.
+///
+/// The teeth are the ONWARD SPLIT off the live successor. That split's conservation pair names
+/// gen 1's ledger id as the parent, so every cell filed there is demanded of the grandchild. The
+/// island's cells belong to gen 0 and were never handed to anyone; filing them under the registry's
+/// current generation invents a debt the successor's lineage cannot pay, and the run-end verdict
+/// reads that as history lost or continued on both sides. Nothing about the shape is synthetic —
+/// the cells are the fork's own inherited baseline, and the ledger id is the only thing in dispute.
+///
+/// Red-proof: revert `conserve_sweep` to `ledger_id(self.generation_of(gid), gid)` with no
+/// replica-generation filter and `finalize_conservation_or_panic` trips on the g1000300->g301
+/// partition, naming the island's parent-tagged values as the missing prefix.
+#[test]
+fn a_coexisting_island_is_conserved_under_its_own_incarnation() {
+  let (seed, grandchild) = (41u64, 301u64);
+  let (mut w, source, child) = island_beside_a_live_successor(seed);
+
+  // The fixture's premise, asserted: two live incarnations of one id, DISTINCT key populations,
+  // and a tag lineage that only the island has.
+  let judged = w.judged_incarnations();
+  assert!(
+    judged.contains(&(child, 0)) && judged.contains(&(child, 1)),
+    "both incarnations must be live-judged: {judged:?}"
+  );
+  let gen0 = w
+    .meta_at(child, 0)
+    .expect("the island's archived meta")
+    .clone();
+  let gen1 = w.meta_at(child, 1).expect("the live successor").clone();
+  assert_ne!(gen0.keys, gen1.keys, "the populations must differ");
+  assert!(
+    gen0.carried_tags.contains(&source) && gen1.carried_tags.is_empty(),
+    "the parent's tag is legal only under gen 0: {:?} vs {:?}",
+    gen0.carried_tags,
+    gen1.carried_tags
+  );
+  // Non-vacuous: the island really holds parent-tagged cells for keys gen 1 also owns.
+  let island: Vec<(u64, u16, u64)> = w
+    .applied_of(2, child)
+    .iter()
+    .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+    .collect();
+  assert!(!island.is_empty(), "the island has no cells to misfile");
+  assert!(
+    island
+      .iter()
+      .all(|&(tag, key, _)| tag == source && gen0.keys.contains(&key) && gen1.keys.contains(&key)),
+    "the island's cells must be parent-tagged and inside BOTH populations: {island:?}"
+  );
+
+  // The live successor writes its own cells over the same keys and then splits them away. The
+  // grandchild's conservation pair takes gen 1's ledger id as its parent.
+  for key in 4u16..8 {
+    let payload = crate::multi::encode_gkv(child, key, 900 + u64::from(key));
+    propose_until_accepted(&mut w, child, &payload);
+  }
+  assert!(
+    w.run_until(4_000, |w| [0u64, 1]
+      .iter()
+      .all(|&n| w.applied_of(n, child).len() >= 4)),
+    "the successor's own load never applied: {}",
+    w.dbg_group(child)
+  );
+  propose_split_until_accepted(&mut w, child, grandchild, 4);
+  assert!(
+    w.run_until(4_000, |w| w.hosting_nodes(grandchild).len() >= 2),
+    "the successor's onward split never materialized: {}",
+    w.dbg_group(child)
+  );
+  assert_eq!(
+    w.replica_gen_of(2, child),
+    0,
+    "the island must still be hosted at gen 0 through the onward split"
+  );
+
+  w.check_now();
+  w.finalize_conservation_or_panic(seed);
+  w.finalize_lineage_or_panic(seed);
+  w.finalize_membership_or_panic(seed);
+}
+
+/// DIRECTION TWO — the incarnation filters must not SILENCE the successor. A cell the successor
+/// cannot legally hold still trips, with an island of the same id hosted beside it.
+///
+/// The corruption is the exact cell the island carries legally: a parent-tagged gkv payload. Gen 0
+/// inherited the parent's tag lineage, gen 1 was recreated and inherits nothing, so the same bytes
+/// are a legal baseline cell on one incarnation and a cross-group leak on the other. A sweep that
+/// filtered the successor's replicas away, or that judged them against the island's expectations,
+/// would let this pass in silence.
+#[test]
+#[should_panic(expected = "cross-group")]
+fn a_corrupted_successor_cell_still_trips_beside_the_island() {
+  let (mut w, source, child) = island_beside_a_live_successor(41);
+  let payload = crate::multi::encode_gkv(source, 2, 4_242);
+  propose_until_accepted(&mut w, child, &payload);
+  w.run_until(4_000, |_| false);
+  panic!("the successor's foreign-tagged cell was never judged");
+}
+
+/// THE ISLAND'S ClusterView CARRIES ITS OWN VOTER DENOMINATOR.
+///
+/// `committed_voters_of` reads the authoritative committed config off the group's replicas, and the
+/// island's replicas are not the successor's. Unqualified it returns the live successor's voters,
+/// which the island's view then intersects with its own single hosting replica to NOTHING: the
+/// quorum-durability leg iterates an empty voter set and certifies vacuously, for the rest of the
+/// run. Qualified, the island supplies its own set and the leg has a denominator to judge against.
+///
+/// Red-proof: drop the `replica_gen_of` filter from `committed_voters_of` and the island's set comes
+/// back as the successor's `{0,1}`, which contains none of the island's replicas.
+#[test]
+fn a_coexisting_island_supplies_its_own_voter_denominator() {
+  let (w, _source, child) = island_beside_a_live_successor(41);
+
+  let island = w.committed_voters_of(child, 0);
+  let successor = w.committed_voters_of(child, 1);
+  assert!(
+    island.contains(&2),
+    "the island's denominator must contain the node actually hosting it: {island:?}"
+  );
+  assert_ne!(
+    island, successor,
+    "the two incarnations must not share a denominator: {island:?}"
+  );
+  assert!(
+    !successor.contains(&2),
+    "and the successor's set is the one that would silence the island: {successor:?}"
+  );
+
+  // The view the oracle suite actually judges: non-empty voters, and the denominator is the
+  // island's own.
+  let view = w.group_view(child, 0);
+  assert_eq!(
+    view.committed_voters.as_ref(),
+    Some(&island),
+    "the island's view must carry its own committed voters"
+  );
+  assert_eq!(
+    view.nodes.iter().filter(|n| n.id == 2).count(),
+    1,
+    "the island's single replica is in its own view"
+  );
+  assert!(
+    island.iter().any(|v| view.nodes.iter().any(|n| n.id == *v)),
+    "the denominator must intersect the view, or every voter-keyed leg judges nothing"
+  );
+}
+
+/// A NON-QUORUM ISLAND COMMIT TRIPS THE QUORUM-DURABILITY LEG. Its sibling above proves the
+/// denominator is the island's own; this proves the leg that denominator feeds is live rather than
+/// merely non-empty.
+///
+/// The commit is synthesized on the fixture's real island view, and it has to be: the island holds
+/// one replica of a three-voter config and the delivery fence keeps its successor's hosts away, so
+/// it can never legitimately commit past the manufactured baseline — which is precisely why a
+/// missing denominator here would never be noticed by a passing run.
+///
+/// Red-proof: drop the `replica_gen_of` filter from `committed_voters_of`. The view's denominator
+/// becomes the successor's `{0,1}`, `ClusterView::voters()` yields nothing, and the same deliberate
+/// violation returns `Ok` — the silent certification this closes.
+#[test]
+fn a_non_quorum_island_commit_trips_the_quorum_durability_leg() {
+  let (w, _source, child) = island_beside_a_live_successor(41);
+  let mut view = w.group_view(child, 0);
+  assert!(
+    view.committed_voters.as_ref().is_some_and(|v| v.len() > 1),
+    "the island's own config is multi-voter, or a lone replica IS its own quorum"
+  );
+  let clean = crate::checker::commit_is_quorum_durable(&view, sailing_proto::FORK_BASE_INDEX.get());
+  assert!(
+    clean.is_ok(),
+    "the untouched island must be clean before the deliberate violation: {clean:?}"
+  );
+
+  // The violation: the island's one replica claims a commit far past anything durable anywhere,
+  // with no second voter to witness it.
+  let island_node = view
+    .nodes
+    .iter_mut()
+    .find(|n| n.id == 2)
+    .expect("the island's replica is in its own view");
+  island_node.commit = 9_999;
+  let verdict =
+    crate::checker::commit_is_quorum_durable(&view, sailing_proto::FORK_BASE_INDEX.get());
+  assert!(
+    verdict.is_err(),
+    "a lone replica claiming an unwitnessed commit must trip the quorum-durability leg"
+  );
+}
+
+/// A MERGE IN ONE INCARNATION MUST NOT DISABLE THE OTHER'S CHECKING.
+///
+/// The append-only gate and the agreement mode switch were read id-wide, so a union folded into the
+/// live successor re-based the successor's record and switched BOTH incarnations out of positional
+/// and phantom-quorum checking. The island absorbed nothing; its record is still append-only, and
+/// retiring its coverage on someone else's merge loses every violation it would have caught for the
+/// rest of the run.
+///
+/// Red-proof: revert `record_is_append_only` and the `group_view` mode switch to the gid-wide
+/// `group_absorbed`/`is_merged`/`group_frozen` reads and the island's two assertions below invert.
+#[test]
+fn a_successors_merge_leaves_the_islands_checking_armed() {
+  let (mut w, _source, child) = island_beside_a_live_successor(41);
+  // Above the child's id: the container orients every merge pair source-encodes-above-target.
+  let donor = 501u64;
+
+  // Both incarnations start armed.
+  assert!(w.record_is_append_only(child, 0) && w.record_is_append_only(child, 1));
+  let judged_before = w.lineage_cells_judged();
+
+  // A union folded into the LIVE successor, on the two nodes that host it.
+  let pair: BTreeSet<u64> = [0u64, 1].into_iter().collect();
+  w.create_group(donor, &pair);
+  assert!(w.run_until(4_000, |w| w.leader_of(donor).is_some()));
+  for key in 0u16..3 {
+    let payload = crate::multi::encode_gkv(donor, key, 500 + u64::from(key));
+    propose_until_accepted(&mut w, donor, &payload);
+  }
+  assert!(w.run_until(3_000, |w| {
+    [0u64, 1].iter().all(|&n| w.applied_of(n, donor).len() >= 3)
+  }));
+  colocate_source_onto_target(&mut w, donor, child);
+  merge_verb_until_accepted(&mut w, 3_000, "the freeze", |w| {
+    w.propose_prepare_merge(donor, child)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
+    w.propose_commit_merge(child, donor)
+  });
+  assert!(
+    w.run_until(8_000, |w| w.group_absorbed_at(child, 1)),
+    "the successor never absorbed the donor: {}",
+    w.dbg_group(child)
+  );
+
+  // THE SEPARATION. The successor is out of positional/append-only checking, as a merge target must
+  // be; the island — which absorbed nothing — is still fully armed.
+  assert!(
+    !w.record_is_append_only(child, 1),
+    "the absorbing successor must leave the append-only leg"
+  );
+  assert!(
+    w.record_is_append_only(child, 0),
+    "but the island absorbed nothing and must stay armed"
+  );
+  assert!(
+    !w.group_absorbed_at(child, 0),
+    "the union belongs to the successor's ledger id, not the island's"
+  );
+  assert!(
+    w.group_view(child, 0).positional_agreement,
+    "the island keeps the positional comparison its own record still satisfies"
+  );
+  assert!(
+    !w.group_view(child, 1).positional_agreement,
+    "and the successor gives it up — the mode switch is per incarnation, not per id"
+  );
+  assert_eq!(
+    w.replica_gen_of(2, child),
+    0,
+    "the island stood through the whole choreography"
+  );
+
+  // NON-VACUOUS: the island's cells are still being fed to the ledger after the merge.
+  w.run_until(400, |_| false);
+  assert!(
+    w.lineage_cells_judged() > judged_before,
+    "the lineage ledger stopped judging cells once the successor merged"
+  );
+  w.check_now();
+  w.finalize_lineage_or_panic(41);
 }
 
 /// VALVE ONE — CONSENT. `clear_tombstone` is the production release for a fork held on a tombstone,
@@ -3572,7 +3960,7 @@ fn retired_husk_aligns_against_its_terminal_population() {
   // The gkv (client) cells an aligned record retains — what the aligned consumers judge (non-gkv conf
   // cells survive alignment regardless, so they cannot stand in for client coverage).
   let gkv_cells = |w: &MultiWorld, n: u64, gid: u64| -> usize {
-    w.aligned_applied(n, gid)
+    w.aligned_applied(n, gid, w.replica_gen_of(n, gid))
       .iter()
       .filter(|(_, c)| crate::multi::decode_gkv(c).is_some())
       .count()
@@ -3701,7 +4089,7 @@ fn retired_husk_aligns_against_its_terminal_population() {
 #[test]
 fn plain_source_husk_aligns_via_the_non_absorbed_branch() {
   let gkv_cells = |w: &MultiWorld, n: u64, gid: u64| -> usize {
-    w.aligned_applied(n, gid)
+    w.aligned_applied(n, gid, w.replica_gen_of(n, gid))
       .iter()
       .filter(|(_, c)| crate::multi::decode_gkv(c).is_some())
       .count()

@@ -550,10 +550,24 @@ impl MultiWorld {
     self.merges_absorbed
   }
 
-  /// Whether `gid` has ever ABSORBED another group — the agreement oracle's mode switch (see
-  /// `ClusterView::positional_agreement`).
+  /// Whether `gid` has ever ABSORBED another group, under ANY incarnation — the id-wide question
+  /// the fuzzer's book and the gid-scoped tests ask. The ORACLE path wants
+  /// [`group_absorbed_at`](Self::group_absorbed_at) instead.
   pub(crate) fn group_absorbed(&self, gid: u64) -> bool {
     self.merges.iter().any(|m| m.target == gid)
+  }
+
+  /// Whether `gid`'s incarnation `generation` has ever ABSORBED another group — the agreement
+  /// oracle's mode switch (see `ClusterView::positional_agreement`), incarnation-qualified.
+  ///
+  /// Merge records carry generation-qualified LEDGER ids, so the question can be asked of ONE
+  /// incarnation, and it must be: a late fork's island and a live successor of the same id own
+  /// different histories, and switching the island into the absorbed comparison mode on its
+  /// successor's union — or leaving the successor in the positional mode because the island never
+  /// absorbed — judges each against the other's shape.
+  pub(crate) fn group_absorbed_at(&self, gid: u64, generation: u64) -> bool {
+    let led = Self::ledger_id(generation, gid);
+    self.merges.iter().any(|m| m.target_led == led)
   }
 
   /// Whether `gid` was merged away (the terminal catalog mark).
@@ -702,6 +716,35 @@ impl MultiWorld {
       .iter()
       .filter_map(|&n| self.hosts[&n].group(&gid))
       .any(|ep| ep.pending_merge().is_some())
+  }
+
+  /// [`group_merge_parked`](Self::group_merge_parked) restricted to the replicas BOUND to
+  /// `generation`. A park lives on a replica, so it belongs to the incarnation that replica speaks
+  /// for; a coexisting incarnation of the same id is a different group to every oracle, and its
+  /// park must not answer here.
+  pub(crate) fn group_merge_parked_at(&self, gid: u64, generation: u64) -> bool {
+    self
+      .node_ids
+      .iter()
+      .filter(|&&n| self.replica_gen_of(n, gid) == generation)
+      .filter_map(|&n| self.hosts[&n].group(&gid))
+      .any(|ep| ep.pending_merge().is_some())
+  }
+
+  /// Whether ANY replica of `gid` bound to `generation` is frozen — the incarnation-qualified form
+  /// of [`group_frozen`](Self::group_frozen), for the append-only EXCLUSION alone.
+  ///
+  /// ∃-any rather than that predicate's leader-or-quorum read, on purpose: this one only ever
+  /// widens an exclusion, and ∃-any is the conservative side of it (it is a superset of both the
+  /// leader read and the quorum read). `group_frozen` answers a different question — may the
+  /// group accept load — where ∃-any would blind the calm window to real livelocks.
+  pub(crate) fn any_replica_frozen_at(&self, gid: u64, generation: u64) -> bool {
+    self
+      .node_ids
+      .iter()
+      .filter(|&&n| self.replica_gen_of(n, gid) == generation)
+      .filter_map(|&n| self.hosts[&n].group(&gid))
+      .any(sailing_proto::Endpoint::is_frozen)
   }
 
   /// The source id a PARKED replica of `gid` (a merge target mid-absorb) names in its
@@ -1189,7 +1232,31 @@ impl MultiWorld {
   /// product would ADMIT (its designed catalog escape) — a superset is sound; the world simply never
   /// draws that removal.
   pub fn merge_choreography_active(&self, gid: u64) -> bool {
+    self.own_replica_choreography(gid, None) || self.foreign_choreography(gid)
+  }
+
+  /// [`merge_choreography_active`](Self::merge_choreography_active), incarnation-qualified for the
+  /// append-only EXCLUSION: the OWN-REPLICA legs are restricted to the replicas bound to
+  /// `generation`, and the two CROSS-GROUP legs are asked whole.
+  ///
+  /// The split is where attribution exists. A freeze, a park, an abandoned obligation, or an
+  /// unapplied merge admin entry all live on a REPLICA, so each belongs to the incarnation that
+  /// replica speaks for — and letting one incarnation's choreography retire a coexisting one's
+  /// phantom-quorum coverage is the gap this closes. The cross-group legs name an ID and not an
+  /// incarnation (another group's park names `gid` as its absorb source; the embedder's freeze book
+  /// names `gid` as a target), so nothing there is attributable, and guessing would only WEAKEN an
+  /// exclusion the oracle depends on. Those stay unrestricted.
+  pub(crate) fn merge_choreography_active_at(&self, gid: u64, generation: u64) -> bool {
+    self.own_replica_choreography(gid, Some(generation)) || self.foreign_choreography(gid)
+  }
+
+  /// The choreography legs carried by `gid`'s OWN replicas — every replica when `generation` is
+  /// `None`, else only those bound to it.
+  fn own_replica_choreography(&self, gid: u64, generation: Option<u64>) -> bool {
     for node in &self.node_ids {
+      if generation.is_some_and(|g| self.replica_gen_of(*node, gid) != g) {
+        continue;
+      }
       if let Some(ep) = self.hosts[node].group(&gid) {
         if ep.merge_freeze_active() || ep.pending_merge().is_some() || ep.has_abandoned() {
           return true;
@@ -1201,6 +1268,12 @@ impl MultiWorld {
         }
       }
     }
+    false
+  }
+
+  /// The choreography legs carried by OTHER groups naming `gid` — unattributable to any one
+  /// incarnation of it, so never restricted.
+  fn foreign_choreography(&self, gid: u64) -> bool {
     let mut gid_bytes = Vec::new();
     sailing_proto::Data::encode(&gid, &mut gid_bytes);
     for node in &self.node_ids {
