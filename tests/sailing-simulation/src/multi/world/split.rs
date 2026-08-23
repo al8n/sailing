@@ -2,12 +2,14 @@
 //! wiring of the reshaping machinery.
 //!
 //! The world plays the DRIVER's role from the reactor choreography: [`MultiWorld::propose_split`]
-//! delegates to the container's gate stack, the per-tick fork pump drains
-//! `MultiRaft::poll_pending_fork` into `create_group_from_fork` materializations (sync stores
-//! make each baseline durable at the call, so the barrier lifts immediately — the one-crank
-//! engine-flush contract collapsed to its synchronous form), and the FIRST materialization of a
-//! child REGISTERS it in the harness catalog (checker, registry entry, key population, the
-//! conservation pair).
+//! delegates to the container's gate stack, the per-tick fork pump runs the drivers' own
+//! `peek_yieldable_fork` → `install_yieldable_fork` pair (sync stores make each baseline durable at
+//! the call, so the barrier lifts immediately — the one-crank engine-flush contract collapsed to
+//! its synchronous form), and the FIRST materialization of a child REGISTERS it in the harness
+//! catalog (checker, registry entry, key population, the conservation pair).
+//!
+//! The forked half NEVER leaves the container, so the world reads it where it lands: the installed
+//! child's own state machine, pinned lossless against its snapshot round-trip at the install site.
 //!
 //! # Key populations and the conservation ledger
 //!
@@ -166,7 +168,7 @@ impl MultiWorld {
       // seams answer one floor for this id on this node.
       let husk_floors = self.embedder_husk_floors(node);
       loop {
-        let polled = {
+        let peeked = {
           let gate = NodeGate {
             node,
             logs: &self.logs,
@@ -176,9 +178,11 @@ impl MultiWorld {
             husk_floors: &husk_floors,
           };
           let host = self.hosts.get_mut(&node).expect("host exists");
-          host.poll_pending_fork_with(&gate)
+          host
+            .peek_yieldable_fork(&gate)
+            .map(|fork| ForkPlan::from_view(&fork))
         };
-        let Some(fork) = polled else {
+        let Some(plan) = peeked else {
           break;
         };
         progressed = true;
@@ -195,11 +199,11 @@ impl MultiWorld {
         // FIRST confirmation only. The purge is idempotent by itself, but a merge into the parent
         // between two hosts' drains can legitimately anchor a key at or above the point — a
         // reacquisition — and a second pass would strip that new anchor away.
-        if !self.partitioned_splits.contains(fork.child())
-          && let Some(point) = self.pending_splits.get(fork.child()).map(|p| p.point)
+        if !self.partitioned_splits.contains(&plan.child)
+          && let Some(point) = self.pending_splits.get(&plan.child).map(|p| p.point)
         {
-          self.partitioned_splits.insert(*fork.child());
-          if let Some(meta) = self.groups.get_mut(fork.parent()) {
+          self.partitioned_splits.insert(plan.child);
+          if let Some(meta) = self.groups.get_mut(&plan.parent) {
             for (_, values) in &mut meta.fold_baselines {
               values.retain(|key, _| *key < point);
             }
@@ -208,12 +212,31 @@ impl MultiWorld {
         }
         // Both the retirement and the floor arms moved INTO the container, reached through the
         // catalog gate: a retired id holds the fork, a below-floor generation abandons it. What
-        // reaches here has passed both, so this is the MATERIALIZE arm — it wires the child HERE — exact knowledge that the fork resolved, no
-        // inference: clear its fence right at the wire (#110).
-        let (materialized_parent, materialized_child) = (*fork.parent(), *fork.child());
-        self.register_split_child(&fork);
-        self.wire_fork_replica(node, fork);
-        self.clear_fork_fence(node, materialized_parent, materialized_child);
+        // reaches here has passed both, so this is the MATERIALIZE arm — it installs the child
+        // HERE, which is exact knowledge that the fork resolved, no inference: clear its fence
+        // right at the wire (#110).
+        //
+        // THE ORDER IS THE PORT. The forked half never leaves the container, so the world can only
+        // read it where it LANDS — the installed child's own state machine. Wire first, register
+        // the expectations off the landed record second.
+        let inherited = self.install_fork_replica(node, &plan, &husk_floors);
+        self.register_split_child(&plan, &inherited);
+        self.clear_fork_fence(node, plan.parent, plan.child);
+      }
+      // THE GUARD ADVANCES EVERY CONSUMPTION OWES, mirrored where a real driver mirrors them: in
+      // its fork drain, every crank, beside the writes that drain was already making. The world
+      // used to drain this queue only at a removal, which was enough while the removal-time
+      // abandonment was its only producer — a redundant fold produces one too, and mirroring it a
+      // teardown later leaves a restart in between restoring below the guard the container had
+      // already moved.
+      let advances: Vec<(u64, u64)> = {
+        let host = self.hosts.get_mut(&node).expect("host exists");
+        core::iter::from_fn(|| host.poll_relay_guard_advance()).collect()
+      };
+      for (parent, generation) in advances {
+        progressed = true;
+        let e = self.relayed_lineage.entry((node, parent)).or_insert(0);
+        *e = (*e).max(generation);
       }
       // TERMINAL refusals: the container abandoned these deliberately, its own `resolve_fork`
       // already lifting the parent's fence. The world still clears its #110 fence record, which
@@ -307,25 +330,29 @@ impl MultiWorld {
   /// one the registry now holds, and it needs its own expectations rather than the successor's.
   /// Keying on the id alone silently gave it the successor's — the misattribution that reads its
   /// legally inherited cells as a cross-group leak.
-  fn register_split_child(&mut self, fork: &sailing_proto::GroupFork<u64, u64, LogSm>) {
-    if self.meta_at(*fork.child(), fork.child_gen()).is_some() {
+  fn register_split_child(
+    &mut self,
+    fork: &ForkPlan,
+    inherited: &[(sailing_proto::Index, bytes::Bytes)],
+  ) {
+    if self.meta_at(fork.child, fork.child_gen).is_some() {
       // This incarnation's expectations already exist — a sibling node materialized the same fork,
       // or the id moved on and left them archived. Only the replica wiring remains, but the island
       // case needs one more thing: a LIVE checker. The retirement froze this incarnation's, and a
       // frozen archive judges NOTHING, so an island would otherwise be hosted and unjudged.
-      self.revive_incarnation_checker(*fork.child(), fork.child_gen());
+      self.revive_incarnation_checker(fork.child, fork.child_gen);
       return;
     }
-    let Some(pending) = self.pending_splits.remove(fork.child()) else {
+    let Some(pending) = self.pending_splits.remove(&fork.child) else {
       // The proposal record is consumed by the FIRST incarnation this child registers at. A later
       // fork at a DIFFERENT incarnation of the same id has no record of its own left to take, and
       // it is not the shape the conservation pair describes — register its expectations from the
       // fork itself and leave the ledger alone.
-      self.register_split_island(fork);
+      self.register_split_island(fork, inherited);
       return;
     };
     let parent_led = Self::ledger_id(self.generation_of(pending.parent), pending.parent);
-    let child_led = Self::ledger_id(fork.child_gen(), *fork.child());
+    let child_led = Self::ledger_id(fork.child_gen, fork.child);
     // The conservation ASSIGNMENT follows the instruction rule, not the population snapshot:
     // `LogSm::split` moves EXACTLY the at-or-above-point cells of the parent's record, which
     // can include keys the propose-time population no longer carried — an earlier
@@ -337,12 +364,12 @@ impl MultiWorld {
     // the population slice keeps assigned-but-never-written keys judged. The WRITABLE
     // population stays the propose-time slice: parked keys remain unroutable.
     let mut assigned = pending.child_keys.clone();
-    assigned.extend(fork.fsm().applied().iter().filter_map(|(_, cmd)| {
+    assigned.extend(inherited.iter().filter_map(|(_, cmd)| {
       super::super::decode_gkv(cmd)
         .map(|(_, key, _)| key)
         .filter(|key| *key >= pending.point)
     }));
-    let voters: BTreeSet<u64> = fork.config().voters().iter().copied().collect();
+    let voters: BTreeSet<u64> = fork.voters.iter().copied().collect();
     // The child's GENESIS fold anchor (see [`lifecycle::GroupMeta::fold_baselines`]): the
     // inherited cells keep the PARENT's log indices and the PARENT's tag, so neither the child's
     // index-bounded reconstruction nor its tag filter can reach them — yet they are the child's
@@ -352,7 +379,7 @@ impl MultiWorld {
     // anchor uses — and, symmetrically with it, over the SPLICED content itself, so the map's
     // keys are exactly what physically arrived here and nothing wider.
     let mut genesis: BTreeMap<u16, u64> = BTreeMap::new();
-    for (_, cmd) in fork.fsm().applied() {
+    for (_, cmd) in inherited {
       if let Some((_, key, value)) = super::super::decode_gkv(cmd) {
         let slot = genesis.entry(key).or_default();
         *slot = (*slot).max(value);
@@ -373,11 +400,11 @@ impl MultiWorld {
       })
       .unwrap_or_default();
     self.install_incarnation_meta(
-      *fork.child(),
-      fork.child_gen(),
+      fork.child,
+      fork.child_gen,
       lifecycle::GroupMeta {
         voters,
-        generation: fork.child_gen(),
+        generation: fork.child_gen,
         carried_tags,
         keys: pending.child_keys.clone(),
         // Every replica of this incarnation opens with the same inherited record, whichever
@@ -387,7 +414,7 @@ impl MultiWorld {
         // snapshot-wired latecomer. Group-level here is what keeps the cross-talk floor
         // independent of HOW a replica arrived (see `cross_talk_sweep` for why the count
         // stays sound once onward splits shrink the inherited prefix).
-        fork_baseline: fork.fsm().applied().len(),
+        fork_baseline: inherited.len(),
         fold_baselines: if genesis.is_empty() {
           Vec::new()
         } else {
@@ -406,15 +433,15 @@ impl MultiWorld {
     assert!(
       self
         .checkers
-        .insert((*fork.child(), fork.child_gen()), checker)
+        .insert((fork.child, fork.child_gen), checker)
         .is_none(),
       "register_split_child: child {} gen {} already had a checker",
-      fork.child(),
-      fork.child_gen()
+      fork.child,
+      fork.child_gen
     );
     self.splits_applied += 1;
     self.splits.insert(
-      *fork.child(),
+      fork.child,
       SplitRecord {
         parent_led,
         child_led,
@@ -457,19 +484,23 @@ impl MultiWorld {
   /// from the fork alone. No conservation pair is registered — the partition this fork carries was
   /// already accounted when the ledger's pair was created, and a second pair would demand the same
   /// cells twice.
-  fn register_split_island(&mut self, fork: &sailing_proto::GroupFork<u64, u64, LogSm>) {
+  fn register_split_island(
+    &mut self,
+    fork: &ForkPlan,
+    inherited: &[(sailing_proto::Index, bytes::Bytes)],
+  ) {
     let carried: BTreeSet<u64> = self
       .groups
-      .get(fork.parent())
+      .get(&fork.parent)
       .map(|m| {
         let mut t = m.carried_tags.clone();
-        t.insert(*fork.parent());
+        t.insert(fork.parent);
         t
       })
       .unwrap_or_default();
     let mut genesis: BTreeMap<u16, u64> = BTreeMap::new();
     let mut keys: BTreeSet<u16> = BTreeSet::new();
-    for (_, cmd) in fork.fsm().applied() {
+    for (_, cmd) in inherited {
       if let Some((_, key, value)) = super::super::decode_gkv(cmd) {
         let slot = genesis.entry(key).or_default();
         *slot = (*slot).max(value);
@@ -477,14 +508,14 @@ impl MultiWorld {
       }
     }
     self.install_incarnation_meta(
-      *fork.child(),
-      fork.child_gen(),
+      fork.child,
+      fork.child_gen,
       lifecycle::GroupMeta {
-        voters: fork.config().voters().iter().copied().collect(),
-        generation: fork.child_gen(),
+        voters: fork.voters.iter().copied().collect(),
+        generation: fork.child_gen,
         carried_tags: carried,
         keys,
-        fork_baseline: fork.fsm().applied().len(),
+        fork_baseline: inherited.len(),
         fold_baselines: if genesis.is_empty() {
           Vec::new()
         } else {
@@ -493,66 +524,115 @@ impl MultiWorld {
         ..lifecycle::GroupMeta::default()
       },
     );
-    self.revive_incarnation_checker(*fork.child(), fork.child_gen());
+    self.revive_incarnation_checker(fork.child, fork.child_gen);
   }
 
-  /// Materialize one fork on `node`: fresh stores, the manufactured snapshot install through
-  /// `create_group_from_fork`, the world's per-replica bookkeeping, and the barrier lift (sync
-  /// stores make the baseline durable at the call). Deliberately NO oracle-view seeding here:
-  /// the aligned view is a pure content rule ([`align_record`](Self::align_record)), the
-  /// cross-talk floor derives from the group registration record (`GroupMeta::fork_baseline`),
-  /// and the conservation recorder starts at 0 so the baseline is observed as the child's
-  /// opening history — a snapshot-wired latecomer gets the identical treatment without ever
-  /// passing through this path.
-  fn wire_fork_replica(&mut self, node: u64, fork: sailing_proto::GroupFork<u64, u64, LogSm>) {
-    let child = *fork.child();
+  /// Install one fork on `node` and return the record the child LANDED with — the world's only
+  /// view of the forked half, because the half never leaves the container. The container makes the
+  /// child's stores and mints its boot epoch inside the call (occupancy is a decision-time fact, so
+  /// creating the storage first would hold the fork against its own install); this adds the
+  /// per-replica bookkeeping around it and lifts the barrier, which sync stores make durable at the
+  /// call. Deliberately NO oracle-view seeding here: the aligned view is a pure content rule
+  /// ([`align_record`](Self::align_record)), the cross-talk floor derives from the group
+  /// registration record (`GroupMeta::fork_baseline`), and the conservation recorder starts at 0 so
+  /// the baseline is observed as the child's opening history — a snapshot-wired latecomer gets the
+  /// identical treatment without ever passing through this path.
+  fn install_fork_replica(
+    &mut self,
+    node: u64,
+    fork: &ForkPlan,
+    husk_floors: &BTreeSet<u64>,
+  ) -> Vec<(sailing_proto::Index, bytes::Bytes)> {
+    let child = fork.child;
     // Record the parent's DURABLE relay lineage on this node — mirroring a real driver's
-    // `engine.set_group_gen(&parent, fork.parent_gen_after())` in its fork drain — so a later restart
+    // `engine.set_group_gen(&parent, parent_gen_after)` in its fork drain — so a later restart
     // restores the container's relay guard past this now-materialized fork (see `relayed_lineage`).
     {
-      let e = self
-        .relayed_lineage
-        .entry((node, *fork.parent()))
-        .or_insert(0);
-      *e = (*e).max(fork.parent_gen_after());
+      let e = self.relayed_lineage.entry((node, fork.parent)).or_insert(0);
+      *e = (*e).max(fork.parent_gen_after);
     }
-    // Fresh stores in the world's configured mode (async under the merge profiles), so a fork-born
-    // child's stores match every other replica's rather than silently reverting to synchronous.
-    let (fresh_log, fresh_stable) = self.fresh_stores(node, child);
-    self.logs.insert((node, child), fresh_log);
-    self.stables.insert((node, child), fresh_stable);
-    self.configs.insert((node, child), fork.config().clone());
+    let (split_at, installed_config) = {
+      let mut engine = NodeEngine {
+        node,
+        logs: &mut self.logs,
+        stables: &mut self.stables,
+        boot_epochs: &mut self.boot_epochs,
+        merge_floors: &self.merge_floors,
+        removal_floors: &self.removal_floors,
+        husk_floors,
+        store_mode: self.store_mode,
+        seed: self.seed,
+      };
+      // The per-node tombstone is embedder state no storage engine holds, so it rides in as the
+      // install's `extra` gate — exactly the coordinators' `retired` augmentation.
+      let tombstones = TombstoneGate {
+        node,
+        host_tombstones: &self.host_tombstones,
+      };
+      let outcome = self
+        .hosts
+        .get_mut(&node)
+        .expect("host exists")
+        .install_yieldable_fork(
+          &fork.parent,
+          &child,
+          &mut engine,
+          &tombstones,
+          self.now,
+          self.seed ^ node,
+        );
+      match outcome {
+        sailing_proto::InstallOutcome::Installed {
+          split_index,
+          config,
+          ..
+        } => (split_index, config),
+        other => panic!("fork of group {child} on node {node} did not install: {other:?}"),
+      }
+    };
+    // THE CONFIG THE CONTAINER INSTALLED, not the one it derived the plan from: the install applies
+    // `reshape_born_prevention` on the way in, so recording the untransformed one would restart this
+    // replica with pre-vote and check-quorum OFF while its peers keep them on.
+    self.configs.insert((node, child), installed_config);
     self.member_view.insert((node, child), true);
     // A fork-born replica speaks for the incarnation the SPLIT named, not for whatever the registry
     // holds now: a fork that materializes late lands as its own (possibly superseded) incarnation,
     // and binding the registry here would silently promote it into the successor's identity.
-    self.replica_gen.insert((node, child), fork.child_gen());
+    self.replica_gen.insert((node, child), fork.child_gen);
     self.host_tombstones.remove(&(node, child));
     *self.restarts.entry((node, child)).or_insert(0) += 1;
-    // The fork boots at the node's next boot epoch (strictly above every prior incarnation on
-    // this node, and >= 1 as the manufactured baseline requires).
-    let epoch = {
-      let e = self.boot_epochs.entry(node).or_insert(0);
-      *e += 1;
-      *e
+    self
+      .hosts
+      .get_mut(&node)
+      .expect("host exists")
+      .lift_fork_barrier(&fork.parent, split_at);
+
+    // THE LANDED HALF, and the pin that makes reading it here equivalent to reading the fork's own
+    // copy. The child was restored from `encode(half.snapshot())`, so the two agree exactly as long
+    // as `LogSm`'s snapshot round-trip is lossless — and `fork_baseline` is a COUNT over this record
+    // while `genesis` is a per-key MAX over it, so a lossy encode would shift the oracle's floors
+    // silently instead of failing. Assert it rather than assume it.
+    let sm = self
+      .hosts
+      .get(&node)
+      .expect("host exists")
+      .group(&child)
+      .expect("the fork just installed")
+      .state_machine();
+    let inherited = sm.applied().to_vec();
+    let round_trip = {
+      let blob = sailing_proto::StateMachine::snapshot(sm).expect("the sim FSM always snapshots");
+      let mut vessel = LogSm::default();
+      sailing_proto::StateMachine::restore(&mut vessel, blob)
+        .expect("the sim FSM restores its own snapshot");
+      vessel.applied().to_vec()
     };
-    // THE SEALED DOOR, handed the fork WHOLE: the container destructures it internally, so the
-    // child id, the half, the blob and the provenance token that reach the baseline are exactly
-    // the ones it minted. The bookkeeping this host still needs is read off accessors first.
-    let (parent, split_at) = (*fork.parent(), fork.split_index());
-    let log = self.logs.get_mut(&(node, child)).expect("fresh log");
-    let stable = self.stables.get_mut(&(node, child)).expect("fresh stable");
-    self
-      .hosts
-      .get_mut(&node)
-      .expect("host exists")
-      .create_group_from_relayed_fork(fork, self.now, self.seed ^ node, epoch, log, stable)
-      .unwrap_or_else(|e| panic!("fork of group {child} on node {node}: {e:?}"));
-    self
-      .hosts
-      .get_mut(&node)
-      .expect("host exists")
-      .lift_fork_barrier(&parent, split_at);
+    assert_eq!(
+      round_trip, inherited,
+      "group {child} on node {node}: the FSM snapshot round-trip is lossy, so the oracle's \
+       fork baseline and genesis anchor would silently disagree with the record that landed"
+    );
+    inherited
   }
 
   /// The ORACLE-ALIGNED applied record for `(node, gid)`:
@@ -571,9 +651,17 @@ impl MultiWorld {
   /// included, and every husk replica of the lineage aligns against the SAME set — views still differ
   /// only by watermark. This heals the aligned consumer (`agreement_holds`' non-absorbed positional
   /// branch for plain-source husks) at one seam.
-  pub(super) fn aligned_applied(&self, node: u64, gid: u64) -> AppliedLog {
+  ///
+  /// The population is `generation`'s OWN — [`meta_at`](Self::meta_at) resolves it live or
+  /// archived — never whatever incarnation the registry currently holds. A late fork lands as its
+  /// own superseded incarnation beside a live successor, and the two own different key sets:
+  /// aligning the island against the successor's population drops cells the island legally owns
+  /// and keeps cells it never did, both silently. Callers walking hosts pass the REPLICA's bound
+  /// generation ([`replica_gen_of`](Self::replica_gen_of)); callers judging one named incarnation
+  /// pass that one, having already filtered the walk to it.
+  pub(super) fn aligned_applied(&self, node: u64, gid: u64, generation: u64) -> AppliedLog {
     let raw = self.applied_of(node, gid);
-    match self.groups.get(&gid) {
+    match self.meta_at(gid, generation) {
       Some(meta) => {
         let population = match &meta.terminal_keys {
           Some(terminal) if meta.keys.is_empty() => terminal,
@@ -634,10 +722,22 @@ impl MultiWorld {
   /// watermark sat within one settle window, and a crash restore resurrects moved cells a
   /// pre-crash sweep never met — both skip real cells forever. The world already pays O(record)
   /// per replica sweep to clone the record, so the walk adds no asymptotic cost.
-  pub(super) fn conserve_sweep(&mut self, gid: u64) {
-    let led = Self::ledger_id(self.generation_of(gid), gid);
+  ///
+  /// ONE INCARNATION per sweep. The ledger id is built from `generation`, and the walk keeps only
+  /// the replicas BOUND to it: a late fork's island holds the dead incarnation's cells, and
+  /// recording them under the registry's current generation files them as the SUCCESSOR's history.
+  /// That is a live false positive, not bookkeeping noise — an onward split off the successor takes
+  /// that ledger id as its `parent_led`, and the finalizer then demands the grandchild's record open
+  /// with cells the island never handed it. Every hosted replica still faces a sweep: `check_now`
+  /// runs one per LIVE checker key, and every incarnation that can host has one (a recreation
+  /// installs it, a materializing island revives it).
+  pub(super) fn conserve_sweep(&mut self, gid: u64, generation: u64) {
+    let led = Self::ledger_id(generation, gid);
     for node in self.node_ids.clone() {
       if !self.hosts[&node].contains_group(&gid) {
+        continue;
+      }
+      if self.replica_gen_of(node, gid) != generation {
         continue;
       }
       let applied = self.applied_of(node, gid);
@@ -749,6 +849,159 @@ impl MultiWorld {
       );
       drop(ctx); // no panic: disarm silently
     }
+  }
+}
+
+/// Everything the world needs off a peeked [`ForkView`](sailing_proto::ForkView), copied out so the
+/// container's borrow ends before the install. The forked half is deliberately absent: it never
+/// leaves the container, and the world reads it off the child that lands.
+struct ForkPlan {
+  parent: u64,
+  child: u64,
+  child_gen: u64,
+  parent_gen_after: u64,
+  voters: Vec<u64>,
+}
+
+impl ForkPlan {
+  fn from_view(view: &sailing_proto::ForkView<'_, u64, u64>) -> Self {
+    Self {
+      parent: *view.parent(),
+      child: *view.child(),
+      child_gen: view.child_gen(),
+      parent_gen_after: view.parent_gen_after(),
+      // The VOTERS are all the world needs off the peeked config; the config it RECORDS is the one
+      // the install hands back, which is the transformed one the child actually booted with.
+      voters: view.config().voters().to_vec(),
+    }
+  }
+}
+
+/// The per-node TOMBSTONE, handed to the install as its `extra` gate: embedder state no storage
+/// engine holds, exactly as the coordinators' `retired` set is. A tombstone is a window — a later
+/// `clear_tombstone` lifts it — so it HOLDS the fork and never floors it.
+struct TombstoneGate<'a> {
+  node: u64,
+  host_tombstones: &'a BTreeSet<(u64, u64)>,
+}
+
+impl sailing_proto::ForkGate<u64> for TombstoneGate<'_> {
+  fn contains_group(&self, gid: &u64) -> bool {
+    self.host_tombstones.contains(&(self.node, *gid))
+  }
+
+  fn floor(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
+/// The world's per-node storage as the container's [`MultiEngine`](sailing_proto::MultiEngine)
+/// seam — what the fork install makes the child's stores and mints its boot epoch through.
+/// Occupancy and floors answer exactly what [`NodeGate`] answers off the same maps for the same id
+/// on the same node; only the tombstone is elsewhere (see [`TombstoneGate`]). New storage goes
+/// through the world's own [`fresh_stores`](MultiWorld::fresh_stores) chokepoint, so a fork-born
+/// child's stores match every other replica's rather than silently reverting to synchronous.
+struct NodeEngine<'a> {
+  node: u64,
+  logs: &'a mut BTreeMap<(u64, u64), crate::MemLog>,
+  stables: &'a mut BTreeMap<(u64, u64), crate::MemStable<u64>>,
+  /// The world's per-NODE monotone boot-epoch counter: strictly above every prior incarnation on
+  /// this node, and `>= 1` as the manufactured baseline requires.
+  boot_epochs: &'a mut BTreeMap<u64, u64>,
+  merge_floors: &'a BTreeSet<(u64, u64)>,
+  removal_floors: &'a BTreeMap<u64, u64>,
+  husk_floors: &'a BTreeSet<u64>,
+  store_mode: crate::StoreMode,
+  seed: u64,
+}
+
+impl sailing_proto::GroupStores<u64, crate::MemLog, crate::MemStable<u64>> for NodeEngine<'_> {
+  fn stores(&mut self, group: &u64) -> Option<(&mut crate::MemLog, &mut crate::MemStable<u64>)> {
+    let log = self.logs.get_mut(&(self.node, *group))?;
+    let stable = self.stables.get_mut(&(self.node, *group))?;
+    Some((log, stable))
+  }
+}
+
+impl sailing_proto::FloorStore<u64> for NodeEngine<'_> {
+  fn floor(&self, gid: &u64) -> u64 {
+    if self.merge_floors.contains(&(self.node, *gid)) || self.husk_floors.contains(gid) {
+      return sailing_proto::MERGED_FLOOR;
+    }
+    self.removal_floors.get(gid).copied().unwrap_or(0)
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
+impl sailing_proto::MultiEngine<u64, u64> for NodeEngine<'_> {
+  type Log = crate::MemLog;
+  type Stable = crate::MemStable<u64>;
+
+  fn set_snapshot_staging_cap(&mut self, _cap: usize) {}
+
+  fn group_ids(&self) -> impl Iterator<Item = &u64> {
+    self
+      .logs
+      .keys()
+      .filter(|(n, _)| *n == self.node)
+      .map(|(_, gid)| gid)
+  }
+
+  // The world drives its stores directly and re-derives its own lineage records, so the batching
+  // metrics, the visibility barrier and the lineage legs are inert here.
+  fn barriers(&self) -> u64 {
+    0
+  }
+
+  fn ops_batched(&self) -> u64 {
+    0
+  }
+
+  fn has_staged(&self) -> bool {
+    false
+  }
+
+  fn flush(&mut self) -> usize {
+    0
+  }
+
+  fn add_group(&mut self, gid: u64) -> bool {
+    if self.logs.contains_key(&(self.node, gid)) {
+      return false;
+    }
+    let (log, stable) = MultiWorld::fresh_stores_in(self.store_mode, self.seed, self.node, gid);
+    self.logs.insert((self.node, gid), log);
+    self.stables.insert((self.node, gid), stable);
+    true
+  }
+
+  fn remove_group(&mut self, gid: &u64) -> bool {
+    self.stables.remove(&(self.node, *gid));
+    self.logs.remove(&(self.node, *gid)).is_some()
+  }
+
+  fn contains_group(&self, gid: &u64) -> bool {
+    self.logs.contains_key(&(self.node, *gid))
+  }
+
+  fn next_boot_epoch(&mut self, gid: &u64) -> Option<u64> {
+    if !self.logs.contains_key(&(self.node, *gid)) {
+      return None;
+    }
+    let epoch = self.boot_epochs.entry(self.node).or_default();
+    *epoch = epoch.checked_add(1)?;
+    Some(*epoch)
+  }
+
+  fn set_group_floor(&mut self, _gid: &u64, _floor: u64) {}
+
+  fn set_group_gen(&mut self, _gid: &u64, _generation: u64) {}
+
+  fn removal_floor(&self, _gid: &u64) -> u64 {
+    0
   }
 }
 

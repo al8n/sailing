@@ -55,3 +55,6 @@ mod conservation;
 // same-token retry) the pure-container world cannot construct with its fresh-child-id verbs.
 #[cfg(test)]
 mod lineage_scenarios;
+
+mod engine;
+pub(crate) use engine::PairEngine;

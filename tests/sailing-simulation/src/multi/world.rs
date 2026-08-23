@@ -139,7 +139,7 @@ pub struct MultiWorld {
   /// Per-`(node, parent)` DURABLE relay lineage — the max `parent_gen_after` of the parent's forks
   /// this node has MATERIALIZED. The container's live relay guard is reset to the (possibly
   /// lagging) durable snapshot meta on restart, so — exactly as a real driver restores it from
-  /// `engine.group_gen` (bumped in its fork drain) via `raise_relay_guard` — the restore path feeds
+  /// the engine's `FloorStore::lineage` (bumped in its fork drain) via `raise_relay_guard` — the restore path feeds
   /// this back so a replayed split folds to a duplicate no-op instead of re-materializing (or, now,
   /// PARKING against) an already-relayed child.
   relayed_lineage: BTreeMap<(u64, u64), u64>,
@@ -466,10 +466,22 @@ impl MultiWorld {
   /// decorrelate; the seed only governs the pre-`reroll_storage` window, since installing a fault
   /// rate reseeds the store's fault PRNG.
   fn fresh_stores(&self, node: u64, gid: u64) -> (MemLog, MemStable<u64>) {
-    if self.store_mode.is_async() {
+    Self::fresh_stores_in(self.store_mode, self.seed, node, gid)
+  }
+
+  /// The chokepoint's body, over the two world fields it actually reads — so the fork install's
+  /// engine seam, which owns the store maps and cannot hold a `&self` beside them, creates the
+  /// child's stores through THIS function rather than a second copy of the rule.
+  pub(super) fn fresh_stores_in(
+    mode: crate::StoreMode,
+    seed: u64,
+    node: u64,
+    gid: u64,
+  ) -> (MemLog, MemStable<u64>) {
+    if mode.is_async() {
       (
-        MemLog::new_async(self.seed ^ node ^ gid.rotate_left(32)),
-        MemStable::new_async(self.seed.rotate_left(32) ^ node ^ gid.rotate_left(32)),
+        MemLog::new_async(seed ^ node ^ gid.rotate_left(32)),
+        MemStable::new_async(seed.rotate_left(32) ^ node ^ gid.rotate_left(32)),
       )
     } else {
       (MemLog::new(), MemStable::new())
@@ -524,6 +536,16 @@ impl MultiWorld {
   /// `is_member` seeds the RemovedSelf transition tracker: `true` for a bootstrap voter (its
   /// founding config lists it), `false` for a catching-up observer (its own AddNode is still
   /// ahead of it in the log).
+  /// The prevention knobs `gid`'s existing replicas carry, if it has any — the agreement source
+  /// [`wire_replica`](Self::wire_replica) derives a late replica's config from.
+  fn live_prevention_knobs(&self, gid: u64) -> Option<(bool, bool)> {
+    self
+      .configs
+      .iter()
+      .find(|((_, g), _)| *g == gid)
+      .map(|(_, c)| (c.pre_vote(), c.check_quorum()))
+  }
+
   fn wire_replica(&mut self, node: u64, gid: u64, config: Config<u64>, is_member: bool) {
     // The snapshot-threshold override lands HERE — the one chokepoint every replica-construction
     // path funnels through (create/recreate/observer/resurrect), and crash restores inherit it
@@ -539,6 +561,19 @@ impl MultiWorld {
     let config = config
       .with_pre_vote(self.pre_vote)
       .with_check_quorum(self.check_quorum);
+    // EVERY REPLICA OF ONE GROUP CARRIES ONE SET OF PREVENTION KNOBS — the container forces them on
+    // for a fork-born child (`reshape_born_prevention`, applied identically on every replica), and
+    // production wires a later replica of such an id through the same derivation at its factory
+    // gate. This path has only the PROFILE's defaults to build from, so it takes the knobs off a
+    // replica the group already has instead. Without it a fork child's late replica arrives with
+    // pre-vote off, campaigns with real votes at a climbing term, and its check-quorum peers refuse
+    // to adopt that term — a live replica that never rejoins its own group.
+    let config = match self.live_prevention_knobs(gid) {
+      Some((pre_vote, check_quorum)) => config
+        .with_pre_vote(pre_vote)
+        .with_check_quorum(check_quorum),
+      None => config,
+    };
     // Fresh stores in the world's configured mode (async for the merge profiles' fsync-loss
     // window). Built before the host borrow so it never straddles the `&self` `fresh_stores` read.
     let (log, stable) = self.fresh_stores(node, gid);
@@ -672,7 +707,9 @@ impl MultiWorld {
       .node_ids
       .iter()
       .filter(|n| self.hosts[n].contains_group(&gid))
-      .map(|&n| self.aligned_applied(n, gid))
+      // Each replica aligns under the incarnation it is BOUND to: its own population is what
+      // decides which of its cells the comparison space keeps.
+      .map(|&n| self.aligned_applied(n, gid, self.replica_gen_of(n, gid)))
       .collect();
     let longest = logs.iter().map(Vec::len).max().unwrap_or(0);
     for k in 0..longest {
@@ -835,8 +872,8 @@ impl MultiWorld {
         .or_default()
         .clear();
       self.cross_talk_sweep(gid, generation);
-      self.conserve_sweep(gid);
-      self.lineage_sweep(gid);
+      self.conserve_sweep(gid, generation);
+      self.lineage_sweep(gid, generation);
     }
   }
 
@@ -846,8 +883,21 @@ impl MultiWorld {
   /// replica is a reaped non-participant (the `leader_of`/quorum-denominator rule), so it is not a
   /// witness here either. Installs are fed separately at the `SnapshotInstalled` event (the chimera
   /// decision point). Pure observer — reads only public accessors and world bookkeeping.
-  fn lineage_sweep(&mut self, gid: u64) {
-    let (seed, tick, generation) = (self.seed, self.tick_count, self.generation_of(gid));
+  ///
+  /// The CONTENT leg is scoped to `generation`, because the ledger keys both of its per-replica
+  /// maps on the incarnation: committed content by `(gid, generation, lineage, index)` and the
+  /// replica's own live lineage by `(node, gid, generation)`. The INSTALL leg already stamps the
+  /// replica's BOUND generation (`replica_gen_of`, read at the `SnapshotInstalled` event), so
+  /// reading the registry's current one here filed ONE replica's content and its installs under two
+  /// different identities — and the chimera leg reads exactly that pairing, so a late fork's island
+  /// would present to an install as a pristine adopter holding no committed lineage of its own.
+  /// The WEDGE leg stays gid-scoped on purpose — a
+  /// leader, its peer progress, and a transfer's reachability are container-level facts with no
+  /// incarnation to filter on — and it re-presents the same cursor harmlessly when an id carries two
+  /// live checkers, because progress is judged against the observation TICK, which does not move
+  /// between the two calls.
+  fn lineage_sweep(&mut self, gid: u64, generation: u64) {
+    let (seed, tick) = (self.seed, self.tick_count);
     let nodes = self.node_ids.clone();
     // Content + phantom-quorum: only for a group whose FSM applied record is APPEND-ONLY, and
     // collect first (immutable reads) before feeding (mutates the ledger). A MERGE absorb re-bases
@@ -859,7 +909,7 @@ impl MultiWorld {
     // cells from the aligned record and re-tags inherited cells under the CHILD's DISTINCT lineage
     // key. One-gid-one-lineage holds in the world, so the lineage key never partitions here — its
     // teeth are the two-lineage squatter scenario, which feeds the ledger directly.
-    if self.record_is_append_only(gid) {
+    if self.record_is_append_only(gid, generation) {
       let mut content: Vec<(u64, Option<ForkId>, AppliedLog)> = Vec::new();
       for &node in &nodes {
         if self.parked.contains(&(node, gid)) {
@@ -868,8 +918,11 @@ impl MultiWorld {
         let Some(ep) = self.hosts[&node].group(&gid) else {
           continue;
         };
+        if self.replica_gen_of(node, gid) != generation {
+          continue;
+        }
         let lineage = ep.fork_id();
-        content.push((node, lineage, self.aligned_applied(node, gid)));
+        content.push((node, lineage, self.aligned_applied(node, gid, generation)));
       }
       for (node, lineage, applied) in &content {
         self.lineage.observe_content(
@@ -925,16 +978,24 @@ impl MultiWorld {
     }
   }
 
-  /// Whether `gid`'s FSM applied record is APPEND-ONLY this instant — the precondition for the
-  /// lineage ledger's per-index phantom-quorum leg (see `lineage_sweep`). A merge (freeze, park,
-  /// absorb, or a merged-away husk) re-bases or folds records non-monotonically, so `(index →
-  /// bytes)` stops being a stable committed history; a split is phantom-safe and is NOT excluded.
-  fn record_is_append_only(&self, gid: u64) -> bool {
-    !(self.group_absorbed(gid)
-      || self.is_merged(gid)
-      || self.group_frozen(gid)
-      || self.merge_choreography_active(gid)
-      || self.group_merge_parked(gid))
+  /// Whether the record of `gid`'s incarnation `generation` is APPEND-ONLY this instant — the
+  /// precondition for the lineage ledger's per-index phantom-quorum leg (see `lineage_sweep`). A
+  /// merge (freeze, park, absorb, or a merged-away husk) re-bases or folds records
+  /// non-monotonically, so `(index → bytes)` stops being a stable committed history; a split is
+  /// phantom-safe and is NOT excluded.
+  ///
+  /// EVERY LEG IS ASKED OF ONE INCARNATION, because the answer retires oracle coverage and the
+  /// records of two coexisting incarnations of an id are unrelated. A union folded into the live
+  /// successor re-bases the successor's record and nothing of the island's, so reading the id
+  /// id-wide would silently switch off the island's phantom-quorum leg for the rest of the run —
+  /// a true positive lost to someone else's merge. Where attribution is impossible the qualified
+  /// forms stay conservative and keep excluding (see `merge_choreography_active_at`).
+  fn record_is_append_only(&self, gid: u64, generation: u64) -> bool {
+    !(self.group_absorbed_at(gid, generation)
+      || self.meta_at(gid, generation).is_some_and(|m| m.merged)
+      || self.any_replica_frozen_at(gid, generation)
+      || self.merge_choreography_active_at(gid, generation)
+      || self.group_merge_parked_at(gid, generation))
   }
 
   /// The run-end LINEAGE LEDGER verdict — chimera, phantom-quorum, and wedge — panicking with the
@@ -1188,10 +1249,10 @@ impl MultiWorld {
       // merge instead ships the RAW record under the equal-applied agreement form (see
       // `ClusterView::positional_agreement`): an absorb re-introduces own-tagged cells at
       // replica-local resolution states, so no positional filter stays lag-invariant.
-      let applied_log = if self.group_absorbed(gid) {
+      let applied_log = if self.group_absorbed_at(gid, generation) {
         self.applied_of(node, gid)
       } else {
-        self.aligned_applied(node, gid)
+        self.aligned_applied(node, gid, generation)
       };
       let cs = ep.conf_state();
       nodes.push(checker::NodeView {
@@ -1223,11 +1284,11 @@ impl MultiWorld {
       });
     }
     checker::ClusterView {
-      positional_agreement: !self.group_absorbed(gid),
+      positional_agreement: !self.group_absorbed_at(gid, generation),
       seed: self.seed,
       tick: self.tick_count,
       committed_voters: {
-        let v = self.committed_voters_of(gid);
+        let v = self.committed_voters_of(gid, generation);
         if v.is_empty() { None } else { Some(v) }
       },
       committed_transitions: self
@@ -1252,11 +1313,18 @@ impl MultiWorld {
   /// Leader role would otherwise become the authoritative config source the moment the group is
   /// between live leaders (and a parked stale config would keep voting in the leaderless tally),
   /// handing the quorum-durability oracle a denominator anchored on a zombie's view.
-  fn committed_voters_of(&self, gid: u64) -> BTreeSet<u64> {
+  ///
+  /// SCOPED TO ONE INCARNATION for the same reason the view is: a replica bound to another
+  /// incarnation of this id descends from a different config history, and its voters are not this
+  /// group's. Unfiltered, a late fork's island reads the live successor's voter set, intersects it
+  /// with its own single hosting replica to nothing, and `commit_is_quorum_durable` then has no
+  /// denominator to judge against — the island goes silently unchecked.
+  fn committed_voters_of(&self, gid: u64, generation: u64) -> BTreeSet<u64> {
     let authoritative = self
       .node_ids
       .iter()
       .filter(|&&n| !self.parked.contains(&(n, gid)))
+      .filter(|&&n| self.replica_gen_of(n, gid) == generation)
       .filter_map(|&n| self.hosts[&n].group(&gid))
       .filter(|ep| ep.role().is_leader())
       .max_by_key(|ep| ep.term());
@@ -1265,7 +1333,7 @@ impl MultiWorld {
     }
     let mut tally: BTreeMap<BTreeSet<u64>, usize> = BTreeMap::new();
     for &n in &self.node_ids {
-      if self.parked.contains(&(n, gid)) {
+      if self.parked.contains(&(n, gid)) || self.replica_gen_of(n, gid) != generation {
         continue;
       }
       let Some(ep) = self.hosts[&n].group(&gid) else {

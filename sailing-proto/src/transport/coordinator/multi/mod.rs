@@ -316,9 +316,8 @@ where
     // THE RESERVATION FENCE STANDS ON THIS DOOR. This is the public, caller-driven fork install —
     // anyone holding a coordinator can call it with a blob and a token of their choosing — so a
     // child id an in-flight or staged split owns must refuse here. The relay's own materialization
-    // does not come through this door: it goes through
-    // [`create_group_from_relayed_fork`](Self::create_group_from_relayed_fork), whose ticket is a
-    // container-minted fork nobody outside this crate can construct.
+    // does not come through this door at all: it never leaves the container, and
+    // [`install_yieldable_fork`](Self::install_yieldable_fork) installs the child in place.
     if self.multi.split_reserved(&gid) {
       return Err(CreateGroupError::SplitReserved);
     }
@@ -328,54 +327,6 @@ where
     self.multi.create_group_from_fork(
       gid, generation, config, now, seed, fsm, snapshot, read_only, boot_epoch, log, stable,
     )?;
-    self.purge_unknown_signal(&key);
-    Ok(())
-  }
-
-  /// Materialize a child from a fork the CONTAINER yielded — the relay's door, and the only one
-  /// that skips the split reservation.
-  ///
-  /// The ticket is possession of a [`GroupFork`](crate::GroupFork): the container mints them, only
-  /// for a committed split whose coordinates it verified, and nothing outside this crate can
-  /// construct one. That is what makes skipping the reservation safe here and nowhere else — the
-  /// reservation fences the OTHER admission doors from squatting an id a split owns, and this call
-  /// IS that split claiming its own id. Consulting the predicate here would refuse the very
-  /// admission it exists to protect: the fork's own parent reserves the id while it is staged, and
-  /// a sibling parent that named the same child reserves it too. Under the relay's hold such a
-  /// refusal has nowhere to go but the caller's fail-closed floor, which in release drops the
-  /// partition. Two committed forks racing one child need no fence between them either — the first
-  /// installs, and the second parks on the hosted child under provenance.
-  ///
-  /// EVERY input is taken from the fork itself, the boot config included: membership comes from the
-  /// committed split, never from the caller, so two hosts cannot install one child id under
-  /// disjoint voter sets. The reshape-born knob forcing is applied inside the container, so it is
-  /// applied identically on every replica.
-  #[allow(clippy::too_many_arguments)]
-  pub fn create_group_from_relayed_fork<L, S>(
-    &mut self,
-    fork: crate::GroupFork<G, I, F>,
-    now: impl Into<Now>,
-    seed: u64,
-    boot_epoch: u64,
-    floors: &impl FloorStore<G>,
-    log: &mut L,
-    stable: &mut S,
-  ) -> Result<(), CreateGroupError>
-  where
-    L: LogStore,
-    S: StableStore<NodeId = I>,
-    I: Data,
-  {
-    validate_floor(floors.floor(fork.child()), fork.child_gen())?;
-    if self.retired.contains(fork.child()) {
-      return Err(CreateGroupError::Retired);
-    }
-    let key = fork.child().cheap_clone();
-    // The fork is handed on WHOLE: the core door destructures it, so nothing between the yield and
-    // the baseline can substitute a field.
-    self
-      .multi
-      .create_group_from_relayed_fork(fork, now, seed, boot_epoch, log, stable)?;
     self.purge_unknown_signal(&key);
     Ok(())
   }
@@ -1080,26 +1031,6 @@ where
     self.multi.debt_names(gid)
   }
 
-  /// The next committed, relay-ready fork from any hosted group (see
-  /// [`MultiRaft::poll_pending_fork`]) — the driver drains this every crank BEFORE its storage
-  /// crank, so the same crank's engine flush covers the materialization.
-  pub fn poll_pending_fork(&mut self) -> Option<crate::GroupFork<G, I, F>> {
-    self.poll_pending_fork_with(&crate::NoHold)
-  }
-
-  /// [`poll_pending_fork`](Self::poll_pending_fork) over the caller's [`ForkGate`](crate::ForkGate), AUGMENTED
-  /// with this coordinator's tombstone set before the container sees it — never merely
-  /// forwarded, because `retired` is state the container does not hold.
-  pub fn poll_pending_fork_with(
-    &mut self,
-    gate: &impl crate::ForkGate<G>,
-  ) -> Option<crate::GroupFork<G, I, F>> {
-    self.multi.poll_pending_fork_with(&CoordGate {
-      retired: &self.retired,
-      outer: gate,
-    })
-  }
-
   /// LOOK at the head fork the relay would install right now (see
   /// [`MultiRaft::peek_yieldable_fork`]), over this coordinator's own gate — its tombstone set
   /// AUGMENTS the caller's, never merely forwards it, because `retired` is state the container does
@@ -1193,13 +1124,6 @@ where
   /// only source; mirror it beside the removal's floor write.
   pub fn poll_relay_guard_advance(&mut self) -> Option<(G, u64)> {
     self.multi.poll_relay_guard_advance()
-  }
-
-  /// Release a YIELDED fork's reservation without installing it (see
-  /// [`MultiRaft::release_yielded_fork`]) — for a caller that received a fork and then abandoned
-  /// it. The install releases the entry itself, so this is only for the abandon path.
-  pub fn release_yielded_fork(&mut self, child: &G) {
-    self.multi.release_yielded_fork(child);
   }
 
   /// Whether `gid`'s fork relay still owes something — a held head fork or an undelivered

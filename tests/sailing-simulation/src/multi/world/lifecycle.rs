@@ -461,14 +461,16 @@ impl MultiWorld {
       // Read the committed set for the unpark decision only; leave `meta` at its last-known values
       // (don't thrash on a transient election). Completing the under-hosted set repairs torn-down
       // voters; the unpark pass then re-derives a mis-parked quorum back to hosting.
-      let voters = self.committed_voters_of(gid);
-      let learners = self.committed_learners_of(gid);
+      let generation = self.generation_of(gid);
+      let voters = self.committed_voters_of(gid, generation);
+      let learners = self.committed_learners_of(gid, generation);
       self.complete_under_hosted(gid);
       self.unpark_committed_members(gid, &voters, &learners);
       return;
     }
-    let voters = self.committed_voters_of(gid);
-    let learners = self.committed_learners_of(gid);
+    let generation = self.generation_of(gid);
+    let voters = self.committed_voters_of(gid, generation);
+    let learners = self.committed_learners_of(gid, generation);
     let conf_in_flight = {
       let meta = self.groups.get_mut(&gid).expect("registered group");
       meta.voters = voters.clone();
@@ -590,7 +592,7 @@ impl MultiWorld {
     if !witness {
       return;
     }
-    let voters = self.committed_voters_of(gid);
+    let voters = self.committed_voters_of(gid, self.generation_of(gid));
     let missing: Vec<u64> = voters
       .iter()
       .copied()
@@ -730,7 +732,7 @@ impl MultiWorld {
     // `drop_group_replica` and `remove_group`.
     self.fork_conflicts.remove(&(node, gid));
     // The durable relay lineage is per-incarnation (a real driver's engine drops the group's
-    // `group_gen` on teardown): a fresh incarnation of this id must not inherit the retired one's
+    // the lineage record on teardown): a fresh incarnation of this id must not inherit the retired one's
     // relayed forks, or a later restart's guard would fold its legitimate new forks.
     self.relayed_lineage.remove(&(node, gid));
     // `restarts` and `read_states` deliberately survive: a later re-wire of the same (node, gid)
@@ -770,7 +772,7 @@ impl MultiWorld {
         panic!("remove_group rollback: restore of group {gid} on node {node}: {e:?}")
       });
     // Restore the container's relay guard from the durable relay lineage (a real driver's
-    // `raise_relay_guard(engine.group_gen)` after restore): the restart replay re-stages every
+    // `raise_relay_guard(FloorStore::lineage)` after restore): the restart replay re-stages every
     // already-materialized fork, and the guard must fold them to duplicates rather than re-relay —
     // or, now, PARK them against a co-hosted child that lost its provenance to churn.
     host.raise_relay_guard(&gid, relayed);
@@ -781,12 +783,14 @@ impl MultiWorld {
   /// (the highest-term leader's `conf_state().learners()`; leaderless, the plurality config's
   /// learners keyed by voter set so the two accessors agree on the chosen config). Parked
   /// replicas are excluded from both paths for the same reason: a reaped zombie's stale config
-  /// must never define the group's committed membership.
-  pub(super) fn committed_learners_of(&self, gid: u64) -> BTreeSet<u64> {
+  /// must never define the group's committed membership. Scoped to `generation` exactly as
+  /// `committed_voters_of` is, so the two keep agreeing on one incarnation's chosen config.
+  pub(super) fn committed_learners_of(&self, gid: u64, generation: u64) -> BTreeSet<u64> {
     let authoritative = self
       .node_ids
       .iter()
       .filter(|&&n| !self.parked.contains(&(n, gid)))
+      .filter(|&&n| self.replica_gen_of(n, gid) == generation)
       .filter_map(|&n| self.hosts[&n].group(&gid))
       .filter(|ep| ep.role().is_leader())
       .max_by_key(|ep| ep.term());
@@ -795,7 +799,7 @@ impl MultiWorld {
     }
     let mut tally: BTreeMap<BTreeSet<u64>, (usize, BTreeSet<u64>)> = BTreeMap::new();
     for &n in &self.node_ids {
-      if self.parked.contains(&(n, gid)) {
+      if self.parked.contains(&(n, gid)) || self.replica_gen_of(n, gid) != generation {
         continue;
       }
       let Some(ep) = self.hosts[&n].group(&gid) else {
