@@ -1223,6 +1223,15 @@ where
     gid: &G,
     removed: Option<&Endpoint<I, F, R>>,
   ) {
+    // A POISONED REMOVED ENDPOINT CERTIFIES NOTHING — the belt, beside the redundant verdict's,
+    // for the same reason: what this arm does on a false certificate is irreversible. The token is
+    // already cleared at every poison transition, so this is defence in depth rather than the
+    // mechanism; it holds even if a future path establishes poison without clearing. Declining to
+    // abandon is the safe direction — the fork stays staged and re-materializes once the id is
+    // free, where abandoning destroys the partition's only clean copy.
+    if removed.is_some_and(Endpoint::is_poisoned) {
+      return;
+    }
     let Some(token) = removed.and_then(Endpoint::fork_id) else {
       return;
     };
@@ -2144,7 +2153,14 @@ where
             fork.child_bytes.clone(),
             fork.child_gen,
           );
-          if hosted.fork_id() == Some(this_fork_id) {
+          // PROVENANCE IS NOT USABILITY. The token proves this hosted group was born from THIS
+          // fork's baseline; discarding the staged blob additionally needs the materialization to
+          // be one the host can actually serve. A POISONED child is inert — it serves nothing and
+          // recovers only by removal — so consuming the parent's copy against it would destroy the
+          // one clean derivation of the partition while leaving nothing usable in its place. Park
+          // instead, on the fork-hold default: the blob survives, and the fork re-materializes once
+          // the bad child is removed.
+          if hosted.fork_id() == Some(this_fork_id) && !hosted.is_poisoned() {
             Verdict::Redundant
           } else {
             Verdict::Park(child)

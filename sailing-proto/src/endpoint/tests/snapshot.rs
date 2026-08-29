@@ -7841,3 +7841,306 @@ fn a_snapshot_only_removal_mints_the_courtesy_debt_at_the_boundary() {
     "and never against self, which stayed a member"
   );
 }
+
+/// A META NAMING THE RESERVED GENERATION BAND FAIL-STOPS AT EVERY INGRESS, so no path can carry it
+/// as far as a removal fence.
+///
+/// The band is unmintable: `next_lineage` refuses it and every admission door refuses it. A meta
+/// that names it anyway is malformed or version-skewed — from a peer over the wire, or from disk —
+/// and adopting it would leave this replica's counter where its own removal fences with the
+/// reserved terminal. That floor is read cluster-wide as a GLOBAL absorbed-away verdict, so an
+/// ordinary local removal would forge one, clear a live thaw obligation on every replica, and
+/// authorize a destructive merge resolution. The verdict is the same fail-stop an invalid
+/// `ConfState` already gets.
+#[test]
+fn a_snapshot_meta_in_the_reserved_generation_band_fail_stops() {
+  use crate::{ConfState, HIGHEST_WORKING_GENERATION, MERGED_FLOOR};
+
+  for reserved in [HIGHEST_WORKING_GENERATION, MERGED_FLOOR] {
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+    let mut log = VecLog::default();
+    let mut stable = AsyncStable::default();
+
+    let meta = SnapshotMeta::new(
+      Index::new(2),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+    .with_shape_gen(reserved);
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(InstallSnapshot::new(
+        Term::new(1),
+        1u64,
+        meta,
+        encode_snapshot(7u64),
+      )),
+    );
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    assert!(
+      ep.is_poisoned(),
+      "an install naming generation {reserved} must fail-stop"
+    );
+    assert_eq!(
+      ep.poison_reason(),
+      Some(crate::PoisonReason::ReservedShapeGen),
+      "and by name, at {reserved}"
+    );
+    assert!(
+      ep.shape_gen() < HIGHEST_WORKING_GENERATION,
+      "the counter never adopted the reserved value: {}",
+      ep.shape_gen()
+    );
+  }
+}
+
+/// The same band, arriving from DISK rather than a peer: a durable meta is trusted exactly as far
+/// as its own validation, and a reserved `shape_gen` is corrupt durable state — the sentinel-index
+/// and impossible-`ConfState` class, fail-stopped the same way rather than recovered into.
+#[test]
+fn a_durable_meta_in_the_reserved_generation_band_fail_stops_at_restart() {
+  use crate::{ConfState, HIGHEST_WORKING_GENERATION, MERGED_FLOOR};
+
+  for reserved in [HIGHEST_WORKING_GENERATION, MERGED_FLOOR] {
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut log = VecLog::default();
+    let mut stable = AsyncStable::default();
+    stable.force_snapshot(
+      SnapshotMeta::new(
+        Index::new(2),
+        Term::new(2),
+        ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+      )
+      .with_shape_gen(reserved),
+      encode_snapshot(7u64),
+    );
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert!(ep.is_poisoned(), "restart into generation {reserved}");
+    assert_eq!(
+      ep.poison_reason(),
+      Some(crate::PoisonReason::ReservedShapeGen)
+    );
+    assert!(ep.shape_gen() < HIGHEST_WORKING_GENERATION);
+  }
+}
+
+/// A FORGED HARD STATE fail-stops at restart on its own account — including beside a perfectly
+/// legal snapshot meta, which is the leg no meta check can cover.
+///
+/// The founding generation feeds the same live counter the meta does, so a durable record naming
+/// the RESERVED band is corrupt in exactly the way a reserved meta is. Booting on it leaves the
+/// counter in a band where every committed shape entry reads stale — this replica diverging from
+/// every peer that never restarted — and the counter is public, so a driver's restore mirrors it
+/// straight into the engine record, where an ordinary removal then fences with the terminal.
+#[test]
+fn a_forged_founding_generation_fail_stops_at_restart() {
+  use crate::{ConfState, GroupEngine, HIGHEST_WORKING_GENERATION, MERGED_FLOOR};
+
+  for reserved in [HIGHEST_WORKING_GENERATION, MERGED_FLOOR] {
+    for with_legal_snapshot in [false, true] {
+      let cfg = Config::try_new(
+        2u64,
+        std::vec![1u64, 2, 3],
+        Duration::from_millis(1000),
+        Duration::from_millis(100),
+      )
+      .unwrap();
+      let mut log = VecLog::default();
+      let mut stable = AsyncStable::default();
+      let token = crate::ForkId::new(
+        bytes::Bytes::from_static(b"p"),
+        1,
+        Index::new(2),
+        Term::new(2),
+        bytes::Bytes::from_static(b"c"),
+        0,
+      );
+      // A legal meta beside the forged hard state: the meta gate passes it, so only the
+      // hard-state gate can catch this.
+      if with_legal_snapshot {
+        stable.force_snapshot(
+          SnapshotMeta::new(
+            Index::new(2),
+            Term::new(2),
+            ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+          )
+          .with_shape_gen(3)
+          // The meta also carries a PROVENANCE TOKEN, so this leg proves the poison drops that
+          // too: a parent's relay reads token equality as proof its staged fork was already
+          // materialized here, and an inert replica must certify no such thing.
+          .with_fork_id(token.clone()),
+          encode_snapshot(7u64),
+        );
+      }
+      // The hard state carries the SAME token: the lineage-first reconciliation discards a
+      // snapshot whose token disagrees with it, so only a matching pair lets the token reach the
+      // split state's seed at all — which is the path this leg has to exercise.
+      let mut hs = crate::HardState::initial()
+        .with_term(Term::new(4))
+        .with_founding_gen(reserved);
+      if with_legal_snapshot {
+        hs = hs.with_lineage(Some(token));
+      }
+      stable.force_hard_state(hs);
+
+      let ep = Endpoint::restart(
+        cfg,
+        Instant::ORIGIN,
+        1,
+        CountSm::default(),
+        1,
+        &mut log,
+        &mut stable,
+      );
+      assert!(
+        ep.is_poisoned(),
+        "founding {reserved} with_legal_snapshot={with_legal_snapshot} must fail-stop"
+      );
+      assert_eq!(
+        ep.poison_reason(),
+        Some(crate::PoisonReason::ReservedShapeGen),
+        "and by name"
+      );
+      // ZERO LINEAGE ADOPTED: a poisoned restart carries nothing forward, so there is no band
+      // value for anything downstream to read.
+      assert_eq!(
+        ep.shape_gen(),
+        0,
+        "a poisoned restart adopts no lineage (founding {reserved})"
+      );
+      assert!(
+        ep.fork_id().is_none(),
+        "nor the provenance token that rides the same rejected state \
+         (with_legal_snapshot={with_legal_snapshot}, founding {reserved})"
+      );
+
+      // AND THE DRIVER MIRROR WRITES NOTHING IN THE BAND. This is the drivers' restore line
+      // verbatim — `set_group_gen(gid, endpoint.shape_gen())` — so the record can never reach a
+      // state whose removal fence is the reserved terminal.
+      let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+      engine.set_group_gen(&7u64, ep.shape_gen());
+      assert!(
+        engine.group_gen(&7u64) < HIGHEST_WORKING_GENERATION,
+        "the mirrored record stays outside the reserved band"
+      );
+      assert_ne!(
+        engine.removal_floor(&7u64),
+        MERGED_FLOOR,
+        "so no removal of it can forge the global absorbed-away verdict"
+      );
+    }
+  }
+}
+
+/// THE CHUNKED INGRESS IS GUARDED TOO — and it is the form ordinary replication actually uses.
+///
+/// The reserved-band check lives at the ONE point every inbound form passes through, ahead of
+/// redundancy, deduplication and staging, so `new_chunk` cannot route around it. A guard reached
+/// only by the legacy single-shot would let the multi-chunk path stage an unmintable meta, persist
+/// it at the final chunk, fold its `shape_gen` at the install, emit `SnapshotInstalled`, and have
+/// the drivers mirror the band into the engine record — the endpoint staying LIVE with a counter
+/// that judges every committed shape entry stale until a restart finally poisons on the durable
+/// meta it wrote itself.
+#[test]
+fn a_chunked_install_in_the_reserved_generation_band_fail_stops() {
+  use crate::{ConfState, GroupEngine, HIGHEST_WORKING_GENERATION, MERGED_FLOOR};
+
+  for reserved in [HIGHEST_WORKING_GENERATION, MERGED_FLOOR] {
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+    let mut log = VecLog::default();
+    let mut stable = AsyncStable::default();
+
+    let blob = encode_snapshot(7u64);
+    let meta = SnapshotMeta::new(
+      Index::new(4),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+    .with_shape_gen(reserved);
+
+    // A MULTI-CHUNK transfer, driven to completion with the storage drain between chunks — the
+    // exact shape ordinary replication sends.
+    let total = blob.len() as u64;
+    let split_at = blob.len() / 2;
+    for (offset, part) in [
+      (0u64, blob.slice(0..split_at)),
+      (split_at as u64, blob.slice(split_at..)),
+    ] {
+      ep.handle_message(
+        Instant::ORIGIN,
+        &mut log,
+        &mut stable,
+        1u64,
+        Message::InstallSnapshot(InstallSnapshot::new_chunk(
+          Term::new(2),
+          1u64,
+          meta.clone(),
+          part,
+          offset,
+          total,
+        )),
+      );
+      ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+      while ep.poll_message().is_some() {}
+    }
+
+    assert!(
+      ep.is_poisoned(),
+      "a chunked install naming generation {reserved} must fail-stop"
+    );
+    assert_eq!(
+      ep.poison_reason(),
+      Some(crate::PoisonReason::ReservedShapeGen),
+      "and by name, at {reserved}"
+    );
+    assert!(
+      ep.shape_gen() < HIGHEST_WORKING_GENERATION,
+      "the counter never adopted the band: {}",
+      ep.shape_gen()
+    );
+    assert!(
+      stable.snapshot().is_none(),
+      "and the reserved meta never reached the durable slot"
+    );
+
+    // The drivers' mirror line verbatim: nothing in the band can reach the engine record, so no
+    // removal of this id can forge the global absorbed-away verdict.
+    let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+    engine.set_group_gen(&7u64, ep.shape_gen());
+    assert!(engine.group_gen(&7u64) < HIGHEST_WORKING_GENERATION);
+    assert_ne!(engine.removal_floor(&7u64), MERGED_FLOOR);
+  }
+}

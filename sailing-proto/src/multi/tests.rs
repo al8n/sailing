@@ -3030,6 +3030,378 @@ fn staged_fork_id_at(m: &MultiRaft<u64, u64, SplitSm>, parent: u64, index: u64) 
   )
 }
 
+/// The relay guard's PROVENANCE: no hosted group's guard stands above the live lineage counter
+/// ⊔ whatever durable fork record was fed to it. `guard <= live` alone is FALSE in an ordinary
+/// window — a restore seeds the guard from a record whose backing entry is durable but not yet
+/// re-committed — so the honest bound admits the record and refuses anything beyond it.
+///
+/// INV-MINT-ABOVE-GUARD, the property that actually protects a fresh fork, is asserted at the mint
+/// site itself (`propose_split`), where the propose gate guarantees it.
+fn assert_guard_provenance<F: StateMachine>(m: &MultiRaft<u64, u64, F>, record: u64) {
+  for gid in m.group_ids() {
+    let live = m
+      .group(gid)
+      .expect("group_ids yields hosted ids")
+      .shape_gen();
+    let guard = m.lineage.get(gid).copied().unwrap_or(0);
+    assert!(
+      guard <= live.max(record),
+      "relay guard {guard} on group {gid} exceeds live counter {live} and record {record}"
+    );
+  }
+}
+
+/// A committed log carrying only ordinary traffic — NO lineage move, so a restart replay leaves the
+/// live lineage counter exactly where the (absent) snapshot meta put it: zero.
+fn lineage_free_committed_log() -> (VecLog, AsyncStable) {
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  (log, stable)
+}
+
+/// A CATALOG generation never reaches the relay guard, so it can never fold the group's next fork.
+///
+/// The guard is seeded from the host's durable FORK record. When a restore was also allowed to
+/// write its admitted generation into that record, the pair went INVERTED — live 0, guard N — and
+/// the group's very next split minted 1, the relay read `1 <= N` as already-relayed, and the fork
+/// folded to a resolved no-op: the staged baseline is the child partition's ONLY local copy on this
+/// host, so the partition was silently discarded. Nothing errored and nothing diverged visibly —
+/// the child simply never existed.
+///
+/// The record carries evidence only, so an id admitted at generation 5 over stores that account for
+/// nothing leaves the guard where its own forks put it: at zero.
+#[test]
+fn a_catalog_generation_never_reaches_the_relay_guard() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = lineage_free_committed_log();
+  m.restore_group_unchecked(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(
+    m.group(&7).unwrap().shape_gen(),
+    0,
+    "the replayed tail carries no lineage move, so replay evidence is zero"
+  );
+
+  // The restore door's guard raise, fed the id's DURABLE FORK RECORD. These stores have relayed no
+  // fork and applied no lineage move, so that record reads zero however high the catalog's claim
+  // was: the claim reaches admission and stops there.
+  m.raise_relay_guard(&7, 0);
+  assert_eq!(
+    m.group(&7).unwrap().shape_gen(),
+    0,
+    "a catalog claim is not evidence this group applied anything"
+  );
+  assert_eq!(m.group_gen(&7), 0, "and the guard has nothing to stand on");
+  assert_guard_provenance(&m, 0);
+
+  // The next split mints one past the evidence, and the clamped guard is below it.
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  m.propose_split(
+    &7,
+    d,
+    &mut log,
+    &stable,
+    &200,
+    0,
+    Bytes::from_static(b"\x01"),
+  )
+  .unwrap()
+  .unwrap();
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  {
+    let fork = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the fresh fork is relayed, never folded away as a replay duplicate");
+    assert_eq!(*fork.child(), 200);
+    assert_eq!(
+      fork.parent_gen_after(),
+      1,
+      "the mint is one past the replay evidence, and clears the guard"
+    );
+  }
+
+  // THE LOSS THIS PREVENTS, shown directly: a fork at or below the guard folds to a resolved
+  // no-op and its staged blob goes with it. That is what a laundered catalog generation of 5
+  // manufactured for every fresh fork this incarnation could ever mint.
+  m.raise_relay_guard(&7, 1);
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "a fork at or below the guard is folded away — the shape a laundered catalog generation \
+     manufactured for every fresh fork"
+  );
+}
+
+/// Raising the relay guard never moves the live lineage counter. The two answer different questions
+/// from different sources: the live counter is replicated state that every apply-time lineage guard
+/// reads for EXACT equality, the guard is volatile per-host bookkeeping seeded from a durable fork
+/// record. The guard may legitimately stand ahead of the counter — its record's backing entry can be
+/// durable but not yet re-committed — and what protects a fresh fork is not an ordering between them
+/// but the propose gate, which blocks every mint until the counter has absorbed that entry.
+#[test]
+fn raising_the_relay_guard_never_moves_the_live_lineage_counter() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group_founded_at(
+    7,
+    4,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(m.group(&7).unwrap().shape_gen(), 4);
+
+  // A record ahead of the counter raises the GUARD and nothing else.
+  m.raise_relay_guard(&7, 9);
+  assert_eq!(
+    m.group(&7).unwrap().shape_gen(),
+    4,
+    "a durable record never enters the replicated apply counter"
+  );
+  assert_eq!(m.group_gen(&7), 9, "the guard alone took the record");
+  assert_guard_provenance(&m, 9);
+
+  // A record BELOW the standing guard never lowers it (monotone), and still moves no counter.
+  m.raise_relay_guard(&7, 2);
+  assert_eq!(m.group(&7).unwrap().shape_gen(), 4);
+  assert_eq!(m.group_gen(&7), 9);
+  assert_guard_provenance(&m, 9);
+}
+
+/// A restored group's live lineage counter is EXACTLY what its replay produced — no per-host record
+/// raises it, and none lowers it. This is INV-APPLY-LINEAGE at the restore door, the one place a
+/// value from outside the replicated log has ever been offered to the counter.
+#[test]
+fn a_restore_leaves_the_live_counter_at_its_replay_evidence() {
+  // A committed tail with NO lineage move replays to zero.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = lineage_free_committed_log();
+  m.restore_group_unchecked(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(m.group(&7).unwrap().shape_gen(), 0);
+  m.raise_relay_guard(&7, 9);
+  assert_eq!(
+    m.group(&7).unwrap().shape_gen(),
+    0,
+    "a durable record does not move the counter the apply guards read"
+  );
+  assert_guard_provenance(&m, 9);
+
+  // A committed tail that DOES carry a split replays to that split's generation — and a record
+  // below it is just as inert as one above.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = split_survivor_log(200);
+  m.restore_group_unchecked(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(
+    m.group(&7).unwrap().shape_gen(),
+    1,
+    "the replayed split is the counter's only mover"
+  );
+  m.raise_relay_guard(&7, 0);
+  assert_eq!(m.group(&7).unwrap().shape_gen(), 1);
+  assert_guard_provenance(&m, 0);
+}
+
+/// ONE COMMITTED SPLIT, ONE ARM, EVERY REPLICA. The apply-time lineage guard admits an entry only at
+/// `shape_gen + 1` exactly: a match PARTITIONS the state machine, a mismatch is a no-op that leaves
+/// it untouched. Two replicas that disagree on that comparison therefore disagree about a committed
+/// entry's effect on their state machines — permanently, and silently.
+///
+/// The comparison is safe only while its input is replicated. Here one replica's host holds a
+/// durable lineage record its own log and snapshot cannot account for; the other holds none. Feeding
+/// that record into the live counter would put the two replicas one comparison apart on the very
+/// next committed split.
+#[test]
+fn one_committed_split_takes_the_same_arm_on_every_replica() {
+  let (mut a, mut la, mut sa) = host_with_staged_fork(200);
+  let (mut b, mut lb, mut sb) = host_with_staged_fork(200);
+  assert_eq!(a.group(&7).unwrap().shape_gen(), 1);
+  assert_eq!(b.group(&7).unwrap().shape_gen(), 1);
+  let units_before = a.group(&7).unwrap().state_machine().units;
+  assert_eq!(b.group(&7).unwrap().state_machine().units, units_before);
+
+  // Only replica A's host carries the above-evidence record.
+  a.raise_relay_guard(&7, 5);
+
+  // The leader mints its next split from the lineage every replica shares, and the SAME committed
+  // entry reaches both.
+  follower_commit_next(&mut a, &mut la, &mut sa, 5);
+  follower_commit_next(&mut b, &mut lb, &mut sb, 5);
+  follower_split_next(&mut a, &mut la, &mut sa, 6, 201, 2, 1);
+  follower_split_next(&mut b, &mut lb, &mut sb, 6, 201, 2, 1);
+
+  assert_eq!(
+    a.group(&7).unwrap().state_machine().units,
+    b.group(&7).unwrap().state_machine().units,
+    "the committed split partitioned both state machines or neither — a per-host record must \
+     never decide which"
+  );
+  assert_eq!(
+    a.group(&7).unwrap().shape_gen(),
+    b.group(&7).unwrap().shape_gen(),
+    "and both replicas' lineage counters moved together"
+  );
+  assert_eq!(
+    a.group(&7).unwrap().staged_forks().count(),
+    2,
+    "the fresh split staged its fork on the replica whose host held the record"
+  );
+  assert_eq!(
+    b.group(&7).unwrap().staged_forks().count(),
+    2,
+    "and on the replica whose host held none"
+  );
+  assert_guard_provenance(&a, 5);
+  assert_guard_provenance(&b, 0);
+}
+
+/// The relay guard's provenance holds at every door that admits a group or moves the guard: a
+/// genesis create, a restore under a durable record, a fork-born child, a relayed fork's guard
+/// advance, and a removal-time abandonment's advance. No door ever puts the guard beyond the live
+/// counter ⊔ the record it was fed.
+#[test]
+fn the_relay_guard_keeps_its_provenance_at_every_door() {
+  // CREATE: the genesis seed puts both at the admitted generation.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (founding_log, mut founding_stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group_founded_at(
+    7,
+    3,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &founding_log,
+    &mut founding_stable,
+  )
+  .unwrap();
+  assert_guard_provenance(&m, 0);
+
+  // RESTORE, under a record standing above the replay evidence.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = lineage_free_committed_log();
+  m.restore_group_unchecked(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  m.raise_relay_guard(&7, 8);
+  assert_guard_provenance(&m, 8);
+
+  // FORK-CREATE: the child's baseline meta carries its own generation, so the counter is seeded
+  // from replicated state and the guard is seeded with it.
+  let (mut clog, mut cstable) = (VecLog::default(), AsyncStable::default());
+  m.create_group_from_fork(
+    200,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+    fork_blob(2),
+    None,
+    1,
+    &mut clog,
+    &mut cstable,
+  )
+  .unwrap();
+  assert_guard_provenance(&m, 8);
+
+  // RELAY: a materialized fork advances the guard to the applied split's generation.
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  assert_guard_provenance(&m, 0);
+  install_head_fork(&mut m, 7, 200, Instant::ORIGIN);
+  assert_guard_provenance(&m, 0);
+
+  // ABANDONMENT: a removal that ends the incarnation a staged fork produced advances the guard
+  // past that fork.
+  let (mut m, _log, _stable) = host_with_staged_fork(201);
+  let gate = TestGate::occupying(201);
+  assert!(m.peek_yieldable_fork(&gate).is_none(), "the fork holds");
+  let token = staged_fork_id(&m, 7);
+  m.create_group(
+    201,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    44,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.group_mut(&201).unwrap().seed_fork_id_for_test(token);
+  assert_guard_provenance(&m, 0);
+  m.remove_group(&201, &mut empty_stores()).unwrap();
+  assert_eq!(
+    m.poll_relay_guard_advance(),
+    Some((7, 1)),
+    "the abandonment advanced the guard past the fork it killed"
+  );
+  assert_guard_provenance(&m, 0);
+}
+
 /// A parent's durable log carrying TWO committed splits — 3 units of load, a split giving 2 to
 /// `first`, one more unit, then a split giving 1 to `second`. The crash-recovery source for the
 /// ordered-abandonment replay.
@@ -15892,5 +16264,500 @@ fn a_removal_fence_never_reaches_the_reserved_terminal() {
     !crate::floor_admits(fence, crate::HIGHEST_WORKING_GENERATION - 1),
     "and it still fences the incarnation it retired"
   );
+}
+
+/// One case PER GUARDED FIELD: the named field carries the reserved value and EVERY other
+/// generation in the payload is valid, so each case can only be caught by that field's operand.
+///
+/// A fixture that corrupts one field per kind cannot tell a guard that reads all of them from one
+/// that reads a single operand — removing the others would leave it green. `valid` is the
+/// successor the harness's live counter expects, so the non-corrupted fields never trip the
+/// stale-mint arm and the fail-stop is attributable to the band alone.
+fn reserved_case(case: &'static str, index: u64, reserved: u64, valid: u64) -> crate::Entry {
+  let mut peer = Vec::new();
+  Data::encode(&200u64, &mut peer);
+  let peer = Bytes::from(peer);
+  let (kind, data) = match case {
+    "split/parent_gen_after" => (
+      crate::EntryKind::Split,
+      split_entry_bytes(200, 0, reserved, 1),
+    ),
+    "split/child_gen" => (
+      crate::EntryKind::Split,
+      split_entry_bytes(200, reserved, valid, 1),
+    ),
+    "prepare/source_gen_after" => {
+      let p = crate::PrepareMergePayload::new(peer, reserved);
+      let mut b = Vec::new();
+      crate::wire::encode_prepare_merge_payload(&p, &mut b);
+      (crate::EntryKind::PrepareMerge, Bytes::from(b))
+    }
+    "commit/source_gen_after" | "commit/target_gen_after" => {
+      let (src, tgt) = if case.ends_with("source_gen_after") {
+        (reserved, valid)
+      } else {
+        (1, reserved)
+      };
+      let p = crate::CommitMergePayload::new(peer, Index::new(2), Term::new(1), src, tgt);
+      let mut b = Vec::new();
+      crate::wire::encode_commit_merge_payload(&p, &mut b);
+      (crate::EntryKind::CommitMerge, Bytes::from(b))
+    }
+    "rollback-abort/source_gen_after" | "rollback-abort/target_gen_after" => {
+      let (src, tgt) = if case.ends_with("source_gen_after") {
+        (reserved, valid)
+      } else {
+        (1, reserved)
+      };
+      let p = crate::RollbackMergePayload::abort(peer, src, tgt);
+      let mut b = Vec::new();
+      crate::wire::encode_rollback_merge_payload(&p, &mut b);
+      (crate::EntryKind::RollbackMerge, Bytes::from(b))
+    }
+    "rollback-unfreeze/source_gen_after" => {
+      let p = crate::RollbackMergePayload::unfreeze(reserved);
+      let mut b = Vec::new();
+      crate::wire::encode_rollback_merge_payload(&p, &mut b);
+      (crate::EntryKind::RollbackMerge, Bytes::from(b))
+    }
+    other => panic!("unknown reserved case: {other}"),
+  };
+  crate::Entry::new(Term::new(1), Index::new(index), kind, data)
+}
+
+/// Every generation field the apply guard claims, one case each — including the fields a
+/// kind-shaped fixture leaves valid by accident. The `split/child_gen` case is the sharpest: a
+/// VALID parent mint beside a reserved child would partition the parent's state machine, and child
+/// admission would then refuse the reserved generation, discarding the fork's only child half.
+const RESERVED_CASES: [&str; 8] = [
+  "split/parent_gen_after",
+  "split/child_gen",
+  "prepare/source_gen_after",
+  "commit/source_gen_after",
+  "commit/target_gen_after",
+  "rollback-abort/source_gen_after",
+  "rollback-abort/target_gen_after",
+  "rollback-unfreeze/source_gen_after",
+];
+
+/// A committed shape entry naming a generation in the RESERVED band is a FAIL-STOP, for every
+/// generation-bearing field, live and on restart replay alike.
+///
+/// A committed entry is agreed state, so the verdict must be identical on every replica — and it
+/// is: the inputs are the entry's own bytes, so all replicas halt together at the same index. That
+/// is the doctrine the other impossible-entry arms already follow (an undecodable payload, a
+/// committed split against an FSM that cannot split) and deliberately not the stale-mint no-op: a
+/// stale mint is a legal value that lost a race, a reserved generation is one no conforming
+/// replica can produce, so skipping it would carry a log known to be corrupt forward as sound.
+#[test]
+fn a_committed_shape_entry_in_the_reserved_band_fail_stops_on_live_apply() {
+  use crate::{HIGHEST_WORKING_GENERATION, MERGED_FLOOR};
+
+  let mut unguarded: Vec<(&str, u64)> = Vec::new();
+  for reserved in [HIGHEST_WORKING_GENERATION, MERGED_FLOOR] {
+    for case in RESERVED_CASES {
+      let (mut m, mut log, mut stable) = host_with_staged_fork(300);
+      let before = m.group(&7).unwrap().state_machine().units;
+      // The staged split at index 4 left the counter at 1, so 2 is the successor every
+      // non-corrupted field must carry to clear the stale-mint arm.
+      m.handle_message(
+        &7,
+        Instant::ORIGIN,
+        &mut log,
+        &mut stable,
+        2u64,
+        Message::AppendEntries(crate::AppendEntries::new(
+          Term::new(1),
+          2u64,
+          Index::new(4),
+          Term::new(1),
+          std::vec![reserved_case(case, 5, reserved, 2)],
+          Index::new(5),
+        )),
+      )
+      .unwrap();
+      while matches!(
+        m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
+        Some(StorageProgress::MorePending)
+      ) {}
+
+      let ep = m.group(&7).unwrap();
+      // COLLECTED, not asserted in place: the guard claims every field below, so a red-proof must
+      // show every field failing — a loop that stops at the first would look identical whether one
+      // operand is read or all of them.
+      if ep.poison_reason() != Some(crate::PoisonReason::ReservedShapeGen)
+        || ep.shape_gen() >= HIGHEST_WORKING_GENERATION
+        || ep.state_machine().units != before
+      {
+        unguarded.push((case, reserved));
+      }
+    }
+  }
+  assert!(
+    unguarded.is_empty(),
+    "these generation fields did not fail-stop on a reserved value: {unguarded:?}"
+  );
+}
+
+#[test]
+fn a_reserved_shape_entry_fail_stops_on_restart_replay_too() {
+  use crate::{HIGHEST_WORKING_GENERATION, MERGED_FLOOR};
+
+  let mut unguarded: Vec<(&str, u64)> = Vec::new();
+  for reserved in [HIGHEST_WORKING_GENERATION, MERGED_FLOOR] {
+    for case in RESERVED_CASES {
+      // A durable log a pre-reservation build could have written, replayed from disk. Replay
+      // starts the counter at 0, so 1 is the successor the valid fields carry.
+      let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+      let cmd = {
+        let mut b = Vec::new();
+        Bytes::from_static(b"c").encode(&mut b);
+        Bytes::from(b)
+      };
+      log.force_append(&[
+        crate::Entry::new(Term::new(1), Index::new(1), crate::EntryKind::Normal, cmd),
+        reserved_case(case, 2, reserved, 1),
+      ]);
+      stable.force_state(Term::new(1), Some(1u64), Index::new(2));
+
+      let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+      m.restore_group_unchecked(
+        7,
+        single_node_cfg(1),
+        Instant::ORIGIN,
+        42,
+        SplitSm::default(),
+        1,
+        &mut log,
+        &mut stable,
+      )
+      .unwrap();
+      let ep = m.group(&7).unwrap();
+      if ep.poison_reason() != Some(crate::PoisonReason::ReservedShapeGen)
+        || ep.shape_gen() >= HIGHEST_WORKING_GENERATION
+      {
+        unguarded.push((case, reserved));
+      }
+    }
+  }
+  assert!(
+    unguarded.is_empty(),
+    "these fields replayed a reserved generation without fail-stopping: {unguarded:?}"
+  );
+}
+/// The MINT side of the same boundary: a caller's reserved `child_gen` is refused at propose, so
+/// no conforming replica can ever append what the apply guard above defends against.
+#[test]
+fn propose_split_refuses_a_reserved_child_generation() {
+  use crate::{HIGHEST_WORKING_GENERATION, MERGED_FLOOR};
+
+  for reserved in [HIGHEST_WORKING_GENERATION, MERGED_FLOOR] {
+    let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+    let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+    m.create_group(
+      7,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      SplitSm::default(),
+    )
+    .unwrap();
+    let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+    let before = log.last_index();
+    assert!(
+      matches!(
+        m.propose_split(
+          &7,
+          d,
+          &mut log,
+          &stable,
+          &200,
+          reserved,
+          Bytes::from_static(b"\x01")
+        ),
+        Some(Err(SplitError::ReservedGeneration))
+      ),
+      "a reserved child generation {reserved} must be refused at propose"
+    );
+    assert_eq!(
+      log.last_index(),
+      before,
+      "and nothing was appended at {reserved}"
+    );
+  }
+}
+
+/// A POISONED CHILD IS NOT A MATERIALIZATION. Token equality proves the hosted group was born from
+/// this fork's baseline; it does not prove the host can serve it. Consuming the parent's staged
+/// blob against an inert child destroys the partition's only clean derivation and leaves nothing
+/// usable behind, so the fork PARKS on the fork-hold default and re-materializes once the bad child
+/// is removed.
+#[test]
+fn a_poisoned_child_does_not_resolve_its_parents_fork_redundant() {
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  let token = staged_fork_id(&m, 7);
+  m.create_group(
+    200,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    44,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.group_mut(&200).unwrap().seed_fork_id_for_test(token);
+
+  // With a HEALTHY twin carrying the token the fork resolves redundant and is consumed.
+  {
+    let mut healthy = m.group(&7).unwrap().staged_forks().count();
+    assert_eq!(healthy, 1, "one fork staged");
+    assert!(
+      m.peek_yieldable_fork(&NoHold).is_none(),
+      "resolved, not yielded"
+    );
+    healthy = m.group(&7).unwrap().staged_forks().count();
+    assert_eq!(healthy, 0, "the healthy twin consumed the parent's copy");
+  }
+
+  // Now the same shape with a POISONED twin: the blob must survive.
+  let (mut m, _log2, _stable2) = host_with_staged_fork(200);
+  let token = staged_fork_id(&m, 7);
+  m.create_group(
+    200,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    44,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.group_mut(&200).unwrap().seed_fork_id_for_test(token);
+  m.group_mut(&200)
+    .unwrap()
+    .poison(crate::PoisonReason::ReservedShapeGen);
+
+  assert!(
+    m.peek_yieldable_fork(&NoHold).is_none(),
+    "the id is occupied, so the fork does not yield either way"
+  );
+  assert_eq!(
+    m.group(&7).unwrap().staged_forks().count(),
+    1,
+    "but the staged blob SURVIVES: an inert child certifies no materialization"
+  );
+  assert!(
+    m.group(&7).unwrap().fork_obligations_standing(),
+    "and the parent still owes the partition, so nothing lifted its barrier"
+  );
+}
+
+/// A CHILD POISONED AFTER ADMISSION CERTIFIES NOTHING AT REMOVAL EITHER. Removal reads the removed
+/// endpoint's provenance token as proof the parent's staged fork descends from the incarnation being
+/// torn down, and abandons that fork — destroying the partition's only clean copy. An inert replica
+/// cannot back that claim, so the token is gone before removal ever asks, the fork survives, its
+/// replay guard does not advance, and the id re-materializes once it is free again.
+#[test]
+fn a_poisoned_child_does_not_let_its_removal_abandon_the_parents_fork() {
+  let (mut m, _log, _stable) = host_with_staged_fork(200);
+  let token = staged_fork_id(&m, 7);
+  m.create_group(
+    200,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    44,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.group_mut(&200).unwrap().seed_fork_id_for_test(token);
+  // Poisoned AFTER admission — the late-replay/final-scan shape, where the token is already held.
+  m.group_mut(&200)
+    .unwrap()
+    .poison(crate::PoisonReason::ReservedShapeGen);
+
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+
+  assert_eq!(
+    m.group(&7).unwrap().staged_forks().count(),
+    1,
+    "the parent's staged fork survives the removal of an inert child"
+  );
+  assert!(
+    m.group(&7).unwrap().fork_obligations_standing(),
+    "and the parent still owes the partition"
+  );
+  assert_eq!(
+    m.poll_relay_guard_advance(),
+    None,
+    "no guard advance: nothing was consumed, so a replay must re-stage it"
+  );
+  assert_eq!(
+    m.poll_split_refusal(),
+    None,
+    "and nothing was refused — this is a deferral, not a verdict about the fork"
+  );
+
+  // The id is free again, so the partition re-materializes from the copy that survived.
+  let fork = m
+    .peek_yieldable_fork(&NoHold)
+    .expect("the fork re-materializes once the bad child is gone");
+  assert_eq!(*fork.child(), 200);
+}
+
+/// A CHILD POISONED BY A RESTART LOG-READ FAULT certifies nothing at removal.
+///
+/// The child's stores DO carry the fork's provenance token — the positive control below proves it —
+/// so this is the shape where a removal could read that certificate as proof the parent's staged
+/// fork descended from it and abandon the fork, destroying the partition's last clean derivation.
+///
+/// SCOPE, stated because the fixture cannot narrow it: the fault lands in one of restart's
+/// construction-time log scans, which are ungated and read the whole log, so `scan_freeze_pending`'s
+/// own post-construction arm cannot be reached in isolation through this seam — any faulting index
+/// is hit by an earlier scan first. That arm's routing through `poison` is swept and correct, but it
+/// is this test's neighbour rather than its subject; isolating it needs a fault seam scoped to a
+/// range rather than to any read at an index.
+#[test]
+fn a_child_poisoned_during_restart_does_not_let_its_removal_abandon_the_parents_fork() {
+  let (mut m, _plog, _pstable) = host_with_staged_fork(200);
+  let token = staged_fork_id(&m, 7);
+
+  // The child's durable state: a snapshot whose meta carries THIS fork's token, vouched for by the
+  // hard state so the restart adopts it and the token reaches the endpoint.
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
+  let mut clog = crate::testkit::FailTermLog::default();
+  let mut cstable = AsyncStable::default();
+  cstable.force_hard_state(
+    crate::HardState::initial()
+      .with_term(Term::new(2))
+      .with_lineage(Some(token.clone())),
+  );
+  cstable.force_snapshot(
+    crate::SnapshotMeta::new(
+      Index::new(1),
+      Term::new(2),
+      crate::ConfState::from_voters(std::vec![1u64]),
+    )
+    .with_fork_id(token.clone()),
+    fork_blob(2),
+  );
+  // A suffix ABOVE the snapshot boundary, and the scan of it faults. The scan reads from
+  // `applied + 1`, so the fault index is 2 — the boundary itself is never the scanned range.
+  clog.force_append(&[
+    crate::Entry::new(
+      Term::new(2),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(2),
+      Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+  ]);
+  clog.fail_entries_at(Some(Index::new(2)));
+
+  // POSITIVE CONTROL, first: the very same stores WITHOUT the fault must restore a child that
+  // HOLDS the token. Without this the `is_none()` assertion below passes for a store that never
+  // adopted a token at all, and the whole regression is vacuous.
+  {
+    let mut healthy_log = crate::testkit::FailTermLog::default();
+    healthy_log.force_append(&[
+      crate::Entry::new(
+        Term::new(2),
+        Index::new(1),
+        crate::EntryKind::Normal,
+        cmd.clone(),
+      ),
+      crate::Entry::new(
+        Term::new(2),
+        Index::new(2),
+        crate::EntryKind::Normal,
+        cmd.clone(),
+      ),
+    ]);
+    let mut healthy_stable = AsyncStable::default();
+    healthy_stable.force_hard_state(
+      crate::HardState::initial()
+        .with_term(Term::new(2))
+        .with_lineage(Some(token.clone())),
+    );
+    healthy_stable.force_snapshot(
+      crate::SnapshotMeta::new(
+        Index::new(1),
+        Term::new(2),
+        crate::ConfState::from_voters(std::vec![1u64]),
+      )
+      .with_fork_id(token.clone()),
+      fork_blob(2),
+    );
+    let mut control: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+    control
+      .restore_group_unchecked(
+        200,
+        single_node_cfg(1),
+        Instant::ORIGIN,
+        44,
+        SplitSm::default(),
+        1,
+        &mut healthy_log,
+        &mut healthy_stable,
+      )
+      .unwrap();
+    let healthy = control.group(&200).expect("hosted");
+    assert!(!healthy.is_poisoned(), "the control must not be poisoned");
+    assert_eq!(
+      healthy.fork_id(),
+      Some(token.clone()),
+      "these stores DO carry the token, so the fault case's None is the clear at work"
+    );
+  }
+
+  m.restore_group_unchecked(
+    200,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    44,
+    SplitSm::default(),
+    1,
+    &mut clog,
+    &mut cstable,
+  )
+  .unwrap();
+
+  let child = m.group(&200).expect("the child is hosted");
+  // By name: a log-read fault, not some unrelated poison the fixture stumbled into.
+  assert_eq!(
+    child.poison_reason(),
+    Some(crate::PoisonReason::LogRead),
+    "the fixture must poison through a log-read fault"
+  );
+  assert!(
+    child.fork_id().is_none(),
+    "and the poisoned restart took the provenance token with it — the control above shows these \
+     stores carry one"
+  );
+
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  assert_eq!(
+    m.group(&7).unwrap().staged_forks().count(),
+    1,
+    "the parent's staged fork survives the inert child's removal"
+  );
+  assert_eq!(
+    m.poll_relay_guard_advance(),
+    None,
+    "and its replay guard did not advance, so a replay still re-stages it"
+  );
+  let fork = m
+    .peek_yieldable_fork(&NoHold)
+    .expect("the partition re-materializes from the copy that survived");
+  assert_eq!(*fork.child(), 200);
 }
 

@@ -795,6 +795,19 @@ where
       return;
     }
 
+    // Reserved-band guard, HERE for the same reason its sibling above is here: this is the one
+    // point every inbound form passes through — the legacy single-shot, `new_chunk`'s first and
+    // final chunks, and anything added later — and it sits before redundancy, deduplication and
+    // staging, so no branch can reach a mutation without it. A `shape_gen` at or above
+    // `HIGHEST_WORKING_GENERATION` is unmintable by any correct peer, so the meta is malformed or
+    // version-skewed. Adopting one leaves this replica's counter in a band where every committed
+    // shape entry reads stale — diverging it from every peer — and the drivers mirror that counter
+    // into the engine record, where an ordinary removal fences with the reserved terminal.
+    if meta.shape_gen() >= crate::HIGHEST_WORKING_GENERATION {
+      self.poison(PoisonReason::ReservedShapeGen);
+      return;
+    }
+
     // Reclaim an abandoned in-progress receive whose boundary the recoverable prefix has already passed:
     // a delayed chunk for it would otherwise short-circuit at the staleness guard below WITHOUT freeing the
     // staging buffer (the leak that pins a full `total_len` allocation). A fatal term-read in the proof
@@ -1418,6 +1431,14 @@ where
     };
     if !meta.conf().is_valid() {
       self.poison(PoisonReason::InvalidConfState);
+      return false;
+    }
+    // The lineage counter this meta would fold in must be a WORKING generation. Nothing this
+    // cluster can mint reaches the reserved band, so a meta that names it is malformed — and
+    // adopting it would leave this replica's counter where its own removal fence is the reserved
+    // terminal, forging a global absorbed-away verdict out of an ordinary removal.
+    if meta.shape_gen() >= crate::HIGHEST_WORKING_GENERATION {
+      self.poison(PoisonReason::ReservedShapeGen);
       return false;
     }
     // ── the mutation suite: nothing below fails benignly.
