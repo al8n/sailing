@@ -88,7 +88,7 @@ pub enum ProposeError<I> {
 }
 
 /// Why [`MultiRaft::create_group`](crate::MultiRaft::create_group) /
-/// [`restore_group`](crate::MultiRaft::restore_group) — or a multi coordinator's tombstone-aware
+/// [`restore_group_unchecked`](crate::MultiRaft::restore_group_unchecked) — or a multi coordinator's tombstone-aware
 /// wrapper of them — refused to admit a group. The already-hosted groups are left untouched in
 /// every case; the moved-in inputs (including the state machine) are dropped — pre-check
 /// [`contains_group`](crate::MultiRaft::contains_group) when they must be preserved.
@@ -362,10 +362,17 @@ pub enum SplitError<I> {
     /// The child id's persisted admission floor.
     floor: u64,
   },
-  /// The child incarnation is the reserved `u64::MAX` merged-floor sentinel — never a working
-  /// incarnation (see [`CreateGroupError::ReservedGeneration`]); a coordinator's floor seam
-  /// refuses it at propose exactly as admission would at materialization.
-  #[error("the child id's incarnation is the reserved merged-floor sentinel (u64::MAX)")]
+  /// The child incarnation is inside the RESERVED band — at or above
+  /// [`HIGHEST_WORKING_GENERATION`](crate::HIGHEST_WORKING_GENERATION), which covers the
+  /// merged-floor sentinel and the fence headroom below it. Never a working incarnation (see
+  /// [`CreateGroupError::ReservedGeneration`]).
+  ///
+  /// Refused by the CORE propose door, not only by a coordinator's floor seam: `child_gen` is the
+  /// caller's own value and this door holds it, so there is nothing to defer. Left unchecked it
+  /// rides into the committed payload, and apply then partitions the parent's state machine while
+  /// the relay classifies the child terminal, drops its blob — the partition's only local copy —
+  /// and lifts the parent's barrier behind it.
+  #[error("the child id's incarnation is inside the reserved generation band")]
   ReservedGeneration,
   /// The child id maps to a different plane than the parent on a sharded (K-plane) host. The
   /// fork must happen inside ONE plane's driver, so a cross-plane child is refused before any

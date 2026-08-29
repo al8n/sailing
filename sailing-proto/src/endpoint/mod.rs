@@ -240,6 +240,14 @@ pub enum PoisonReason {
   /// invariants (empty voters, learner/voter overlap, bad `learners_next`, non-joint `auto_leave`).
   /// Installing it verbatim would corrupt the membership tracker; a correct leader never sends one.
   InvalidConfState,
+  /// A snapshot (install or restart) carried a `shape_gen` inside the RESERVED generation band —
+  /// at or above [`HIGHEST_WORKING_GENERATION`](crate::HIGHEST_WORKING_GENERATION). No mint and no
+  /// admission door can produce one, so the meta is malformed or version-skewed. Adopting it
+  /// verbatim would put the live lineage counter in a band whose removal fence is the reserved
+  /// terminal itself, and a driver mirroring that counter into its engine record would then have an
+  /// ordinary removal forge a GLOBAL absorbed-away verdict — clearing a live thaw obligation on
+  /// every replica. Fail-stop instead, exactly as an invalid `ConfState` does.
+  ReservedShapeGen,
   /// On a snapshot INSTALL, `LogStore::restore` did not re-baseline the log to the snapshot boundary
   /// (`first_index() != last_index() + 1` afterward), so the log read-view is inconsistent with the
   /// commit/applied watermarks the install just advanced — every later AppendEntries consistency check
@@ -363,6 +371,7 @@ impl PoisonReason {
       Self::CommittedTruncation => "committed_truncation",
       Self::NonContiguousAppend => "non_contiguous_append",
       Self::InvalidConfState => "invalid_conf_state",
+      Self::ReservedShapeGen => "reserved_shape_gen",
       Self::SnapshotRebaseline => "snapshot_rebaseline",
       Self::OrphanedLog => "orphaned_log",
       Self::LineageMismatch => "lineage_mismatch",
@@ -2120,6 +2129,28 @@ where
     self.next_op_id = OpId::first_of_epoch(boot_epoch);
   }
 
+  /// Whether any generation a committed shape payload carries is inside the RESERVED band.
+  ///
+  /// THE VERDICT IS FAIL-STOP, and it is deterministic. A committed entry is agreed state: every
+  /// conforming replica meets this one at the same index with the same bytes, so every replica
+  /// reaches the same answer and halts together. That is the doctrine the other impossible-entry
+  /// arms already follow — a committed `Split` against an FSM that cannot split, a committed entry
+  /// whose payload will not decode — and it is deliberately NOT the stale-mint arm's deterministic
+  /// no-op. A stale mint is a legal value that lost a race; a reserved generation is a value no
+  /// conforming replica can produce at all, so treating it as a skippable no-op would carry a log
+  /// this replica knows to be corrupt forward as if it were sound.
+  ///
+  /// WHAT PRODUCES ONE. Not our own mints: `next_lineage` stops short of the band and the propose
+  /// doors refuse a caller's reserved `child_gen`, so no conforming leader can append one. What
+  /// remains is corrupted or version-skewed durable state, or a peer running a build from before
+  /// the band was reserved. The population of such logs is empty for any published version — the
+  /// reservation ships in the first one — but corruption and skew do not depend on that argument,
+  /// which is why this is a guard rather than a comment.
+  fn shape_payload_reserves(gens: impl IntoIterator<Item = u64>) -> bool {
+    gens
+      .into_iter()
+      .any(|g| g >= crate::HIGHEST_WORKING_GENERATION)
+  }
 
   /// Mint a unique, monotonically-increasing operation id for a storage submission.
   fn mint_op_id(&mut self) -> OpId {
@@ -2145,6 +2176,18 @@ where
   pub(crate) fn poison(&mut self, reason: PoisonReason) {
     self.poison.poisoned = true;
     self.poison.poison_reason.get_or_insert(reason);
+    // A POISONED ENDPOINT CERTIFIES NOTHING. The fork provenance token is not history, it is a
+    // CLAIM other groups act on: a parent's relay reads token equality as proof its staged fork was
+    // already materialized here, and a removal reads it as proof the fork descends from the
+    // incarnation being torn down. Both then destroy the partition's only clean local copy. An
+    // inert replica can back neither claim, so the certificate goes with the poison — cleared at
+    // the transition rather than re-checked at each consumer, which is the only way a consumer
+    // added later inherits the answer.
+    //
+    // The COUNTERS deliberately stay. A live poison does not make the lineage this endpoint
+    // actually reached untrue, and zeroing it would discard real history; the restart path is the
+    // one that must also drop the counters, because there the values come from state it rejected.
+    self.split.fork_id = None;
   }
 
   /// Whether this node has hit an unrecoverable error.
@@ -3511,6 +3554,10 @@ where
                 break;
               }
             };
+            if Self::shape_payload_reserves([payload.parent_gen_after(), payload.child_gen()]) {
+              self.poison(PoisonReason::ReservedShapeGen);
+              break;
+            }
             // THE LINEAGE GUARD: a split applies ONLY at its minted generation — the mint read
             // the live counter at propose, so a legal entry carries exactly `shape_gen + 1`
             // here (replay included: the counter re-walks the same values). A mismatch is a
@@ -3522,7 +3569,8 @@ where
             // nothing is staged, no snapshot fence arms, and the event surfaces so the embedder
             // can re-propose. `checked_add` also parks a counter already at the reserved
             // `u64::MAX` (never a working generation) on this arm instead of overflowing.
-            if Some(payload.parent_gen_after()) != self.split.shape_gen.checked_add(1) {
+            if Some(payload.parent_gen_after()) != crate::multi::next_lineage(self.split.shape_gen)
+            {
               self
                 .outputs
                 .events
@@ -3611,6 +3659,10 @@ where
                 break;
               }
             };
+            if Self::shape_payload_reserves([payload.source_gen_after()]) {
+              self.poison(PoisonReason::ReservedShapeGen);
+              break;
+            }
             // The freeze fold: full Frozen semantics start HERE (apply-time, the membership
             // doctrine's shape); the lease kill has been live since this entry's APPEND. The
             // gen bump is a max-fold so a restart replay re-walks the same values idempotently;
@@ -3643,6 +3695,13 @@ where
                 break;
               }
             };
+            if Self::shape_payload_reserves([
+              payload.source_gen_after(),
+              payload.target_gen_after(),
+            ]) {
+              self.poison(PoisonReason::ReservedShapeGen);
+              break;
+            }
             // THE LINEAGE GUARD (the SplitStale shape): a commit applies only at exactly its
             // minted target generation. A stale mint means a same-base competitor won the log
             // race below this entry — a target-side abort (the merge is abandoned; parks never
@@ -3651,7 +3710,8 @@ where
             // replica no-ops the same entry identically. Snapshot-compaction-safe by the same
             // token: `shape_gen` rides the snapshot meta, so a replica restored past the
             // competitor still sees the moved counter.
-            if Some(payload.target_gen_after()) != self.split.shape_gen.checked_add(1) {
+            if Some(payload.target_gen_after()) != crate::multi::next_lineage(self.split.shape_gen)
+            {
               self
                 .outputs
                 .events
@@ -3708,6 +3768,13 @@ where
                 break;
               }
             };
+            if Self::shape_payload_reserves([
+              payload.source_gen_after(),
+              payload.target_gen_after(),
+            ]) {
+              self.poison(PoisonReason::ReservedShapeGen);
+              break;
+            }
             if payload.is_unfreeze() {
               // The SOURCE-role thaw (this group was the frozen source; the entry rides its
               // own log as the container-relayed consequence of the target-side abort).
@@ -3736,7 +3803,9 @@ where
                   idx,
                   self.split.shape_gen,
                 )));
-            } else if Some(payload.target_gen_after()) == self.split.shape_gen.checked_add(1) {
+            } else if Some(payload.target_gen_after())
+              == crate::multi::next_lineage(self.split.shape_gen)
+            {
               // The TARGET-role abort at its live mint: the merge attempt named in the payload
               // is dead on THIS log, totally ordered against its CommitMerge — a later commit
               // from the same base no-ops at its own lineage guard, everywhere identically.

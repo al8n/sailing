@@ -184,6 +184,18 @@ where
     let mut applied = Index::ZERO;
     let mut poisoned = false;
     let mut poison_reason: Option<PoisonReason> = None;
+    // THE HARD STATE IS AN INGRESS TOO, and the one no meta check can stand in for: the founding
+    // value feeds the same live counter a snapshot meta does, and a store carrying a legal meta
+    // beside a forged founding would sail past the meta gate. Nothing this cluster can mint or
+    // admit reaches the RESERVED band, so a durable record naming it is corrupt or version-skewed —
+    // the sentinel-boundary and impossible-`ConfState` class, and fail-stopped the same way. A
+    // counter left in that band judges every committed shape entry stale, diverging this replica
+    // from every peer, and a driver mirroring it into the engine record puts the band where an
+    // ordinary removal fences with the reserved terminal.
+    if founding_gen >= crate::HIGHEST_WORKING_GENERATION {
+      poisoned = true;
+      poison_reason = Some(PoisonReason::ReservedShapeGen);
+    }
     // Bootstrap tracker from the static seed first; may be overridden below if a
     // durable snapshot carries a more recent ConfState.
     let seed_cs =
@@ -314,6 +326,14 @@ where
       } else if !meta.conf().is_valid() {
         poisoned = true;
         poison_reason = Some(PoisonReason::InvalidConfState);
+      } else if meta.shape_gen() >= crate::HIGHEST_WORKING_GENERATION {
+        // A durable meta naming the RESERVED generation band. No mint and no admission door can
+        // produce one, so this is corrupt or version-skewed durable state — the same class as the
+        // sentinel boundary and the impossible ConfState above, and fail-stopped the same way.
+        // Recovering into it would leave the counter where an ordinary removal fences with the
+        // reserved terminal, forging a global absorbed-away verdict.
+        poisoned = true;
+        poison_reason = Some(PoisonReason::ReservedShapeGen);
       } else {
         match <F::Snapshot as Data>::decode_exact(data) {
           Ok(snap) => {
@@ -676,10 +696,13 @@ where
     if !ep.poison.poisoned {
       match Self::scan_freeze_pending(log, ep.applied) {
         Ok(fp) => ep.merge.freeze_pending = fp,
-        Err(reason) => {
-          ep.poison.poisoned = true;
-          ep.poison.poison_reason = Some(reason);
-        }
+        // THROUGH `poison`, never the fields. The endpoint EXISTS by now, so this is a live
+        // transition and owes what every live transition owes: the fork provenance token dropped
+        // with it. Assigning the fields directly left a fork-born child inert but still certifying
+        // its own materialization, and a later removal read that certificate and abandoned the
+        // parent's staged fork — the partition's last clean derivation. Routing here also restores
+        // first-cause-wins, which the direct overwrite silently lost.
+        Err(reason) => ep.poison(reason),
       }
     }
     // if this incarnation's enforcement window GREW the durable floor (a config grow, or a legacy
