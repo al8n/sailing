@@ -456,12 +456,192 @@ where
   S: StableStore,
   S::NodeId: PartialEq,
 {
-  let used = stable.hard_state() != HardState::initial()
+  if stores_hold_state(log, stable) {
+    return Err(CreateGroupError::StorageInUse);
+  }
+  Ok(())
+}
+
+/// Whether a `(log, stable)` pair holds ANY state at all: a hard state moved off the initial one, a
+/// snapshot slot, log content, or a log re-baselined above index 1.
+///
+/// The one predicate behind both store-shape admission doors — a fork refuses stores that DO hold
+/// state, a restore refuses stores that do NOT — so the two can never disagree about what "used"
+/// means.
+fn stores_hold_state<L, S>(log: &L, stable: &S) -> bool
+where
+  L: LogStore,
+  S: StableStore,
+  S::NodeId: PartialEq,
+{
+  stable.hard_state() != HardState::initial()
     || stable.snapshot().is_some()
     || log.last_index() > Index::ZERO
-    || log.first_index() > Index::new(1);
-  if used {
-    return Err(CreateGroupError::StorageInUse);
+    || log.first_index() > Index::new(1)
+}
+
+/// Whether a durable snapshot slot is one a restart will ADOPT — the lineage-first reconciliation,
+/// in one place so the restart that acts on it and the validator that reasons about it cannot
+/// drift.
+///
+/// `(index, term)` coordinate proofs certify content only WITHIN one lineage, so which artifacts to
+/// trust is a token question first. Agreeing tokens adopt (a token-less pair included). A token-less
+/// hard state beside a token-bearing meta adopts only when the log is BASELINED AT that meta's
+/// boundary — its prefix gone and the retained boundary term the meta's — because that shape is the
+/// destructive `log.restore` having already run, leaving only the stamp missing. Anything else is an
+/// UNADOPTED leftover the restart ignores, so nothing may credit it as evidence either.
+pub(crate) fn snapshot_is_adopted<L, I>(
+  hs_lineage: Option<&crate::ForkId>,
+  meta: &crate::SnapshotMeta<I>,
+  log: &L,
+) -> bool
+where
+  L: LogStore,
+{
+  if hs_lineage == meta.fork_id() {
+    return true;
+  }
+  hs_lineage.is_none()
+    && log.first_index() == meta.last_index().next()
+    && log.term(meta.last_index()).ok() == Some(meta.last_term())
+}
+
+/// # What `generation` IS, and what it is not
+///
+/// It is the incarnation the caller's CATALOG asserts, and it is used exactly twice: to clear the
+/// id's admission floor (which the stores' own recoverable lineage must independently clear — see
+/// [`CreateGroupError::StoredStateBelowFloor`]), and to refuse a restore below the durable lineage
+/// record. Beyond that it is INERT by design.
+///
+/// It is never INSTALLED: the restore doors do not hand it to the container, and the booted
+/// generation derives from the stores alone (the restored snapshot meta ⊔ the hard state's founding
+/// generation ⊔ the replayed committed tail). It is never written to the engine lineage record — the
+/// drivers mirror the endpoint's LIVE counter there, so the record stays pure evidence of applied
+/// moves. It is never stamped onto a frame, because the wire stamp reads that same live counter.
+///
+/// So a claim cannot install an incarnation, cannot inflate the record, cannot reach a peer, and
+/// cannot clear a fence the stores do not clear. It asserts that the id HAS a history — which is
+/// why empty stores, and stores that name no incarnation at all, refuse against it — without
+/// asserting how far that history reached.
+///
+/// The RESTORE-side admission legs beyond the floor, for every door that recovers a group from
+/// stores: a coordinator's `restore_group`, a driver's restart path, an embedder's own.
+///
+/// `record` is the id's DURABLE lineage counter — [`FloorStore::lineage`], the value an engine
+/// flushed with this id's last reshape. It is EVIDENCE, not memory of a claim: every writer states
+/// a lineage move this host applied or a fork it materialized or abandoned, so the record names
+/// only generations this id's own stores account for. Two rules follow from it:
+///
+/// - **A supplied generation below the record REFUSES**
+///   ([`CreateGroupError::BelowLineageRecord`]) rather than folding up by `max`. The catalog is
+///   naming an incarnation below what these very stores prove the id already reached, and a restore
+///   is the one moment where that contradiction is visible. At or above the record the two agree on
+///   the lineage's direction, and the caller's own `max` fold stands.
+///
+///   A generation ABOVE the record is admitted and then forgotten, deliberately: nothing durable
+///   remembers a claim no local state backs. Cross-host agreement about which generations exist
+///   comes from the replicated log — the live lineage counter is a pure function of it — never from
+///   per-host memory of what a catalog once asserted.
+/// - **A known id over empty stores REFUSES** ([`CreateGroupError::NoStoredState`]). An id the
+///   lineage knows has a history; stores holding no hard state, no snapshot, and no log do not
+///   contain it. Restoring would present a blank term-0 endpoint as recovered state.
+/// - **Stores whose recoverable lineage is BELOW the floor refuse**
+///   ([`CreateGroupError::StoredStateBelowFloor`]). The floor gate judges the caller's claim; this
+///   judges what the stores can actually account for, and admitting on the claim alone resurrects
+///   a fenced incarnation.
+/// - **A known id whose stores hold state but no INCARNATION refuses**
+///   ([`CreateGroupError::IncarnationUnrecoverable`]). See that variant for why the founding
+///   generation — alone among the durable safety values — needs its loss detected here rather than
+///   covered by a response gate.
+///
+/// Neither leg WRITES anything: both read the stores synchronously and refuse before any replay.
+/// An id the lineage does not know (`record == 0` and no floor) keeps today's behaviour exactly —
+/// a gen-0 world has no record to contradict.
+///
+/// # Errors
+/// [`CreateGroupError::BelowLineageRecord`] and [`CreateGroupError::NoStoredState`], per the rules
+/// above.
+pub fn validate_restore<L, S>(
+  record: u64,
+  floor: u64,
+  generation: u64,
+  log: &L,
+  stable: &S,
+) -> Result<(), CreateGroupError>
+where
+  L: LogStore,
+  S: StableStore,
+  S::NodeId: PartialEq,
+{
+  if generation < record {
+    return Err(CreateGroupError::BelowLineageRecord { record });
+  }
+  // THE CLAIM COUNTS AS "this id has a history" too. A catalog naming a nonzero incarnation is
+  // asserting exactly that, so empty stores contradict it as surely as they contradict a nonzero
+  // record or floor — and without this leg `(record 0, floor 0, generation N)` over nothing at all
+  // was admitted and came up blank.
+  if (record != 0 || floor != 0 || generation != 0) && !stores_hold_state(log, stable) {
+    return Err(CreateGroupError::NoStoredState);
+  }
+  // THE INCARNATION MUST BE RECONSTRUCTABLE FROM WHAT SURVIVED. An id the record knows above zero
+  // was founded above zero (or has since reshaped), and the founding generation lives in the hard
+  // state until the first capture folds it into a meta. The stable and log stores have NO
+  // cross-store durability ordering — the core's own term discipline says so in as many words, and
+  // is safe there only because every response is withheld until the term is durable. The founding
+  // generation gates no response, so an initial hard state beside surviving log content is the one
+  // shape where its loss is both possible and undetectable later: the counter would rebuild at zero
+  // here while peers stand at the founding value.
+  //
+  // Deliberately NOT carved out for a surviving snapshot. A meta would carry the value, but a
+  // durable meta beside an initial hard state is only unreachable if stable-store durability is
+  // ordered across submissions, which the storage contract does not promise (it promises ordered
+  // COMPLETION DELIVERY, which is a different thing — and the core defers compaction on the
+  // snapshot's own completion precisely because it cannot assume the stronger rule). Refusing costs
+  // a re-ceremony; admitting on an unstated ordering would gamble the apply guards on it.
+  //
+  // THE CLAIM COUNTS AS HISTORY HERE TOO. A catalog naming a nonzero incarnation asserts one just
+  // as a nonzero record does, so the same shape — state in the stores, nothing in them naming an
+  // incarnation — is just as unrecoverable when the assertion came from the catalog. Gating this on
+  // the record alone let `(record 0, floor 0, generation N)` over a non-empty log with an initial
+  // hard state through, to be rebuilt at zero under the name N.
+  //
+  // NOTE WHAT THIS DELIBERATELY DOES NOT DO: it does not require the stores to REACH `generation`.
+  // A claim legitimately runs ahead of everything readable here when the evidence is a retained,
+  // still-uncommitted shape entry — the reopen the whole lineage-record discipline exists for —
+  // and the counter gets there once that entry re-commits. Bounding the claim by what is readable
+  // now would refuse exactly that replica, which is the same mistake as bounding it by the
+  // replay-derived counter. A NON-INITIAL hard state is the discriminator: it means some
+  // incarnation really did write here, so the stores are that incarnation's and replay may carry
+  // them the rest of the way.
+  if (record > 0 || generation > 0)
+    && stores_hold_state(log, stable)
+    && stable.hard_state() == HardState::initial()
+  {
+    return Err(CreateGroupError::IncarnationUnrecoverable { record });
+  }
+  // THE STORES MUST CLEAR THE FLOOR, not merely the caller's claim about them. The floor gate the
+  // coordinators run judges `generation`, and the doors deliberately do not INSTALL that value —
+  // the live counter comes from the stores — so a claim at the floor over stores founded below it
+  // admits the fenced incarnation and then recovers it: it can campaign, serve retired state, and
+  // judge current-generation traffic by a dead incarnation's lineage guards.
+  //
+  // The bound is every reading of lineage these stores can account for. `record` is the driver's
+  // mirror of applied lineage moves, so it covers whatever a replay will reach at the driver level;
+  // the founding generation and the snapshot meta cover what a restart seeds before any replay. A
+  // container-direct embedder owns the record it passes, and this bound is only as good as it.
+  // Conservative by construction: it refuses when NOTHING in the stores reaches the fence.
+  let recoverable = record.max(stable.hard_state().founding_gen()).max(
+    // ONLY AN ADOPTED SLOT COUNTS. A restart ignores a snapshot whose lineage the hard state does
+    // not vouch for, so crediting it here would clear a floor with a boundary the boot then
+    // discards — admitting a fenced incarnation that comes up blank and, on a single voter, can
+    // campaign and serve below the fence.
+    stable
+      .snapshot()
+      .filter(|(meta, _)| snapshot_is_adopted(stable.hard_state().lineage(), meta, log))
+      .map_or(0, |(meta, _)| meta.shape_gen()),
+  );
+  if floor > 0 && recoverable < floor {
+    return Err(CreateGroupError::StoredStateBelowFloor { floor, recoverable });
   }
   Ok(())
 }
@@ -910,6 +1090,32 @@ where
   /// under a snapshot that already carries the bump) and folds to a resolved no-op. Deliberately
   /// DISTINCT from the endpoints' live `shape_gen` (bumped at APPLY, before the relay — guarding
   /// on it would drop every first relay).
+  ///
+  /// INV-MINT-ABOVE-GUARD: every generation this group MINTS is strictly above this view, so a
+  /// fork the group has yet to mint can never be read as already-relayed and discarded — the
+  /// staged baseline being the child partition's only local copy, that discard is a silent loss.
+  ///
+  /// The invariant is NOT `guard <= shape_gen` — that is false in an ordinary window. This view is
+  /// seeded at a restore from the host's DURABLE fork record, and the live counter can be
+  /// temporarily behind that record: the entry backing it is durable in the log but not yet
+  /// re-committed, so replay has not re-applied it. The record is never AHEAD of the group's
+  /// evidence, only ahead of where replay currently stands.
+  ///
+  /// What closes the gap is that a mint cannot happen inside that window. Only a leader mints, and
+  /// `become_leader` re-seats `pending_split_index` at the log's last index, so `propose_split`
+  /// refuses until `applied` absorbs the whole inherited tail — including the entry the record is
+  /// waiting on. By the time a mint is possible the live counter has absorbed everything the record
+  /// names, and `shape_gen + 1` clears this view. The mint site asserts it directly.
+  ///
+  /// Two properties hold unconditionally and are asserted where they are established: a relayed or
+  /// abandoned fork's own generation is at-or-below the live counter (its split applied), and a
+  /// fresh mint exceeds this view.
+  ///
+  /// The founding term of the live counter is what keeps the second property true across a restart
+  /// that caught no capture: the counter comes back at the generation the ceremony founded the
+  /// incarnation at, so it cannot mint beneath a guard seeded from a record that remembers the same
+  /// ceremony. See INV-APPLY-LINEAGE on `SplitState::shape_gen` for the provenance rule, and #125
+  /// face 11 for the one member-materializing door that does not yet satisfy it.
   lineage: BTreeMap<G, u64>,
   /// The host's node identity, latched by the FIRST admitted group and retained for the
   /// container's whole lifetime — including across [`remove_group`](Self::remove_group) emptying
@@ -1345,6 +1551,17 @@ where
   /// re-derivable — and it is deliberately volatile, tracked in #125 (see the `!at_head` arm in
   /// `abandon_fork_this_removal_descends_from` for why contiguity forbids the mirror there).
   fn advance_relay_guard(&mut self, gid: &G, parent_gen_after: u64) {
+    // INV-GUARD-BELOW-LIVE. Every generation this advances past belongs to a fork that was STAGED
+    // BY AN APPLIED SPLIT, so the live counter already absorbed it at that apply — a consumption
+    // can never push the guard above the evidence. An unhosted id has no live counter to compare
+    // against (its guard is a removed incarnation's last relayed bump).
+    debug_assert!(
+      self
+        .groups
+        .get(gid)
+        .is_none_or(|ep| parent_gen_after <= ep.shape_gen()),
+      "the relay guard advanced past the live lineage counter"
+    );
     let guard = self
       .lineage
       .entry(gid.cheap_clone())
@@ -1739,6 +1956,15 @@ where
   /// container knows it: the LIVE endpoint counter when hosted (it includes every applied
   /// split), else the relay-time view (a removed id's last relayed bump). `0` for an id never
   /// admitted or reshaped.
+  ///
+  /// This is the value the transports stamp onto every outbound frame's group header, and both of
+  /// its inputs are the group's own EVIDENCE: the live counter is replicated state, and the relay
+  /// view names only generations this host's durable fork record accounts for. The receiving fence
+  /// compares the stamp against the id's admission FLOOR — a retirement fact — so a stamp lifted
+  /// above the sender's evidence is exactly the claim that fence exists to refuse: an incarnation
+  /// speaking for generations nothing of its own holds is the identity collapse that makes every
+  /// gen-keyed observer read two incarnations as one. A catalog value supplied at a restore is such
+  /// a claim, and it reaches neither input.
   #[must_use]
   pub fn group_gen(&self, gid: &G) -> u64 {
     let live = self.groups.get(gid).map(Endpoint::shape_gen).unwrap_or(0);
@@ -2566,6 +2792,17 @@ where
   /// Feeding the engine's record here folds those already-durable forks to resolved no-ops
   /// instead. Monotone (never lowers) and a no-op for an unhosted `gid`, so a lineage-less
   /// floor store leaves the snapshot-seeded guard exactly as it was.
+  ///
+  /// # The record is fork EVIDENCE, and the raise trusts it whole
+  ///
+  /// Every writer of that record states a fork fact this host already carried out — a materialized
+  /// fork's generation, an abandoned fork's, an applied lineage move's — so it can only ever name a
+  /// generation this group's own durable log or snapshot accounts for. The raise therefore takes it
+  /// unbounded. Bounding it by the live counter would discard exactly the facts it exists to carry:
+  /// at a restore the live counter is often BEHIND the record for a purely temporal reason — the
+  /// backing entry is durable but not yet re-committed, so replay has not reached it. An abandonment record is the sharpest case, since
+  /// the child it condemned is gone for good and re-staging that fork would aim a manufactured
+  /// baseline at the clean slate the removal made.
   pub fn raise_relay_guard(&mut self, gid: &G, lineage: u64) {
     if !self.groups.contains_key(gid) {
       return;
@@ -2594,6 +2831,14 @@ where
   /// generation this incarnation ever mints (splits, merge freezes/thaws/absorbs) lies strictly
   /// above its floor — a recreate can never repeat a predecessor's generations, which is what
   /// binds gen-keyed state (a stale merge-abort obligation above all) to exactly one incarnation.
+  ///
+  /// STORE WIRING IS THE CALLER'S. This door takes no stores, so the endpoint it builds mints its
+  /// operation ids from epoch zero and cannot check what it will later be handed. Wire it to stores
+  /// that are FRESH — or at least quiescent, with no submission from a prior incarnation of this id
+  /// still outstanding — or a leftover completion can alias this endpoint's first write and release
+  /// a vote grant or a campaign on durability it does not have. The doors that DO take stores
+  /// ([`create_group_founded_at`](Self::create_group_founded_at) and the fork constructors) enforce
+  /// this instead of asking for it, because they can see what they were given.
   ///
   /// # Errors
   /// [`CreateGroupError::Exists`] if a group with `gid` is already hosted,
@@ -2854,7 +3099,7 @@ where
   /// A fork is a LOCAL act by an already-authorized replica: it is never solicited over the
   /// wire, and no factory path reaches it — a catalog that marks ids fork-born should DECLINE
   /// solicitations for them. Same `boot_epoch` contract as
-  /// [`restore_group`](Self::restore_group) (strictly above every prior incarnation of this
+  /// [`restore_group_unchecked`](Self::restore_group_unchecked) (strictly above every prior incarnation of this
   /// group on this node — a re-fork after removal is a later incarnation), with its floor
   /// ENFORCED here: `boot_epoch == 0` is refused, because the manufactured baseline's store
   /// writes ride the prior epoch and epoch 0 has none — the baseline's completions would land
@@ -3836,6 +4081,22 @@ where
     let Some(parent_gen_after) = next_lineage(ep.shape_gen()) else {
       return Some(Err(SplitError::LineageExhausted));
     };
+    // INV-MINT-ABOVE-GUARD, at the site that establishes it: this mint must clear the relay guard,
+    // or the fork it produces folds to a resolved no-op and the child partition's only local copy
+    // goes with it. The propose gate is what makes this hold — a fresh leader re-seats
+    // `pending_split_index` at the log's last index, so no mint happens until `applied` has absorbed
+    // every entry the guard's durable seed was waiting on.
+    debug_assert!(
+      parent_gen_after > self.lineage.get(gid).copied().unwrap_or(0),
+      "a fresh split minted at or below the relay guard would be folded away as already-relayed"
+    );
+    // THE CHILD'S GENERATION IS THE CALLER'S, so it is validated here — this door holds the value
+    // and can judge it, unlike the doors whose facts live a level up. A reserved child generation
+    // survives into the committed payload otherwise, and apply then partitions the parent while the
+    // relay reads the child as terminal and drops its blob.
+    if validate_working_generation(child_gen).is_err() {
+      return Some(Err(SplitError::ReservedGeneration));
+    }
     let child_bytes = Bytes::from(child_bytes);
     let payload = SplitPayload::new(
       child_bytes.clone(),

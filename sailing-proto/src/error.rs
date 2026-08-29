@@ -223,6 +223,32 @@ pub enum CreateGroupError {
     "a fork must boot at epoch >= 1 (epoch 0 would alias the baseline's completions with the child's first live ops)"
   )]
   InvalidBootEpoch,
+  /// A RESTORE supplied an incarnation BELOW the id's DURABLE LINEAGE RECORD — the counter the
+  /// engine flushed with this id's last reshape. The restore is refused rather than folded up.
+  ///
+  /// The record is the cross-restart authority for which incarnation this id is ON. A catalog that
+  /// names a lower one is stating something the durable evidence contradicts, and the two readings
+  /// cannot both be acted on: the endpoint would be seeded at the supplied generation while the
+  /// relay guard, the admission doors, and every gen-keyed obligation answered to the record.
+  /// Silently taking the max hides that disagreement at exactly the moment it matters — a catalog
+  /// that has rolled back is the shape a restore is least able to tolerate, since the whole point
+  /// of the record is to outlive the process that wrote it. At or above the record the two agree
+  /// on the lineage's direction and the max fold stands as before.
+  #[error("the restore's incarnation is below the id's durable lineage record ({record})")]
+  BelowLineageRecord {
+    /// The id's durable lineage record: the incarnation counter the engine last flushed for it.
+    record: u64,
+  },
+  /// A RESTORE named an id the durable lineage KNOWS — it carries a floor or a lineage record —
+  /// over stores that hold NOTHING: no hard state, no snapshot slot, an empty never-re-baselined
+  /// log.
+  ///
+  /// There is nothing to recover. Proceeding would build a blank term-0, index-0 endpoint and
+  /// present it as recovered state, and the id's own record says that is false — this id has a
+  /// history the handed stores do not contain. The node must be re-provisioned (or created afresh
+  /// at an admissible incarnation), not silently resurrected as a blank replica.
+  #[error("no stored state to restore for this group")]
+  NoStoredState,
   /// A fork constructor was handed stores that already hold state (a durable/visible hard state,
   /// a snapshot slot, or log content). The manufactured baseline OVERWRITES whatever the stores
   /// hold, so a fork over a used incarnation's storage would destroy its progress since the fork
