@@ -1,0 +1,16 @@
+[package]
+name = "sailing-storage-conformance"
+description = "A conformance kit for sailing's storage seams: suites a store or engine implementation runs against itself, plus the crash/fault reference types they need"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sailing-proto = { workspace = true, features = ["std"] }
+bytes.workspace = true
+
+[lints]
+workspace = true
