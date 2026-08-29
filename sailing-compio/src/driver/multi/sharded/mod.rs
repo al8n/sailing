@@ -767,6 +767,36 @@ where
       .await
   }
 
+  /// Refuse `group` when the plane that OWNS it reports its incarnation below its admission floor,
+  /// BEFORE this handle answers a placement question about the other participant.
+  ///
+  /// THE OWNED PARTICIPANT'S OWN STATE OUTRANKS PLACEMENT. A cross-plane peer is a routing fact the
+  /// caller cures by remapping; a fence is a fact about the group itself, cured by rerouting or
+  /// retiring it. Answering the routing one first sends the caller to remap what it should have
+  /// buried, and it can retry that forever against a group that can never propose again.
+  ///
+  /// ONLY the participant this plane owns — the id its verb is addressed to on the driver thread:
+  /// the split's parent, the freeze's source, the absorb's target, the abort's target. A peer that
+  /// maps elsewhere has no floor visible from here, so the cross-plane answer is the honest one for
+  /// a healthy owned participant, and the peer's own plane judges it on dispatch. This preflight
+  /// does not promise to have judged both participants.
+  ///
+  /// The query proposes nothing, and the plane establishes hosting before it reads a floor, so an
+  /// id this plane merely used to run raises no objection and the placement answer still stands.
+  async fn refuse_if_fenced(
+    &self,
+    plane: usize,
+    group: G,
+    role: &str,
+  ) -> Result<(), DriverError<I>> {
+    match self.shards[plane].fenced_floor(group).await? {
+      Some(floor) => Err(DriverError::Rejected {
+        reason: format!("the {role} is below its admission floor ({floor})"),
+      }),
+      None => Ok(()),
+    }
+  }
+
   /// Propose a group SPLIT on `parent`'s mapped plane. v1 CONSTRAINT, refused HERE — typed,
   /// before any command crosses a channel: `shard(child) == shard(parent)`, because the fork
   /// materializes inside one plane's driver (a cross-plane child would need a handoff seam
@@ -781,6 +811,11 @@ where
     instruction: bytes::Bytes,
   ) -> Result<sailing_proto::Index, DriverError<I>> {
     let plane = self.map.shard(&parent);
+    // The split is addressed to the PARENT on the driver thread, so the parent is the participant
+    // this plane owns, and its fence outranks the child's placement.
+    self
+      .refuse_if_fenced(plane, parent.cheap_clone(), "proposing parent group")
+      .await?;
     if self.map.shard(&child) != plane {
       return Err(DriverError::Rejected {
         reason: sailing_proto::SplitError::<I>::CrossPlane.to_string(),
@@ -802,6 +837,11 @@ where
     target: G,
   ) -> Result<sailing_proto::Index, DriverError<I>> {
     let plane = self.map.shard(&source);
+    // The freeze rides the SOURCE's log — the dispatch arm addresses the coordinator's verb at the
+    // source, the same id this handle routes on — so the source is this plane's own participant.
+    self
+      .refuse_if_fenced(plane, source.cheap_clone(), "freeze's source group")
+      .await?;
     if self.map.shard(&target) != plane {
       return Err(DriverError::Rejected {
         reason: sailing_proto::MergeError::<I>::CrossPlane.to_string(),
@@ -819,6 +859,11 @@ where
     source: G,
   ) -> Result<sailing_proto::Index, DriverError<I>> {
     let plane = self.map.shard(&target);
+    // The absorb rides the TARGET's log — the dispatch arm resolves the target's stores and
+    // addresses the coordinator's verb there — so the target is this plane's own participant.
+    self
+      .refuse_if_fenced(plane, target.cheap_clone(), "absorb's target group")
+      .await?;
     if self.map.shard(&source) != plane {
       return Err(DriverError::Rejected {
         reason: sailing_proto::MergeError::<I>::CrossPlane.to_string(),
@@ -836,6 +881,11 @@ where
     source: G,
   ) -> Result<sailing_proto::Index, DriverError<I>> {
     let plane = self.map.shard(&target);
+    // The abort rides the TARGET's log — the dispatch arm addresses the coordinator's verb at the
+    // target — so the target is this plane's own participant.
+    self
+      .refuse_if_fenced(plane, target.cheap_clone(), "abort's target group")
+      .await?;
     if self.map.shard(&source) != plane {
       return Err(DriverError::Rejected {
         reason: sailing_proto::MergeError::<I>::CrossPlane.to_string(),

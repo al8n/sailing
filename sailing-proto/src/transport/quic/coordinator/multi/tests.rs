@@ -136,7 +136,10 @@ fn coordinator_drives_isolated_groups() {
   let cmd = bytes::Bytes::copy_from_slice(&[7u8]);
   {
     let (l, s) = stores.stores(&100).unwrap();
-    coord.submit_propose(&100, d, l, s, &cmd).unwrap().unwrap();
+    coord
+      .submit_propose(&100, d, l, s, &cmd, &NoFloors)
+      .unwrap()
+      .unwrap();
   }
   {
     let (l, s) = stores.stores(&100).unwrap();
@@ -1316,10 +1319,12 @@ fn fork_purges_a_queued_unknown_group_signal() {
 /// reserved `u64::MAX` incarnation refuses as its own class at any floor.
 #[test]
 fn propose_split_gates_the_child_floor() {
+  // Floors the CHILD id only: the parent is judged first and on its own record, so a fixture that
+  // answers one floor for every id would fence the parent and never reach the leg under test.
   struct Floors(u64);
   impl FloorStore<u64> for Floors {
-    fn floor(&self, _: &u64) -> u64 {
-      self.0
+    fn floor(&self, gid: &u64) -> u64 {
+      if *gid == 200 { self.0 } else { 0 }
     }
 
     fn lineage(&self, _: &u64) -> u64 {
@@ -1755,7 +1760,7 @@ fn merge_verbs_ride_the_coordinator() {
   {
     let (l, s) = stores.stores(&1).unwrap();
     assert!(matches!(
-      coord.rollback_merge(&1, now, l, s, &2).unwrap(),
+      coord.rollback_merge(&1, now, l, s, &2, &NoFloors).unwrap(),
       Err(crate::MergeError::SourceMissing)
     ));
   }

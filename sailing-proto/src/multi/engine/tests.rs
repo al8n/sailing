@@ -1365,11 +1365,17 @@ mod engine_backed_cluster {
     let cmd = Bytes::copy_from_slice(&[7u8]);
     {
       let (l, s) = w.ea.stores(&100).unwrap();
-      w.a.submit_propose(&100, now, l, s, &cmd).unwrap().unwrap();
+      w.a
+        .submit_propose(&100, now, l, s, &cmd, &NoFloors)
+        .unwrap()
+        .unwrap();
     }
     {
       let (l, s) = w.ea.stores(&200).unwrap();
-      w.a.submit_propose(&200, now, l, s, &cmd).unwrap().unwrap();
+      w.a
+        .submit_propose(&200, now, l, s, &cmd, &NoFloors)
+        .unwrap()
+        .unwrap();
     }
     let batched = w.flush_a();
     assert!(

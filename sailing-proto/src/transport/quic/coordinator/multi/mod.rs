@@ -701,11 +701,18 @@ where
     log: &mut L,
     stable: &S,
     cmd: &F::Command,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self.multi.propose(group, now, log, stable, cmd)?;
     let _ = self.multi.flush_appends(group, now, log, stable);
@@ -725,11 +732,18 @@ where
     log: &mut L,
     stable: &S,
     cmd: &F::Command,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self.multi.propose(group, now, log, stable, cmd)?;
     self.pump(now.mono());
@@ -765,11 +779,18 @@ where
     log: &mut L,
     stable: &S,
     cc: crate::ConfChange<I>,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self
       .multi
@@ -789,11 +810,18 @@ where
     log: &mut L,
     stable: &S,
     cc: crate::ConfChangeV2<I>,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self
       .multi
@@ -813,11 +841,18 @@ where
     log: &mut L,
     stable: &S,
     mode: crate::ReadOnlyOption,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self
       .multi
@@ -853,6 +888,15 @@ where
   {
     if !self.multi.contains_group(group) {
       return None;
+    }
+    // THE PARENT IS JUDGED FIRST, on nothing but its own placement and its own floor. A husk
+    // parent replicates a split entry toward a quorum that is gone, exactly as its ordinary
+    // proposals would — and it stays the answer whatever the child claim turns out to be, so no
+    // child-shaped refusal below may mask it. Its refusal travels as the PARENT'S OWN propose
+    // failure, which is what tells a caller to reroute or retire the parent rather than adjust
+    // the child generation the bare `SplitError::BelowFloor` below is about.
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(crate::SplitError::Propose(e)));
     }
     // A locally-tombstoned child could never materialize its fork here (admission refuses
     // `Retired`), so refuse the split at propose — the entry is never appended. The floor leg
@@ -899,7 +943,7 @@ where
     if !self.multi.contains_group(source) {
       return None;
     }
-    if let Err(e) = self.merge_floor_check(source, target, floors) {
+    if let Err(e) = self.merge_floor_check([source, target], floors) {
       return Some(Err(e));
     }
     let now: Now = now.into();
@@ -931,7 +975,7 @@ where
     if !self.multi.contains_group(target) {
       return None;
     }
-    if let Err(e) = self.merge_floor_check(source, target, floors) {
+    if let Err(e) = self.merge_floor_check([source, target], floors) {
       return Some(Err(e));
     }
     let now: Now = now.into();
@@ -943,8 +987,20 @@ where
 
   /// Propose the merge ABORT on `target` (see [`MultiRaft::rollback_merge`]): the target-side
   /// abort entry, totally ordered against `CommitMerge` on the target's own log, replicating
-  /// immediately. No floor leg: aborting is always legitimate on groups this host still runs.
-  /// `None` if no group `target` is hosted.
+  /// immediately. `None` if no group `target` is hosted.
+  ///
+  /// THE ABORT ANSWERS TO THE FLOOR OF THE LOG THAT CARRIES IT, AND ONLY THAT — the target's. Its
+  /// sibling verbs gate on both participants; this one gates on one, and the asymmetry is the point.
+  /// The abort is the merge's RELEASE VALVE: the entry it appends is what CREATES the source-side
+  /// thaw obligation, and that committed obligation is the SOLE authorization for the later thaw.
+  /// There is deliberately no timeout behind it — nothing else ever unfreezes the source. So a
+  /// source-side floor leg here would refuse the one verb that can free a frozen source and strand
+  /// it frozen forever, whatever the floor's value: the same merge-freeze wedge the thaw-obligation
+  /// discharge in [`MultiRaft::service_merge_applies`] fences its floor leg off a frozen source to
+  /// avoid, one step earlier — at propose, where the obligation is never created at all.
+  ///
+  /// A floored TARGET is still refused. The abort rides the target's log, so a target below its own
+  /// floor cannot carry the entry in the first place.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   pub fn rollback_merge<L, S>(
     &mut self,
@@ -953,11 +1009,20 @@ where
     log: &mut L,
     stable: &S,
     source: &G,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, crate::MergeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(target) {
+      return None;
+    }
+    // TARGET ONLY — the log that carries the abort. A source-side leg here would wedge a frozen
+    // source permanently; see this verb's doc for the release-valve argument.
+    if let Err(e) = self.merge_floor_check([target], floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self
       .multi
@@ -967,16 +1032,69 @@ where
     Some(r)
   }
 
-  /// The merge verbs' floor leg: BOTH participants' current incarnations must clear their
-  /// persisted admission floors — an under-floor participant is a fenced incarnation's stale
-  /// survivor, and anchoring a merge on it would resurrect exactly what the floor buried.
-  fn merge_floor_check(
+  /// The floor this host's own incarnation of `group` fails to clear, or `None` when there is no
+  /// local objection — the id is not hosted here, or it is and its generation clears the floor
+  /// `floors` reports. The same predicate every gated verb applies, asked without proposing
+  /// anything, so a caller that must answer a placement question first can still let the group's
+  /// OWN state outrank it.
+  ///
+  /// Hosting is established before the floor is read, for the reason the gated verbs share: a
+  /// floor outlives the incarnation it fenced, so reading one first would report a fence for an id
+  /// this host merely used to run.
+  #[must_use]
+  pub fn fenced_floor(&self, group: &G, floors: &impl FloorStore<G>) -> Option<u64> {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    match self.propose_floor_check(group, floors) {
+      Err(ProposeError::BelowFloor { floor }) => Some(floor),
+      _ => None,
+    }
+  }
+
+  /// The ordinary propose verbs' floor leg, applied only AFTER the caller has established that
+  /// this host runs the group at all. Every gated verb here answers `None` for an id it does not
+  /// host before it reads a floor, uniformly: a floor persists past the incarnation it fenced, so
+  /// reading one first would let residual retirement state answer an unhosted id with a refusal
+  /// where the documented answer is "not mine" — and placement would then depend on which ids this
+  /// host happened to have buried.
+  ///
+  /// This group's CURRENT incarnation must clear its
+  /// persisted admission floor. A group under its floor is a fenced incarnation's stale survivor,
+  /// and every entry it proposes replicates toward a quorum that no longer exists — the caller
+  /// waits out a timeout instead of learning that the id has moved on without it.
+  fn propose_floor_check(
     &self,
-    source: &G,
-    target: &G,
+    group: &G,
     floors: &impl FloorStore<G>,
-  ) -> Result<(), crate::MergeError<I>> {
-    for gid in [source, target] {
+  ) -> Result<(), ProposeError<I>> {
+    let floor = floors.floor(group);
+    if crate::floor_admits(floor, self.multi.group_gen(group)) {
+      Ok(())
+    } else {
+      Err(ProposeError::BelowFloor { floor })
+    }
+  }
+
+  /// The merge verbs' floor leg over the participants a verb NAMES: each one's current incarnation
+  /// must clear its persisted admission floor — an under-floor participant is a fenced
+  /// incarnation's stale survivor, and anchoring a merge on it would resurrect exactly what the
+  /// floor buried.
+  ///
+  /// THE SET IS PER-VERB, and the asymmetry is deliberate. The freeze and the absorb name BOTH
+  /// participants: each writes an obligation the other must be alive to meet. The ABORT names ONLY
+  /// its target — it is the RELEASE VALVE, and a source-side floor leg here would strand a frozen
+  /// source permanently (see [`rollback_merge`](Self::rollback_merge)). Passing the set at the call
+  /// site keeps that difference readable there instead of hiding it in a second helper.
+  fn merge_floor_check<'a>(
+    &self,
+    participants: impl IntoIterator<Item = &'a G>,
+    floors: &impl FloorStore<G>,
+  ) -> Result<(), crate::MergeError<I>>
+  where
+    G: 'a,
+  {
+    for gid in participants {
       let floor = floors.floor(gid);
       if !crate::floor_admits(floor, self.multi.group_gen(gid)) {
         return Err(crate::MergeError::BelowFloor { floor });

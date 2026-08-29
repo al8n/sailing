@@ -1651,3 +1651,174 @@ async fn a_staged_removal_floor_fences_a_create_in_the_same_command_batch() {
     "a refused create must leave the id unhosted"
   );
 }
+
+/// Records, at the instant the driver wakes a reply's receiver, whether the plane's in-flight
+/// budget has a free slot — the exact question a sharded verb asks next.
+struct SlotAtWake {
+  budget: sailing_driver::shared::InflightBudget,
+  free: std::sync::atomic::AtomicI8,
+}
+
+impl futures_util::task::ArcWake for SlotAtWake {
+  fn wake_by_ref(this: &std::sync::Arc<Self>) {
+    // The probe reservation is released immediately; only its verdict is kept.
+    let free = this.budget.try_reserve::<u64>(0).is_ok();
+    this
+      .free
+      .store(i8::from(free), std::sync::atomic::Ordering::SeqCst);
+  }
+}
+
+/// THE FENCE PREFLIGHT RELEASES ITS SLOT BEFORE IT REPLIES. A sharded verb spends one in-flight
+/// slot asking a plane for a fence and then a SECOND on the real command, and the reply is what
+/// starts that second reservation. Answering while still holding the first makes an admissible
+/// operation race its own preflight and be turned away `Busy`. This driver's handle is `Send`, so
+/// the caller genuinely runs on another thread — the twin of the compio regression, maintained in
+/// parity rather than shared.
+#[tokio::test]
+async fn the_fence_preflight_frees_its_slot_before_waking_the_caller() {
+  let (mut driver, _handle) = bind_host().await;
+  let budget = sailing_driver::shared::InflightBudget::new(1, 1024);
+  let reservation = budget
+    .try_reserve::<u64>(0)
+    .expect("the preflight takes the only slot");
+  let probe = std::sync::Arc::new(SlotAtWake {
+    budget: budget.clone(),
+    free: std::sync::atomic::AtomicI8::new(-1),
+  });
+  let (tx, rx) = futures_channel::oneshot::channel();
+  let waker = futures_util::task::waker(probe.clone());
+  let mut rx = std::pin::pin!(rx);
+  assert!(
+    rx.as_mut()
+      .poll(&mut core::task::Context::from_waker(&waker))
+      .is_pending(),
+    "the caller parks on the fence reply"
+  );
+
+  let now = driver.clock.now();
+  driver.handle_command(
+    now,
+    sailing_driver::MultiCommand::GroupFenced {
+      group: 1,
+      reply: tx,
+      reservation,
+    },
+  );
+
+  assert_eq!(
+    probe.free.load(std::sync::atomic::Ordering::SeqCst),
+    1,
+    "the preflight's slot must already be free when its reply wakes the caller"
+  );
+}
+
+/// THE RULE IS THE DISPATCH LOOP'S, NOT THE FENCE ARM'S. `Transfer` stands for every arm that
+/// answers inline: it holds a reservation, replies once, and must free the slot first — a caller
+/// chaining a second command on this wake would otherwise race the slot it believes it just freed.
+/// The fence arm is probed separately because it is the one a sharded verb chains from; this leg
+/// proves the ordering is the loop's uniform shape rather than that arm's local fix.
+#[tokio::test]
+async fn a_plain_arm_frees_its_slot_before_waking_the_caller() {
+  let (mut driver, _handle) = bind_host().await;
+  let budget = sailing_driver::shared::InflightBudget::new(1, 1024);
+  let reservation = budget
+    .try_reserve::<u64>(0)
+    .expect("the command takes the only slot");
+  let probe = std::sync::Arc::new(SlotAtWake {
+    budget: budget.clone(),
+    free: std::sync::atomic::AtomicI8::new(-1),
+  });
+  let (tx, rx) = futures_channel::oneshot::channel();
+  let waker = futures_util::task::waker(probe.clone());
+  let mut rx = std::pin::pin!(rx);
+  assert!(
+    rx.as_mut()
+      .poll(&mut core::task::Context::from_waker(&waker))
+      .is_pending(),
+    "the caller parks on the transfer verdict"
+  );
+
+  let now = driver.clock.now();
+  driver.handle_command(
+    now,
+    sailing_driver::MultiCommand::Transfer {
+      group: 1,
+      to: 2,
+      reply: tx,
+      reservation,
+    },
+  );
+
+  assert_eq!(
+    probe.free.load(std::sync::atomic::Ordering::SeqCst),
+    1,
+    "the arm's slot must already be free when its reply wakes the caller"
+  );
+}
+
+/// THE REFUSAL BRANCHES ANSWER TOO. `Submit` parks its reservation only when the propose is
+/// ACCEPTED; a floor refusal answers inline, and it is the branch a caller is most likely to chain
+/// from — `BelowFloor` names a fenced incarnation, and the recovery is another command. Holding the
+/// slot across that reply would meet the recovery with `Busy` at `max_inflight = 1`, from a plane
+/// with nothing in flight at all.
+#[tokio::test]
+async fn a_refusal_branch_frees_its_slot_before_waking_the_caller() {
+  let (mut driver, handle) = bind_host().await;
+  let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+  drive(
+    &mut driver,
+    handle.create_group(1u64, cfg, 7, MergeSm::default(), 0),
+  )
+  .await
+  .expect("group admission");
+  // A fence over the hosted incarnation: floor 7 above generation 0, so every propose is refused
+  // `BelowFloor` — the inline-answer branch of an otherwise parking arm.
+  driver.engine.set_group_floor(&1u64, 7);
+
+  let budget = sailing_driver::shared::InflightBudget::new(1, 1024);
+  let reservation = budget
+    .try_reserve::<u64>(0)
+    .expect("the submit takes the only slot");
+  let probe = std::sync::Arc::new(SlotAtWake {
+    budget: budget.clone(),
+    free: std::sync::atomic::AtomicI8::new(-1),
+  });
+  let (tx, rx) = futures_channel::oneshot::channel();
+  let waker = futures_util::task::waker(probe.clone());
+  let mut rx = std::pin::pin!(rx);
+  assert!(
+    rx.as_mut()
+      .poll(&mut core::task::Context::from_waker(&waker))
+      .is_pending(),
+    "the caller parks on the submit verdict"
+  );
+
+  let now = driver.clock.now();
+  driver.handle_command(
+    now,
+    sailing_driver::MultiCommand::Submit {
+      group: 1,
+      cmd: Bytes::from_static(b"x"),
+      reply: tx,
+      reservation,
+    },
+  );
+
+  assert_eq!(
+    probe.free.load(std::sync::atomic::Ordering::SeqCst),
+    1,
+    "the refusal branch's slot must already be free when its reply wakes the caller"
+  );
+  // The branch under test really is the floor refusal, not an incidental miss.
+  match rx
+    .as_mut()
+    .poll(&mut core::task::Context::from_waker(&waker))
+  {
+    Poll::Ready(Ok(Err(e))) => assert!(
+      e.to_string().contains("floor"),
+      "the inline answer must be the floor refusal: {e}"
+    ),
+    other => panic!("expected the floor refusal, got {other:?}"),
+  }
+}

@@ -759,8 +759,16 @@ pub enum PendingAck<I> {
 }
 
 impl<I> PendingAck<I> {
-  /// Release the verdict to its caller and free the reservation. A receiver that stopped awaiting
-  /// is not an error — the send is best-effort exactly as it is on the immediate path.
+  /// Free the reservation and then release the verdict to its caller. A receiver that stopped
+  /// awaiting is not an error — the send is best-effort exactly as it is on the immediate path.
+  ///
+  /// SLOT BEFORE REPLY, in that order. The reply is the caller's starting gun, and a caller that
+  /// chains a second command on the wake — a retry of a refused create, the next step of a
+  /// lifecycle sequence — would otherwise race the very slot it believes it just freed and be
+  /// turned away [`Busy`](DriverError::Busy) by an operation that is already finished. Held as a
+  /// field, the guard would outlive the send by the width of this match arm; dropped explicitly, it
+  /// does not. (The rule is restated here rather than pointed at: this queue serves both the
+  /// single-group and the multi drivers, and neither owns it.)
   pub fn send(self) {
     match self {
       Self::Admission {
@@ -768,16 +776,16 @@ impl<I> PendingAck<I> {
         verdict,
         reservation,
       } => {
-        let _ = reply.send(verdict);
         drop(reservation);
+        let _ = reply.send(verdict);
       }
       Self::Removal {
         reply,
         verdict,
         reservation,
       } => {
-        let _ = reply.send(verdict);
         drop(reservation);
+        let _ = reply.send(verdict);
       }
     }
   }
@@ -1645,5 +1653,70 @@ mod tests {
       apply_checked_failover(out, |f: &u64, _win| Some(*f)),
       Ok(Some(42))
     );
+  }
+
+  /// Records, at the instant the ack wakes its receiver, whether the budget has a free slot.
+  struct SlotAtWake {
+    budget: InflightBudget,
+    free: std::sync::atomic::AtomicI8,
+  }
+
+  impl futures_util::task::ArcWake for SlotAtWake {
+    fn wake_by_ref(this: &std::sync::Arc<Self>) {
+      // The probe reservation is released immediately; only its verdict is kept.
+      let free = this.budget.try_reserve::<u64>(0).is_ok();
+      this
+        .free
+        .store(i8::from(free), std::sync::atomic::Ordering::SeqCst);
+    }
+  }
+
+  /// A DEFERRED VERDICT FREES ITS SLOT BEFORE IT WAKES ITS CALLER. The lifecycle acks carry their
+  /// reservation as a FIELD, so it would otherwise outlive the send by the width of the match arm —
+  /// and a caller chaining on the wake (retrying a refused create, stepping a lifecycle sequence)
+  /// would meet `Busy` from an operation that had already finished. Both variants, since each
+  /// carries its own guard.
+  #[test]
+  fn a_deferred_ack_frees_its_slot_before_waking_the_caller() {
+    for removal in [false, true] {
+      let budget = InflightBudget::new(1, 1024);
+      let reservation = budget
+        .try_reserve::<u64>(0)
+        .expect("the command takes the only slot");
+      let probe = std::sync::Arc::new(SlotAtWake {
+        budget: budget.clone(),
+        free: std::sync::atomic::AtomicI8::new(-1),
+      });
+      let waker = futures_util::task::waker(probe.clone());
+      let mut cx = core::task::Context::from_waker(&waker);
+
+      if removal {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        let mut rx = core::pin::pin!(rx);
+        assert!(core::future::Future::poll(rx.as_mut(), &mut cx).is_pending());
+        PendingAck::<u64>::Removal {
+          reply: tx,
+          verdict: Ok(true),
+          reservation,
+        }
+        .send();
+      } else {
+        let (tx, rx) = futures_channel::oneshot::channel();
+        let mut rx = core::pin::pin!(rx);
+        assert!(core::future::Future::poll(rx.as_mut(), &mut cx).is_pending());
+        PendingAck::<u64>::Admission {
+          reply: tx,
+          verdict: Ok(()),
+          reservation,
+        }
+        .send();
+      }
+
+      assert_eq!(
+        probe.free.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the ack's slot must already be free when its verdict wakes the caller (removal: {removal})"
+      );
+    }
   }
 }

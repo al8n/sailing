@@ -188,6 +188,22 @@ where
     /// The owning budget reservation (zero-byte).
     reservation: ReservationGuard,
   },
+  /// Ask this plane whether it holds a fence against `group`, without proposing anything.
+  /// Answered with the floor the group's own incarnation fails to clear, or `None` when there is
+  /// no local objection — the id is not hosted here, or it is and its generation clears its floor.
+  ///
+  /// A sharded caller uses this to let a group's OWN state outrank a placement answer: an id
+  /// mapped to another plane is a routing fact, while a fenced incarnation is a fact about the
+  /// group itself, and reporting the routing one first sends the caller to remap what it should
+  /// have retired.
+  GroupFenced {
+    /// The addressed group.
+    group: G,
+    /// Answered with the unmet floor, or `None` for no local objection.
+    reply: oneshot::Sender<Option<u64>>,
+    /// The owning budget reservation (zero-byte).
+    reservation: ReservationGuard,
+  },
   /// Snapshot one group's runtime [`Status`]; answer `reply` with the status read off that group's
   /// live endpoint ON the driver thread. `Err(Rejected)` when no such group is hosted — the
   /// group-keyed surface has a miss case the single-group one does not.
@@ -667,6 +683,23 @@ where
       reservation,
     })?;
     rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// The floor this plane's own incarnation of `group` fails to clear, or `None` when the plane
+  /// raises no objection — it does not host the id, or it does and the incarnation clears its
+  /// floor. Proposes nothing.
+  ///
+  /// # Errors
+  /// [`DriverError::ShuttingDown`] if the driver task is gone, or a budget refusal.
+  pub async fn fenced_floor(&self, group: G) -> Result<Option<u64>, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::GroupFenced {
+      group,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)
   }
 
   /// Remove a group, awaiting whether it was hosted. The group's parked operations fail with
