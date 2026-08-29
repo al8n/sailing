@@ -222,22 +222,41 @@ pub trait GroupStores<G, L, S> {
 /// floor is a GLOBAL fact about a resolved lineage; it is never a knob to break a wedge by hand.
 pub const MERGED_FLOOR: u64 = u64::MAX;
 
+/// One past the highest generation a working incarnation may ever occupy: the reserved terminal
+/// [`MERGED_FLOOR`] sentinel, less the FENCE HEADROOM its own removal needs.
+///
+/// A removal floors an id one PAST the highest generation it reached, because [`floor_admits`]
+/// admits at-or-above the floor and so a fence must strictly EXCEED what it fences. An id retired
+/// at `MERGED_FLOOR - 1` would therefore need a floor of exactly `MERGED_FLOOR`, and there is no
+/// value between them to use instead. That floor is not merely a high one: `MERGED_FLOOR` is read
+/// as a GLOBAL proof that a lineage was absorbed away, so an ordinary local removal would forge a
+/// cluster-wide verdict, clear a live thaw obligation on every replica, and strand a still-frozen
+/// source forever.
+///
+/// Reserving the top TWO values instead of one removes the shape rather than choosing an answer for
+/// it: the highest working generation is `MERGED_FLOOR - 2`, so a removal ceiling's `+ 1` lands at
+/// `MERGED_FLOOR - 1` — representable, strictly fencing, and never the sentinel. The cost is one
+/// generation out of a `u64`.
+pub const HIGHEST_WORKING_GENERATION: u64 = MERGED_FLOOR - 1;
+
 /// The floor-admission predicate every admission gate applies — the multi coordinators'
 /// create/restore checks and the drivers' factory pre-build gate: `generation` is admissible
 /// against `floor` iff it clears the floor AND is not the reserved [`MERGED_FLOOR`] sentinel
 /// (never a working incarnation). The second leg makes a `MERGED_FLOOR` fence refuse EVERY
 /// generation, the sentinel itself included.
 pub const fn floor_admits(floor: u64, generation: u64) -> bool {
-  generation < MERGED_FLOOR && generation >= floor
+  generation < HIGHEST_WORKING_GENERATION && generation >= floor
 }
 
 /// The floor-INDEPENDENT admission leg of [`floor_admits`], enforced by the CORE group
 /// constructors so the reserved terminal [`MERGED_FLOOR`] sentinel is refused at creation — not
 /// only at the coordinators' floor validator. A group born AT the sentinel would read as
 /// merged-away to every downstream consumer (a `MERGED_FLOOR` floor admits nothing, `next_lineage`
-/// never mints it), so no working incarnation may occupy it, whatever floor a caller supplies.
+/// never mints it), so no working incarnation may occupy it, whatever floor a caller supplies —
+/// nor the generation below it, which that id's own removal fence needs (see
+/// [`HIGHEST_WORKING_GENERATION`]).
 const fn validate_working_generation(generation: u64) -> Result<(), CreateGroupError> {
-  if generation < MERGED_FLOOR {
+  if generation < HIGHEST_WORKING_GENERATION {
     Ok(())
   } else {
     Err(CreateGroupError::ReservedGeneration)
@@ -254,7 +273,7 @@ const fn validate_working_generation(generation: u64) -> Result<(), CreateGroupE
 pub(crate) const fn validate_floor(floor: u64, generation: u64) -> Result<(), CreateGroupError> {
   if floor_admits(floor, generation) {
     Ok(())
-  } else if generation == MERGED_FLOOR && floor < MERGED_FLOOR {
+  } else if generation >= HIGHEST_WORKING_GENERATION && floor <= HIGHEST_WORKING_GENERATION {
     Err(CreateGroupError::ReservedGeneration)
   } else {
     Err(CreateGroupError::BelowFloor { floor })
@@ -268,7 +287,9 @@ pub(crate) const fn validate_floor(floor: u64, generation: u64) -> Result<(), Cr
 /// read downstream as merged-away, and the counter can never wrap past the terminal to `0`. The
 /// mint analogue of [`floor_admits`]'s admission leg.
 pub(crate) fn next_lineage(generation: u64) -> Option<u64> {
-  generation.checked_add(1).filter(|n| *n < MERGED_FLOOR)
+  generation
+    .checked_add(1)
+    .filter(|n| *n < HIGHEST_WORKING_GENERATION)
 }
 
 /// The engine IS the drivers' floor store: lookups delegate to the freshest-read lineage
@@ -318,7 +339,7 @@ pub const FORK_BASE_TERM: Term = Term::new(1);
 /// Same-epoch ids would collide with the child's first ops: a vote write pending at
 /// `(boot_epoch, 0)` would see OUR completion and ack a not-yet-durable vote. That is exactly
 /// what `boot_epoch == 0` would produce — the saturating subtraction has no prior epoch to land
-/// in — so the fork constructors refuse it ([`validate_fork_boot_epoch`]) before reaching here;
+/// in — so the fork constructors refuse it ([`validate_boot_epoch`]) before reaching here;
 /// the subtraction never actually saturates.
 #[allow(clippy::too_many_arguments)]
 fn write_fork_baseline<I, L, S>(
