@@ -143,6 +143,9 @@ jobs:
         cargo check -p sailing-proto
         cargo check -p sailing-proto --features tls-rustls-ring
         cargo check -p sailing-proto --features quic-rustls-ring
+        # The conformance kit is compiled by out-of-tree storage authors, so its declared MSRV has
+        # to be as real as the core's.
+        cargo check -p sailing-storage-conformance --all-targets
 
   # Prove the no_std core (sailing-proto) links on a real bare-metal target with only `alloc` and
   # no `std`. Any accidental std dependency fails to build here.
@@ -273,10 +276,12 @@ jobs:
       # The downstream crates carry no test-relevant feature combinatorics, so each runs ONCE rather
       # than per powerset combo. The transport drivers use the ring backend (aws-lc-rs is CI-excluded
       # as in memberlist); sailing-driver + the simulator carry no transport backend, so --all-features
-      # stays fine there.
+      # stays fine there. Every crate is named EXPLICITLY here, so a new member's tests run only once
+      # it is added to this list.
       run: |
         cargo test -p sailing-driver --all-features
         cargo test -p sailing-simulation --all-features
+        cargo test -p sailing-storage-conformance --all-features
         cargo test -p sailing-compio --features serde,clap,unverified-wall-clock
         cargo test -p sailing-reactor --features tokio,smol,serde,clap,unverified-wall-clock
 
@@ -311,9 +316,10 @@ jobs:
             ${{ runner.os }}-coverage-
       - name: Run llvm-cov
         # Coverage scope is the library crates (proto + driver + compio + reactor); the benchmark
-        # (dev tooling) and the simulation (test harness) still RUN to exercise the proto, but their
-        # own source is excluded from the report via --ignore-filename-regex.
-        run: cargo llvm-cov --workspace --all-features --ignore-filename-regex '(benchmarks|tests/sailing-simulation)/' --lcov --output-path lcov.info
+        # (dev tooling), the simulation (test harness), and the conformance kit (dev tooling) still
+        # RUN to exercise the proto, but their own source is excluded from the report via
+        # --ignore-filename-regex.
+        run: cargo llvm-cov --workspace --all-features --ignore-filename-regex '(benchmarks|tests/sailing-simulation|sailing-storage-conformance)/' --lcov --output-path lcov.info
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7
         with:
