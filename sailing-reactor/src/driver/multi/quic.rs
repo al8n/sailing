@@ -1302,6 +1302,17 @@ where
   /// whose command wrote engine state is released through
   /// [`ack_engine_write`](Self::ack_engine_write), behind the barrier that made the write
   /// durable.
+  ///
+  /// SLOT BEFORE REPLY. Every arm that answers inline DROPS its reservation and only then sends
+  /// the reply: the reply is the caller's starting gun, and a caller that chains a second command
+  /// on the wake — a sharded verb's fence preflight followed by its real command is the sharpest
+  /// case — would race the very slot it believes it just freed, and be turned away `Busy` for an
+  /// operation the budget can afford. Arms that PARK their work keep the guard instead, moving it
+  /// into the pending entry so the slot stays spent exactly as long as the work is outstanding —
+  /// but ONLY on the branch that actually parks: every immediate exit from a parked arm (a group
+  /// this host does not hold, a floor refusal, any propose the coordinator turns away) answers the
+  /// caller then and there, and must free the slot on that branch first, or a caller that reacts to
+  /// the refusal with its recovery command meets a slot the refusal is still holding.
   fn handle_command(&mut self, now: Now, cmd: MultiCommand<G, I, F>) -> bool {
     // Any group-addressed CLIENT operation un-quiesces its group BEFORE dispatch (see the stream
     // sibling); pure observability (`Status`) and the lifecycle commands do not wake.
@@ -1331,6 +1342,7 @@ where
           lineage: sailing_proto::FloorStore::lineage(&self.engine, &group),
         };
         let Some((log, stable)) = self.engine.stores(&group) else {
+          drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
           let _ = reply.send(Err(no_such_group()));
           return false;
         };
@@ -1351,9 +1363,12 @@ where
             }
           }
           Some(Err(e)) => {
-            let _ = reply.send(Err(map_propose_err(e)));
+            let answer = Err(map_propose_err(e));
+            drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
+            let _ = reply.send(answer);
           }
           None => {
+            drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
             let _ = reply.send(Err(no_such_group()));
           }
         }
@@ -1369,6 +1384,7 @@ where
           lineage: sailing_proto::FloorStore::lineage(&self.engine, &group),
         };
         let Some((log, stable)) = self.engine.stores(&group) else {
+          drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
           let _ = reply.send(Err(no_such_group()));
           return false;
         };
@@ -1389,9 +1405,12 @@ where
             }
           }
           Some(Err(e)) => {
-            let _ = reply.send(Err(map_propose_err(e)));
+            let answer = Err(map_propose_err(e));
+            drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
+            let _ = reply.send(answer);
           }
           None => {
+            drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
             let _ = reply.send(Err(no_such_group()));
           }
         }
@@ -1407,6 +1426,7 @@ where
           lineage: sailing_proto::FloorStore::lineage(&self.engine, &group),
         };
         let Some((log, stable)) = self.engine.stores(&group) else {
+          drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
           let _ = reply.send(Err(no_such_group()));
           return false;
         };
@@ -1427,9 +1447,12 @@ where
             }
           }
           Some(Err(e)) => {
-            let _ = reply.send(Err(map_propose_err(e)));
+            let answer = Err(map_propose_err(e));
+            drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
+            let _ = reply.send(answer);
           }
           None => {
+            drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
             let _ = reply.send(Err(no_such_group()));
           }
         }
@@ -1453,6 +1476,7 @@ where
         // fail-stopped groups restarts from durable state, a divergent group is unrecoverable. Only a
         // panicking `Drop` — an abort-level anti-pattern the `query` contract forbids — reaches this.
         let Some(routing) = self.routing.get_mut(&group) else {
+          drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
           if complete(Err(no_such_group())) == CompletionOutcome::Panicked {
             self.coord.fail_stop_plane_unattributable_panic();
           }
@@ -1460,6 +1484,7 @@ where
         };
         let ctx = routing.mint_query_ctx();
         let Some((log, stable)) = self.engine.stores(&group) else {
+          drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
           if complete(Err(no_such_group())) == CompletionOutcome::Panicked {
             self.coord.fail_stop_plane_unattributable_panic();
           }
@@ -1489,6 +1514,7 @@ where
           // caught panic is UNATTRIBUTABLE and fail-stops the WHOLE plane (uniform policy) — the same
           // reaction the not-hosted refusal below raises.
           Some(Err(e)) => {
+            drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
             if complete(Err(map_read_err(e))) == CompletionOutcome::Panicked {
               self.coord.fail_stop_plane_unattributable_panic();
             }
@@ -1496,6 +1522,7 @@ where
           // The coordinator does not hold the group: the third not-hosted refusal, plane-fatal on a
           // caught panic for the reason above.
           None => {
+            drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
             if complete(Err(no_such_group())) == CompletionOutcome::Panicked {
               self.coord.fail_stop_plane_unattributable_panic();
             }
@@ -1512,11 +1539,14 @@ where
             complete,
             _reservation: reservation,
           });
-        } else if complete(Err(no_such_group())) == CompletionOutcome::Panicked {
+        } else {
+          drop(reservation); // slot before the wake, refusal branches included; see this fn's doc
           // Not hosted: the same UNATTRIBUTABLE tear the `Query` arm's refusals describe — the
           // dropped closure's captured guard could have torn ANY hosted group's state machine, and
           // this one names none — so the refusal is plane-fatal here too.
-          self.coord.fail_stop_plane_unattributable_panic();
+          if complete(Err(no_such_group())) == CompletionOutcome::Panicked {
+            self.coord.fail_stop_plane_unattributable_panic();
+          }
         }
       }
       MultiCommand::Transfer {
@@ -1532,8 +1562,8 @@ where
             None => Err(no_such_group()),
           },
         };
+        drop(reservation); // the slot is freed before the wake; see this fn's doc
         let _ = reply.send(verdict);
-        drop(reservation);
       }
       MultiCommand::SetReadMode {
         group,
@@ -1560,8 +1590,8 @@ where
         if verdict.is_ok() {
           self.flush_pending = true;
         }
+        drop(reservation); // the slot is freed before the wake; see this fn's doc
         let _ = reply.send(verdict);
-        drop(reservation);
       }
       MultiCommand::ProposeSplit {
         group,
@@ -1600,8 +1630,8 @@ where
         if verdict.is_ok() {
           self.flush_pending = true;
         }
+        drop(reservation); // the slot is freed before the wake; see this fn's doc
         let _ = reply.send(verdict);
-        drop(reservation);
       }
       MultiCommand::PrepareMerge {
         source,
@@ -1624,8 +1654,8 @@ where
         if verdict.is_ok() {
           self.flush_pending = true;
         }
+        drop(reservation); // the slot is freed before the wake; see this fn's doc
         let _ = reply.send(verdict);
-        drop(reservation);
       }
       MultiCommand::CommitMerge {
         target,
@@ -1649,8 +1679,8 @@ where
         if verdict.is_ok() {
           self.flush_pending = true;
         }
+        drop(reservation); // the slot is freed before the wake; see this fn's doc
         let _ = reply.send(verdict);
-        drop(reservation);
       }
       MultiCommand::RollbackMerge {
         target,
@@ -1674,8 +1704,8 @@ where
         if verdict.is_ok() {
           self.flush_pending = true;
         }
+        drop(reservation); // the slot is freed before the wake; see this fn's doc
         let _ = reply.send(verdict);
-        drop(reservation);
       }
       MultiCommand::GroupFenced {
         group,
@@ -1689,12 +1719,7 @@ where
           lineage: sailing_proto::FloorStore::lineage(&self.engine, &group),
         };
         let verdict = self.coord.fenced_floor(&group, &floors);
-        // RELEASE BEFORE REPLYING. The reply is the caller's starting gun: a sharded verb awaits
-        // this preflight and then reserves a SECOND slot for the real command. Waking the caller
-        // while this reservation still holds a slot makes an admissible operation race its own
-        // preflight — certain to answer `Busy` at max_inflight = 1, possible whenever the budget is
-        // saturated. Nothing below the drop needs the guard.
-        drop(reservation);
+        drop(reservation); // the slot is freed before the wake; see this fn's doc
         let _ = reply.send(verdict);
       }
       MultiCommand::Status {
@@ -1717,8 +1742,9 @@ where
           frozen: ep.is_frozen(),
           shape_gen: ep.shape_gen(),
         });
-        let _ = reply.send(status.ok_or_else(no_such_group));
-        drop(reservation);
+        let answer = status.ok_or_else(no_such_group);
+        drop(reservation); // the slot is freed before the wake; see this fn's doc
+        let _ = reply.send(answer);
       }
       MultiCommand::CreateGroup {
         gid,
@@ -1791,8 +1817,9 @@ where
         reply,
         reservation,
       } => {
-        let _ = reply.send(self.coord.clear_tombstone(&gid));
-        drop(reservation);
+        let answer = self.coord.clear_tombstone(&gid);
+        drop(reservation); // the slot is freed before the wake; see this fn's doc
+        let _ = reply.send(answer);
       }
       MultiCommand::Shutdown => return true,
     }
