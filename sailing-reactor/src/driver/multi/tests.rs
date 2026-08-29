@@ -653,3 +653,101 @@ fn the_factory_gate_refuses_a_debt_named_source_and_releases_at_the_discharge() 
     "the debt window's refusal is self-releasing"
   );
 }
+
+/// A SPLIT READS TWO IDS, so its floor seam must be keyed by id. Both of the coordinator's split
+/// legs consult it — the parent's own incarnation and the caller's claim about the child — and a
+/// one-id snapshot answers whatever it was built from for BOTH of them. Built from the child, it
+/// carries a terminally floored parent's doomed split through on an unfloored child, and fences a
+/// live parent behind a child legitimately recreated above a nonzero floor.
+#[test]
+fn a_split_floor_seam_answers_each_id_its_own_floor() {
+  use sailing_proto::{FloorStore, GroupEngine};
+
+  use super::{FloorSnapshot, PairFloors};
+
+  const PARENT: u64 = 1;
+  const CHILD: u64 = 2;
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  engine.add_group(PARENT);
+  engine.add_group(CHILD);
+  engine.set_group_floor(&PARENT, sailing_proto::MERGED_FLOOR);
+  engine.flush();
+
+  // The child-keyed snapshot reports the CHILD's floor for the parent, so the parent's terminal
+  // fence disappears at exactly the leg that reads it.
+  let child_only = FloorSnapshot {
+    floor: FloorStore::floor(&engine, &CHILD),
+    lineage: FloorStore::lineage(&engine, &CHILD),
+  };
+  assert_eq!(FloorStore::floor(&child_only, &CHILD), 0);
+  assert_eq!(
+    FloorStore::floor(&child_only, &PARENT),
+    0,
+    "a one-id seam loses the parent's fence — the direction that lets a doomed split through"
+  );
+
+  // The pair snapshot answers each id from its own record.
+  let pair = PairFloors::snapshot(&engine, &PARENT, &CHILD);
+  assert_eq!(
+    FloorStore::floor(&pair, &PARENT),
+    sailing_proto::MERGED_FLOOR,
+    "a terminally floored parent still reads as fenced"
+  );
+  assert_eq!(FloorStore::floor(&pair, &CHILD), 0);
+
+  // THE OTHER DIRECTION. A child recreated above a nonzero floor is legitimate, and a live parent
+  // at a lower generation must not inherit that floor.
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  engine.add_group(PARENT);
+  engine.add_group(CHILD);
+  engine.set_group_floor(&CHILD, 7);
+  engine.flush();
+  let child_only = FloorSnapshot {
+    floor: FloorStore::floor(&engine, &CHILD),
+    lineage: FloorStore::lineage(&engine, &CHILD),
+  };
+  assert_eq!(
+    FloorStore::floor(&child_only, &PARENT),
+    7,
+    "a one-id seam hands the child's floor to the parent — the false-rejection direction"
+  );
+  let pair = PairFloors::snapshot(&engine, &PARENT, &CHILD);
+  assert_eq!(
+    FloorStore::floor(&pair, &PARENT),
+    0,
+    "a live parent keeps its own floor whatever the child was recreated above"
+  );
+  assert_eq!(FloorStore::floor(&pair, &CHILD), 7);
+}
+
+/// THE TWO FLOOR REFUSALS REACH A CALLER DISTINGUISHABLY. Both proto shapes carry a single `floor`
+/// field, so the drivers' `{:?}` reason would render them identically — and they need opposite
+/// recovery: reroute or retire a fenced parent, versus raise the child generation. A caller that
+/// cannot tell them apart retries the cure that cannot work, forever.
+#[test]
+fn the_split_floor_refusals_surface_with_their_participant() {
+  use sailing_proto::{ProposeError, SplitError};
+
+  use super::map_split_err;
+  use crate::DriverError;
+
+  let parent: SplitError<u64> = SplitError::Propose(ProposeError::BelowFloor {
+    floor: sailing_proto::MERGED_FLOOR,
+  });
+  let child: SplitError<u64> = SplitError::BelowFloor { floor: 7 };
+
+  let (DriverError::Rejected { reason: p }, DriverError::Rejected { reason: c }) =
+    (map_split_err(parent), map_split_err(child))
+  else {
+    panic!("both floor refusals map to the drivers' rejection shape");
+  };
+  assert_ne!(p, c, "the two refusals must not read identically");
+  assert!(
+    p.contains("parent"),
+    "the parent's refusal names the parent: {p}"
+  );
+  assert!(
+    c.contains("child"),
+    "the child's refusal names the child: {c}"
+  );
+}

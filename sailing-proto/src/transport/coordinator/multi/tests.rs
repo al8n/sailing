@@ -112,7 +112,10 @@ fn coordinator_drives_isolated_groups() {
   let cmd = bytes::Bytes::copy_from_slice(&[7u8]);
   {
     let (l, s) = stores.stores(&100).unwrap();
-    coord.submit_propose(&100, d, l, s, &cmd).unwrap().unwrap();
+    coord
+      .submit_propose(&100, d, l, s, &cmd, &NoFloors)
+      .unwrap()
+      .unwrap();
   }
   {
     let (l, s) = stores.stores(&100).unwrap();
@@ -1010,7 +1013,10 @@ fn mixed_traffic_keeps_appends_in_their_own_frames() {
   let cmd = bytes::Bytes::from_static(b"x");
   {
     let (l, s) = w.sa.stores(&100).unwrap();
-    w.a.submit_propose(&100, now, l, s, &cmd).unwrap().unwrap();
+    w.a
+      .submit_propose(&100, now, l, s, &cmd, &NoFloors)
+      .unwrap()
+      .unwrap();
   }
   {
     let (l, s) = w.sa.stores(&100).unwrap();
@@ -2246,10 +2252,12 @@ fn fork_purges_a_queued_unknown_group_signal() {
 /// reserved `u64::MAX` incarnation refuses as its own class at any floor.
 #[test]
 fn propose_split_gates_the_child_floor() {
+  // Floors the CHILD id only: the parent is judged first and on its own record, so a fixture that
+  // answers one floor for every id would fence the parent and never reach the leg under test.
   struct Floors(u64);
   impl FloorStore<u64> for Floors {
-    fn floor(&self, _: &u64) -> u64 {
-      self.0
+    fn floor(&self, gid: &u64) -> u64 {
+      if *gid == 200 { self.0 } else { 0 }
     }
 
     fn lineage(&self, _: &u64) -> u64 {
@@ -2490,7 +2498,7 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
   assert!(c1.group(&100).unwrap().role().is_leader());
   for _ in 0..3 {
     let (l, s) = engine.stores(&100).unwrap();
-    c1.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"))
+    c1.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"), &NoFloors)
       .unwrap()
       .unwrap();
     settle_engine(&mut c1, &mut engine, &[100], d);
@@ -2544,7 +2552,7 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
   assert!(c1.group(&300).unwrap().role().is_leader());
   for _ in 0..2 {
     let (l, s) = engine.stores(&300).unwrap();
-    c1.submit_propose(&300, dc, l, s, &Bytes::from_static(b"c"))
+    c1.submit_propose(&300, dc, l, s, &Bytes::from_static(b"c"), &NoFloors)
       .unwrap()
       .unwrap();
     settle_engine(&mut c1, &mut engine, &[100, 300], dc);
@@ -2728,7 +2736,7 @@ fn the_public_fork_door_is_fenced_in_every_window_and_takes_no_provenance() {
   settle_engine(&mut c, &mut engine, &[100], d);
   for _ in 0..3 {
     let (l, s) = engine.stores(&100).unwrap();
-    c.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"))
+    c.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"), &NoFloors)
       .unwrap()
       .unwrap();
     settle_engine(&mut c, &mut engine, &[100], d);
@@ -2844,7 +2852,7 @@ fn admission_refuses_an_in_flight_splits_child_id() {
   assert!(c.group(&100).unwrap().role().is_leader());
   for _ in 0..3 {
     let (l, s) = engine.stores(&100).unwrap();
-    c.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"))
+    c.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"), &NoFloors)
       .unwrap()
       .unwrap();
     settle_engine(&mut c, &mut engine, &[100], d);
@@ -3205,7 +3213,7 @@ fn a_forked_groups_hard_state_records_its_lineage_from_birth() {
   settle_engine(&mut sc, &mut engine, &[100], d);
   for _ in 0..3 {
     let (l, st) = engine.stores(&100).unwrap();
-    sc.submit_propose(&100, d, l, st, &Bytes::from_static(b"c"))
+    sc.submit_propose(&100, d, l, st, &Bytes::from_static(b"c"), &NoFloors)
       .unwrap()
       .unwrap();
     settle_engine(&mut sc, &mut engine, &[100], d);
@@ -3515,7 +3523,7 @@ fn settle_group(c: &mut SplitCoord, g: u64, st: &mut Stores, d: Instant) {
 fn commit_one_on(c: &mut SplitCoord, g: u64, st: &mut Stores, d: Instant) {
   {
     let (l, s) = st.stores(&g).unwrap();
-    c.submit_propose(&g, d, l, s, &Bytes::from_static(b"c"))
+    c.submit_propose(&g, d, l, s, &Bytes::from_static(b"c"), &NoFloors)
       .unwrap()
       .unwrap();
   }
@@ -4155,4 +4163,422 @@ fn the_valve_thaws_a_source_frozen_under_a_floored_lineage() {
     coord.group(&2).is_some_and(|ep| !ep.is_frozen()),
     "the relayed thaw UNFREEZES the source — the valve works end to end"
   );
+}
+
+/// A TERMINALLY FLOORED GROUP REFUSES PROPOSALS INSTEAD OF TIMING OUT. Every ordinary propose verb
+/// on a husk replicates toward a quorum that went with the incarnation the floor buried, so the
+/// caller's only signal is a timeout it cannot distinguish from a slow leader. The floor is the
+/// truthful answer and it is already durable, so the refusal costs one comparison.
+#[test]
+fn the_propose_verbs_refuse_a_floored_group() {
+  let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  stores
+    .map
+    .insert(1u64, (VecLog::default(), AsyncStable::default()));
+  coord
+    .create_group(
+      1,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+  let d = coord.group(&1).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_timeout(&1, d, l, s).unwrap();
+  }
+  for _ in 0..2 {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_storage(&1, d, l, s).unwrap();
+  }
+  assert!(coord.group(&1).unwrap().role().is_leader());
+  let now = Instant::ORIGIN;
+  let before = stores.map.get(&1).unwrap().0.last_index();
+
+  // Each verb, against the terminal sentinel: the typed refusal, and nothing appended.
+  macro_rules! refused {
+    ($call:expr) => {{
+      let verdict = $call;
+      assert!(
+        matches!(
+          verdict,
+          Some(Err(ProposeError::BelowFloor {
+            floor: MERGED_FLOOR
+          }))
+        ),
+        "expected a typed floor refusal, got {verdict:?}"
+      );
+      assert_eq!(
+        stores.map.get(&1).unwrap().0.last_index(),
+        before,
+        "a refused proposal appends nothing"
+      );
+    }};
+  }
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    refused!(coord.submit_propose(&1, now, l, s, &Bytes::from_static(b"c"), &MaxFloors));
+  }
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    refused!(coord.submit_propose_deferred(&1, now, l, s, &Bytes::from_static(b"c"), &MaxFloors));
+  }
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    refused!(coord.propose_conf_change(
+      &1,
+      now,
+      l,
+      s,
+      crate::ConfChange::new(crate::ConfChangeType::AddNode, 2u64, Bytes::new()),
+      &MaxFloors
+    ));
+  }
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    refused!(coord.propose_conf_change_v2(
+      &1,
+      now,
+      l,
+      s,
+      crate::ConfChange::new(crate::ConfChangeType::AddNode, 2u64, Bytes::new()).into_v2(),
+      &MaxFloors
+    ));
+  }
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    refused!(coord.propose_read_mode_change(
+      &1,
+      now,
+      l,
+      s,
+      crate::ReadOnlyOption::LeaseBased,
+      &MaxFloors
+    ));
+  }
+
+  // THE NON-REFUSAL BOUNDARY. A live group with no floor at all, and one whose floor it clears,
+  // both reach the container — the entry is appended, which is what a false positive here would
+  // have cost.
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord
+      .submit_propose(&1, now, l, s, &Bytes::from_static(b"c"), &NoFloors)
+      .unwrap()
+      .expect("an unfloored group proposes");
+  }
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord
+      .submit_propose(&1, now, l, s, &Bytes::from_static(b"c"), &FloorFor(1, 0))
+      .unwrap()
+      .expect("a group at floor zero proposes");
+  }
+  assert!(
+    stores.map.get(&1).unwrap().0.last_index() > before,
+    "the admitted proposals really were appended"
+  );
+}
+
+/// THE RECREATED ID IS THE FALSE-POSITIVE BOUNDARY. A group re-admitted ABOVE the floor that
+/// fenced its predecessor is exactly what the floor exists to permit, and refusing it would make
+/// the fence permanent rather than incarnation-scoped. Its generation clears the floor, so every
+/// verb must reach the container.
+#[test]
+fn a_recreated_group_above_its_floor_still_proposes() {
+  let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  stores
+    .map
+    .insert(1u64, (VecLog::default(), AsyncStable::default()));
+  let (founding_log, mut founding_stable) = (VecLog::default(), AsyncStable::default());
+  coord
+    .create_group_founded_at(
+      1,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      2,
+      &FloorFor(1, 2),
+      1,
+      &founding_log,
+      &mut founding_stable,
+    )
+    .expect("a recreation at the floor is admitted");
+  let d = coord.group(&1).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_timeout(&1, d, l, s).unwrap();
+  }
+  for _ in 0..2 {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_storage(&1, d, l, s).unwrap();
+  }
+  let now = Instant::ORIGIN;
+  let before = stores.map.get(&1).unwrap().0.last_index();
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    let verdict = coord
+      .submit_propose(&1, now, l, s, &Bytes::from_static(b"c"), &FloorFor(1, 2))
+      .unwrap();
+    assert!(
+      !matches!(verdict, Err(ProposeError::BelowFloor { .. })),
+      "a generation at its floor is admitted, not fenced: {verdict:?}"
+    );
+  }
+  assert!(
+    stores.map.get(&1).unwrap().0.last_index() > before,
+    "the recreated incarnation's proposal was appended"
+  );
+}
+
+/// The split delegator fences its PARENT as well as its child. The child leg judges the caller's
+/// claim about a new id; a husk parent proposing a split replicates that entry toward the quorum
+/// its own floor buried, which is the ordinary doomed proposal wearing a different verb.
+#[test]
+fn propose_split_refuses_a_floored_parent() {
+  let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  stores
+    .map
+    .insert(1u64, (VecLog::default(), AsyncStable::default()));
+  coord
+    .create_group(
+      1,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+  let d = coord.group(&1).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_timeout(&1, d, l, s).unwrap();
+  }
+  for _ in 0..2 {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_storage(&1, d, l, s).unwrap();
+  }
+  let now = Instant::ORIGIN;
+  let before = stores.map.get(&1).unwrap().0.last_index();
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    let verdict = coord
+      .propose_split(
+        &1,
+        now,
+        l,
+        s,
+        &2,
+        0,
+        bytes::Bytes::from_static(b"i"),
+        &FloorFor(1, MERGED_FLOOR),
+      )
+      .unwrap();
+    assert!(
+      matches!(
+        verdict,
+        Err(crate::SplitError::Propose(ProposeError::BelowFloor {
+          floor: MERGED_FLOOR
+        }))
+      ),
+      "a fenced PARENT is the parent's own propose failure — the shape that says reroute or \
+       retire it, not raise the child generation. Got {verdict:?}"
+    );
+  }
+  assert_eq!(stores.map.get(&1).unwrap().0.last_index(), before);
+}
+
+/// AN ID THIS HOST DOES NOT RUN ANSWERS "NOT MINE", whatever floor it left behind. A floor outlives
+/// the incarnation it fenced, so a host that once buried an id still holds a terminal value for it;
+/// reading that before establishing placement would answer an unhosted id with a refusal where the
+/// contract says `None`, and callers discriminating placement from ownership would then depend on
+/// which ids this host happened to have retired.
+#[test]
+fn the_propose_verbs_answer_none_for_an_id_this_host_does_not_run() {
+  let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  // Storage exists for the id; the COORDINATOR does not host it, which is the shape a resolved
+  // merge or a torn-down group leaves behind.
+  stores
+    .map
+    .insert(9u64, (VecLog::default(), AsyncStable::default()));
+  let now = Instant::ORIGIN;
+  let (l, s) = stores.stores(&9).unwrap();
+  assert!(
+    coord
+      .submit_propose(&9, now, l, s, &Bytes::from_static(b"c"), &MaxFloors)
+      .is_none()
+  );
+  assert!(
+    coord
+      .submit_propose_deferred(&9, now, l, s, &Bytes::from_static(b"c"), &MaxFloors)
+      .is_none()
+  );
+  assert!(
+    coord
+      .propose_conf_change(
+        &9,
+        now,
+        l,
+        s,
+        crate::ConfChange::new(crate::ConfChangeType::AddNode, 2u64, Bytes::new()),
+        &MaxFloors
+      )
+      .is_none()
+  );
+  assert!(
+    coord
+      .propose_conf_change_v2(
+        &9,
+        now,
+        l,
+        s,
+        crate::ConfChange::new(crate::ConfChangeType::AddNode, 2u64, Bytes::new()).into_v2(),
+        &MaxFloors
+      )
+      .is_none()
+  );
+  assert!(
+    coord
+      .propose_read_mode_change(&9, now, l, s, crate::ReadOnlyOption::LeaseBased, &MaxFloors)
+      .is_none()
+  );
+}
+
+/// THE SPLIT'S FALSE-REJECTION BOUNDARY. A child recreated above a nonzero floor is exactly what a
+/// floor permits, and the parent proposing that split is live at a lower generation. The two legs
+/// read DIFFERENT ids, so a seam that answers one floor for both fences a healthy parent behind
+/// its child's history — the split must be admitted and the entry appended.
+#[test]
+fn propose_split_admits_a_live_parent_under_a_recreated_child() {
+  let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  stores
+    .map
+    .insert(1u64, (VecLog::default(), AsyncStable::default()));
+  coord
+    .create_group(
+      1,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+  let d = coord.group(&1).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_timeout(&1, d, l, s).unwrap();
+  }
+  for _ in 0..2 {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_storage(&1, d, l, s).unwrap();
+  }
+  let now = Instant::ORIGIN;
+  let before = stores.map.get(&1).unwrap().0.last_index();
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord
+      .propose_split(
+        &1,
+        now,
+        l,
+        s,
+        &2,
+        7,
+        bytes::Bytes::from_static(b"i"),
+        &FloorFor(2, 7),
+      )
+      .unwrap()
+      .expect("a live parent splits out a child recreated at its own floor");
+  }
+  assert!(
+    stores.map.get(&1).unwrap().0.last_index() > before,
+    "the split entry was appended"
+  );
+}
+
+/// THE CHILD LEG KEEPS THE CHILD-SCOPED VARIANT. A claim below the child id's floor is cured by
+/// raising `child_gen` or recreating the child above it, which is the opposite of what a fenced
+/// parent needs — so the two refusals must not share a shape.
+#[test]
+fn propose_split_reports_a_floored_child_under_its_own_variant() {
+  let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  stores
+    .map
+    .insert(1u64, (VecLog::default(), AsyncStable::default()));
+  coord
+    .create_group(
+      1,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+  let d = coord.group(&1).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_timeout(&1, d, l, s).unwrap();
+  }
+  for _ in 0..2 {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_storage(&1, d, l, s).unwrap();
+  }
+  let now = Instant::ORIGIN;
+  let before = stores.map.get(&1).unwrap().0.last_index();
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    // The parent is unfloored; only the child's claim is under its floor.
+    let verdict = coord
+      .propose_split(
+        &1,
+        now,
+        l,
+        s,
+        &2,
+        3,
+        bytes::Bytes::from_static(b"i"),
+        &FloorFor(2, 7),
+      )
+      .unwrap();
+    assert!(
+      matches!(verdict, Err(crate::SplitError::BelowFloor { floor: 7 })),
+      "a below-floor child claim keeps the child-scoped variant, got {verdict:?}"
+    );
+  }
+  assert_eq!(stores.map.get(&1).unwrap().0.last_index(), before);
 }

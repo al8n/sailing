@@ -70,6 +70,19 @@ pub enum ProposeError<I> {
     /// The per-frame entry budget, in bytes.
     max: usize,
   },
+  /// The group's CURRENT incarnation sits below its persisted admission floor, so this host is
+  /// running a stale survivor of an incarnation the catalog has already condemned. Every proposal
+  /// it makes replicates to a quorum that no longer exists, so the caller would learn of the fence
+  /// only by waiting out a timeout. Refused before anything is appended.
+  ///
+  /// `floor` is the persisted value and it reads unambiguously, because no path can forge it:
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) means the lineage was absorbed away cluster-wide, and
+  /// any other value fences a specific incarnation this id has moved past. Nothing was appended.
+  #[error("the group's incarnation is below its admission floor ({floor})")]
+  BelowFloor {
+    /// The persisted admission floor this group's current incarnation failed to clear.
+    floor: u64,
+  },
   /// The membership this conf change would install carries a `ConfState` so large that its
   /// `InstallSnapshot` metadata leaves no room for a data chunk under the frame limit. A committed
   /// such config would make `send_snapshot_chunk` defer FOREVER after the next compaction — a silent,
@@ -380,9 +393,15 @@ pub enum SplitError<I> {
   /// replica of the parent (`SplitDecode`) — a self-inflicted cluster-wide fail-stop.
   #[error("the child group id's encoding is empty or exceeds the wire bound")]
   InvalidChild,
-  /// The child incarnation is below the id's persisted admission floor (a coordinator-layer
-  /// refusal through its floor seam): a removal or merge fenced the id, so the fork could never
-  /// be admitted at materialization. Produced at propose so the entry is never appended.
+  /// The CHILD claim is below that id's persisted admission floor (a coordinator-layer refusal
+  /// through its floor seam): a removal or merge fenced the id, so the fork could never be
+  /// admitted at materialization. Produced at propose so the entry is never appended.
+  ///
+  /// CHILD-ONLY, always. A fenced PARENT surfaces as
+  /// [`Propose(ProposeError::BelowFloor)`](Self::Propose), because the two need opposite recovery:
+  /// this one is cured by raising `child_gen` or recreating the child above its floor, that one by
+  /// rerouting or retiring the parent. Flattening them into one variant leaves a caller retrying
+  /// the cure that cannot work.
   #[error("the child id's incarnation is below its admission floor ({floor})")]
   BelowFloor {
     /// The child id's persisted admission floor.
@@ -427,9 +446,13 @@ pub enum SplitError<I> {
   /// property of the FSM type — re-propose only against a group whose FSM implements `split`.
   #[error("the parent group's state machine does not support splitting")]
   Unsupported,
-  /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
-  /// entry too large for one frame). The split-specific gates all passed; the failure is the
-  /// ordinary admin-append class, surfaced verbatim.
+  /// The PARENT's own propose refused (poisoned / transfer in progress / index space exhausted /
+  /// entry too large for one frame / the parent's incarnation below its admission floor). The
+  /// failure belongs to the group doing the proposing, surfaced verbatim.
+  ///
+  /// [`ProposeError::BelowFloor`] here therefore means the PARENT is fenced — reroute or retire
+  /// it — which is the opposite recovery from the child-scoped
+  /// [`SplitError::BelowFloor`](Self::BelowFloor) above.
   #[error(transparent)]
   Propose(#[from] ProposeError<I>),
 }

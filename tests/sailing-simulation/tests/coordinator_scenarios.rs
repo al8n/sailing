@@ -217,7 +217,7 @@ impl World {
       let (l, s) = self.sa.stores(&group).unwrap();
       self
         .a
-        .submit_propose(&group, now, l, s, &cmd)
+        .submit_propose(&group, now, l, s, &cmd, &NoFloors)
         .unwrap()
         .unwrap();
     }

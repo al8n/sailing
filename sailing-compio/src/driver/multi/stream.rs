@@ -1598,13 +1598,17 @@ where
         reply,
         reservation,
       } => {
+        let floors = FloorSnapshot {
+          floor: sailing_proto::FloorStore::floor(&self.engine, &group),
+          lineage: sailing_proto::FloorStore::lineage(&self.engine, &group),
+        };
         let Some((log, stable)) = self.engine.stores(&group) else {
           let _ = reply.send(Err(no_such_group()));
           return false;
         };
         match self
           .coord
-          .submit_propose_deferred(&group, now, log, stable, &cmd)
+          .submit_propose_deferred(&group, now, log, stable, &cmd, &floors)
         {
           Some(Ok(index)) => {
             self.flush_pending = true;
@@ -1632,11 +1636,18 @@ where
         reply,
         reservation,
       } => {
+        let floors = FloorSnapshot {
+          floor: sailing_proto::FloorStore::floor(&self.engine, &group),
+          lineage: sailing_proto::FloorStore::lineage(&self.engine, &group),
+        };
         let Some((log, stable)) = self.engine.stores(&group) else {
           let _ = reply.send(Err(no_such_group()));
           return false;
         };
-        match self.coord.propose_conf_change(&group, now, log, stable, cc) {
+        match self
+          .coord
+          .propose_conf_change(&group, now, log, stable, cc, &floors)
+        {
           Some(Ok(index)) => {
             self.flush_pending = true;
             if let Some(routing) = self.routing.get_mut(&group) {
@@ -1663,13 +1674,17 @@ where
         reply,
         reservation,
       } => {
+        let floors = FloorSnapshot {
+          floor: sailing_proto::FloorStore::floor(&self.engine, &group),
+          lineage: sailing_proto::FloorStore::lineage(&self.engine, &group),
+        };
         let Some((log, stable)) = self.engine.stores(&group) else {
           let _ = reply.send(Err(no_such_group()));
           return false;
         };
         match self
           .coord
-          .propose_conf_change_v2(&group, now, log, stable, cc)
+          .propose_conf_change_v2(&group, now, log, stable, cc, &floors)
         {
           Some(Ok(index)) => {
             self.flush_pending = true;
@@ -1798,12 +1813,16 @@ where
         reply,
         reservation,
       } => {
+        let floors = FloorSnapshot {
+          floor: sailing_proto::FloorStore::floor(&self.engine, &group),
+          lineage: sailing_proto::FloorStore::lineage(&self.engine, &group),
+        };
         let verdict = match self.engine.stores(&group) {
           None => Err(no_such_group()),
           Some((log, stable)) => {
             match self
               .coord
-              .propose_read_mode_change(&group, now, log, stable, mode)
+              .propose_read_mode_change(&group, now, log, stable, mode, &floors)
             {
               Some(r) => r.map_err(map_propose_err),
               None => Err(no_such_group()),
@@ -1824,13 +1843,14 @@ where
         reply,
         reservation,
       } => {
-        // The propose-time floor leg reads a pre-call snapshot of the CHILD id's lineage (the
-        // engine is lent to the propose as `(log, stable)`); the drain above keeps the
+        // TWO IDS, so a two-id snapshot. The split's floor legs read the PARENT's own incarnation
+        // and the caller's claim about the CHILD, and a one-id snapshot answers whatever it was
+        // built from for both: a child-keyed one lets an unfloored child carry a terminally
+        // floored parent's doomed split through, and lets a child legitimately recreated above a
+        // nonzero floor fence a live parent. The engine is lent to the propose as
+        // `(log, stable)`, so both floors are read before that borrow; the drain above keeps the
         // authoritative materialization-edge recheck.
-        let floors = FloorSnapshot {
-          floor: sailing_proto::FloorStore::floor(&self.engine, &child),
-          lineage: sailing_proto::FloorStore::lineage(&self.engine, &child),
-        };
+        let floors = PairFloors::snapshot(&self.engine, &group, &child);
         let verdict = match self.engine.stores(&group) {
           None => Err(no_such_group()),
           Some((log, stable)) => {

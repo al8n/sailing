@@ -701,11 +701,18 @@ where
     log: &mut L,
     stable: &S,
     cmd: &F::Command,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self.multi.propose(group, now, log, stable, cmd)?;
     let _ = self.multi.flush_appends(group, now, log, stable);
@@ -725,11 +732,18 @@ where
     log: &mut L,
     stable: &S,
     cmd: &F::Command,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self.multi.propose(group, now, log, stable, cmd)?;
     self.pump(now.mono());
@@ -765,11 +779,18 @@ where
     log: &mut L,
     stable: &S,
     cc: crate::ConfChange<I>,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self
       .multi
@@ -789,11 +810,18 @@ where
     log: &mut L,
     stable: &S,
     cc: crate::ConfChangeV2<I>,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self
       .multi
@@ -813,11 +841,18 @@ where
     log: &mut L,
     stable: &S,
     mode: crate::ReadOnlyOption,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, ProposeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self
       .multi
@@ -853,6 +888,15 @@ where
   {
     if !self.multi.contains_group(group) {
       return None;
+    }
+    // THE PARENT IS JUDGED FIRST, on nothing but its own placement and its own floor. A husk
+    // parent replicates a split entry toward a quorum that is gone, exactly as its ordinary
+    // proposals would — and it stays the answer whatever the child claim turns out to be, so no
+    // child-shaped refusal below may mask it. Its refusal travels as the PARENT'S OWN propose
+    // failure, which is what tells a caller to reroute or retire the parent rather than adjust
+    // the child generation the bare `SplitError::BelowFloor` below is about.
+    if let Err(e) = self.propose_floor_check(group, floors) {
+      return Some(Err(crate::SplitError::Propose(e)));
     }
     // A locally-tombstoned child could never materialize its fork here (admission refuses
     // `Retired`), so refuse the split at propose — the entry is never appended. The floor leg
@@ -986,6 +1030,30 @@ where
     let _ = self.multi.flush_appends(target, now, log, stable);
     self.pump(now.mono());
     Some(r)
+  }
+
+  /// The ordinary propose verbs' floor leg, applied only AFTER the caller has established that
+  /// this host runs the group at all. Every gated verb here answers `None` for an id it does not
+  /// host before it reads a floor, uniformly: a floor persists past the incarnation it fenced, so
+  /// reading one first would let residual retirement state answer an unhosted id with a refusal
+  /// where the documented answer is "not mine" — and placement would then depend on which ids this
+  /// host happened to have buried.
+  ///
+  /// This group's CURRENT incarnation must clear its
+  /// persisted admission floor. A group under its floor is a fenced incarnation's stale survivor,
+  /// and every entry it proposes replicates toward a quorum that no longer exists — the caller
+  /// waits out a timeout instead of learning that the id has moved on without it.
+  fn propose_floor_check(
+    &self,
+    group: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Result<(), ProposeError<I>> {
+    let floor = floors.floor(group);
+    if crate::floor_admits(floor, self.multi.group_gen(group)) {
+      Ok(())
+    } else {
+      Err(ProposeError::BelowFloor { floor })
+    }
   }
 
   /// The merge verbs' floor leg over the participants a verb NAMES: each one's current incarnation

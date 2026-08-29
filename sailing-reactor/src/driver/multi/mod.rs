@@ -130,6 +130,18 @@ pub(crate) fn map_split_err<I: core::fmt::Debug>(
 ) -> DriverError<I> {
   match e {
     sailing_proto::SplitError::NotLeader { leader } => DriverError::NotLeader { leader },
+    // THE TWO FLOOR REFUSALS NAME THEIR PARTICIPANT. Both carry the same shape and the same field,
+    // so a `{:?}` reason renders them identically — and they call for opposite recovery: reroute
+    // or retire a fenced parent, versus raise the child generation or recreate the child above its
+    // floor. A caller that cannot tell them apart retries the cure that cannot work.
+    sailing_proto::SplitError::Propose(sailing_proto::ProposeError::BelowFloor { floor }) => {
+      DriverError::Rejected {
+        reason: format!("the proposing parent group is below its admission floor ({floor})"),
+      }
+    }
+    sailing_proto::SplitError::BelowFloor { floor } => DriverError::Rejected {
+      reason: format!("the child id is below its admission floor ({floor})"),
+    },
     sailing_proto::SplitError::Propose(inner) => crate::driver::map_propose_err(inner),
     other => DriverError::Rejected {
       reason: format!("{other:?}"),
