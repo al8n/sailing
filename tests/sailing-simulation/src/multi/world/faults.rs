@@ -124,8 +124,12 @@ impl MultiWorld {
     let host = self.hosts.get_mut(&id).expect("crash: node exists");
     let gids: Vec<u64> = host.group_ids().copied().collect();
     let epoch = {
+      // Checked, for the reason the founding path is: an epoch handed out twice folds two
+      // incarnations onto one identity, and a wrap past the top would hand out `0` again.
       let e = self.boot_epochs.entry(id).or_insert(0);
-      *e += 1;
+      *e = e
+        .checked_add(1)
+        .unwrap_or_else(|| panic!("crash: node {id}'s boot-epoch counter is exhausted"));
       *e
     };
     let mut fresh: MultiRaft<u64, u64, LogSm> = MultiRaft::new();

@@ -1919,16 +1919,22 @@ fn wedge_a_retired_hold_behind_a_merge(seed: u64) -> (MultiWorld, u64, u64, u64)
   (w, source, target, child)
 }
 
-/// THE ISLAND, BUILT DELIBERATELY. A fork held through its child's ENTIRE removal-and-recreation
-/// ceremony, then released onto an id that has moved on: what lands is the DEAD incarnation's
-/// baseline — inherited parent cells and all — beside a registry reading generation 1.
+/// THE ISLAND, BUILT DELIBERATELY — the HELD regime. A fork held through its child's removal, then
+/// released onto the tombstoned id: what lands is the incarnation the split named, inherited parent
+/// cells and all.
 ///
-/// This is the shape the single-meta oracle misread. Judged against the successor's expectations
-/// (no inherited prefix, no tag lineage) every inherited cell reads as a cross-group leak; judged
+/// The subject is deliberately a FLOOR-LESS id. A retirement persists an admission floor only for a
+/// RESHAPED id (one past its removal ceiling), and this child never reshaped, so its tombstone is
+/// the only thing standing between the fork and its id — and a tombstone HOLDS, because consent can
+/// lift it. The sibling below takes the other regime, where a recreation makes the id reshaped and
+/// its retirement leaves a floor a monotone counter can never clear.
+///
+/// This is the shape the single-meta oracle misread. Judged against a successor's expectations (no
+/// inherited prefix, no tag lineage) every inherited cell reads as a cross-group leak; judged
 /// against its OWN, they are exactly what a fork child legitimately opens with. The cure is neither
 /// exclusion nor an assert that coexistence cannot happen — it remains reachable through paths this
 /// branch does not close — but INCARNATION-BOUND JUDGING: the island gets its own live checker and
-/// its own expectations, and the successor's checker never sees it.
+/// its own expectations.
 #[test]
 fn a_late_fork_lands_as_its_own_incarnation_and_is_judged_there() {
   let (source, child) = (11u64, 300u64);
@@ -1953,16 +1959,22 @@ fn a_late_fork_lands_as_its_own_incarnation_and_is_judged_there() {
   propose_split_until_accepted(&mut w, source, child, 4);
   assert!(w.run_until(3_000, |w| w.splits_applied() == 1));
 
-  // THE WHOLE CEREMONY while node 2 is away: retire gen 0, bring the id back as gen 1, retire that
-  // too. Node 2 is a MEMBER throughout, so each removal tombstones it — and the gen-1 replica it
-  // briefly held carries no fork token, so that teardown SPARES the fork rather than abandoning it.
-  assert!(w.remove_group(child));
-  w.recreate_group(child);
+  // RETIRE IT while node 2 is away. Node 2 is a MEMBER, so the removal tombstones it — and the
+  // teardown carries no fork token, so it SPARES the fork rather than abandoning it. No recreation:
+  // bringing the id back would make it a reshaped id, and retiring THAT leaves a floor the held
+  // fork could never clear — the sibling regime, not this one.
   assert!(w.remove_group(child));
   assert_eq!(
     w.generation_of(child),
-    1,
-    "the id moved on while node 2 was away"
+    0,
+    "the id never moved on: this regime's subject is the incarnation the split named"
+  );
+  // THE PREMISE, ASSERTED. A never-reshaped id acquires no admission floor at its retirement, so
+  // the tombstone is the whole of what stands in the fork's way — and a tombstone is liftable.
+  assert_eq!(
+    w.removal_floors.get(&child),
+    None,
+    "the held regime needs a FLOOR-LESS subject; a floor here would abandon the fork instead"
   );
 
   w.heal(2);
@@ -1976,7 +1988,7 @@ fn a_late_fork_lands_as_its_own_incarnation_and_is_judged_there() {
     "a token-less removal spares the fork — it is held, not abandoned"
   );
 
-  // Consent releases it onto an id whose registry incarnation is now 1.
+  // Consent lifts the tombstone — the one thing standing in the fork's way — and releases it.
   assert!(
     w.clear_tombstone(child),
     "a tombstone was standing to clear"
@@ -1991,16 +2003,54 @@ fn a_late_fork_lands_as_its_own_incarnation_and_is_judged_there() {
     "it lands as the incarnation the SPLIT named, not as whatever the id has become"
   );
 
-  // JUDGED, in isolation. The island has a checker of its own; the successor's was archived at its
-  // removal and never sees these replicas.
+  // THE PARENT IS DISCHARGED, exactly as it is on the terminal side — a fork that lands must free
+  // its parent as surely as one that is abandoned, or the parent stays capture-fenced behind a
+  // fork that has already resolved.
+  assert!(
+    w.hosts
+      .get_mut(&2)
+      .expect("node 2 is hosted")
+      .peek_yieldable_fork(&sailing_proto::NoHold)
+      .is_none(),
+    "no fork remains staged: materializing POPS it"
+  );
+  assert!(
+    w.fork_conflicts
+      .get(&(2, source))
+      .is_none_or(std::collections::BTreeMap::is_empty),
+    "no fork barrier still stands on the parent: {:?}",
+    w.fork_conflicts.get(&(2, source))
+  );
+  assert!(
+    !w.hosts[&2].split_reserved(&child),
+    "the child id is no longer reserved by an in-flight split"
+  );
+  // AND HERE THE TWO REGIMES PART. A terminal refusal owes NO guard advance — it re-derives from
+  // the floor. A held fork that is later RELEASED did relay, so the mirror must have moved with it:
+  // a regression that installs the child while leaving the mirror stale would replay this very fork
+  // again after a restart and aim a second manufactured baseline at the child's real progress.
+  let parent_gen_after = w.hosts[&2]
+    .group(&source)
+    .expect("node 2 hosts the parent")
+    .shape_gen();
+  assert_eq!(
+    parent_gen_after, 1,
+    "the one split bumps the parent's lineage to 1"
+  );
+  assert_eq!(
+    w.relayed_lineage.get(&(2, source)),
+    Some(&parent_gen_after),
+    "the relay mirror must equal the installed fork's parent generation; it reads {:?}",
+    w.relayed_lineage.get(&(2, source))
+  );
+
+  // JUDGED under its own incarnation, with a checker of its own. (The coexistence shape — an island
+  // hosted beside a LIVE successor of the same id — is built and judged by
+  // `island_beside_a_live_successor` and its tests, which reach it without retiring the successor.)
   let judged = w.judged_incarnations();
   assert!(
     judged.contains(&(child, 0)),
     "the island is judged under its own incarnation: {judged:?}"
-  );
-  assert!(
-    !judged.contains(&(child, 1)),
-    "and not folded into the successor's suite: {judged:?}"
   );
   // Its expectations are its own: an inherited prefix, and the parent's tag as a LEGAL carrier.
   let island = w
@@ -2020,6 +2070,177 @@ fn a_late_fork_lands_as_its_own_incarnation_and_is_judged_there() {
   assert!(
     w.applied_of(2, child).len() >= island.fork_baseline,
     "the inherited cells are present to be judged"
+  );
+  w.check_now();
+  w.finalize_conservation_or_panic(41);
+}
+
+/// HARNESS FIDELITY, not a product guarantee. The world's create path mirrors the drivers, and a
+/// driver barriers its stores after an admission before the replica takes traffic; without that
+/// barrier the founding stamp sits in an async store's in-flight window, and a crash landing
+/// between the admission ack and the first tick rolls it back — the replica comes back founded at
+/// zero, beneath the generation it was admitted at, and its lineage counter disagrees with every
+/// peer's.
+///
+/// What this pin encodes is that the HARNESS keeps the drivers' barrier. It is deliberately NOT a
+/// claim about what an embedder gets: a separate-stores embedder that genuinely crashes inside that
+/// window has no stamp to recover, and the product's answer there is the typed
+/// `IncarnationUnrecoverable` refusal from `validate_restore`. The world does not exercise that
+/// refusal at all — its crash path calls `MultiRaft::restore_group` directly and bypasses the
+/// coordinator door `validate_restore` lives behind — so that coverage gap is real and recorded in
+/// the PR notes rather than papered over here.
+#[test]
+fn a_founding_stamp_survives_a_crash_before_the_first_tick() {
+  let gid = 700u64;
+  let mut w = MultiWorld::new(9);
+  // ASYNC stores: the mode where an unflushed write is genuinely rolled back by a crash. Under the
+  // sync default nothing is ever in flight and the pin could not fail however the barrier moved.
+  w.set_store_mode(crate::StoreMode::Async);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(gid, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(gid).is_some()));
+
+  // Retire and bring it back: the recreation is what founds a replica at a NONZERO generation, and
+  // the storeless door cannot serve one — so this is the only path that writes a founding stamp.
+  assert!(w.remove_group(gid));
+  w.recreate_group(gid);
+  let generation = w.generation_of(gid);
+  assert_eq!(generation, 1, "the recreation founds the id at 1");
+
+  // CRASH IN THE SAME ITERATION — before any tick, so nothing but the admission's own barrier can
+  // have made the stamp durable.
+  w.crash(0);
+
+  assert_eq!(
+    w.hosts[&0]
+      .group(&gid)
+      .expect("the crashed node restored its replica")
+      .shape_gen(),
+    generation,
+    "the restored replica must come back founded where it was admitted; a rolled-back stamp \
+     brings it up at zero and it mints beneath its own peers"
+  );
+  for node in [1u64, 2] {
+    assert_eq!(
+      w.hosts[&node]
+        .group(&gid)
+        .expect("peer hosts the group")
+        .shape_gen(),
+      generation,
+      "and it agrees with peer {node}, which never crashed"
+    );
+  }
+}
+
+/// THE OTHER REGIME: the same late fork, against an id whose retirement left a FLOOR.
+///
+/// A recreation makes the id reshaped, so retiring the successor persists an admission floor one
+/// past its removal ceiling. The fork the isolated node still owes was minted at generation 0 and
+/// names that generation for its child; a floor is monotone, so no consent call and no later event
+/// can ever bring it back within reach. That is what separates this from the held regime: a
+/// tombstone is a decision the embedder can reverse, a floor is one it cannot, so the fork is
+/// TERMINALLY abandoned rather than parked.
+///
+/// The refusal is only half the claim. The other half — the load-bearing half — is that abandoning
+/// it leaves the PARENT clean: the fork is popped rather than left staged, its barrier lifts, the
+/// child id stops being reserved, and no relay-guard advance is owed, because a Terminal refusal
+/// re-derives from the floor rather than from a recorded bump. A refusal that left any of those
+/// behind would wedge the parent's next capture on a fork that will never resolve.
+#[test]
+fn a_late_fork_below_a_recreated_ids_floor_is_abandoned() {
+  let (source, child) = (11u64, 300u64);
+  let mut w = MultiWorld::new(41);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(source, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(source).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(source, key, u64::from(key));
+    propose_until_accepted(&mut w, source, &payload);
+  }
+  assert!(w.run_until(2_000, |w| {
+    (0..3).all(|n| w.applied_of(n, source).len() >= 8)
+  }));
+
+  // Node 2 lags the split: {0,1} materialize the child while node 2 never even sees the entry.
+  w.isolate(2);
+  assert!(w.run_until(3_000, |w| w.leader_of(source).is_some_and(|l| l != 2)));
+  propose_split_until_accepted(&mut w, source, child, 4);
+  assert!(w.run_until(3_000, |w| w.splits_applied() == 1));
+
+  // THE WHOLE CEREMONY while node 2 is away: retire gen 0, bring the id back as gen 1, retire that
+  // too. The recreation is what makes the id reshaped, and retiring a reshaped id is what leaves
+  // the floor behind.
+  assert!(w.remove_group(child));
+  w.recreate_group(child);
+  assert!(w.remove_group(child));
+  assert_eq!(
+    w.generation_of(child),
+    1,
+    "the id moved on while node 2 was away"
+  );
+  assert_eq!(
+    w.removal_floors.get(&child).copied(),
+    Some(2),
+    "retiring the recreated incarnation leaves a floor one past its ceiling"
+  );
+
+  w.heal(2);
+  assert!(
+    w.run_until(6_000, |w| w.split_refused_observed() >= 1),
+    "node 2 replays the split and its fork is refused below the floor: {}",
+    w.dbg_group(child)
+  );
+  // STABLE, not merely slow: a long quiet window buys no park and no second refusal.
+  w.run_until(4_000, |_| false);
+  assert_eq!(
+    w.split_refused_observed(),
+    1,
+    "exactly one fork was abandoned"
+  );
+  assert_eq!(
+    w.split_conflicts_observed(),
+    0,
+    "a below-floor fork is never parked: a park waits for a decision to be reversed, and a \
+     monotone floor is the one refusal that provably never lifts"
+  );
+
+  // THE PARENT IS DISCHARGED CLEAN — the half that keeps a refusal from wedging the parent.
+  assert!(
+    w.hosts
+      .get_mut(&2)
+      .expect("node 2 is hosted")
+      .peek_yieldable_fork(&sailing_proto::NoHold)
+      .is_none(),
+    "no fork remains staged: the refusal POPS it rather than leaving it to be re-examined forever"
+  );
+  assert!(
+    w.fork_conflicts
+      .get(&(2, source))
+      .is_none_or(std::collections::BTreeMap::is_empty),
+    "no fork barrier still stands on the parent: {:?}",
+    w.fork_conflicts.get(&(2, source))
+  );
+  assert!(
+    !w.hosts[&2].split_reserved(&child),
+    "the child id is no longer reserved by an in-flight split"
+  );
+  assert_eq!(
+    w.relayed_lineage.get(&(2, source)),
+    None,
+    "a Terminal refusal owes no relay-guard advance — it re-derives from the floor, and mirroring \
+     a bump for a fork that never relayed would fold the NEXT one away with it"
+  );
+
+  // AND NO ISLAND FORMS. The whole point of the other regime is unreachable here.
+  assert!(
+    !w.hosts_group(2, child),
+    "nothing landed: the fork was abandoned, not held for a consent that could release it"
   );
   w.check_now();
   w.finalize_conservation_or_panic(41);
@@ -3696,6 +3917,51 @@ fn a_partial_admit_teardown_rolls_back_atomically() {
   w.check_now();
 }
 
+/// A ROLLBACK RESTORE CONSUMES A BOOT EPOCH, exactly as a crash restore and a nonzero founding do.
+///
+/// The rollback is the THIRD writer of this counter, and reusing the outgoing epoch here would be
+/// wrong for a reason that is not about in-flight messages: it is about OP IDS. The partial
+/// teardown below aborts at node
+/// 2's `Claimed` refusal and rolls nodes 0 and 1 back — potentially before their founding
+/// completion drained. `discard_inflight` drops only the UNFLUSHED window, so a flushed completion
+/// survives it; restored at the same epoch, that retained acknowledgment sits at exactly the
+/// `(epoch, 0)` the rebuilt endpoint's first submission mints, and a torn next flush lets a dead
+/// incarnation's completion satisfy a live undurable write.
+///
+/// The pin is the counter, in both halves: the rolled-back nodes must have consumed an epoch, and
+/// the node that never gave one up must not have.
+#[test]
+fn a_rollback_restore_consumes_a_boot_epoch() {
+  let mut w = freeze_pending_led_on_node2(13);
+  w.active_freezes.remove(&11);
+  let before: Vec<u64> = (0..3)
+    .map(|n| w.boot_epochs.get(&n).copied().unwrap_or(0))
+    .collect();
+  assert!(
+    !w.remove_group(10),
+    "the partial-admit teardown rolls back and abandons"
+  );
+  let after: Vec<u64> = (0..3)
+    .map(|n| w.boot_epochs.get(&n).copied().unwrap_or(0))
+    .collect();
+  for n in 0..2usize {
+    assert!(
+      after[n] > before[n],
+      "node {n}'s replica was torn down and restored from its retained stores, so the restore owes \
+       a NEW epoch; the counter went {} -> {}. An epoch handed out twice lets the outgoing \
+       incarnation's retained completion sit at the same (epoch, 0) the rebuilt endpoint's first \
+       submission mints",
+      before[n],
+      after[n]
+    );
+  }
+  assert_eq!(
+    after[2], before[2],
+    "node 2 REFUSED the teardown, so its replica was never removed and never restored — nothing \
+     there may consume an epoch"
+  );
+}
+
 /// A DEAD-END merge-abort obligation clears CLUSTER-WIDE off a committed `ThawDischarged` witness.
 /// Source S owes a target-role thaw to an upstream group U (S was the aborted TARGET of U→S, so it
 /// carries `abandoned[U]`). On a host that holds S but NEVER U, that host can neither drive U's thaw
@@ -5066,4 +5332,63 @@ fn a_quorum_of_adopt_superseded_replicas_converges_under_the_oracles() {
     "every live member drains the post-cure load to applied == commit"
   );
   w.check_now();
+}
+
+/// A FOUNDING INCARNATION CONSUMES A BOOT EPOCH, so the next crash cannot hand out the same one.
+///
+/// The nonzero-founding door takes an epoch exactly as a restore does. Reading `counter + 1`
+/// without storing it left the counter untouched, and the very next crash then restored every
+/// group with the value the founding incarnation had already minted under. Flushed completions
+/// deliberately survive a simulation crash here, so two incarnations sharing an epoch is not a
+/// cosmetic collision: the founding incarnation's queued acknowledgment stops sorting strictly
+/// below the restored one and can alias its first submission — the aliasing the boot epoch exists
+/// to prevent, and the property this world is supposed to be evidence FOR.
+///
+/// The pin is the counter itself. Recreate at a nonzero generation, then crash the same node in
+/// the same iteration, and require the recreation to have advanced the counter and the restore's
+/// epoch to sit strictly above the founding one.
+#[test]
+fn founding_at_a_nonzero_generation_consumes_a_boot_epoch() {
+  let mut w = MultiWorld::new(2);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(600, |w| w.leader_of(100).is_some()));
+
+  // A gen-0 founding goes through the storeless door and takes no epoch at all.
+  assert_eq!(
+    w.boot_epochs.get(&0).copied().unwrap_or(0),
+    0,
+    "the storeless door writes nothing and must consume no epoch"
+  );
+
+  assert!(w.remove_group(100));
+  w.recreate_group(100);
+  assert_eq!(
+    w.generation_of(100),
+    1,
+    "the recreation must land at a nonzero generation, or the founded door is never taken"
+  );
+
+  let founding = w.boot_epochs.get(&0).copied().unwrap_or(0);
+  assert!(
+    founding > 0,
+    "the recreation founded node 0's replica at generation 1 through the door that TAKES an \
+     epoch, so the counter must record the epoch it consumed; it still reads {founding}"
+  );
+
+  // The crash lands in the same iteration, before anything else can advance the counter — the
+  // narrowest window in which a collision is possible, and the one a real deployment hits when a
+  // host dies right after a recreation.
+  w.crash(0);
+  let restored = w.boot_epochs.get(&0).copied().unwrap_or(0);
+  assert!(
+    restored > founding,
+    "the restored incarnation's boot epoch is {restored} and the founding one minted under \
+     {founding}. An epoch handed out twice folds two incarnations onto one identity: the founding \
+     incarnation's flushed completion survives the crash and is no longer strictly below the ids \
+     the restored incarnation mints"
+  );
 }
