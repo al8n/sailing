@@ -576,18 +576,35 @@ impl MultiWorld {
     };
     // Fresh stores in the world's configured mode (async for the merge profiles' fsync-loss
     // window). Built before the host borrow so it never straddles the `&self` `fresh_stores` read.
-    let (log, stable) = self.fresh_stores(node, gid);
+    let (log, mut stable) = self.fresh_stores(node, gid);
     // This replica's incarnation, bound ONCE here: every non-fork path wires the registry's live
     // generation, which is the generation this replica object will speak for until it is torn
     // down. A re-wire rebinds because it IS a new object. Read before the host borrow, like the
     // stores above.
     let bound = self.generation_of(gid);
+    // A FOUNDING INCARNATION CONSUMES AN EPOCH, exactly as a crash restore does — advanced AND
+    // STORED here, before the door is called. Reading `+ 1` without writing it back left the
+    // counter where it was, so the next crash minted the SAME epoch the founding incarnation had
+    // already minted under. Flushed completions deliberately survive a simulation crash, so that
+    // collision stops the founding incarnation's queued acknowledgment from sorting below the
+    // restored one and lets it alias the restored incarnation's first submission — precisely the
+    // aliasing the boot epoch exists to prevent, and the evidence this world exists to produce.
+    //
+    // Checked, like the drivers' `next_boot_epoch`, which answers `None` on exhaustion: an epoch
+    // handed out twice folds two incarnations onto one identity, so a wrap is not a smaller
+    // failure than a panic. Only the nonzero-founding door takes an epoch; a gen-0 replica goes
+    // through the storeless door and consumes nothing, byte for byte as before.
+    let founding_epoch = (bound != 0).then(|| {
+      let counter = self.boot_epochs.entry(node).or_insert(0);
+      *counter = counter
+        .checked_add(1)
+        .unwrap_or_else(|| panic!("wire_replica: node {node}'s boot-epoch counter is exhausted"));
+      *counter
+    });
     let host = self
       .hosts
       .get_mut(&node)
       .unwrap_or_else(|| panic!("wire_replica: node {node} was never added"));
-    self.logs.insert((node, gid), log);
-    self.stables.insert((node, gid), stable);
     self.configs.insert((node, gid), config.clone());
     self.member_view.insert((node, gid), is_member);
     self.replica_gen.insert((node, gid), bound);
@@ -602,9 +619,52 @@ impl MultiWorld {
     // need distinct base seeds too — identical streams under the shared global clock would draw
     // identical election timeouts and split votes forever (the single-group harness seeds each
     // Endpoint by node id for the same reason).
-    host
-      .create_group(gid, 0, config, self.now, self.seed ^ node, LogSm::new())
+    // FOUND AT THE INCARNATION THE REGISTRY RECORDS, not at zero. `bound` is the registry's
+    // incarnation counter — advanced only by a recreation, never by a shape move — so it is this
+    // replica's FOUNDING generation rather than a later current shape, which is the only value a
+    // restart may recover a lineage counter from. Wiring every replica at zero left the entire
+    // nonzero-founding population, and every crash and restore through it, with no coverage.
+    //
+    // THE SPLIT IS REQUIRED, not a convenience: the storeless door refuses a nonzero generation
+    // (`FoundingNeedsStore`), because founding above zero is a fact that has to be persisted before
+    // the admission is acked. A gen-0 replica keeps going through that door, byte for byte as
+    // before — zero is the only generation it admits, and nothing needs persisting to found there.
+    let admitted = if bound == 0 {
+      host.create_group(gid, 0, config, self.now, self.seed ^ node, LogSm::new())
+    } else {
+      host.create_group_founded_at(
+        gid,
+        bound,
+        config,
+        self.now,
+        self.seed ^ node,
+        LogSm::new(),
+        // A founding incarnation takes an op-id epoch like a restored or forked one. These stores
+        // are fresh, so there is no prior incarnation to sort below — but the door enforces the
+        // floor, and the world must speak the same contract a driver does.
+        founding_epoch.expect("a nonzero founding takes the epoch reserved above"),
+        &log,
+        &mut stable,
+      )
+    };
+    admitted
       .unwrap_or_else(|e| panic!("wire_replica: admission of group {gid} on node {node}: {e:?}"));
+    // BARRIER THE FOUNDING STAMP BEFORE THE REPLICA IS EXPOSED — the drivers' own `flush_pending`
+    // after an admission, on the one pair this admission wrote. Under an async store the stamp sits
+    // in the in-flight window until something flushes it, so a crash landing between the admission
+    // ack and the first tick would roll it back and bring the replica up founded at zero, beneath
+    // the generation it was admitted at. A no-op for the storeless door, which writes nothing, so a
+    // gen-0 replica stays byte-identical.
+    if stable.has_inflight() {
+      let torn_before = stable.torn_writes();
+      stable.flush();
+      self.stable_flushes += 1;
+      self.torn_writes_fired += stable.torn_writes() - torn_before;
+    }
+    // The stores enter the maps only now: the door reads the log and writes the founding stamp
+    // THROUGH the stable one above, so both stay locals until it has been given them.
+    self.logs.insert((node, gid), log);
+    self.stables.insert((node, gid), stable);
   }
 
   /// The id of the node currently believing itself leader of `gid`, if any — anchored on the
@@ -874,6 +934,42 @@ impl MultiWorld {
       self.cross_talk_sweep(gid, generation);
       self.conserve_sweep(gid, generation);
       self.lineage_sweep(gid, generation);
+    }
+    self.guard_provenance_sweep();
+  }
+
+  /// THE RELAY GUARD'S PROVENANCE on every hosted replica: the container's fork replay guard stands
+  /// at or below that replica's live lineage counter ⊔ the durable fork record this world fed it
+  /// ([`relayed_lineage`](Self::relayed_lineage), the driver's engine mirror). A guard beyond both
+  /// has no fact behind it, and it would fold the group's NEXT fork — minted at `shape_gen + 1` —
+  /// away as already-relayed, discarding the child partition's only local copy.
+  ///
+  /// Deliberately NOT `guard <= live`: a crash-restore seeds the guard from the record, and the
+  /// live counter is behind it for as long as the entry backing that record is durable but not yet
+  /// re-committed. `group_gen` is `live ⊔ guard`, so it reads back as `live ⊔ record` exactly while
+  /// the provenance holds. Host-scoped rather than incarnation-scoped: the guard is per-container
+  /// bookkeeping that outlives any one incarnation of the id.
+  fn guard_provenance_sweep(&self) {
+    for (node, host) in &self.hosts {
+      for gid in host.group_ids() {
+        let live = host
+          .group(gid)
+          .expect("group_ids yields hosted ids")
+          .shape_gen();
+        let record = self
+          .relayed_lineage
+          .get(&(*node, *gid))
+          .copied()
+          .unwrap_or(0);
+        assert_eq!(
+          host.group_gen(gid),
+          live.max(record),
+          "seed {} tick {}: relay guard on node {node} group {gid} beyond its provenance (live \
+           {live}, record {record})",
+          self.seed,
+          self.tick_count,
+        );
+      }
     }
   }
 
@@ -1195,10 +1291,11 @@ impl MultiWorld {
   /// generation each retirement ended, plus the terminal `MERGED_FLOOR` for a source this host
   /// resolved away (a merged id is never re-admitted, so its fence is terminal by construction).
   ///
-  /// Deliberately NOT [`NodeStores::floor`]: that store answers on the CONTAINER's lineage scale
-  /// (a reshaped id's removal ceiling), while the world re-admits every recreation at container
-  /// generation 0 — the two scales do not order against each other, and comparing them would
-  /// fence a live incarnation's own traffic. The diligent-embedder HUSK feed is excluded for a
+  /// Deliberately NOT [`NodeStores::floor`]: that store answers on the CONTAINER's lineage scale —
+  /// a RESHAPED id's removal ceiling, which an id that never split or merged never acquires — while
+  /// this one counts retirements. A recreation now founds at the registry's incarnation, so the two
+  /// scales agree on a reshaped id and diverge on every other, and comparing them would fence a
+  /// live incarnation's own traffic. The diligent-embedder HUSK feed is excluded for a
   /// second reason: it is a pre-teardown hint about a source this host still runs, and the
   /// product's demux reads only the engine's persisted record.
   fn admission_floor(&self, node: u64, gid: u64) -> u64 {

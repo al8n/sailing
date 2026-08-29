@@ -744,13 +744,28 @@ impl MultiWorld {
   /// [`drop_group_endpoint`](Self::drop_group_endpoint) removed while the store was kept. A
   /// crash-style restart: in-flight (unflushed) store windows are discarded and the incarnation
   /// bumps so the checker resets this replica's monotonicity baseline, exactly as
-  /// [`crash`](Self::crash) restores a rebooted node. The boot epoch is REUSED (the rollback is not
-  /// a reboot; no in-flight message was ever sent to distinguish from).
+  /// [`crash`](Self::crash) restores a rebooted node — the boot epoch included.
   fn restore_group_replica(&mut self, gid: u64, node: u64) {
     // The probe's endpoint removal tombstoned the id here; rolling it back re-admits the same
     // replica, which in production is the embedder clearing its own consent gate first.
     self.host_tombstones.remove(&(node, gid));
-    let epoch = self.boot_epochs.get(&node).copied().unwrap_or(0);
+    // A ROLLBACK CONSUMES AN EPOCH TOO. Reusing the outgoing one read the rollback as "not a
+    // reboot, so nobody can be confused" — but the confusion is not about messages, it is about
+    // OP IDS. A partial teardown aborts at a later node's `Claimed` refusal and rolls back before
+    // the founding completion drained; `discard_inflight` drops the UNFLUSHED window and a flushed
+    // completion survives it. Restored at the same epoch, that retained completion sits at exactly
+    // the `(epoch, 0)` the rebuilt endpoint's first submission mints, so a torn next flush lets a
+    // dead incarnation's acknowledgment satisfy a live undurable write.
+    //
+    // Checked and stored, like the founding and crash paths: an epoch handed out twice folds two
+    // incarnations onto one identity, so a wrap is not a smaller failure than a panic.
+    let epoch = {
+      let counter = self.boot_epochs.entry(node).or_insert(0);
+      *counter = counter.checked_add(1).unwrap_or_else(|| {
+        panic!("remove_group rollback: node {node}'s boot-epoch counter is exhausted")
+      });
+      *counter
+    };
     let config = self.configs[&(node, gid)].clone();
     let now = self.now;
     let seed = self.seed ^ node;
