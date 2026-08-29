@@ -3082,7 +3082,7 @@ fn merge_verbs_ride_the_coordinator() {
   {
     let (l, s) = stores.stores(&1).unwrap();
     assert!(matches!(
-      coord.rollback_merge(&1, now, l, s, &2).unwrap(),
+      coord.rollback_merge(&1, now, l, s, &2, &NoFloors).unwrap(),
       Err(crate::MergeError::SourceMissing)
     ));
   }
@@ -3964,4 +3964,195 @@ fn the_group_header_stamp_reads_the_replicated_evidence() {
        catalog claimed at admission"
     );
   }
+}
+
+/// One floor for one id, zero for the rest — so each participant's leg can be fenced alone.
+struct FloorFor(u64, u64);
+
+impl FloorStore<u64> for FloorFor {
+  fn floor(&self, gid: &u64) -> u64 {
+    if *gid == self.0 { self.1 } else { 0 }
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
+/// A frozen source (2) and the target (1) whose log carries the abort, both single-voter leaders —
+/// the posture every abort leg below starts from.
+fn a_frozen_source_and_its_target() -> (
+  MultiStreamCoordinator<u64, u64, CountSm, TestRecord>,
+  Stores,
+) {
+  let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  for gid in [1u64, 2] {
+    stores
+      .map
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    coord
+      .create_group(
+        gid,
+        single_voter(1),
+        Instant::ORIGIN,
+        1,
+        CountSm::default(),
+        0,
+        &NoFloors,
+      )
+      .unwrap();
+    let d = coord.group(&gid).unwrap().poll_timeout().unwrap();
+    {
+      let (l, s) = stores.stores(&gid).unwrap();
+      coord.handle_timeout(&gid, d, l, s).unwrap();
+    }
+    for _ in 0..2 {
+      let (l, s) = stores.stores(&gid).unwrap();
+      coord.handle_storage(&gid, d, l, s).unwrap();
+    }
+    assert!(coord.group(&gid).unwrap().role().is_leader());
+  }
+  let now = Instant::ORIGIN;
+  coord
+    .prepare_merge(&2, now, &mut stores, &1, &NoFloors)
+    .unwrap()
+    .unwrap();
+  {
+    let (l, s) = stores.stores(&2).unwrap();
+    coord.handle_storage(&2, now, l, s).unwrap();
+  }
+  assert!(coord.group(&2).unwrap().is_frozen(), "the source is frozen");
+  (coord, stores)
+}
+
+/// Append the abort on target 1 under `floors`, apply it, and answer whether the target now records
+/// the source-side thaw obligation. The obligation is the load-bearing observation: an abort that
+/// appended but recorded nothing would leave the source frozen with no authorization to thaw it.
+fn abort_and_apply(
+  coord: &mut MultiStreamCoordinator<u64, u64, CountSm, TestRecord>,
+  stores: &mut Stores,
+  floors: &impl FloorStore<u64>,
+) -> (Result<Index, crate::MergeError<u64>>, bool, bool) {
+  let now = Instant::ORIGIN;
+  let before = stores.map.get(&1).unwrap().0.last_index();
+  let verdict = {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.rollback_merge(&1, now, l, s, &2, floors).unwrap()
+  };
+  if verdict.is_ok() {
+    // Persist, commit, apply — the abort must be APPLIED before the target records the debt.
+    for _ in 0..3 {
+      let (l, s) = stores.stores(&1).unwrap();
+      coord.handle_storage(&1, now, l, s).unwrap();
+    }
+  }
+  let after = stores.map.get(&1).unwrap().0.last_index();
+  let owed = coord.group(&1).is_some_and(|ep| ep.has_abandoned());
+  (verdict, after != before, owed)
+}
+
+/// THE ABORT ANSWERS TO THE FLOOR OF THE LOG THAT CARRIES IT, AND ONLY THAT. Its sibling merge
+/// verbs gate on both participants; the abort is the merge's RELEASE VALVE — the entry it appends
+/// CREATES the source-side thaw obligation, and that committed obligation is the sole authorization
+/// for the thaw. Nothing else ever unfreezes the source and there is no timeout behind it, so a
+/// source-side floor leg here would strand a frozen source permanently: the merge-freeze wedge the
+/// thaw-obligation discharge fences its own floor leg off a frozen source to avoid, arriving one
+/// step earlier — at propose, where the obligation would never be created at all.
+///
+/// A NON-TERMINAL floor on the frozen source: the valve opens, and the obligation assert is the
+/// load-bearing half — an abort that appended but recorded nothing would leave the source frozen
+/// with nothing authorized to free it.
+#[test]
+fn the_abort_ignores_a_non_terminal_floor_on_its_frozen_source() {
+  let (mut coord, mut stores) = a_frozen_source_and_its_target();
+  let (verdict, appended, owed) = abort_and_apply(&mut coord, &mut stores, &FloorFor(2, 7));
+  assert!(
+    verdict.is_ok(),
+    "a floored source must not close the valve, got {verdict:?}"
+  );
+  assert!(appended, "the abort rides the target's log");
+  assert!(
+    owed,
+    "the appended abort must CREATE the thaw obligation — an append that records nothing leaves \
+     the source frozen with nothing authorized to free it"
+  );
+}
+
+/// The rule is TARGET-ONLY whatever the source floor's value: a source whose lineage resolved away
+/// cluster-wide is still a frozen source until its thaw runs, so the terminal sentinel does not
+/// close the valve either.
+#[test]
+fn the_abort_ignores_even_a_terminal_floor_on_its_source() {
+  let (mut coord, mut stores) = a_frozen_source_and_its_target();
+  let (verdict, appended, owed) =
+    abort_and_apply(&mut coord, &mut stores, &FloorFor(2, MERGED_FLOOR));
+  assert!(
+    verdict.is_ok(),
+    "the terminal sentinel on the SOURCE does not gate the abort, got {verdict:?}"
+  );
+  assert!(appended && owed, "the valve opens and records the debt");
+}
+
+/// The half that was right, kept: a floored TARGET still refuses. The abort rides the target's log,
+/// so a target below its own floor cannot carry the entry at all — nothing is appended and no
+/// obligation is recorded.
+#[test]
+fn the_abort_still_refuses_a_floored_target() {
+  let (mut coord, mut stores) = a_frozen_source_and_its_target();
+  let (verdict, appended, owed) = abort_and_apply(&mut coord, &mut stores, &FloorFor(1, 7));
+  assert!(
+    matches!(verdict, Err(crate::MergeError::BelowFloor { floor: 7 })),
+    "a floored target is refused at propose, got {verdict:?}"
+  );
+  assert!(!appended, "a refused abort appends nothing");
+  assert!(!owed, "and records no obligation");
+}
+
+/// Both participants clear: the pre-floor behaviour verbatim.
+#[test]
+fn an_unfloored_abort_appends_and_records_the_debt() {
+  let (mut coord, mut stores) = a_frozen_source_and_its_target();
+  let (verdict, appended, owed) = abort_and_apply(&mut coord, &mut stores, &NoFloors);
+  assert!(
+    verdict.is_ok(),
+    "an unfloored world appends, got {verdict:?}"
+  );
+  assert!(appended && owed);
+}
+
+/// FOLLOW-THROUGH, END TO END: the valve the propose gate keeps open actually frees the source. A
+/// source frozen under a floor that no longer admits its incarnation is aborted, and the relayed
+/// source-side thaw UNFREEZES it — the outcome a source-side floor leg at propose would have made
+/// unreachable forever.
+#[test]
+fn the_valve_thaws_a_source_frozen_under_a_floored_lineage() {
+  let (mut coord, mut stores) = a_frozen_source_and_its_target();
+  let now = Instant::ORIGIN;
+  // The world itself floors the source's lineage — the same fact the propose gate must not act on.
+  stores.floors.insert(2, 7);
+
+  let (verdict, appended, owed) = abort_and_apply(&mut coord, &mut stores, &FloorFor(2, 7));
+  assert!(verdict.is_ok() && appended && owed);
+  assert!(
+    coord.group(&2).unwrap().is_frozen(),
+    "the source is still frozen — only the thaw frees it"
+  );
+
+  // Drive the service passes that relay the obligation to the source and let it apply.
+  for _ in 0..4 {
+    let _ = coord.service_merge_applies(now, &mut stores);
+    for gid in [1u64, 2] {
+      if let Some((l, s)) = stores.stores(&gid) {
+        coord.handle_storage(&gid, now, l, s).unwrap();
+      }
+    }
+  }
+  assert!(
+    coord.group(&2).is_some_and(|ep| !ep.is_frozen()),
+    "the relayed thaw UNFREEZES the source — the valve works end to end"
+  );
 }

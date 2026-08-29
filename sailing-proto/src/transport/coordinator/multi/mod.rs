@@ -969,7 +969,7 @@ where
     if !self.multi.contains_group(source) {
       return None;
     }
-    if let Err(e) = self.merge_floor_check(source, target, floors) {
+    if let Err(e) = self.merge_floor_check([source, target], floors) {
       return Some(Err(e));
     }
     let now: Now = now.into();
@@ -1001,7 +1001,7 @@ where
     if !self.multi.contains_group(target) {
       return None;
     }
-    if let Err(e) = self.merge_floor_check(source, target, floors) {
+    if let Err(e) = self.merge_floor_check([source, target], floors) {
       return Some(Err(e));
     }
     let now: Now = now.into();
@@ -1013,8 +1013,20 @@ where
 
   /// Propose the merge ABORT on `target` (see [`MultiRaft::rollback_merge`]): the target-side
   /// abort entry, totally ordered against `CommitMerge` on the target's own log, replicating
-  /// immediately. No floor leg: aborting is always legitimate on groups this host still runs.
-  /// `None` if no group `target` is hosted.
+  /// immediately. `None` if no group `target` is hosted.
+  ///
+  /// THE ABORT ANSWERS TO THE FLOOR OF THE LOG THAT CARRIES IT, AND ONLY THAT — the target's. Its
+  /// sibling verbs gate on both participants; this one gates on one, and the asymmetry is the point.
+  /// The abort is the merge's RELEASE VALVE: the entry it appends is what CREATES the source-side
+  /// thaw obligation, and that committed obligation is the SOLE authorization for the later thaw.
+  /// There is deliberately no timeout behind it — nothing else ever unfreezes the source. So a
+  /// source-side floor leg here would refuse the one verb that can free a frozen source and strand
+  /// it frozen forever, whatever the floor's value: the same merge-freeze wedge the thaw-obligation
+  /// discharge in [`MultiRaft::service_merge_applies`] fences its floor leg off a frozen source to
+  /// avoid, one step earlier — at propose, where the obligation is never created at all.
+  ///
+  /// A floored TARGET is still refused. The abort rides the target's log, so a target below its own
+  /// floor cannot carry the entry in the first place.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   pub fn rollback_merge<L, S>(
     &mut self,
@@ -1023,11 +1035,20 @@ where
     log: &mut L,
     stable: &S,
     source: &G,
+    floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, crate::MergeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.multi.contains_group(target) {
+      return None;
+    }
+    // TARGET ONLY — the log that carries the abort. A source-side leg here would wedge a frozen
+    // source permanently; see this verb's doc for the release-valve argument.
+    if let Err(e) = self.merge_floor_check([target], floors) {
+      return Some(Err(e));
+    }
     let now: Now = now.into();
     let r = self
       .multi
@@ -1037,16 +1058,25 @@ where
     Some(r)
   }
 
-  /// The merge verbs' floor leg: BOTH participants' current incarnations must clear their
-  /// persisted admission floors — an under-floor participant is a fenced incarnation's stale
-  /// survivor, and anchoring a merge on it would resurrect exactly what the floor buried.
-  fn merge_floor_check(
+  /// The merge verbs' floor leg over the participants a verb NAMES: each one's current incarnation
+  /// must clear its persisted admission floor — an under-floor participant is a fenced
+  /// incarnation's stale survivor, and anchoring a merge on it would resurrect exactly what the
+  /// floor buried.
+  ///
+  /// THE SET IS PER-VERB, and the asymmetry is deliberate. The freeze and the absorb name BOTH
+  /// participants: each writes an obligation the other must be alive to meet. The ABORT names ONLY
+  /// its target — it is the RELEASE VALVE, and a source-side floor leg here would strand a frozen
+  /// source permanently (see [`rollback_merge`](Self::rollback_merge)). Passing the set at the call
+  /// site keeps that difference readable there instead of hiding it in a second helper.
+  fn merge_floor_check<'a>(
     &self,
-    source: &G,
-    target: &G,
+    participants: impl IntoIterator<Item = &'a G>,
     floors: &impl FloorStore<G>,
-  ) -> Result<(), crate::MergeError<I>> {
-    for gid in [source, target] {
+  ) -> Result<(), crate::MergeError<I>>
+  where
+    G: 'a,
+  {
+    for gid in participants {
       let floor = floors.floor(gid);
       if !crate::floor_admits(floor, self.multi.group_gen(gid)) {
         return Err(crate::MergeError::BelowFloor { floor });

@@ -1638,12 +1638,13 @@ where
         reply,
         reservation,
       } => {
+        let floors = PairFloors::snapshot(&self.engine, &source, &target);
         let verdict = match self.engine.stores(&target) {
           None => Err(no_such_group()),
           Some((log, stable)) => {
             match self
               .coord
-              .rollback_merge(&target, now, log, stable, &source)
+              .rollback_merge(&target, now, log, stable, &source, &floors)
             {
               Some(r) => r.map_err(map_merge_err),
               None => Err(no_such_group()),

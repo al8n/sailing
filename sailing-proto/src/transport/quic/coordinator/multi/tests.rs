@@ -1755,7 +1755,7 @@ fn merge_verbs_ride_the_coordinator() {
   {
     let (l, s) = stores.stores(&1).unwrap();
     assert!(matches!(
-      coord.rollback_merge(&1, now, l, s, &2).unwrap(),
+      coord.rollback_merge(&1, now, l, s, &2, &NoFloors).unwrap(),
       Err(crate::MergeError::SourceMissing)
     ));
   }
