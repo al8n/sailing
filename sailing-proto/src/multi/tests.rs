@@ -16114,6 +16114,198 @@ fn the_founding_door_refuses_storage_that_is_not_virgin() {
   );
 }
 
+/// A restore whose stores hold state but no INCARNATION refuses typed.
+///
+/// The founding generation lives in the hard state until the first capture, and the two stores have
+/// no cross-store durability ordering — so a crash can leave durable log content beside a hard state
+/// that never landed. Recovering there would rebuild the lineage counter at zero on this replica
+/// while its peers stand at the founding value, and one committed shape entry would then be judged
+/// by two different yardsticks. Nothing observable is lost by refusing: entries that survived
+/// without a durable term were never acked.
+#[test]
+fn a_restore_refuses_stores_that_hold_state_but_no_incarnation() {
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
+  // The window: log content survived, no stable write did.
+  let mut log = VecLog::default();
+  log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::Normal,
+    cmd,
+  )]);
+  let stable = AsyncStable::default();
+  assert_eq!(stable.hard_state(), crate::HardState::initial());
+  assert_eq!(
+    crate::validate_restore(5, 0, 5, &log, &stable),
+    Err(CreateGroupError::IncarnationUnrecoverable { record: 5 }),
+    "an id the record knows above zero cannot be rebuilt from stores that name no incarnation"
+  );
+
+  // THE GEN-0 WORLD IS UNTOUCHED: a record of zero never reaches the arm.
+  assert_eq!(crate::validate_restore(0, 0, 0, &log, &stable), Ok(()));
+
+  // A TORN FORK CHILD — its baseline meta lost, its record standing at the founding generation —
+  // refuses here rather than booting as incarnation zero. The child is re-delivered, not adopted.
+  assert_eq!(
+    crate::validate_restore(3, 0, 3, &log, &stable),
+    Err(CreateGroupError::IncarnationUnrecoverable { record: 3 })
+  );
+
+  // NoStoredState still owns the EMPTY case, and the two refusals partition cleanly.
+  let empty_log = VecLog::default();
+  assert_eq!(
+    crate::validate_restore(5, 0, 5, &empty_log, &stable),
+    Err(CreateGroupError::NoStoredState),
+    "nothing survived at all is the other refusal, not this one"
+  );
+
+  // A surviving hard state carries the incarnation, so the arm stands down.
+  let mut recorded = AsyncStable::default();
+  recorded.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial()
+      .with_term(Term::new(1))
+      .with_founding_gen(5),
+  );
+  assert_eq!(crate::validate_restore(5, 0, 5, &log, &recorded), Ok(()));
+}
+
+/// THE UNCHECKED DOOR'S CONTRACT, pinned so a rename cannot quietly become a validated door and a
+/// validated door cannot quietly become this one.
+///
+/// The container holds no catalog generation, no floor, and no lineage record — floors are a
+/// coordinator-and-driver concern and no container door takes a `FloorStore` — so it cannot make
+/// the incarnation judgements the coordinators make. It admits the two shapes they refuse, and the
+/// name is what says so. The caller composing this door owes those checks; `validate_restore` is
+/// the public seam that performs them.
+#[test]
+fn the_unchecked_restore_door_admits_what_a_validated_one_refuses() {
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
+
+  // SHAPE ONE — stores that hold nothing. A validated door refuses a KNOWN id here.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut empty_log, mut empty_stable) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    crate::validate_restore(5, 0, 5, &empty_log, &empty_stable),
+    Err(CreateGroupError::NoStoredState),
+    "the validated seam refuses it"
+  );
+  m.restore_group_unchecked(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut empty_log,
+    &mut empty_stable,
+  )
+  .expect("the unchecked door admits it — it has no record to know the id by");
+  assert_eq!(m.group(&7).unwrap().shape_gen(), 0);
+
+  // SHAPE TWO — state in the stores, no incarnation in them: the shape a lost founding stamp
+  // leaves. A validated door refuses; this one recovers at zero, which is precisely why the caller
+  // owes the check.
+  let mut log = VecLog::default();
+  log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::Normal,
+    cmd,
+  )]);
+  let mut stable = AsyncStable::default();
+  assert_eq!(
+    crate::validate_restore(5, 0, 5, &log, &stable),
+    Err(CreateGroupError::IncarnationUnrecoverable { record: 5 }),
+    "the validated seam refuses it"
+  );
+  let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m2.restore_group_unchecked(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .expect("the unchecked door admits it too");
+  assert_eq!(
+    m2.group(&7).unwrap().shape_gen(),
+    0,
+    "recovered at zero — the incarnation the stores could not name"
+  );
+
+  // The STRUCTURAL checks it does keep still fire.
+  assert_eq!(
+    m2.restore_group_unchecked(
+      7,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      SplitSm::default(),
+      1,
+      &mut log,
+      &mut stable
+    ),
+    Err(CreateGroupError::Exists),
+    "structural admission is still the container's"
+  );
+}
+
+/// A hard state that SURVIVED carries the founding generation, so a zero there is exact and the
+/// restore refusal deliberately stands down — the counter heals by replaying the moves the record
+/// counts. The refusal fires on the shape where the hard state did NOT survive; these two readings
+/// are what make the arm's predicate honest rather than merely conservative.
+#[test]
+fn a_surviving_hard_state_names_its_incarnation_and_is_admitted() {
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
+  let mut log = VecLog::default();
+  log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::Normal,
+    cmd,
+  )]);
+
+  // Founded at zero and since reshaped: the record counts applied moves, the hard state honestly
+  // reads zero, and replay is what heals the counter.
+  let mut moved = AsyncStable::default();
+  moved.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial().with_term(Term::new(4)),
+  );
+  assert_eq!(moved.hard_state().founding_gen(), 0);
+  assert_eq!(
+    crate::validate_restore(3, 0, 3, &log, &moved),
+    Ok(()),
+    "a founded-at-zero group that reshaped is recoverable, and the arm must not brick it"
+  );
+
+  // Founded above zero: the surviving hard state carries it, so nothing is ambiguous.
+  let mut founded = AsyncStable::default();
+  founded.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial()
+      .with_term(Term::new(4))
+      .with_founding_gen(3),
+  );
+  assert_eq!(crate::validate_restore(3, 0, 3, &log, &founded), Ok(()));
+}
+
 /// A COMPLETION LEFT OVER FROM A PRIOR INCARNATION CREDITS NOTHING HERE.
 ///
 /// The founding door writes into the store it is handed and builds a fresh endpoint, so without an
@@ -16488,6 +16680,76 @@ fn propose_split_refuses_a_reserved_child_generation() {
   }
 }
 
+/// STORES MUST CLEAR THE FLOOR THEMSELVES — the caller's claim is not evidence about them.
+///
+/// The floor gate judges `generation`; the doors deliberately never install it, so the live counter
+/// comes from the stores. A claim at the floor over stores founded below it therefore admits the
+/// fenced incarnation AND recovers it: it campaigns, serves retired state, and judges
+/// current-generation traffic by a dead incarnation's lineage guards.
+#[test]
+fn a_restore_refuses_stores_whose_lineage_cannot_reach_the_floor() {
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
+  let mut log = VecLog::default();
+  log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::Normal,
+    cmd,
+  )]);
+  // Coherent stores whose every lineage reading is zero: a term, no founding, no meta.
+  let mut fenced = AsyncStable::default();
+  fenced.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial().with_term(Term::new(4)),
+  );
+
+  // The claim clears the floor; the evidence does not.
+  assert_eq!(
+    crate::validate_restore(0, 2, 2, &log, &fenced),
+    Err(CreateGroupError::StoredStateBelowFloor {
+      floor: 2,
+      recoverable: 0
+    }),
+    "an at-floor claim over below-floor stores resurrects the fenced incarnation"
+  );
+
+  // EACH of the three evidence readings alone lifts it to the floor — the bound is their max, so
+  // a legitimate store is admitted by whichever one it happens to carry.
+  let mut founded = AsyncStable::default();
+  founded.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial()
+      .with_term(Term::new(4))
+      .with_founding_gen(2),
+  );
+  assert_eq!(crate::validate_restore(0, 2, 2, &log, &founded), Ok(()));
+
+  let mut captured = AsyncStable::default();
+  captured.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial().with_term(Term::new(4)),
+  );
+  captured.force_snapshot(
+    crate::SnapshotMeta::new(
+      Index::new(1),
+      Term::new(1),
+      crate::ConfState::from_voters(std::vec![1u64]),
+    )
+    .with_shape_gen(2),
+    Bytes::from_static(b"\x00"),
+  );
+  assert_eq!(crate::validate_restore(0, 2, 2, &log, &captured), Ok(()));
+  // The record is the driver's mirror of applied lineage moves, so it too satisfies the bound.
+  assert_eq!(crate::validate_restore(2, 2, 2, &log, &fenced), Ok(()));
+
+  // THE GEN-0 WORLD NEVER REACHES THE ARM: no floor, nothing to clear.
+  assert_eq!(crate::validate_restore(0, 0, 0, &log, &fenced), Ok(()));
+}
+
 /// A POISONED CHILD IS NOT A MATERIALIZATION. Token equality proves the hosted group was born from
 /// this fork's baseline; it does not prove the host can serve it. Consuming the parent's staged
 /// blob against an inert child destroys the partition's only clean derivation and leaves nothing
@@ -16549,6 +16811,80 @@ fn a_poisoned_child_does_not_resolve_its_parents_fork_redundant() {
   assert!(
     m.group(&7).unwrap().fork_obligations_standing(),
     "and the parent still owes the partition, so nothing lifted its barrier"
+  );
+}
+
+/// AN UNADOPTED SNAPSHOT IS NOT EVIDENCE. The blob reached the slot but the install never ran, so
+/// the hard state carries no token while the meta does and the log was never re-baselined at its
+/// boundary — the leftover shape a restart deliberately ignores. Crediting its `shape_gen` would
+/// clear a floor with a boundary the boot then discards, admitting a fenced incarnation that comes
+/// up blank and, on a single voter, can campaign and serve below the fence.
+#[test]
+fn an_unadopted_snapshot_does_not_clear_the_floor() {
+  let token = crate::ForkId::new(
+    Bytes::from_static(b"p"),
+    1,
+    Index::new(1),
+    Term::new(2),
+    Bytes::from_static(b"c"),
+    0,
+  );
+  let meta = || {
+    crate::SnapshotMeta::new(
+      Index::new(1),
+      Term::new(2),
+      crate::ConfState::from_voters(std::vec![1u64]),
+    )
+    .with_shape_gen(2)
+    .with_fork_id(token.clone())
+  };
+
+  // A VIRGIN log: the blob is durable, the destructive re-baseline never ran.
+  let log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  stable.force_hard_state(crate::HardState::initial().with_term(Term::new(4)));
+  stable.force_snapshot(meta(), Bytes::from_static(b"\x00"));
+  assert_eq!(
+    crate::validate_restore(0, 2, 2, &log, &stable),
+    Err(CreateGroupError::StoredStateBelowFloor {
+      floor: 2,
+      recoverable: 0
+    }),
+    "an ignored slot must not raise the recoverable lineage"
+  );
+
+  // THE ADOPTED TWIN, one field apart: the hard state vouches for the same lineage, so the restart
+  // WILL boot on this slot and its generation is real evidence.
+  let mut adopted = AsyncStable::default();
+  adopted.force_hard_state(
+    crate::HardState::initial()
+      .with_term(Term::new(4))
+      .with_lineage(Some(token.clone())),
+  );
+  adopted.force_snapshot(meta(), Bytes::from_static(b"\x00"));
+  assert_eq!(
+    crate::validate_restore(0, 2, 2, &log, &adopted),
+    Ok(()),
+    "an adopted slot's generation clears the floor"
+  );
+
+  // And the OTHER adoption leg: a token-less hard state adopts a token-bearing meta only when the
+  // log is baselined AT its boundary — the install having already run, only the stamp missing.
+  let mut baselined = VecLog::default();
+  baselined.force_append(&[crate::Entry::new(
+    Term::new(2),
+    Index::new(1),
+    crate::EntryKind::Empty,
+    Bytes::new(),
+  )]);
+  baselined.compact(Index::new(1));
+  let mut tokenless = AsyncStable::default();
+  tokenless.force_hard_state(crate::HardState::initial().with_term(Term::new(4)));
+  tokenless.force_snapshot(meta(), Bytes::from_static(b"\x00"));
+  assert_eq!(
+    crate::validate_restore(0, 2, 2, &baselined, &tokenless),
+    Ok(()),
+    "a baselined-at-boundary log adopts the slot, so it counts"
   );
 }
 
@@ -16761,3 +17097,90 @@ fn a_child_poisoned_during_restart_does_not_let_its_removal_abandon_the_parents_
   assert_eq!(*fork.child(), 200);
 }
 
+/// THE CLAIM IS EVIDENCE OF HISTORY, NOT EVIDENCE OF LINEAGE.
+///
+/// A catalog naming a nonzero incarnation asserts the id HAS a history, so empty stores — or stores
+/// that name no incarnation at all — contradict it exactly as they contradict a nonzero record.
+/// Gating those two refusals on the record alone let a claim recover a blank endpoint under a name
+/// it never reached: on a single voter it campaigns and serves that blank state, and its
+/// generation-0 frames pass any peer whose floor is still zero.
+///
+/// What the claim is NOT is a bound the stores must reach. That is the discriminator this test
+/// pins in both directions.
+#[test]
+fn a_nonzero_claim_needs_stores_that_name_an_incarnation() {
+  let cmd = {
+    let mut b = Vec::new();
+    Bytes::from_static(b"c").encode(&mut b);
+    Bytes::from(b)
+  };
+  let with_content = || {
+    let mut l = VecLog::default();
+    l.force_append(&[crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    )]);
+    l
+  };
+
+  // (record 0, floor 0, claim N) over NOTHING: the claim alone now trips the empty-stores refusal.
+  let empty_log = VecLog::default();
+  let empty_stable = AsyncStable::default();
+  assert_eq!(
+    crate::validate_restore(0, 0, 7, &empty_log, &empty_stable),
+    Err(CreateGroupError::NoStoredState),
+    "a claimed incarnation over empty stores has nothing to recover"
+  );
+  // …and the gen-0 world is untouched: no claim, no record, no floor, nothing asserted.
+  assert_eq!(
+    crate::validate_restore(0, 0, 0, &empty_log, &empty_stable),
+    Ok(())
+  );
+
+  // (record 0, floor 0, claim N) over content whose hard state names NO incarnation.
+  let initial_hs = AsyncStable::default();
+  assert_eq!(initial_hs.hard_state(), crate::HardState::initial());
+  assert_eq!(
+    crate::validate_restore(0, 0, 7, &with_content(), &initial_hs),
+    Err(CreateGroupError::IncarnationUnrecoverable { record: 0 }),
+    "state that names no incarnation cannot be recovered as one the catalog asserts"
+  );
+
+  // THE DISCRIMINATOR, and the reason the claim is not a lower bound on the stores: a NON-INITIAL
+  // hard state means some incarnation really did write here, so these stores are that
+  // incarnation's — and a claim may legitimately run ahead of everything readable when the evidence
+  // is a retained, still-uncommitted shape entry that will carry the counter the rest of the way.
+  let mut wrote = AsyncStable::default();
+  wrote.force_state(Term::new(1), Some(1u64), Index::new(1));
+  assert_eq!(
+    crate::validate_restore(0, 0, 7, &with_content(), &wrote),
+    Ok(()),
+    "a claim ahead of readable lineage is the reopen this discipline exists for, not a fault"
+  );
+
+  // EVERY LEGITIMATE DOOR'S TUPLE, admitted. `(record, floor, generation)` against stores that
+  // carry the matching evidence — none of the refusals above may catch one of these.
+  for (record, floor, generation, founding) in [
+    (0u64, 0u64, 0u64, 0u64),
+    (2, 2, 2, 2),
+    (5, 0, 5, 0),
+    (1, 0, 1, 0),
+  ] {
+    let mut st = AsyncStable::default();
+    st.force_state(Term::new(1), Some(1u64), Index::new(1));
+    if founding > 0 {
+      st.force_hard_state(
+        crate::HardState::initial()
+          .with_term(Term::new(1))
+          .with_founding_gen(founding),
+      );
+    }
+    assert_eq!(
+      crate::validate_restore(record, floor, generation, &with_content(), &st),
+      Ok(()),
+      "legitimate door refused: record {record}, floor {floor}, generation {generation}"
+    );
+  }
+}

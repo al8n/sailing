@@ -237,21 +237,15 @@ where
     //    fail-stop (`LineageMismatch`) rather than reconcile coordinates across two lineages.
     let snapshot = match snapshot {
       Some((meta, data)) => {
-        if hs.lineage() == meta.fork_id() {
-          Some((meta, data))
-        } else if hs.lineage().is_none() {
-          let baselined_at_boundary = log.first_index() == meta.last_index().next()
-            && log.term(meta.last_index()).ok() == Some(meta.last_term());
-          if baselined_at_boundary {
-            Some((meta, data))
-          } else {
-            None
-          }
-        } else {
+        // ONE predicate, shared with the restore validator so the two readings of "will this boot
+        // adopt that slot?" cannot drift apart.
+        let adopted = crate::multi::snapshot_is_adopted(hs.lineage(), &meta, log);
+        if !adopted && hs.lineage().is_some() {
+          // Token-bearing hard state disagreeing with the slot: self-contradictory durable state.
           poisoned = true;
           poison_reason = Some(PoisonReason::LineageMismatch);
-          None
         }
+        if adopted { Some((meta, data)) } else { None }
       }
       None => {
         if hs.lineage().is_some() {

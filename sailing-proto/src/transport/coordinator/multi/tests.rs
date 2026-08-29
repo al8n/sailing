@@ -1238,8 +1238,9 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     )
     .unwrap_err();
   assert!(matches!(e, CreateGroupError::BelowFloor { floor: 2 }));
-  // cell 4: at the floor — admitted
-  c.create_group(
+  // cell 4: at the floor — admitted, through the door a nonzero founding value must use
+  let (founding_log, mut founding_stable) = (VecLog::default(), AsyncStable::default());
+  c.create_group_founded_at(
     100,
     single_voter(1),
     now,
@@ -1247,6 +1248,9 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     CountSm::default(),
     2,
     &Floors(2, 0),
+    1,
+    &founding_log,
+    &mut founding_stable,
   )
   .expect("at-floor admitted");
   // cell 1 under floor-first ordering: hosted + below-floor reports the fence, not Exists
@@ -1293,7 +1297,10 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     .unwrap_err();
   assert!(matches!(e, CreateGroupError::Retired));
   assert!(c.clear_tombstone(&100));
-  c.create_group(
+  // The rejoin is a FRESH incarnation and gets fresh stores: the founding door refuses storage
+  // that already holds an incarnation's state, including the one it stamped a moment ago.
+  let (rejoin_log, mut rejoin_stable) = (VecLog::default(), AsyncStable::default());
+  c.create_group_founded_at(
     100,
     single_voter(1),
     now,
@@ -1301,6 +1308,9 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     CountSm::default(),
     9,
     &Floors(2, 0),
+    1,
+    &rejoin_log,
+    &mut rejoin_stable,
   )
   .expect("two-act rejoin");
   // cell 5: NoFloors = the P5 world
@@ -1397,6 +1407,64 @@ fn restore_admission_walks_the_same_floor_gate() {
     )
     .unwrap_err();
   assert!(matches!(e, CreateGroupError::ReservedGeneration));
+  // A floored id is one with a HISTORY, so an at-floor restore over stores that hold nothing is
+  // refused before the floor gate is even the question: there is nothing here to recover.
+  let e = c
+    .restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      2,
+      &Floors(2),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::NoStoredState));
+
+  // STATE ALONE IS NOT ENOUGH. These stores hold a term but account for no lineage at all — they
+  // are the FENCED incarnation's — so the at-floor CLAIM must not recover them. Admitting on the
+  // claim resurrects exactly what the floor buried.
+  stable.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial().with_term(Term::new(1)),
+  );
+  let e = c
+    .restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      2,
+      &Floors(2),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(
+      e,
+      CreateGroupError::StoredStateBelowFloor {
+        floor: 2,
+        recoverable: 0
+      }
+    ),
+    "stores that reach no lineage must not be recovered at the floor, got {e:?}"
+  );
+
+  // With the stores' OWN lineage at the floor — the shape a legitimate recreate-at-2 leaves, its
+  // founding generation stamped before the create was acked — the at-floor restore admits.
+  stable.submit_write(
+    crate::OpId::new(2),
+    crate::HardState::initial()
+      .with_term(Term::new(1))
+      .with_founding_gen(2),
+  );
   c.restore_group(
     100,
     single_voter(1),
@@ -1409,7 +1477,182 @@ fn restore_admission_walks_the_same_floor_gate() {
     &mut log,
     &mut stable,
   )
-  .expect("at-floor restore admitted");
+  .expect("at-floor restore admitted once the stores reach the floor");
+}
+
+/// A restore's `generation` is compared against the id's DURABLE LINEAGE RECORD, not only its
+/// floor: below the record it REFUSES, at or above it admits and the guard's `max` fold stands.
+///
+/// The record outlives the process that wrote it, so at a restore it is definitionally the
+/// better-informed of the two readings. Folding a lower catalog value up by `max` — which is what
+/// the relay guard did on its own — hid the disagreement at the one moment it matters, leaving the
+/// endpoint seeded at the supplied generation while every gen-keyed door answered to the record.
+#[test]
+fn restore_below_the_durable_lineage_record_refuses() {
+  struct Record(u64);
+  impl FloorStore<u64> for Record {
+    fn floor(&self, _: &u64) -> u64 {
+      0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.0
+    }
+  }
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  stable.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial().with_term(Term::new(1)),
+  );
+
+  let e = c
+    .restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      6,
+      &Record(7),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::BelowLineageRecord { record: 7 }),
+    "a generation below the durable record must refuse typed, got {e:?}"
+  );
+  assert!(
+    c.group(&100).is_none(),
+    "a refused restore leaves the container untouched"
+  );
+
+  // AT the record admits — and the admitted generation stays OUT of the endpoint: the live counter
+  // is the input to every apply-time lineage guard, and these stores replay no lineage move at all.
+  c.restore_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    1,
+    7,
+    &Record(7),
+    &mut log,
+    &mut stable,
+  )
+  .expect("an at-record restore is admitted");
+  assert_eq!(
+    c.group(&100).unwrap().shape_gen(),
+    0,
+    "the admitted generation gates the door; the live counter still reads the replay evidence"
+  );
+}
+
+/// A restore ABOVE the record admits — the catalog is entitled to move an id's incarnation forward
+/// — and the admitted generation is VALIDATED, never INSTALLED. The live lineage counter is the
+/// input to every apply-time lineage guard, and those guards compare for exact equality: a counter
+/// carrying a per-host catalog value would have this replica mint generations no other replica can
+/// admit, and judge committed shape entries by a yardstick no other replica shares.
+#[test]
+fn a_restore_above_the_record_validates_but_never_installs_the_admitted_generation() {
+  struct Record(u64);
+  impl FloorStore<u64> for Record {
+    fn floor(&self, _: &u64) -> u64 {
+      0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.0
+    }
+  }
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  stable.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial().with_term(Term::new(1)),
+  );
+  c.restore_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    1,
+    9,
+    &Record(7),
+    &mut log,
+    &mut stable,
+  )
+  .expect("an above-record restore is admitted");
+  assert_eq!(
+    c.group(&100).unwrap().shape_gen(),
+    0,
+    "the endpoint's counter reads its replay evidence, not the generation it was admitted at"
+  );
+  assert_eq!(
+    c.multi.group_gen(&100),
+    7,
+    "the guard took the durable record, and nothing anywhere took the catalog's 9"
+  );
+}
+
+/// A restore naming an id the lineage KNOWS, over stores holding nothing, refuses rather than
+/// building a blank term-0 endpoint and presenting it as recovered state. An id the lineage does
+/// NOT know keeps the gen-0 world's behaviour exactly.
+#[test]
+fn restore_over_empty_stores_refuses_only_for_a_known_id() {
+  struct Record(u64);
+  impl FloorStore<u64> for Record {
+    fn floor(&self, _: &u64) -> u64 {
+      0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.0
+    }
+  }
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let e = c
+    .restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      4,
+      &Record(4),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::NoStoredState),
+    "a known id over empty stores has nothing to recover, got {e:?}"
+  );
+
+  // The gen-0 world is untouched: an id with no record and no floor restores off empty stores
+  // exactly as it always did.
+  c.restore_group(
+    101,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    1,
+    0,
+    &Record(0),
+    &mut log,
+    &mut stable,
+  )
+  .expect("an unknown id keeps the gen-0 behaviour");
 }
 
 /// The reserved sentinel is refused at its OWN generation on the create path: `u64::MAX` is the
@@ -1474,32 +1717,47 @@ fn merged_floor_sentinel_generation_is_reserved() {
   );
 }
 
-/// A group admitted at the highest working generation — one below the reserved `MERGED_FLOOR`
-/// terminal — floors PERMANENTLY on removal: its removal ceiling saturates AT the terminal rather
-/// than overflowing past it, and the persisted terminal fence then refuses every recreate.
+/// A group admitted at the HIGHEST WORKING generation floors PERMANENTLY on removal — and does so
+/// with the headroom below the sentinel, never the sentinel itself. A `MERGED_FLOOR` floor is read
+/// as a GLOBAL verdict that a lineage was absorbed away; an ordinary local removal must not be able
+/// to forge one, which is why the top two generations are reserved rather than the top one.
 #[test]
 fn a_terminal_edge_group_floors_permanently_on_removal() {
-  // One below the terminal is still an admissible working generation.
-  assert!(crate::floor_admits(0, MERGED_FLOOR - 1));
+  // The highest working generation is two below the sentinel: the one between is the fence's.
+  assert!(crate::floor_admits(
+    0,
+    crate::HIGHEST_WORKING_GENERATION - 1
+  ));
+  assert!(!crate::floor_admits(0, crate::HIGHEST_WORKING_GENERATION));
   let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
-  engine.set_group_gen(&7, MERGED_FLOOR - 1);
-  // The removal ceiling is `group_gen + 1`, saturated: at the edge it lands ON the terminal
-  // instead of wrapping to `0` (which would break the monotone removal/recreate fence).
+  engine.set_group_gen(&7, crate::HIGHEST_WORKING_GENERATION - 1);
   let floor = engine.removal_floor(&7);
   assert_eq!(
+    floor,
+    crate::HIGHEST_WORKING_GENERATION,
+    "the ceiling fences with the reserved headroom, and never reaches the terminal"
+  );
+  assert_ne!(
     floor, MERGED_FLOOR,
-    "the removal ceiling saturates at the reserved terminal"
+    "a local removal forges no global verdict"
   );
   engine.set_group_floor(&7, floor);
-  // The persisted terminal fence admits nothing: under a `MERGED_FLOOR` floor the truthful verdict
-  // stays the fence itself at EVERY generation — the sentinel included — so recreation is refused.
-  for generation in [0, MERGED_FLOOR - 1, MERGED_FLOOR] {
+  // The fence still admits nothing: every working generation is strictly below it, and the two
+  // reserved values are refused for being reserved.
+  for generation in [0, crate::HIGHEST_WORKING_GENERATION - 1] {
     assert_eq!(
       crate::multi::validate_floor(engine.group_floor(&7), generation),
       Err(CreateGroupError::BelowFloor {
-        floor: MERGED_FLOOR
+        floor: crate::HIGHEST_WORKING_GENERATION
       }),
-      "the terminal fence refuses recreation at generation {generation}"
+      "the fence refuses recreation at working generation {generation}"
+    );
+  }
+  for generation in [crate::HIGHEST_WORKING_GENERATION, MERGED_FLOOR] {
+    assert_eq!(
+      crate::multi::validate_floor(engine.group_floor(&7), generation),
+      Err(CreateGroupError::ReservedGeneration),
+      "and a reserved generation is refused as reserved, at {generation}"
     );
   }
 }
@@ -3442,4 +3700,268 @@ fn the_demux_fence_drops_a_debt_named_sources_frames_without_signalling() {
     "the absorbing target is untouched by its consumed source's stragglers"
   );
   assert!(b.group(&2).is_none(), "the source endpoint stays consumed");
+}
+
+/// The `Data`-encoded payload of a committed `Split` entry, as `propose_split` builds it.
+fn split_payload_bytes(child: u64, parent_gen_after: u64, give: u8) -> Bytes {
+  let mut child_bytes = Vec::new();
+  crate::Data::encode(&child, &mut child_bytes);
+  let payload = crate::SplitPayload::new(
+    Bytes::from(child_bytes),
+    0,
+    parent_gen_after,
+    Bytes::copy_from_slice(&[give]),
+  );
+  let mut buf = Vec::new();
+  crate::wire::encode_split_payload(&payload, &mut buf);
+  Bytes::from(buf)
+}
+
+/// A parent's crash image whose `Split` is DURABLE IN THE LOG but NOT YET COMMITTED: three
+/// committed commands, then the split of `child` minted at parent generation 1 sitting ABOVE the
+/// durable commit index. Every replica reaches this shape whenever an entry's append outlives the
+/// hard-state write that would have recorded its commit — apply runs off the in-memory commit, and
+/// only the durable one survives a crash.
+fn parent_holding_an_uncommitted_split(child: u64) -> (VecLog, AsyncStable) {
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cmd = {
+    let mut c = Vec::new();
+    crate::Data::encode(&Bytes::from_static(b"c"), &mut c);
+    Bytes::from(c)
+  };
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
+      crate::EntryKind::Split,
+      split_payload_bytes(child, 1, 2),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  (log, stable)
+}
+
+/// A `Split` that was durable but UNCOMMITTED when the host crashed still partitions the state
+/// machine when it commits after the reopen — at the generation it was minted with, exactly as it
+/// does on every replica that never crashed.
+///
+/// The apply-time lineage guard admits the entry only at `shape_gen + 1` exactly. This replica
+/// reopens with a lineage record its replay cannot account for (the record was flushed with the
+/// child's baseline; the commit-index write was not), so an admitted generation or a record folded
+/// into the live counter would put it one comparison past the retained entry: the entry would no-op
+/// while every replica that stayed up partitioned on it. The counter therefore reads the replay
+/// evidence, and the retained entry lands.
+#[test]
+fn an_uncommitted_split_still_partitions_when_it_commits_after_a_reopen() {
+  struct Record(u64);
+  impl FloorStore<u64> for Record {
+    fn floor(&self, _: &u64) -> u64 {
+      0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.0
+    }
+  }
+  let now = Instant::ORIGIN;
+  let (mut log, mut stable) = parent_holding_an_uncommitted_split(300);
+  let mut c = SplitCoord::new();
+  // The catalog has moved this id to generation 1 — the split committed elsewhere — while this
+  // host's own fork record still reads 0: it crashed before materializing anything.
+  c.restore_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    SplitSm::default(),
+    1,
+    1,
+    &Record(0),
+    &mut log,
+    &mut stable,
+  )
+  .expect("the reopen is admitted above the record");
+
+  assert_eq!(
+    c.group(&100).unwrap().state_machine().units,
+    3,
+    "replay stops below the uncommitted split, so the FSM still holds all three units"
+  );
+  assert_eq!(
+    c.group(&100).unwrap().shape_gen(),
+    0,
+    "and the live counter reads that replay, not the generation the reopen was admitted at"
+  );
+
+  // The replica rejoins and the retained entry COMMITS: a fresh term's own entry carries the
+  // stale-term tail past the commit point with it.
+  let d = c.group(&100).unwrap().poll_timeout().unwrap();
+  c.handle_timeout(&100, d, &mut log, &mut stable).unwrap();
+  while matches!(
+    c.handle_storage(&100, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+
+  assert_eq!(
+    c.group(&100).unwrap().shape_gen(),
+    1,
+    "the committed split applied at the generation it was minted with"
+  );
+  assert_eq!(
+    c.group(&100).unwrap().state_machine().units,
+    1,
+    "the state machine PARTITIONED: three units less the two it gave away"
+  );
+  {
+    let fork = c
+      .peek_yieldable_fork(&NoHold)
+      .expect("the applied split staged its fork for the relay");
+    assert_eq!(((*fork.child()), fork.parent_gen_after()), (300, 1));
+  }
+
+  // THE OTHER LEG. The same reopen on a host whose fork record DOES cover this split — it
+  // materialized the child before the crash, and only the commit-index write was lost. The entry
+  // still applies (the apply guard reads the replay, which is identical on both hosts), and the
+  // re-staged fork now folds as the duplicate it is rather than re-materializing over the child's
+  // real durable progress.
+  let (mut log, mut stable) = parent_holding_an_uncommitted_split(300);
+  let mut c = SplitCoord::new();
+  c.restore_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    SplitSm::default(),
+    1,
+    1,
+    &Record(1),
+    &mut log,
+    &mut stable,
+  )
+  .expect("the reopen is admitted at the record");
+  let d = c.group(&100).unwrap().poll_timeout().unwrap();
+  c.handle_timeout(&100, d, &mut log, &mut stable).unwrap();
+  while matches!(
+    c.handle_storage(&100, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert_eq!(
+    c.group(&100).unwrap().state_machine().units,
+    1,
+    "the committed split partitioned this replica identically"
+  );
+  assert!(
+    c.peek_yieldable_fork(&NoHold).is_none(),
+    "and its fork folded against the record that already covers it"
+  );
+}
+
+/// The group-header incarnation stamp on every outbound frame reads the group's REPLICATED
+/// evidence. The receiver compares it against that id's admission floor — a retirement fact — so a
+/// stamp lifted above the sender's own evidence would have a reopened replica speak for
+/// generations its stores do not hold, which is the identity collapse the fence exists to refuse.
+#[test]
+fn the_group_header_stamp_reads_the_replicated_evidence() {
+  struct Record(u64);
+  impl FloorStore<u64> for Record {
+    fn floor(&self, _: &u64) -> u64 {
+      0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.0
+    }
+  }
+  // The peer link is bound and its handshake settled before the group is reopened, so every frame
+  // captured below is this group's own tagged traffic.
+  let mut w = World::new(&[], &[100]);
+  w.settle();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  stable.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial().with_term(Term::new(1)),
+  );
+  w.a
+    .restore_group(
+      100,
+      two_voter(1),
+      w.now,
+      1,
+      CountSm::default(),
+      1,
+      9,
+      &Record(7),
+      &mut log,
+      &mut stable,
+    )
+    .expect("an above-record restore is admitted");
+  w.sa.map.insert(100, (log, stable));
+  assert_eq!(
+    w.a.group(&100).unwrap().shape_gen(),
+    0,
+    "the replay evidence is zero"
+  );
+
+  // Campaign, capturing what leaves before the peer ever answers.
+  let mut frames = Vec::new();
+  for _ in 0..40 {
+    let d = w.a.group(&100).unwrap().poll_timeout().unwrap();
+    w.now = w.now.max(d);
+    let now = w.now;
+    {
+      let (l, s) = w.sa.stores(&100).unwrap();
+      w.a.handle_timeout(&100, now, l, s).unwrap();
+    }
+    for _ in 0..8 {
+      let (l, s) = w.sa.stores(&100).unwrap();
+      let _ = w.a.handle_storage(&100, now, l, s);
+    }
+    frames.extend(transmit_frames(&w.a.poll_transmit()));
+    if !frames.is_empty() {
+      break;
+    }
+  }
+  let mut stamps = Vec::new();
+  for f in &frames {
+    let bytes = bytes::Bytes::copy_from_slice(f);
+    let tagged = if crate::transport::frame::is_coalesced_frame(f) {
+      crate::transport::frame::split_coalesced(bytes)
+        .expect("well-formed coalesced payload")
+        .into_iter()
+        .map(|(_, group, generation, _)| (group, generation))
+        .collect::<Vec<_>>()
+    } else {
+      let (group, generation, _) =
+        crate::transport::frame::split_group_header(bytes).expect("well-formed group header");
+      std::vec![(group, generation)]
+    };
+    for (group, generation) in tagged {
+      assert_eq!(u64::decode_exact(group).expect("u64 tag"), 100);
+      stamps.push(generation);
+    }
+  }
+  assert!(
+    !stamps.is_empty(),
+    "the campaigning group must have emitted at least one tagged frame"
+  );
+  for s in stamps {
+    assert_eq!(
+      s, 7,
+      "the stamp is the group's own evidence — its durable fork record here — never the 9 the \
+       catalog claimed at admission"
+    );
+  }
 }

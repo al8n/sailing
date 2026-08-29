@@ -325,10 +325,22 @@ where
     if self.multi.split_reserved(&gid) {
       return Err(CreateGroupError::SplitReserved);
     }
+    // The restore-side legs beyond the floor: a generation BELOW the durable lineage record
+    // refuses rather than folding up, and a KNOWN id over empty stores refuses rather than
+    // presenting a blank endpoint as recovered state. Both read the stores; neither writes.
+    crate::validate_restore(
+      floors.lineage(&gid),
+      floors.floor(&gid),
+      generation,
+      log,
+      stable,
+    )?;
     let key = gid.cheap_clone();
     self
       .multi
       .restore_group_unchecked(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
+    // The guard is raised from the DURABLE fork record; the admitted generation stays out of the
+    // endpoint entirely (INV-APPLY-LINEAGE) and out of that record.
     self.multi.raise_relay_guard(&key, floors.lineage(&key));
     self.purge_unknown_signal(&key);
     Ok(())

@@ -881,8 +881,9 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     )
     .unwrap_err();
   assert!(matches!(e, CreateGroupError::BelowFloor { floor: 2 }));
-  // cell 4: at the floor — admitted
-  c.create_group(
+  // cell 4: at the floor — admitted, through the door a nonzero founding value must use
+  let (founding_log, mut founding_stable) = (VecLog::default(), AsyncStable::default());
+  c.create_group_founded_at(
     100,
     single_voter(1),
     now,
@@ -890,6 +891,9 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     CountSm::default(),
     2,
     &Floors(2, 0),
+    1,
+    &founding_log,
+    &mut founding_stable,
   )
   .expect("at-floor admitted");
   // cell 1 under floor-first ordering: hosted + below-floor reports the fence, not Exists
@@ -936,7 +940,10 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     .unwrap_err();
   assert!(matches!(e, CreateGroupError::Retired));
   assert!(c.clear_tombstone(&100));
-  c.create_group(
+  // The rejoin is a FRESH incarnation and gets fresh stores: the founding door refuses storage
+  // that already holds an incarnation's state, including the one it stamped a moment ago.
+  let (rejoin_log, mut rejoin_stable) = (VecLog::default(), AsyncStable::default());
+  c.create_group_founded_at(
     100,
     single_voter(1),
     now,
@@ -944,6 +951,9 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     CountSm::default(),
     9,
     &Floors(2, 0),
+    1,
+    &rejoin_log,
+    &mut rejoin_stable,
   )
   .expect("two-act rejoin");
   // cell 5: NoFloors = the P5 world
@@ -1894,4 +1904,236 @@ fn quic_admission_fences_on_a_staged_removal_floor() {
     "the create must refuse off the staged floor, before any barrier"
   );
   assert!(c.group(&7).is_none(), "a refused create admits nothing");
+}
+
+/// The QUIC twin of the stream coordinator's reopen pin: a `Split` that was durable but UNCOMMITTED
+/// when the host crashed still partitions the state machine when it commits after the reopen, at
+/// the generation it was minted with.
+///
+/// The apply-time lineage guard admits the entry only at `shape_gen + 1` exactly. This replica
+/// reopens under a catalog that has already moved this id to generation 1 — the split committed
+/// elsewhere — while its own durable state accounts for none of it. A generation folded into the
+/// live counter from that claim would put this replica one comparison past the retained entry: the
+/// entry would no-op here while every replica that stayed up partitioned on it.
+#[test]
+fn quic_an_uncommitted_split_still_partitions_when_it_commits_after_a_reopen() {
+  #[derive(Default)]
+  struct SplitSm {
+    units: u64,
+  }
+
+  impl crate::StateMachine for SplitSm {
+    type Command = Bytes;
+    type Response = u64;
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+
+    fn apply(&mut self, _index: Index, _cmd: Bytes) -> Result<u64, Self::Error> {
+      self.units += 1;
+      Ok(self.units)
+    }
+
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.units)
+    }
+
+    fn restore(&mut self, snapshot: u64) -> Result<(), Self::Error> {
+      self.units = snapshot;
+      Ok(())
+    }
+
+    fn split(&mut self, instruction: &[u8]) -> Option<Self> {
+      let give = u64::from(*instruction.first()?).min(self.units);
+      self.units -= give;
+      Some(Self { units: give })
+    }
+
+    fn supports_split(&self) -> bool {
+      true
+    }
+  }
+
+  struct Floors(u64);
+  impl FloorStore<u64> for Floors {
+    fn floor(&self, _: &u64) -> u64 {
+      0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.0
+    }
+  }
+
+  // The crash image: three committed commands, then the split of child 300 minted at parent
+  // generation 1 sitting ABOVE the durable commit index.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let mut child_bytes = Vec::new();
+  crate::Data::encode(&300u64, &mut child_bytes);
+  let payload =
+    crate::SplitPayload::new(Bytes::from(child_bytes), 0, 1, Bytes::from_static(b"\x02"));
+  let mut buf = Vec::new();
+  crate::wire::encode_split_payload(&payload, &mut buf);
+  let cmd = {
+    let mut c = Vec::new();
+    crate::Data::encode(&Bytes::from_static(b"c"), &mut c);
+    Bytes::from(c)
+  };
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
+      crate::EntryKind::Split,
+      Bytes::from(buf),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([21u8; 16]);
+  let opts = ca
+    .cluster_tls(&san(1, &cluster))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+    .build();
+  let mut c =
+    MultiQuicCoordinator::<u64, u64, SplitSm>::with_identity(opts, Some([1u8; 32]), cluster);
+  c.restore_group(
+    100,
+    single_voter(1),
+    Instant::ORIGIN,
+    1,
+    SplitSm::default(),
+    1,
+    1,
+    &Floors(0),
+    &mut log,
+    &mut stable,
+  )
+  .expect("the reopen is admitted above the record");
+
+  assert_eq!(
+    c.group(&100).unwrap().state_machine().units,
+    3,
+    "replay stops below the uncommitted split, so the FSM still holds all three units"
+  );
+  assert_eq!(
+    c.group(&100).unwrap().shape_gen(),
+    0,
+    "and the live counter reads that replay, not the generation the reopen was admitted at"
+  );
+
+  // The replica rejoins and the retained entry COMMITS: a fresh term's own entry carries the
+  // stale-term tail past the commit point with it.
+  let d = c.group(&100).unwrap().poll_timeout().unwrap();
+  c.handle_timeout(&100, d, &mut log, &mut stable).unwrap();
+  for _ in 0..6 {
+    c.handle_storage(&100, d, &mut log, &mut stable).unwrap();
+  }
+
+  assert_eq!(
+    c.group(&100).unwrap().shape_gen(),
+    1,
+    "the committed split applied at the generation it was minted with"
+  );
+  assert_eq!(
+    c.group(&100).unwrap().state_machine().units,
+    1,
+    "the state machine PARTITIONED: three units less the two it gave away"
+  );
+  let fork = c
+    .peek_yieldable_fork(&NoHold)
+    .expect("the applied split staged its fork for the relay");
+  assert_eq!(((*fork.child()), fork.parent_gen_after()), (300, 1));
+}
+
+/// THE FOUNDED DOOR RAISES THE CONNECTION CAP, exactly as every sibling admission does.
+///
+/// The cap is a floor over the TRACKED PEER UNION, so any door that widens that union owes the
+/// raise at the moment it widens it — ordinary create, restore, and fork all make the call before
+/// returning. A door that defers it to the next pump leaves a window in which accepts from the very
+/// peers it just admitted are statelessly refused, and a caller driving the coordinator directly
+/// has no next pump to close that window for it.
+///
+/// Parity, not a magic number: the founded door must leave the cap where ORDINARY create leaves it
+/// for the same group and membership.
+#[test]
+fn the_founded_door_raises_the_connection_cap_like_ordinary_create() {
+  fn coordinator() -> MultiQuicCoordinator<u64, u64, CountSm> {
+    let ca = TestClusterCa::generate();
+    let cluster = ClusterId([9u8; 16]);
+    // A CONFIGURED CAP BELOW THE MESH FLOOR, so the raise is observable at all: the effective cap
+    // is `configured.max(mesh_floor(peers))`, and at the default the floor for a small membership
+    // never exceeds it — the check would then pass whether the door raised anything or not.
+    let opts = ca
+      .cluster_tls(&san(1, &cluster))
+      .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+      .build()
+      .with_max_connections(2);
+    let mut seed = [0u8; 32];
+    seed[0] = 3;
+    MultiQuicCoordinator::with_identity(opts, Some(seed), cluster)
+  }
+  let members = std::vec![1u64, 2, 3, 4, 5];
+  let config = Config::try_new(
+    1,
+    members,
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+
+  let mut ordinary = coordinator();
+  ordinary
+    .create_group(
+      100,
+      config.clone(),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+  let expected = ordinary.bridge.max_connections_for_test();
+
+  let mut founded = coordinator();
+  let (log, mut stable) = (VecLog::default(), AsyncStable::default());
+  founded
+    .create_group_founded_at(
+      100,
+      config,
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      7,
+      &NoFloors,
+      1,
+      &log,
+      &mut stable,
+    )
+    .unwrap();
+
+  assert!(
+    expected > 2,
+    "the fixture must put the mesh floor above the configured cap, or the parity is vacuous: \
+     {expected}"
+  );
+  assert_eq!(
+    founded.bridge.max_connections_for_test(),
+    expected,
+    "the founded door must leave the connection cap where ordinary create leaves it — it widened \
+     the same tracked-peer union"
+  );
 }
