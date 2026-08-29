@@ -1032,6 +1032,26 @@ where
     Some(r)
   }
 
+  /// The floor this host's own incarnation of `group` fails to clear, or `None` when there is no
+  /// local objection — the id is not hosted here, or it is and its generation clears the floor
+  /// `floors` reports. The same predicate every gated verb applies, asked without proposing
+  /// anything, so a caller that must answer a placement question first can still let the group's
+  /// OWN state outrank it.
+  ///
+  /// Hosting is established before the floor is read, for the reason the gated verbs share: a
+  /// floor outlives the incarnation it fenced, so reading one first would report a fence for an id
+  /// this host merely used to run.
+  #[must_use]
+  pub fn fenced_floor(&self, group: &G, floors: &impl FloorStore<G>) -> Option<u64> {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    match self.propose_floor_check(group, floors) {
+      Err(ProposeError::BelowFloor { floor }) => Some(floor),
+      _ => None,
+    }
+  }
+
   /// The ordinary propose verbs' floor leg, applied only AFTER the caller has established that
   /// this host runs the group at all. Every gated verb here answers `None` for an id it does not
   /// host before it reads a floor, uniformly: a floor persists past the incarnation it fenced, so

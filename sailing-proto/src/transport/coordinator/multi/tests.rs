@@ -4582,3 +4582,46 @@ fn propose_split_reports_a_floored_child_under_its_own_variant() {
   }
   assert_eq!(stores.map.get(&1).unwrap().0.last_index(), before);
 }
+
+/// THE FENCE QUERY IS THE GATED VERBS' OWN PREDICATE, asked without proposing. A caller that must
+/// answer a placement question before dispatching needs the group's own state first, and hosting
+/// is established before the floor is read — an id this host merely used to run raises no
+/// objection, however terminal the floor it left behind.
+#[test]
+fn fenced_floor_reports_only_a_hosted_groups_own_fence() {
+  let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  stores
+    .map
+    .insert(1u64, (VecLog::default(), AsyncStable::default()));
+  coord
+    .create_group(
+      1,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+
+  assert_eq!(
+    coord.fenced_floor(&1, &MaxFloors),
+    Some(MERGED_FLOOR),
+    "a hosted group under a terminal floor reports it"
+  );
+  assert_eq!(
+    coord.fenced_floor(&1, &NoFloors),
+    None,
+    "a hosted group that clears its floor raises no objection"
+  );
+  assert_eq!(
+    coord.fenced_floor(&9, &MaxFloors),
+    None,
+    "an id this host does not run raises no objection, whatever floor it left behind"
+  );
+}

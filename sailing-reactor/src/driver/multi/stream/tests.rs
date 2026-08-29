@@ -1651,3 +1651,64 @@ async fn a_staged_removal_floor_fences_a_create_in_the_same_command_batch() {
     "a refused create must leave the id unhosted"
   );
 }
+
+/// Records, at the instant the driver wakes a reply's receiver, whether the plane's in-flight
+/// budget has a free slot — the exact question a sharded verb asks next.
+struct SlotAtWake {
+  budget: sailing_driver::shared::InflightBudget,
+  free: std::sync::atomic::AtomicI8,
+}
+
+impl futures_util::task::ArcWake for SlotAtWake {
+  fn wake_by_ref(this: &std::sync::Arc<Self>) {
+    // The probe reservation is released immediately; only its verdict is kept.
+    let free = this.budget.try_reserve::<u64>(0).is_ok();
+    this
+      .free
+      .store(i8::from(free), std::sync::atomic::Ordering::SeqCst);
+  }
+}
+
+/// THE FENCE PREFLIGHT RELEASES ITS SLOT BEFORE IT REPLIES. A sharded verb spends one in-flight
+/// slot asking a plane for a fence and then a SECOND on the real command, and the reply is what
+/// starts that second reservation. Answering while still holding the first makes an admissible
+/// operation race its own preflight and be turned away `Busy`. This driver's handle is `Send`, so
+/// the caller genuinely runs on another thread — the twin of the compio regression, maintained in
+/// parity rather than shared.
+#[tokio::test]
+async fn the_fence_preflight_frees_its_slot_before_waking_the_caller() {
+  let (mut driver, _handle) = bind_host().await;
+  let budget = sailing_driver::shared::InflightBudget::new(1, 1024);
+  let reservation = budget
+    .try_reserve::<u64>(0)
+    .expect("the preflight takes the only slot");
+  let probe = std::sync::Arc::new(SlotAtWake {
+    budget: budget.clone(),
+    free: std::sync::atomic::AtomicI8::new(-1),
+  });
+  let (tx, rx) = futures_channel::oneshot::channel();
+  let waker = futures_util::task::waker(probe.clone());
+  let mut rx = std::pin::pin!(rx);
+  assert!(
+    rx.as_mut()
+      .poll(&mut core::task::Context::from_waker(&waker))
+      .is_pending(),
+    "the caller parks on the fence reply"
+  );
+
+  let now = driver.clock.now();
+  driver.handle_command(
+    now,
+    sailing_driver::MultiCommand::GroupFenced {
+      group: 1,
+      reply: tx,
+      reservation,
+    },
+  );
+
+  assert_eq!(
+    probe.free.load(std::sync::atomic::Ordering::SeqCst),
+    1,
+    "the preflight's slot must already be free when its reply wakes the caller"
+  );
+}

@@ -1949,6 +1949,26 @@ where
         let _ = reply.send(verdict);
         drop(reservation);
       }
+      MultiCommand::GroupFenced {
+        group,
+        reply,
+        reservation,
+      } => {
+        // Read off the plane's own engine, on the driver thread: the id's placement here and the
+        // floor its incarnation must clear. Nothing is proposed and nothing is lent out.
+        let floors = FloorSnapshot {
+          floor: sailing_proto::FloorStore::floor(&self.engine, &group),
+          lineage: sailing_proto::FloorStore::lineage(&self.engine, &group),
+        };
+        let verdict = self.coord.fenced_floor(&group, &floors);
+        // RELEASE BEFORE REPLYING. The reply is the caller's starting gun: a sharded verb awaits
+        // this preflight and then reserves a SECOND slot for the real command. Waking the caller
+        // while this reservation still holds a slot makes an admissible operation race its own
+        // preflight — certain to answer `Busy` at max_inflight = 1, possible whenever the budget is
+        // saturated. Nothing below the drop needs the guard.
+        drop(reservation);
+        let _ = reply.send(verdict);
+      }
       MultiCommand::Status {
         group,
         reply,

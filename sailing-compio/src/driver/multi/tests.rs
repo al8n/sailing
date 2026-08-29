@@ -293,3 +293,35 @@ fn a_pending_farewell_blocks_quiescence() {
     "idle-eligible once the farewell budget drains"
   );
 }
+
+/// THE TWO FLOOR REFUSALS REACH A CALLER DISTINGUISHABLY on this driver's own mapping too — it
+/// keeps a separate copy of the split mapping, so the sibling driver's coverage does not speak for
+/// it. Both proto shapes carry a single `floor` field and need opposite recovery: reroute or retire
+/// a fenced parent, versus raise the child generation.
+#[test]
+fn the_split_floor_refusals_surface_with_their_participant() {
+  use sailing_proto::{ProposeError, SplitError};
+
+  use super::map_split_err;
+  use crate::DriverError;
+
+  let parent: SplitError<u64> = SplitError::Propose(ProposeError::BelowFloor {
+    floor: sailing_proto::MERGED_FLOOR,
+  });
+  let child: SplitError<u64> = SplitError::BelowFloor { floor: 7 };
+
+  let (DriverError::Rejected { reason: p }, DriverError::Rejected { reason: c }) =
+    (map_split_err(parent), map_split_err(child))
+  else {
+    panic!("both floor refusals map to the drivers' rejection shape");
+  };
+  assert_ne!(p, c, "the two refusals must not read identically");
+  assert!(
+    p.contains("parent"),
+    "the parent's refusal names the parent: {p}"
+  );
+  assert!(
+    c.contains("child"),
+    "the child's refusal names the child: {c}"
+  );
+}
