@@ -362,17 +362,21 @@ fn create_rejects_the_reserved_terminal_generation() {
     "the fork's baseline write never happened — refused before any store write"
   );
 
-  // A working generation just below the sentinel admits normally.
-  m.create_group(
+  // A working generation just below the sentinel admits normally — through the door that can
+  // persist it, the only one a nonzero founding value may use.
+  m.create_group_founded_at(
     3,
-    MERGED_FLOOR - 1,
+    MERGED_FLOOR - 2,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
     CountSm::default(),
+    1,
+    &log,
+    &mut stable,
   )
   .unwrap();
-  assert_eq!(m.group_gen(&3), MERGED_FLOOR - 1);
+  assert_eq!(m.group_gen(&3), MERGED_FLOOR - 2);
 }
 
 #[test]
@@ -882,7 +886,7 @@ fn fork_then_store_roundtrip_equals_restore() {
   // A SECOND container restoring a FRESH vessel from the same stores is indistinguishable:
   // the fork IS a manufactured install, so restore recovers it as one.
   let mut r: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
-  r.restore_group(
+  r.restore_group_unchecked(
     7,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -1176,7 +1180,7 @@ fn two_voter_cfg() -> Config<u64> {
 fn restore_from_empty_stores_surfaces_no_events() {
   let mut mr = MultiRaft::<u64, u64, CountSm>::new();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
-  mr.restore_group(
+  mr.restore_group_unchecked(
     1,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -2931,7 +2935,7 @@ fn removing_a_child_descended_from_a_held_fork_abandons_it() {
 fn the_mirrored_guard_folds_a_replayed_abandoned_fork() {
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = split_survivor_log(200);
-  m.restore_group(
+  m.restore_group_unchecked(
     7,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -2977,7 +2981,7 @@ fn the_mirrored_guard_folds_a_replayed_abandoned_fork() {
 fn a_replayed_abandoned_fork_resurrects_without_the_mirrored_guard() {
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = split_survivor_log(200);
-  m.restore_group(
+  m.restore_group_unchecked(
     7,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -3173,7 +3177,7 @@ fn a_removal_condemns_a_fork_below_the_head_and_the_drain_takes_it_in_order() {
 fn the_mirrored_guard_folds_both_replayed_forks_after_an_ordered_abandonment() {
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = two_split_survivor_log(200, 201);
-  m.restore_group(
+  m.restore_group_unchecked(
     7,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -3258,7 +3262,7 @@ fn a_redundant_resolution_persists_its_guard_advance_across_a_crash() {
   // CRASH + REPLAY. The restored parent replays its split entry and re-stages the fork; the guard
   // is seeded from the DURABLE mirror, which is the only place the fold was recorded.
   let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
-  m2.restore_group(
+  m2.restore_group_unchecked(
     7,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -3306,7 +3310,7 @@ fn a_redundant_resolution_persists_its_guard_advance_across_a_crash() {
 fn abandoning_a_below_guard_fork_never_regresses_the_relay_guard() {
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = two_split_survivor_log(200, 201);
-  m.restore_group(
+  m.restore_group_unchecked(
     7,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -3630,7 +3634,7 @@ fn fork_and_park_on_same_child(
     std::collections::BTreeSet::new(),
   );
   let (mut log, mut stable) = split_then_absorb_log(child, closer);
-  m.restore_group(
+  m.restore_group_unchecked(
     7,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -3720,7 +3724,7 @@ fn an_unrelated_parents_fork_for_a_consumed_id_holds_rather_than_dropping_its_ha
   let (mut m, mut stores) = fork_and_park_on_same_child(200, Some(crate::EntryKind::Empty));
   // Q: a DIFFERENT parent whose own committed split gives a NONZERO half to the same child id.
   let (mut qlog, mut qstable) = split_survivor_log(200);
-  m.restore_group(
+  m.restore_group_unchecked(
     9,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -3882,7 +3886,7 @@ fn a_new_park_does_not_inherit_the_previous_parks_latch() {
   let mut stable = AsyncStable::default();
   // Committed through index 3: park one's `k + 1` (index 2) is decided, park two's (index 4) is not.
   stable.force_state(Term::new(1), Some(1u64), Index::new(3));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -4905,7 +4909,7 @@ fn an_absorb_capture_preserves_fork_provenance() {
   // The contract the stamp protects: a rebuilt container re-derives the token from exactly
   // this durable meta.
   let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
-  m2.restore_group(
+  m2.restore_group_unchecked(
     200,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -5123,7 +5127,7 @@ fn restore_seeds_the_replay_guard_from_durable_lineage() {
   )]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(1));
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
-  m.restore_group(
+  m.restore_group_unchecked(
     7,
     cfg(),
     Instant::ORIGIN,
@@ -5162,7 +5166,7 @@ fn restore_seeds_the_replay_guard_from_durable_lineage() {
     split_entry_bytes(201, 0, 1, 1),
   )]);
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
-  m.restore_group(
+  m.restore_group_unchecked(
     7,
     cfg().with_snapshot_threshold(1),
     Instant::ORIGIN,
@@ -5277,7 +5281,7 @@ fn reshaped_twin_breaks_the_fork_merge_capture_cycle() {
     ),
   ]);
   pstable.force_state(Term::new(1), Some(1u64), Index::new(4));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -5672,7 +5676,7 @@ fn parked_fork_conserves_units_across_a_crash() {
     ),
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(4));
-  m.restore_group(
+  m.restore_group_unchecked(
     7,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -8155,7 +8159,7 @@ fn dead_target_thaw_needs_the_terminal_floor_not_a_non_terminal_one() {
   )]);
   let mut sstable = AsyncStable::default();
   sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
-  m.restore_group(
+  m.restore_group_unchecked(
     2,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -8879,8 +8883,21 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
     .inner
     .0
     .insert(2, (VecLog::default(), AsyncStable::default()));
-  m.create_group(2, 2, single_node_cfg(1), now, 7, CountSm::default())
+  {
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    m.create_group_founded_at(
+      2,
+      2,
+      single_node_cfg(1),
+      now,
+      7,
+      CountSm::default(),
+      1,
+      &*log,
+      stable,
+    )
     .unwrap();
+  }
   {
     let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
     let d = m.group(&2).unwrap().poll_timeout().unwrap();
@@ -9003,7 +9020,7 @@ fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor
   assert!(m.remove_group(&1, &mut stores).unwrap().is_some());
   {
     let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
-    m.restore_group(
+    m.restore_group_unchecked(
       1,
       single_node_cfg(1),
       now,
@@ -9035,8 +9052,21 @@ fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor
     .0
     .insert(2, (VecLog::default(), AsyncStable::default()));
   assert!(crate::floor_admits(*stores.floors.get(&2).unwrap(), 2));
-  m.create_group(2, 2, single_node_cfg(1), now, 7, CountSm::default())
+  {
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    m.create_group_founded_at(
+      2,
+      2,
+      single_node_cfg(1),
+      now,
+      7,
+      CountSm::default(),
+      1,
+      &*log,
+      stable,
+    )
     .unwrap();
+  }
   {
     let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
     let d = m.group(&2).unwrap().poll_timeout().unwrap();
@@ -9277,7 +9307,7 @@ fn a_lost_freeze_mirror_heals_on_the_restore_resync() {
   let epoch = engine.next_boot_epoch(&2).unwrap();
   {
     let (log, stable) = engine.stores(&2).unwrap();
-    m2.restore_group(
+    m2.restore_group_unchecked(
       2,
       single_node_cfg(1),
       now,
@@ -10660,7 +10690,7 @@ fn park_waits_for_the_source_then_resolves() {
   )]);
   let mut stable2 = crate::testkit::NoopStable::<u64>::default();
   stable2.force_state(Term::new(1), Some(1u64), Index::new(1));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -10747,7 +10777,7 @@ fn wedged_host(boundary_entry: crate::Entry) -> (MultiRaft<u64, u64, CountSm>, M
     Duration::from_millis(100),
   )
   .unwrap();
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     three,
     Instant::ORIGIN,
@@ -10780,7 +10810,7 @@ fn wedged_host(boundary_entry: crate::Entry) -> (MultiRaft<u64, u64, CountSm>, M
   )]);
   let mut tgt_stable = crate::testkit::NoopStable::<u64>::default();
   tgt_stable.force_state(Term::new(1), Some(1u64), Index::new(1));
-  m.restore_group(
+  m.restore_group_unchecked(
     2,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -10944,7 +10974,7 @@ fn a_log_behind_source_park_never_self_resolves() {
     Duration::from_millis(100),
   )
   .unwrap();
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     three,
     Instant::ORIGIN,
@@ -10974,7 +11004,7 @@ fn a_log_behind_source_park_never_self_resolves() {
   )]);
   let mut tgt_stable = crate::testkit::NoopStable::<u64>::default();
   tgt_stable.force_state(Term::new(1), Some(1u64), Index::new(1));
-  m.restore_group(
+  m.restore_group_unchecked(
     2,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -11022,9 +11052,9 @@ fn lineage_mint_stops_short_of_the_reserved_terminal() {
   // The pure mint helper: it chains strictly below the terminal, and refuses AT it (the negative
   // pin — a normal small generation is untouched, the ceiling is `None`).
   assert_eq!(next_lineage(5), Some(6));
-  assert_eq!(next_lineage(MERGED_FLOOR - 2), Some(MERGED_FLOOR - 1));
+  assert_eq!(next_lineage(MERGED_FLOOR - 3), Some(MERGED_FLOOR - 2));
   assert_eq!(
-    next_lineage(MERGED_FLOOR - 1),
+    next_lineage(MERGED_FLOOR - 2),
     None,
     "the next mint would be the reserved terminal itself"
   );
@@ -11036,13 +11066,16 @@ fn lineage_mint_stops_short_of_the_reserved_terminal() {
   let (mut log2, mut stable2) = (VecLog::default(), AsyncStable::default());
   // Source (1) admitted one below the terminal; target (2) at genesis. Identical single voter, so
   // every merge precondition passes and the freeze reaches its `source_gen_after` mint.
-  m.create_group(
+  m.create_group_founded_at(
     2,
-    MERGED_FLOOR - 1,
+    MERGED_FLOOR - 2,
     single_node_cfg(1),
     Instant::ORIGIN,
     7,
     SplitSm::default(),
+    1,
+    &log2,
+    &mut stable2,
   )
   .unwrap();
   m.create_group(
@@ -11082,13 +11115,16 @@ fn lineage_mint_stops_short_of_the_reserved_terminal() {
   // ---- propose_split at the ceiling ----
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
-  m.create_group(
+  m.create_group_founded_at(
     7,
-    MERGED_FLOOR - 1,
+    MERGED_FLOOR - 2,
     single_node_cfg(1),
     Instant::ORIGIN,
     7,
     SplitSm::default(),
+    1,
+    &log,
+    &mut stable,
   )
   .unwrap();
   let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
@@ -11541,7 +11577,7 @@ fn merge_commit_refuses_learner_carrying_participants() {
     ]);
     let mut sstable = AsyncStable::default();
     sstable.force_state(Term::new(1), Some(1u64), Index::new(2));
-    m.restore_group(
+    m.restore_group_unchecked(
       2,
       single_node_cfg(1),
       Instant::ORIGIN,
@@ -12916,7 +12952,7 @@ fn a_held_forks_derivation_is_process_lifetime_only_after_a_covering_install() {
   drop(m);
   let (mut log, mut stable) = stores.0.remove(&1).expect("the parent's durable stores");
   let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
-  m2.restore_group(
+  m2.restore_group_unchecked(
     1,
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -13257,7 +13293,7 @@ fn a_replayed_chain_resolves_the_inner_park_beneath_a_pending_freeze() {
     ]);
     stable2.force_state(Term::new(1), Some(1u64), Index::new(2));
   }
-  m.restore_group(
+  m.restore_group_unchecked(
     2,
     single_node_cfg(1),
     now,
@@ -13305,7 +13341,7 @@ fn a_replayed_chain_resolves_the_inner_park_beneath_a_pending_freeze() {
     ]);
     stable1.force_state(Term::new(1), Some(1u64), Index::new(3));
   }
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -13500,7 +13536,7 @@ fn a_crash_inside_the_debt_window_re_parks_and_converges() {
   let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   {
     let (plog, pstable) = stores.0.get_mut(&1).unwrap();
-    m2.restore_group(
+    m2.restore_group_unchecked(
       1,
       single_node_cfg(1),
       now,
@@ -13514,7 +13550,7 @@ fn a_crash_inside_the_debt_window_re_parks_and_converges() {
   }
   {
     let (slog, sstable) = stores.0.get_mut(&2).unwrap();
-    m2.restore_group(
+    m2.restore_group_unchecked(
       2,
       single_node_cfg(1),
       now,
@@ -13701,7 +13737,7 @@ fn a_debt_names_its_source_at_every_lifecycle_surface() {
     let (l, s) = stores.0.get_mut(&2).unwrap();
     assert!(
       matches!(
-        m.restore_group(
+        m.restore_group_unchecked(
           2,
           single_node_cfg(1),
           Instant::ORIGIN,
@@ -13811,7 +13847,7 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
     crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(3));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -13931,7 +13967,7 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
     crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd2),
   ]);
   stable2.force_state(Term::new(1), Some(1u64), Index::new(3));
-  m2.restore_group(
+  m2.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -13991,7 +14027,7 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
   let mut m3: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m3.restore_group(
+    m3.restore_group_unchecked(
       1,
       single_node_cfg(1),
       now,
@@ -14135,7 +14171,7 @@ fn a_faulting_advance_source_identity_read_latches_in_the_same_crank() {
     ]);
     stable2.force_state(Term::new(1), Some(1u64), Index::new(1));
   }
-  m.restore_group(
+  m.restore_group_unchecked(
     2,
     single_node_cfg(1),
     now,
@@ -14169,7 +14205,7 @@ fn a_faulting_advance_source_identity_read_latches_in_the_same_crank() {
     crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
   ]);
   stable1.force_state(Term::new(1), Some(1u64), Index::new(3));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -14360,7 +14396,7 @@ fn under_hosted_park_host() -> (MultiRaft<u64, u64, SplitSm>, MapStores) {
     crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(3));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -14574,7 +14610,7 @@ fn an_adopts_faulting_capture_fail_stops_and_latches() {
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(3));
   let fail = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -14931,7 +14967,7 @@ fn a_crossing_with_a_hosted_source_withholds_the_cure() {
     crate::Entry::new(Term::new(1), Index::new(4), crate::EntryKind::Normal, cmd),
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(4));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -15030,7 +15066,7 @@ fn a_blob_beyond_local_commit_defers_until_the_walk_catches_up() {
     ),
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(3));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -15184,7 +15220,7 @@ fn a_hosted_unadvanced_counterparty_withholds_the_cure() {
     crate::Entry::new(Term::new(1), Index::new(4), crate::EntryKind::Normal, cmd),
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(4));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -15388,7 +15424,7 @@ fn an_undecodable_crossing_id_fail_stops_the_target() {
     crate::Entry::new(Term::new(1), Index::new(4), crate::EntryKind::Normal, cmd),
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(4));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -15454,7 +15490,7 @@ fn a_malformed_crossing_payload_fail_stops_the_target() {
     crate::Entry::new(Term::new(1), Index::new(4), crate::EntryKind::Normal, cmd),
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(4));
-  m.restore_group(
+  m.restore_group_unchecked(
     1,
     single_node_cfg(1),
     now,
@@ -15481,3 +15517,380 @@ fn a_malformed_crossing_payload_fail_stops_the_target() {
     "a poisoned park never advertises"
   );
 }
+
+/// A group FOUNDED above zero keeps that generation across a crash that caught no capture — and a
+/// replica that never crashed judges the mint it then makes by the same yardstick.
+///
+/// The founding value is the lineage counter's first term and the ceremony is its only source. It
+/// reaches the endpoint through the store-taking door, and until the group's first capture the
+/// durable hard state is the only place it lives: a restart in that window that could not read it
+/// back would rebuild the counter at zero on this replica alone, mint one past THAT, and hand every
+/// replica still standing at the founding value an entry their exact-match apply guard reads as
+/// stale — one committed shape entry, two verdicts, permanently divergent state machines. The same
+/// mint would also land at or below the relay guard the restore seeds from the durable record, so
+/// the child's staged baseline would be folded away with it.
+#[test]
+fn a_founding_generation_survives_a_crash_without_a_capture() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group_founded_at(
+    7,
+    5,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &log,
+    &mut stable,
+  )
+  .unwrap();
+  // Ordinary operation only: a term, a vote, committed entries — and no capture, so the hard
+  // state is the founding value's only durable home.
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  assert!(
+    stable.snapshot().is_none(),
+    "no capture happened, so no snapshot meta carries the founding generation"
+  );
+
+  // CRASH: the container dies, the stores survive.
+  drop(m);
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m.restore_group_unchecked(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    // A NEW EPOCH, because this is a new incarnation. The founding one minted under epoch 1 and
+    // its completions can still be sitting in the surviving stores; restoring at 1 again would let
+    // one of them sort at or above an id this incarnation is about to mint. Reusing the epoch here
+    // modelled the very collision the counter exists to prevent.
+    2,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(
+    m.group(&7).unwrap().shape_gen(),
+    5,
+    "the ceremony's founding generation came back from the durable hard state"
+  );
+
+  // The restored replica leads and mints — one past the founding value, which is exactly what a
+  // replica that never crashed would mint and admit.
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  m.propose_split(
+    &7,
+    d,
+    &mut log,
+    &stable,
+    &200,
+    0,
+    Bytes::from_static(b"\x01"),
+  )
+  .unwrap()
+  .unwrap();
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert_eq!(
+    m.group(&7).unwrap().shape_gen(),
+    6,
+    "the mint is one past the founding value"
+  );
+  {
+    let fork = m
+      .peek_yieldable_fork(&NoHold)
+      .expect("the fresh fork is relayed, never folded away beneath the restore's relay guard");
+    assert_eq!(((*fork.child()), fork.parent_gen_after()), (200, 6));
+  }
+
+  // THE UNIFORM ARM. A replica of the same incarnation that never crashed — still holding the
+  // founding value it was created with — applies that very entry, and partitions its state
+  // machine exactly as the restored one did.
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut peer: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut plog, mut pstable) = (VecLog::default(), AsyncStable::default());
+  peer
+    .create_group_founded_at(
+      7,
+      5,
+      cfg,
+      Instant::ORIGIN,
+      43,
+      SplitSm::default(),
+      1,
+      &plog,
+      &mut pstable,
+    )
+    .unwrap();
+  for idx in 1..=3 {
+    follower_commit_next(&mut peer, &mut plog, &mut pstable, idx);
+  }
+  let units_before = peer.group(&7).unwrap().state_machine().units;
+  follower_split_next(&mut peer, &mut plog, &mut pstable, 4, 200, 6, 2);
+  assert_eq!(
+    peer.group(&7).unwrap().shape_gen(),
+    6,
+    "the peer admitted the same mint at the same generation"
+  );
+  assert_eq!(
+    peer.group(&7).unwrap().state_machine().units,
+    units_before - 2,
+    "and PARTITIONED its state machine — the arm the restored replica took"
+  );
+  assert_eq!(peer.group(&7).unwrap().staged_forks().count(), 1);
+}
+
+/// The founding door REFUSES storage that already holds an incarnation's state. It writes the
+/// founding stamp and builds a term-0 endpoint, so reused storage would carry an old term, vote,
+/// commit, snapshot, lineage token — or another incarnation's founding generation — into a fresh
+/// incarnation and stamp over it. The precondition is enforced through the same predicate the fork
+/// door uses, and refusal precedes every store write.
+#[test]
+fn the_founding_door_refuses_storage_that_is_not_virgin() {
+  // A store the door itself founded is no longer virgin: the stamp it wrote is state.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group_founded_at(
+    7,
+    4,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &log,
+    &mut stable,
+  )
+  .unwrap();
+  let mut other: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  assert_eq!(
+    other.create_group_founded_at(
+      8,
+      4,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      SplitSm::default(),
+      1,
+      &log,
+      &mut stable
+    ),
+    Err(CreateGroupError::StorageInUse),
+    "a store already carrying a founding generation is refused"
+  );
+  assert!(other.is_empty(), "nothing admitted over used storage");
+
+  // A VOTED-BUT-EMPTY store is refused too. Hard state is written on a vote, so its presence is
+  // not evidence of a log — but it IS evidence that some incarnation already used this storage,
+  // and a fresh term-0 endpoint founded over it would inherit that vote.
+  let (voted_log, mut voted_stable) = (VecLog::default(), AsyncStable::default());
+  voted_stable.submit_write(
+    crate::OpId::new(1),
+    crate::HardState::initial()
+      .with_term(Term::new(3))
+      .with_vote(Some(9u64)),
+  );
+  let mut m3: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  assert_eq!(
+    m3.create_group_founded_at(
+      9,
+      4,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      SplitSm::default(),
+      1,
+      &voted_log,
+      &mut voted_stable
+    ),
+    Err(CreateGroupError::StorageInUse),
+    "a residual hard state is refused, log or no log"
+  );
+
+  // THE FRESH PATH IS UNCHANGED, and the stamp is EXACT: a virgin pair founds, and the record the
+  // door leaves differs from the initial hard state in the founding generation alone.
+  let (fresh_log, mut fresh_stable) = (VecLog::default(), AsyncStable::default());
+  let mut m4: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m4.create_group_founded_at(
+    10,
+    4,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &fresh_log,
+    &mut fresh_stable,
+  )
+  .expect("a virgin pair founds");
+  assert_eq!(
+    fresh_stable.hard_state(),
+    crate::HardState::initial().with_founding_gen(4),
+    "the stamp moved the founding generation and nothing else"
+  );
+}
+
+/// A COMPLETION LEFT OVER FROM A PRIOR INCARNATION CREDITS NOTHING HERE.
+///
+/// The founding door writes into the store it is handed and builds a fresh endpoint, so without an
+/// op-id floor that endpoint would mint from epoch zero — exactly where a prior incarnation of the
+/// same id minted. A stale `Wrote` landing afterwards would then alias this incarnation's own
+/// write and release what that write gates: a vote grant, or a campaign's `become_leader`, on
+/// durability it does not have. The epoch is what makes the stale id sort below everything this
+/// incarnation mints.
+#[test]
+fn a_founding_incarnation_mints_above_a_prior_incarnations_completions() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group_founded_at(
+    7,
+    4,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    9,
+    &log,
+    &mut stable,
+  )
+  .expect("a virgin pair founds at epoch 9");
+
+  // Everything this incarnation submits sorts strictly above every id epoch 8 and below could
+  // mint — the stamp included, which is this endpoint's very first write.
+  let stale = crate::OpId::first_of_epoch(8);
+  let mine = m.group_mut(&7).unwrap().mint_op_id_for_test();
+  assert_eq!(
+    mine.epoch(),
+    9,
+    "this incarnation mints in the epoch the door was given, from its very first id"
+  );
+  assert!(
+    stale < mine,
+    "a prior incarnation's completion sorts below it: {stale:?} vs {mine:?}"
+  );
+}
+
+/// Epoch zero is refused at both store-writing doors. It is where an unseeded endpoint starts, so
+/// founding or forking there hands a prior incarnation's leftover completions ids that can alias
+/// this one's — the floor is enforced rather than documented because these doors can see the store.
+#[test]
+fn the_store_writing_doors_refuse_boot_epoch_zero() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (log, mut stable) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    m.create_group_founded_at(
+      7,
+      4,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      SplitSm::default(),
+      0,
+      &log,
+      &mut stable
+    ),
+    Err(CreateGroupError::InvalidBootEpoch),
+    "founding at epoch zero has no separation from a prior incarnation"
+  );
+  assert!(m.is_empty(), "nothing admitted at the floor");
+  assert_eq!(
+    stable.hard_state(),
+    crate::HardState::initial(),
+    "and the refusal precedes every store write"
+  );
+
+  // The fork door's identical floor, unchanged.
+  let (mut flog, mut fstable) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    m.create_group_from_fork(
+      8,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      SplitSm::default(),
+      fork_blob(3),
+      None,
+      0,
+      &mut flog,
+      &mut fstable
+    ),
+    Err(CreateGroupError::InvalidBootEpoch)
+  );
+}
+
+/// NO REMOVAL CAN FORGE THE TERMINAL SENTINEL. A floor of `MERGED_FLOOR` is read as a GLOBAL proof
+/// that a lineage was absorbed away — the thaw witness's own global-proof leg rests on it — so an
+/// ordinary local removal producing one would clear a live thaw obligation on every replica and
+/// strand a still-frozen source. The fence needs a value strictly above the ceiling it fences, and
+/// at the top of the space there is none to spare, so the top TWO generations are reserved: the
+/// sentinel, and the headroom its fence needs.
+#[test]
+fn a_removal_fence_never_reaches_the_reserved_terminal() {
+  // The boundary is one value, shared by every gate that judges a generation.
+  assert_eq!(crate::HIGHEST_WORKING_GENERATION, MERGED_FLOOR - 1);
+  assert_eq!(
+    next_lineage(crate::HIGHEST_WORKING_GENERATION - 1),
+    None,
+    "the mint stops short of the reserved band"
+  );
+  assert_eq!(
+    next_lineage(crate::HIGHEST_WORKING_GENERATION - 2),
+    Some(crate::HIGHEST_WORKING_GENERATION - 1),
+    "and reaches the highest working generation"
+  );
+  assert!(!crate::floor_admits(0, crate::HIGHEST_WORKING_GENERATION));
+  assert!(crate::floor_admits(
+    0,
+    crate::HIGHEST_WORKING_GENERATION - 1
+  ));
+
+  // The admission doors agree with the mint: the reserved band is refused whatever floor applies.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (log, mut stable) = (VecLog::default(), AsyncStable::default());
+  for reserved in [crate::HIGHEST_WORKING_GENERATION, MERGED_FLOOR] {
+    assert_eq!(
+      m.create_group_founded_at(
+        7,
+        reserved,
+        single_node_cfg(1),
+        Instant::ORIGIN,
+        42,
+        SplitSm::default(),
+        1,
+        &log,
+        &mut stable
+      ),
+      Err(CreateGroupError::ReservedGeneration),
+      "a reserved generation is refused at admission: {reserved}"
+    );
+  }
+
+  // The fold over the highest generation an id can actually reach lands on the headroom, and the
+  // headroom is distinguishable from the terminal by the reader that matters.
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  engine.set_group_gen(&7, crate::HIGHEST_WORKING_GENERATION - 1);
+  let fence = engine.removal_floor(&7);
+  assert_eq!(fence, crate::HIGHEST_WORKING_GENERATION);
+  assert_ne!(
+    fence, MERGED_FLOOR,
+    "the fence is an ordinary high floor, not a global absorbed-away verdict"
+  );
+  assert!(
+    !crate::floor_admits(fence, crate::HIGHEST_WORKING_GENERATION - 1),
+    "and it still fences the incarnation it retired"
+  );
+}
+

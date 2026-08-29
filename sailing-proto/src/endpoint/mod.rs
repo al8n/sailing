@@ -1718,7 +1718,7 @@ where
         lease_vote_fence_until: None,
       },
       pending_conf_index: Index::ZERO,
-      split: split::SplitState::new(0, None),
+      split: split::SplitState::new(0, 0, None),
       merge: merge::MergeState::default(),
       reads: Reads {
         read_only: ReadOnly::new(read_only_opt),
@@ -2099,6 +2099,27 @@ where
     }
     any
   }
+
+  /// Seed this endpoint's operation-id counter at `boot_epoch` — the create-side twin of what
+  /// [`restart`](Self::restart) does for every recovered incarnation.
+  ///
+  /// Op ids are epoch-major, so an incarnation seeded here mints ids strictly above every id a
+  /// prior incarnation of the same group minted at a lower epoch. That is what makes a completion
+  /// left over from a prior incarnation inert: it arrives carrying an id below this incarnation's
+  /// floor, so no durability watermark credits it and no gated action is released on it. Without
+  /// the seed a fresh endpoint starts at [`OpId::ZERO`] and a stale `Wrote` can alias its very
+  /// first write — releasing a vote grant, or a campaign, on durability it does not have.
+  ///
+  /// Must run BEFORE the endpoint's first submission, which for the founding door is the stamp.
+  pub(crate) fn seed_boot_epoch(&mut self, boot_epoch: u64) {
+    debug_assert_eq!(
+      self.next_op_id,
+      OpId::ZERO,
+      "the boot epoch seeds a counter that has minted nothing"
+    );
+    self.next_op_id = OpId::first_of_epoch(boot_epoch);
+  }
+
 
   /// Mint a unique, monotonically-increasing operation id for a storage submission.
   fn mint_op_id(&mut self) -> OpId {

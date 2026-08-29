@@ -145,7 +145,7 @@ impl MultiWorld {
       stable.discard_inflight();
       let config = self.configs[&(id, gid)].clone();
       fresh
-        .restore_group(
+        .restore_group_unchecked(
           gid,
           config,
           self.now,

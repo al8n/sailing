@@ -168,6 +168,13 @@ where
     I: Data, // decode ConfChangeV2 entries when replaying the log's membership (Raft §4.1)
   {
     let hs = stable.hard_state();
+    // THE CEREMONY SEED, recovered. The live counter is `founding ⊔ meta ⊔ applied-prefix`, and the
+    // first term has no other durable home: a group founded above zero writes no snapshot until its
+    // first capture, so without this the counter would come back at zero while every replica that
+    // has not restarted still stood at the founding value — and one committed shape entry would then
+    // be judged by two different yardsticks. Safe to fold in precisely because it is a per-incarnation
+    // CONSTANT: no entry of this incarnation can lie below it.
+    let founding_gen: u64 = hs.founding_gen();
     // Chunk-snapshot staging is VOLATILE across restart: `snapshot_recv` is reset to `None` below and there
     // is no Phase-1 recovery API to restore an in-flight transfer's identity from durable staging, so any
     // staging a store happened to persist is now ORPHANED — discard it, else a post-restart lower snapshot
@@ -593,7 +600,24 @@ where
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
       },
-      split: super::split::SplitState::new(snap_shape_gen, snap_fork_id),
+      // A POISONED restart adopts NO lineage. The counter is public and a driver mirrors it into
+      // its engine record on the restore path, so carrying a value read out of state we just
+      // rejected would put the reserved band into the record of an inert replica — exactly the
+      // forged fence the ingress gate exists to stop.
+      split: super::split::SplitState::new(
+        if poisoned {
+          0
+        } else {
+          snap_shape_gen.max(founding_gen)
+        },
+        if poisoned { 0 } else { founding_gen },
+        // The PROVENANCE TOKEN goes with the rest. It is read out of the same meta the poison
+        // rejected, and it is not inert: a parent's relay treats token equality as proof that its
+        // staged fork was already materialized here, resolving REDUNDANT and consuming the child's
+        // only clean local copy. An inert replica must not be able to certify a materialization it
+        // cannot serve.
+        if poisoned { None } else { snap_fork_id },
+      ),
       merge: super::merge::MergeState::default(),
       reads: Reads {
         read_only: ReadOnly::new(read_only_opt),

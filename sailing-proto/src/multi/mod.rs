@@ -422,16 +422,20 @@ pub(crate) fn mint_fork_id<G: GroupId>(
   )
 }
 
-/// The fork constructors' boot-epoch admission check, run BEFORE any store write: a fork must
-/// boot at epoch >= 1 because [`write_fork_baseline`] issues the manufactured baseline's store
-/// writes at the PRIOR epoch. At `boot_epoch == 0` there is no prior epoch — the baseline ids
-/// would collapse into epoch 0, the very epoch [`Endpoint::restart`] seeds the child's own op
-/// counter with, so a queued baseline `Wrote(0, 0)` completion could release a live vote or
-/// campaign action whose durability it does not prove (leadership on a phantom durable
-/// self-vote). Restart already CONTRACTS epochs strictly above every prior incarnation; a fork
-/// additionally reserves the prior epoch for its baseline, so this floor is enforced, not
-/// merely documented.
-const fn validate_fork_boot_epoch(boot_epoch: u64) -> Result<(), CreateGroupError> {
+/// The store-writing constructors' boot-epoch admission check, run BEFORE any store write.
+///
+/// A FORK must boot at epoch >= 1 because [`write_fork_baseline`] issues the manufactured
+/// baseline's store writes at the PRIOR epoch. At `boot_epoch == 0` there is no prior epoch — the
+/// baseline ids would collapse into epoch 0, the very epoch [`Endpoint::restart`] seeds the child's
+/// own op counter with, so a queued baseline `Wrote(0, 0)` completion could release a live vote or
+/// campaign action whose durability it does not prove (leadership on a phantom durable self-vote).
+///
+/// A FOUNDING create takes the same floor for the same hazard read from the other side: epoch 0 is
+/// where an unseeded endpoint starts, so founding there gives a prior incarnation's leftover
+/// completions ids that can alias this one's. Restart already CONTRACTS epochs strictly above every
+/// prior incarnation; both of these doors write into the store, so for them the floor is enforced
+/// rather than merely documented.
+const fn validate_boot_epoch(boot_epoch: u64) -> Result<(), CreateGroupError> {
   if boot_epoch == 0 {
     return Err(CreateGroupError::InvalidBootEpoch);
   }
@@ -1979,7 +1983,7 @@ where
       return PrepareOutcome::Done(InstallOutcome::Held);
     };
     let config = reshape_born_prevention(plan.config.clone());
-    let refusal = validate_fork_boot_epoch(epoch)
+    let refusal = validate_boot_epoch(epoch)
       .and_then(|()| validate_working_generation(plan.child_gen))
       .and_then(|()| validate_new_group(&self.groups, &self.host_id, child, &config))
       .and_then(|()| match engine.stores(child) {
@@ -2592,6 +2596,11 @@ where
   ) -> Result<(), CreateGroupError> {
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     validate_working_generation(generation)?;
+    // A founding value this door cannot persist is one a restart cannot recover: refuse rather
+    // than seed a counter that would come back at zero on this replica alone.
+    if generation != 0 {
+      return Err(CreateGroupError::FoundingNeedsStore);
+    }
     self.host_id.get_or_insert(config.id());
     let mut ep = Endpoint::new(config, now, group_seed(seed, &gid), fsm);
     ep.seed_lineage(generation);
@@ -2604,17 +2613,118 @@ where
     Ok(())
   }
 
+  /// Create a fresh group FOUNDED at a nonzero `generation`, persisting that founding value into
+  /// the group's stable store before returning.
+  ///
+  /// The storeless [`create_group`](Self::create_group) seeds the lineage counter in memory alone,
+  /// which is sound only at generation zero — the value every replica reconstructs by default. A
+  /// group founded above zero writes no snapshot until its first capture, so without a durable
+  /// stamp a restart in that window rebuilds the counter at zero while every replica still up
+  /// stands at the founding value, and one committed shape entry is then judged by two different
+  /// yardsticks. This door closes that window: the stamp is submitted here, and the caller's next
+  /// barrier makes it durable before the admission is acknowledged.
+  ///
+  /// The write moves the founding generation and nothing else, so a fresh store's record differs
+  /// from the initial hard state in that one field.
+  ///
+  /// The handed stores must be VIRGIN, and that is ENFORCED rather than assumed: this door writes
+  /// into them and builds a term-0 endpoint, so storage already holding a term, a vote, a commit, a
+  /// snapshot, a lineage token, or another incarnation's founding generation is refused with
+  /// [`CreateGroupError::StorageInUse`] — the fork door's verdict for the same precondition, read
+  /// through the same predicate. Refusal precedes every store write.
+  ///
+  /// KNOWN LIMIT, and the reason the restore door carries a matching refusal: the stamp submitted
+  /// here is durable only once the caller barriers it, and the stable and log stores have no
+  /// cross-store durability ordering. A crash between this call and that barrier can leave log
+  /// content beside a hard state that never landed; `validate_restore` refuses to recover from that
+  /// shape rather than rebuild the counter at zero (see
+  /// [`CreateGroupError::IncarnationUnrecoverable`]). A participation gate — withholding the
+  /// group's first append and vote until the stamp completes — would narrow the window instead of
+  /// detecting it, at the cost of a new stall class; the detection is what ships, because the
+  /// entries such a crash leaves are necessarily unacked and so cost only a re-ceremony.
+  ///
+  /// WHY THE EPOCH IS THE WHOLE CURE. `boot_epoch` closes completion ALIASING: a leftover
+  /// completion from a prior incarnation of this id carries an id below this incarnation's floor,
+  /// so it credits no watermark and releases no gated action. It does not by itself order the
+  /// prior incarnation's un-landed WRITE against the stamp — but nothing else needs to. Completion
+  /// delivery is FIFO, and a `Wrote` is a claim the durable reader must already agree with, so in
+  /// every ordering whose final durable content is the prior incarnation's, some completion is
+  /// delivered while the reader contradicts it: stamp-then-stale makes the stamp's own `Wrote`
+  /// dishonest, and a `Wrote` delivered before anything landed is dishonest on its face. A store
+  /// that can lose the stamp this way is therefore already non-conformant on the completion-honesty
+  /// rule its conformance suite checks by name, and the ordering is owed by that contract rather
+  /// than by a pristine-store capability here.
+  ///
+  /// # Errors
+  /// The admission checks of [`create_group`](Self::create_group), plus
+  /// [`CreateGroupError::StorageInUse`] when the handed stores are not virgin — see
+  /// [`CreateGroupError`].
+  #[allow(clippy::too_many_arguments)]
+  pub fn create_group_founded_at<L, S>(
+    &mut self,
+    gid: G,
+    generation: u64,
+    config: Config<I>,
+    now: impl Into<Now>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    log: &L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    validate_working_generation(generation)?;
+    validate_boot_epoch(boot_epoch)?;
+    // VIRGIN STORES, ENFORCED. This door WRITES the founding stamp, and it builds a term-0
+    // endpoint: handed a store that already holds a term, a vote, a commit, a snapshot, a lineage
+    // token, or another incarnation's founding value, it would carry that state into a fresh
+    // incarnation and stamp over it. The fork door refuses used storage for the same reason and
+    // through the same predicate. Refusal happens BEFORE any store write.
+    validate_virgin_stores(log, stable)?;
+    self.host_id.get_or_insert(config.id());
+    let mut ep = Endpoint::new(config, now, group_seed(seed, &gid), fsm);
+    // The op-id floor goes in BEFORE the stamp is submitted: a completion left over from a
+    // prior incarnation of this id then sorts below every id this one mints, so it can credit no
+    // watermark here and release no gated action.
+    ep.seed_boot_epoch(boot_epoch);
+    ep.seed_lineage(generation);
+    ep.submit_founding_stamp(stable);
+    self.lineage.insert(gid.cheap_clone(), generation);
+    self.clear_unresolvable_hints_naming(&gid);
+    self.groups.insert(gid, ep);
+    Ok(())
+  }
+
   /// Recover a group from durable storage, replaying its committed tail into the state machine.
   /// Replay surfaces NO events (mirroring [`Endpoint::restart`], which deliberately clears them —
   /// replay is not new work); the restore MAY leave one pending stable write (a grown lease
   /// floor), drained by the driver's normal `handle_storage` cadence. Same `gid`-folded seeding as
   /// [`create_group`](Self::create_group).
   ///
+  /// # UNCHECKED, and what that means
+  ///
+  /// This door performs the STRUCTURAL admission checks only — the id's encoding, the host
+  /// identity latch, and that no group with this id is already hosted. It performs NONE of the
+  /// INCARNATION checks, because it cannot: those compare the caller's catalog generation and the
+  /// id's durable floor and lineage record against the handed stores, and the container holds none
+  /// of the three. Floors and records are a coordinator-and-driver concern here by design — no
+  /// container door takes a [`FloorStore`].
+  ///
+  /// So this door will happily recover a group over stores that hold nothing, and over the exact
+  /// shape a lost founding stamp leaves (state in the stores, no incarnation in them) — both of
+  /// which the coordinators refuse. A caller reaching for this door directly owns those checks:
+  /// run [`validate_restore`] against the id's record and floor first. The transport coordinators'
+  /// `restore_group` is that composition, and is the door to prefer.
+  ///
   /// # Errors
-  /// The same admission checks as [`create_group`](Self::create_group) — see
+  /// The structural admission checks of [`create_group`](Self::create_group) — see
   /// [`CreateGroupError`]. Refusal happens BEFORE any store is read.
   #[allow(clippy::too_many_arguments)]
-  pub fn restore_group<L, S>(
+  pub fn restore_group_unchecked<L, S>(
     &mut self,
     gid: G,
     config: Config<I>,
@@ -2665,8 +2775,10 @@ where
   /// # Errors
   /// The same admission checks as [`create_group`](Self::create_group) — see
   /// [`CreateGroupError`]. Refusal happens BEFORE any store is read.
+  /// UNCHECKED in the same sense as [`restore_group_unchecked`](Self::restore_group_unchecked):
+  /// structural admission only, with the incarnation checks left to the caller.
   #[allow(clippy::too_many_arguments)]
-  pub fn restore_group_migrating<L, S>(
+  pub fn restore_group_migrating_unchecked<L, S>(
     &mut self,
     gid: G,
     config: Config<I>,
@@ -2955,7 +3067,7 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
-    validate_fork_boot_epoch(boot_epoch)?;
+    validate_boot_epoch(boot_epoch)?;
     validate_working_generation(generation)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     validate_virgin_stores(log, stable)?;
@@ -3015,9 +3127,100 @@ where
   ) -> Result<(), CreateGroupError> {
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     validate_working_generation(generation)?;
+    // See `create_group`: a storeless door may found only at the generation a restart rebuilds.
+    if generation != 0 {
+      return Err(CreateGroupError::FoundingNeedsStore);
+    }
     self.host_id.get_or_insert(config.id());
     let mut ep = Endpoint::new_with_rng(config, now, rng, fsm);
     ep.seed_lineage(generation);
+    self.lineage.insert(gid.cheap_clone(), generation);
+    self.clear_unresolvable_hints_naming(&gid);
+    self.groups.insert(gid, ep);
+    Ok(())
+  }
+
+  /// Create a fresh group FOUNDED at a nonzero `generation` under a caller-supplied RNG,
+  /// persisting that founding value into
+  /// the group's stable store before returning.
+  ///
+  /// The storeless [`create_group`](Self::create_group) seeds the lineage counter in memory alone,
+  /// which is sound only at generation zero — the value every replica reconstructs by default. A
+  /// group founded above zero writes no snapshot until its first capture, so without a durable
+  /// stamp a restart in that window rebuilds the counter at zero while every replica still up
+  /// stands at the founding value, and one committed shape entry is then judged by two different
+  /// yardsticks. This door closes that window: the stamp is submitted here, and the caller's next
+  /// barrier makes it durable before the admission is acknowledged.
+  ///
+  /// The write moves the founding generation and nothing else, so a fresh store's record differs
+  /// from the initial hard state in that one field.
+  ///
+  /// The handed stores must be VIRGIN, and that is ENFORCED rather than assumed: this door writes
+  /// into them and builds a term-0 endpoint, so storage already holding a term, a vote, a commit, a
+  /// snapshot, a lineage token, or another incarnation's founding generation is refused with
+  /// [`CreateGroupError::StorageInUse`] — the fork door's verdict for the same precondition, read
+  /// through the same predicate. Refusal precedes every store write.
+  ///
+  /// KNOWN LIMIT, and the reason the restore door carries a matching refusal: the stamp submitted
+  /// here is durable only once the caller barriers it, and the stable and log stores have no
+  /// cross-store durability ordering. A crash between this call and that barrier can leave log
+  /// content beside a hard state that never landed; `validate_restore` refuses to recover from that
+  /// shape rather than rebuild the counter at zero (see
+  /// [`CreateGroupError::IncarnationUnrecoverable`]). A participation gate — withholding the
+  /// group's first append and vote until the stamp completes — would narrow the window instead of
+  /// detecting it, at the cost of a new stall class; the detection is what ships, because the
+  /// entries such a crash leaves are necessarily unacked and so cost only a re-ceremony.
+  ///
+  /// WHY THE EPOCH IS THE WHOLE CURE. `boot_epoch` closes completion ALIASING: a leftover
+  /// completion from a prior incarnation of this id carries an id below this incarnation's floor,
+  /// so it credits no watermark and releases no gated action. It does not by itself order the
+  /// prior incarnation's un-landed WRITE against the stamp — but nothing else needs to. Completion
+  /// delivery is FIFO, and a `Wrote` is a claim the durable reader must already agree with, so in
+  /// every ordering whose final durable content is the prior incarnation's, some completion is
+  /// delivered while the reader contradicts it: stamp-then-stale makes the stamp's own `Wrote`
+  /// dishonest, and a `Wrote` delivered before anything landed is dishonest on its face. A store
+  /// that can lose the stamp this way is therefore already non-conformant on the completion-honesty
+  /// rule its conformance suite checks by name, and the ordering is owed by that contract rather
+  /// than by a pristine-store capability here.
+  ///
+  /// # Errors
+  /// The admission checks of [`create_group`](Self::create_group), plus
+  /// [`CreateGroupError::StorageInUse`] when the handed stores are not virgin — see
+  /// [`CreateGroupError`].
+  #[allow(clippy::too_many_arguments)]
+  pub fn create_group_founded_at_with_rng<L, S>(
+    &mut self,
+    gid: G,
+    generation: u64,
+    config: Config<I>,
+    now: impl Into<Now>,
+    rng: R,
+    fsm: F,
+    boot_epoch: u64,
+    log: &L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    validate_working_generation(generation)?;
+    validate_boot_epoch(boot_epoch)?;
+    // VIRGIN STORES, ENFORCED. This door WRITES the founding stamp, and it builds a term-0
+    // endpoint: handed a store that already holds a term, a vote, a commit, a snapshot, a lineage
+    // token, or another incarnation's founding value, it would carry that state into a fresh
+    // incarnation and stamp over it. The fork door refuses used storage for the same reason and
+    // through the same predicate. Refusal happens BEFORE any store write.
+    validate_virgin_stores(log, stable)?;
+    self.host_id.get_or_insert(config.id());
+    let mut ep = Endpoint::new_with_rng(config, now, rng, fsm);
+    // The op-id floor goes in BEFORE the stamp is submitted: a completion left over from a
+    // prior incarnation of this id then sorts below every id this one mints, so it can credit no
+    // watermark here and release no gated action.
+    ep.seed_boot_epoch(boot_epoch);
+    ep.seed_lineage(generation);
+    ep.submit_founding_stamp(stable);
     self.lineage.insert(gid.cheap_clone(), generation);
     self.clear_unresolvable_hints_naming(&gid);
     self.groups.insert(gid, ep);
@@ -3029,8 +3232,10 @@ where
   ///
   /// # Errors
   /// The admission checks of [`CreateGroupError`]; refusal happens BEFORE any store is read.
+  /// UNCHECKED in the same sense as [`restore_group_unchecked`](Self::restore_group_unchecked):
+  /// structural admission only, with the incarnation checks left to the caller.
   #[allow(clippy::too_many_arguments)]
-  pub fn restore_group_with_rng<L, S>(
+  pub fn restore_group_with_rng_unchecked<L, S>(
     &mut self,
     gid: G,
     config: Config<I>,
@@ -3066,8 +3271,10 @@ where
   ///
   /// # Errors
   /// The admission checks of [`CreateGroupError`]; refusal happens BEFORE any store is read.
+  /// UNCHECKED in the same sense as [`restore_group_unchecked`](Self::restore_group_unchecked):
+  /// structural admission only, with the incarnation checks left to the caller.
   #[allow(clippy::too_many_arguments)]
-  pub fn restore_group_migrating_with_rng<L, S>(
+  pub fn restore_group_migrating_with_rng_unchecked<L, S>(
     &mut self,
     gid: G,
     config: Config<I>,
@@ -3260,7 +3467,7 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
-    validate_fork_boot_epoch(boot_epoch)?;
+    validate_boot_epoch(boot_epoch)?;
     validate_working_generation(generation)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     validate_virgin_stores(log, stable)?;
