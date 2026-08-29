@@ -209,18 +209,80 @@ where
     Ok(())
   }
 
-  /// Recover a group from durable storage (see [`MultiRaft::restore_group`]). Admission is
+  /// Create a group FOUNDED at a nonzero `generation` (see
+  /// [`MultiRaft::create_group_founded_at`]), gated exactly as
+  /// [`create_group`](Self::create_group) and additionally persisting the founding value into the
+  /// handed stable store before returning — the caller's next barrier makes it durable before the
+  /// admission is acknowledged. The handed stores must be VIRGIN — the door writes into them and
+  /// builds a term-0 endpoint — and that precondition is ENFORCED, not assumed:
+  /// [`CreateGroupError::StorageInUse`] refuses a store holding any state. `boot_epoch` must be
+  /// strictly above every prior incarnation of this id on this node — the caller's engine counter
+  /// supplies it, exactly as for a restore or a fork — and zero is refused.
+  ///
+  /// # Errors
+  /// The refusals of [`create_group`](Self::create_group), plus
+  /// [`CreateGroupError::StorageInUse`] when the handed stores are not virgin — see
+  /// [`CreateGroupError`].
+  #[allow(clippy::too_many_arguments)]
+  pub fn create_group_founded_at<L, S>(
+    &mut self,
+    gid: G,
+    config: Config<I>,
+    now: impl Into<Now>,
+    seed: u64,
+    fsm: F,
+    generation: u64,
+    floors: &impl FloorStore<G>,
+    boot_epoch: u64,
+    log: &L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    validate_floor(floors.floor(&gid), generation)?;
+    if self.retired.contains(&gid) {
+      return Err(CreateGroupError::Retired);
+    }
+    if self.multi.split_reserved(&gid) {
+      return Err(CreateGroupError::SplitReserved);
+    }
+    let key = gid.cheap_clone();
+    self.multi.create_group_founded_at(
+      gid, generation, config, now, seed, fsm, boot_epoch, log, stable,
+    )?;
+    self.purge_unknown_signal(&key);
+    Ok(())
+  }
+
+  /// Recover a group from durable storage (see [`MultiRaft::restore_group_unchecked`]). Admission is
   /// gated exactly as [`create_group`](Self::create_group): floor first (via the caller's
   /// `floors` seam), then the tombstone, then the container. The embedder's catalog supplies
   /// `generation` — the cross-restart incarnation authority: a restore that lies about it
   /// collapses two incarnations into one identity for every gen-keyed observer (the multi-VOPR
   /// one-identity oracle keys on it), voiding what the fence exists to distinguish.
   ///
+  /// `generation` is the incarnation the caller's catalog asserts, and it is INERT beyond two uses:
+  /// clearing the id's admission floor (which the stores' own recoverable lineage must
+  /// independently clear) and refusing a restore below the durable lineage record. It is never
+  /// installed into the group, never written to the engine's lineage record, and never stamped onto
+  /// a frame — the booted generation, the record, and the wire stamp all derive from the stores.
+  /// See [`validate_restore`](crate::validate_restore) for the full statement.
+  ///
+  /// `generation` is VALIDATED, never INSTALLED. It gates admission — against the id's floor and
+  /// its durable lineage record — and the caller records it as this id's incarnation, but it does
+  /// not reach the group's live lineage counter, which derives from the restored snapshot meta and
+  /// the replayed committed tail alone (INV-APPLY-LINEAGE). A catalog value is a per-host reading;
+  /// the live counter is the input to every apply-time lineage guard, so folding one into the other
+  /// would let two replicas take different arms on one committed shape entry.
+  ///
   /// The `floors` seam feeds the fork replay guard too: the admitted group's guard is raised to
-  /// `floors.lineage(&gid)`, the DURABLE lineage record the driver flushed with each of this
-  /// id's materialized forks — the restored snapshot meta alone can lag it, and a meta-seeded
-  /// guard would re-relay a replayed fork whose child baseline is already durable (see
-  /// [`MultiRaft::raise_relay_guard`]).
+  /// `floors.lineage(&gid)`, the DURABLE fork record the driver flushed with each of this id's
+  /// materialized and abandoned forks — the restored snapshot meta alone can lag it, and a
+  /// meta-seeded guard would re-relay a replayed fork whose child baseline is already durable, or
+  /// one a removal deliberately killed (see [`MultiRaft::raise_relay_guard`]). That record carries
+  /// no part of `generation`, so the guard it seeds names only forks this host really has.
   ///
   /// # Errors
   /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor (a
@@ -228,7 +290,11 @@ where
   /// [`CreateGroupError::ReservedGeneration`] when `generation` is the reserved `u64::MAX`
   /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal,
   /// [`CreateGroupError::SplitReserved`] when the id is reserved as an in-flight split's
-  /// child (self-releasing when the fork resolves); otherwise the admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
+  /// child (self-releasing when the fork resolves),
+  /// [`CreateGroupError::BelowLineageRecord`] when `generation` is below the id's durable lineage
+  /// record, and [`CreateGroupError::NoStoredState`] when the lineage KNOWS this id but the handed
+  /// stores hold nothing (see [`validate_restore`](crate::validate_restore) for both);
+  /// otherwise the admission checks of [`MultiRaft::restore_group_unchecked`] — see [`CreateGroupError`].
   #[allow(clippy::too_many_arguments)]
   pub fn restore_group<L, S>(
     &mut self,
@@ -262,7 +328,7 @@ where
     let key = gid.cheap_clone();
     self
       .multi
-      .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
+      .restore_group_unchecked(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
     self.multi.raise_relay_guard(&key, floors.lineage(&key));
     self.purge_unknown_signal(&key);
     Ok(())

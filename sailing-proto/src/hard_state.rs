@@ -84,6 +84,34 @@ impl LeaseSupport {
 /// An out-of-tree disk decoder maps an absent field to `None` — exact, not merely conservative: no
 /// pre-`lineage` writer could ever have forked or adopted, so its log is unconditionally the token-less
 /// lineage's.
+///
+/// `founding_gen` is the generation the group's admission ceremony FOUNDED this incarnation at — the
+/// only reading of that value which outlives the process. Two facts make it safe to recover a lineage
+/// counter from, and both must stay true of any writer:
+///
+/// - It is a per-incarnation CONSTANT, set once at the ceremony and never moved. It does not track the
+///   group's current shape; a shape move writes nothing here.
+/// - It is therefore TEMPORALLY PRIOR to every entry of the incarnation — no committed entry can be
+///   below it, so recovering it can never place a retained entry behind a counter it has yet to reach.
+///
+/// A value that tracked the CURRENT shape would satisfy neither, and recovering one would be unsound:
+/// the durable record pairs monotone in-memory floors with a possibly-stale `commit`, so a record can
+/// carry a shape a restart's replay does not reach, and seeding from it would leave a re-committing
+/// shape entry stale on this replica while its peers applied it.
+///
+/// An out-of-tree disk decoder maps an absent field to `0`. That reading is exact for every record
+/// this crate can produce — the storeless create door refuses a nonzero founding generation, so a
+/// writer of this format founds above zero only through the door that stamps the field — but it is
+/// exact for THAT REASON and no other, and the reason is a property of the writer, not of the
+/// encoding. A blob written before the field existed is indistinguishable from a recorded zero, and
+/// such a blob could name a nonzero incarnation: an absent field there means UNKNOWN, not zero, and
+/// a decoder that can encounter one must refuse rather than assume.
+///
+/// No published version can produce such a blob — the field ships in the first one — so the
+/// ambiguity is closed by construction rather than by a provenance flag. A future format change
+/// that reintroduces it would need one, and would need the restore door to discriminate: the device
+/// is recorded (a store with no shape evidence can only hold a ceremony-granted founding value, so
+/// the record may seed it; with shape evidence it cannot be reconstructed and must refuse).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HardState<I> {
   term: Term,
@@ -91,6 +119,7 @@ pub struct HardState<I> {
   commit: Index,
   lease_support: LeaseSupport,
   lineage: Option<Box<ForkId>>,
+  founding_gen: u64,
 }
 
 impl<I> HardState<I> {
@@ -103,6 +132,7 @@ impl<I> HardState<I> {
       commit: Index::ZERO,
       lease_support: LeaseSupport::Recorded(None),
       lineage: None,
+      founding_gen: 0,
     }
   }
 
@@ -176,6 +206,24 @@ impl<I> HardState<I> {
   #[must_use]
   pub fn with_lineage(mut self, lineage: Option<ForkId>) -> Self {
     self.lineage = lineage.map(Box::new);
+    self
+  }
+
+  /// The generation this incarnation was FOUNDED at — a per-incarnation constant, `0` for every
+  /// group founded through the storeless create door. See the type-level doc for why a restart may
+  /// recover a lineage counter from this and from no other durable per-replica value.
+  #[inline(always)]
+  pub const fn founding_gen(&self) -> u64 {
+    self.founding_gen
+  }
+
+  /// Replace the founding generation (consuming builder). Written at the durable choke-point on
+  /// every hard-state write, so no builder can persist a record that disowns its incarnation's
+  /// founding value.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_founding_gen(mut self, founding_gen: u64) -> Self {
+    self.founding_gen = founding_gen;
     self
   }
 }

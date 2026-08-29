@@ -64,15 +64,55 @@ pub(crate) struct SplitState<I, F> {
   /// durable mirror here and who owns the residual.
   pub(crate) abandoned: BTreeSet<Index>,
   /// The group's LINEAGE counter — one unified monotone per-id value for incarnation and shape
-  /// (seeded from the admission generation / recovered snapshot meta; bumped to
+  /// (seeded from the admission generation at genesis / the recovered snapshot meta; bumped to
   /// `parent_gen_after` when a split applies). Stamped into every snapshot meta this endpoint
   /// captures.
+  ///
+  /// INV-APPLY-LINEAGE: this counter is `founding ⊔ meta ⊔ applied-prefix` and nothing else — the
+  /// generation the admission ceremony FOUNDED this incarnation at, the restored snapshot meta, and
+  /// the applied committed log prefix. No other host-local input — an admission generation supplied
+  /// at a restore, an engine's durable lineage record, a floor — may write it.
+  ///
+  /// THE PROVENANCE RULE, which the founding term rests on. Every door that materializes a member
+  /// either hands it a `shape_gen`-bearing baseline (a snapshot meta, a fork baseline) or durably
+  /// stamps the ceremony seed before the admission is acknowledged — and the ceremony seed is the
+  /// group's FOUNDING generation, never its current one. Only the founding value composes with
+  /// pure-log catch-up: a member replaying from index 1 walks every shape entry itself, so a seed
+  /// above the founding value would leave each of those entries reading stale against it, and the
+  /// member's state machine would never take the partitions its peers did.
+  ///
+  /// The founding term is safe to recover from per-replica durable state precisely because it is a
+  /// per-incarnation CONSTANT: being temporally prior to every entry of the incarnation, folding it
+  /// back can never place a retained entry behind a counter it has yet to reach. A value tracking
+  /// the CURRENT shape would have neither property, and recovering one would strand exactly the
+  /// entries a replay still owes.
+  ///
+  /// One door does NOT satisfy the rule and is tracked rather than cured here: a member added by
+  /// conf change materializes through the factory's create path, which hands it whatever generation
+  /// the embedder's catalog supplies and can verify none of it — and if its leader never compacted,
+  /// it catches up by pure log and never sees a meta. See the incarnation-epoch doctrine (#125,
+  /// face 11).
+  ///
+  /// The apply-time lineage guards compare an entry's minted generation against this value for
+  /// EXACT equality (the `Split`, `CommitMerge`, and target-role `RollbackMerge` arms of
+  /// `apply_committed`), and a mismatch is a deterministic no-op that leaves the state machine
+  /// untouched while a match PARTITIONS it. Those verdicts agree across replicas only while every
+  /// input is replicated: fold a per-host value in here and two replicas take different arms on
+  /// one committed entry — state-machine divergence, not a stalled fork. The same purity is what
+  /// lets a mint (`next_lineage` of this counter) be admitted by its own guard everywhere; a
+  /// generation drawn from a local reading self-stales on every replica that does not share it.
   pub(crate) shape_gen: u64,
-  /// The lineage recovered from DURABLE state at boot (admission generation ⊔ the restored
-  /// snapshot meta), BEFORE any restart replay re-bumped [`shape_gen`](Self::shape_gen): the
-  /// container seeds its replay guard from this, so a fork re-staged by restart replay is
-  /// relayed again rather than dropped as a duplicate.
+  /// The lineage recovered from DURABLE state at boot (the restored snapshot meta), BEFORE any
+  /// restart replay re-bumped [`shape_gen`](Self::shape_gen): the container seeds its replay
+  /// guard from this, so a fork re-staged by restart replay is relayed again rather than dropped
+  /// as a duplicate.
   pub(crate) restored_lineage: u64,
+  /// The generation this incarnation was FOUNDED at — the admission ceremony's seed, set once and
+  /// NEVER moved: a shape move writes `shape_gen`, never this. Stamped onto every hard-state write
+  /// at the durable choke-point, which is what lets a restart recover it and re-seed the live
+  /// counter with it. Being constant, it is temporally prior to every entry of the incarnation, so
+  /// recovering it can never place a retained entry behind a counter it has yet to reach.
+  pub(crate) founding_gen: u64,
   /// Log index of the most recently appended (not-yet-applied) `Split` entry — the ONE-IN-FLIGHT
   /// propose gate (`> applied` ⇒ a split is in flight), mirroring `pending_conf_index` /
   /// `pending_read_mode_index` exactly: `propose_split` mints `parent_gen_after` from the live
@@ -104,7 +144,7 @@ pub(crate) struct SplitState<I, F> {
 }
 
 impl<I, F> SplitState<I, F> {
-  pub(crate) fn new(lineage: u64, fork_id: Option<crate::ForkId>) -> Self {
+  pub(crate) fn new(lineage: u64, founding_gen: u64, fork_id: Option<crate::ForkId>) -> Self {
     Self {
       pending_forks: VecDeque::new(),
       forked_fsms: VecDeque::new(),
@@ -112,6 +152,7 @@ impl<I, F> SplitState<I, F> {
       abandoned: BTreeSet::new(),
       shape_gen: lineage,
       restored_lineage: lineage,
+      founding_gen,
       pending_split_index: Index::ZERO,
       pending_split_child: Bytes::new(),
       fork_id,
@@ -296,6 +337,7 @@ where
   pub(crate) fn seed_lineage(&mut self, generation: u64) {
     self.split.shape_gen = generation;
     self.split.restored_lineage = generation;
+    self.split.founding_gen = generation;
   }
 
   /// Test seam: seed this endpoint's fork provenance exactly as a peer's installed fork baseline

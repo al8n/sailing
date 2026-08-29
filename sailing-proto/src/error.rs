@@ -98,6 +98,64 @@ pub enum CreateGroupError {
   /// A group with this id is already hosted.
   #[error("a group with this id already exists")]
   Exists,
+  /// The handed stores are COHERENT but belong to a FENCED incarnation: every reading of the
+  /// lineage they can account for — the durable record, the hard state's founding generation, the
+  /// snapshot meta's `shape_gen` — sits below the id's admission floor.
+  ///
+  /// Distinct from [`BelowFloor`](Self::BelowFloor), which judges the caller's CLAIM. Here the
+  /// claim clears the floor and the EVIDENCE does not, so admitting on the claim alone would
+  /// resurrect the very incarnation the fence buried: a single-node group could campaign and serve
+  /// retired state, and current-generation frames would reach a state machine whose lineage guards
+  /// are the dead incarnation's. An operator needs the two apart — one says the catalog is wrong,
+  /// this one says these stores are the wrong incarnation's.
+  #[error(
+    "the stores' recoverable lineage {recoverable} is below the id's admission floor {floor}"
+  )]
+  StoredStateBelowFloor {
+    /// The id's persisted admission floor.
+    floor: u64,
+    /// The highest lineage these stores can account for.
+    recoverable: u64,
+  },
+  /// The stores hold state, but nothing in them records which INCARNATION that state belongs to:
+  /// the id's durable lineage record is above zero while the handed hard state is the initial one.
+  /// A group founded above zero carries its founding generation in the hard state alone until its
+  /// first capture, and the two stores have no cross-store durability ordering — so a crash can
+  /// leave durable log content beside a hard state that never landed. Recovering there would
+  /// rebuild the lineage counter at zero on this replica while its peers stand at the founding
+  /// value, and one committed shape entry would then be judged by two different yardsticks.
+  ///
+  /// Unlike the term — whose loss is covered because every response is withheld until it is durable,
+  /// so no peer ever observed it — the founding generation gates no response, so nothing detects its
+  /// loss at the time. This refusal is that detection, moved to the one place the contradiction is
+  /// visible. The entries that survived are necessarily unacked (no ack without a durable term), so
+  /// nothing observable is lost: the id is re-founded or recovered from a peer.
+  ///
+  /// THE SHAPE THIS DOES NOT CATCH, and why it need not: a hard state that SURVIVED but carries no
+  /// founding generation reads as founded-at-zero, and this arm does not fire on it. For any record
+  /// this crate writes that reading is exact — a surviving hard state carries the founding latch,
+  /// so a zero there means the group really was founded at zero, and a record above zero then
+  /// implies applied lineage moves whose replay heals the counter. Only a blob written before the
+  /// field existed could present that shape dishonestly, and no published version can produce one
+  /// (see [`HardState`](crate::HardState)). The discriminator such a blob would need — a scan of the
+  /// retained log for shape entries — is not available here in any case: a `Pending` in-range read
+  /// is fatal at restart, so admission cannot depend on one.
+  #[error(
+    "the stores hold state but no incarnation: the lineage record reads {record} over an initial hard state"
+  )]
+  IncarnationUnrecoverable {
+    /// The id's durable lineage record — the incarnation the surviving stores cannot account for.
+    record: u64,
+  },
+  /// A NONZERO founding generation was offered to the storeless create door. That door seeds the
+  /// lineage counter in memory alone, and the counter's first term has no other durable home until
+  /// the group's first capture: a restart in that window would rebuild it at zero while every
+  /// replica still up stood at the founding value, leaving one committed shape entry judged by two
+  /// different yardsticks. Found through the store-taking door instead, which stamps the value
+  /// durably before the admission is acknowledged. Generation zero is unaffected — it is the value
+  /// every replica reconstructs by default.
+  #[error("a nonzero founding generation must be persisted through the store-taking create door")]
+  FoundingNeedsStore,
   /// The group's `Config` node id differs from the host identity latched by the first group ever
   /// admitted. The latch survives group removal — even of the last group — because a multi-Raft
   /// host is ONE physical node whose live transport connections stay authenticated under that

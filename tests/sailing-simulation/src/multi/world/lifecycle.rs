@@ -767,7 +767,7 @@ impl MultiWorld {
     let relayed = self.relayed_lineage.get(&(node, gid)).copied().unwrap_or(0);
     let host = self.hosts.get_mut(&node).expect("host exists");
     host
-      .restore_group(gid, config, now, seed, LogSm::new(), epoch, log, stable)
+      .restore_group_unchecked(gid, config, now, seed, LogSm::new(), epoch, log, stable)
       .unwrap_or_else(|e| {
         panic!("remove_group rollback: restore of group {gid} on node {node}: {e:?}")
       });

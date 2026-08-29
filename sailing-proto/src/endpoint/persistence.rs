@@ -238,12 +238,18 @@ where
   /// `F` adds exactly ONE line here: `.with_f(hs.f().max(self.f_floor))`.
   pub(crate) fn stamp_floors(&self, hs: HardState<I>) -> HardState<I> {
     let raised = hs.lease_support().raise(self.durable.lease_support_floor);
+    let founding = hs.founding_gen().max(self.split.founding_gen);
     hs.with_lease_support(raised)
       // The lineage is a LATCH, not a monotone floor: stamped from the endpoint's current identity on
       // every write, `None` until the node forks or adopts and that token thereafter. Stamping at the
       // choke-point means no builder can accidentally persist a hard state that disowns the log's
       // lineage — the record restart reconciliation compares against the durable snapshot's token.
       .with_lineage(self.split.fork_id.clone())
+      // The founding generation is a LATCH like the lineage token, not a monotone floor over live
+      // state: it is this incarnation's ceremony seed and never moves, so stamping it here keeps
+      // every record carrying it however stale a builder's re-read was. The `max` preserves a
+      // record already carrying it rather than trusting the re-read.
+      .with_founding_gen(founding)
   }
 
   pub(crate) fn submit_write<S: StableStore<NodeId = I>>(
@@ -284,6 +290,27 @@ where
     // this write is still in the fsync window. Every write carries a vote, so record it unconditionally.
     self.durable.last_submitted_vote = hard_state.vote();
     stable.submit_write(id, hard_state);
+  }
+
+  /// Submit the durable stamp of this incarnation's FOUNDING generation — the create door's
+  /// persist-before-ack write, issued while the ceremony's seed is still the only copy of that
+  /// value anywhere.
+  ///
+  /// Built from the INITIAL record rather than a re-read of the store, so the value written is
+  /// exactly the ceremony's founding generation. The door this runs behind has already refused a
+  /// store that holds anything, so a re-read could only return the initial record anyway — building
+  /// it structurally makes the write independent of that argument instead of resting on it, and
+  /// leaves [`stamp_floors`](Self::stamp_floors)'s monotone fold provably inert (`max(0, N) == N`).
+  /// A fresh endpoint carries no lease floor and no lineage token, so the choke-point moves nothing
+  /// else: the result differs from the initial hard state in the founding generation alone.
+  pub(crate) fn submit_founding_stamp<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
+    debug_assert_eq!(
+      stable.hard_state(),
+      HardState::initial(),
+      "the founding stamp runs only over a store the door proved virgin"
+    );
+    let opid = self.mint_op_id();
+    self.submit_write(stable, opid, HardState::initial());
   }
 
   /// Whether `self.term`'s HardState write has reached stable storage. A follower must not RESPOND to an
