@@ -116,9 +116,9 @@ pub use endpoint::{Endpoint, PeerProgress, PendingMergeApply, PoisonReason, Role
 mod multi;
 pub use multi::{
   EngineLog, EngineStable, EngineStorageError, FORK_BASE_INDEX, FORK_BASE_TERM, FloorStore,
-  ForkGate, ForkView, GroupEngine, GroupId, GroupStores, InstallOutcome, MERGED_FLOOR,
-  MergeBlocked, MergeBlockedCause, MergeResolution, MultiEngine, MultiRaft, NoFloors, NoHold,
-  floor_admits, reshape_born_prevention,
+  ForkGate, ForkView, GroupEngine, GroupId, GroupStores, HIGHEST_WORKING_GENERATION,
+  InstallOutcome, MERGED_FLOOR, MergeBlocked, MergeBlockedCause, MergeResolution, MultiEngine,
+  MultiRaft, NoFloors, NoHold, floor_admits, reshape_born_prevention,
 };
 
 mod tracker;

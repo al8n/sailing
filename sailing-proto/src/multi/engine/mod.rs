@@ -222,6 +222,15 @@ where
 
   /// Write `gid`'s lineage counter — monotone, freshest-read, and barrier-durable exactly as
   /// [`set_group_floor`](Self::set_group_floor).
+  ///
+  /// CALLER CONTRACT: `generation` is a WORKING generation, strictly below
+  /// [`HIGHEST_WORKING_GENERATION`](crate::HIGHEST_WORKING_GENERATION). Every in-tree writer
+  /// validates before writing — the admission doors at creation, the mint at propose, and the
+  /// install and restart ingress gates for a meta that arrived from a peer or from disk — because
+  /// a record in the reserved band makes [`removal_floor`](Self::removal_floor) fence with the
+  /// reserved terminal, which is read cluster-wide as an absorbed-away verdict. An implementation
+  /// may assume the contract; it may not rely on the record being clamped for it, and the
+  /// conformance kit pins the caller's half.
   fn set_group_gen(&mut self, gid: &G, generation: u64);
 
   /// The admission floor a REMOVAL of `gid` must persist — one past the highest generation this
@@ -443,7 +452,7 @@ where
   }
 
   /// The next boot epoch for `gid` — a per-group monotonic counter (first call returns 1). Pass
-  /// it to [`MultiRaft::restore_group`](crate::MultiRaft::restore_group) so each incarnation's
+  /// it to [`MultiRaft::restore_group_unchecked`](crate::MultiRaft::restore_group_unchecked) so each incarnation's
   /// [`OpId`]s strictly exceed every prior incarnation's for that group (the epoch-major ordering
   /// the completion plumbing relies on).
   ///
@@ -595,7 +604,27 @@ where
     if ceiling == 0 {
       0
     } else {
-      ceiling.saturating_add(1)
+      // TOTAL BY CONSTRUCTION, not by saturation. Every generation folded into `ceiling` came from
+      // an admission gate or a mint, and both refuse at `HIGHEST_WORKING_GENERATION`, so the
+      // ceiling is at most `MERGED_FLOOR - 2` and this `+ 1` can neither overflow nor land on the
+      // reserved terminal. That second half is the load-bearing one: a floor of `MERGED_FLOOR`
+      // reads as a GLOBAL proof that the lineage was absorbed away, so forging one from an ordinary
+      // local removal would clear a live thaw obligation cluster-wide and strand a frozen source.
+      debug_assert!(
+        ceiling < crate::HIGHEST_WORKING_GENERATION,
+        "a removal ceiling above the working range would fence with the reserved terminal"
+      );
+      // AND ENFORCED IN RELEASE, because the in-tree ingress gates cannot speak for a foreign
+      // engine: the answer is capped at the highest fence that means anything. On every legal
+      // ceiling the cap is the identity. On an impossible one it yields a fence that still admits
+      // NOTHING — `floor_admits` requires a generation strictly below
+      // `HIGHEST_WORKING_GENERATION`, so a floor at it refuses every working generation — while
+      // never being the terminal. That is deliberately not "an answer chosen for corrupt input":
+      // the corrupt input is refused at the doors that own it, and this only bounds the output so
+      // no path can forge a global verdict.
+      ceiling
+        .saturating_add(1)
+        .min(crate::HIGHEST_WORKING_GENERATION)
     }
   }
 }

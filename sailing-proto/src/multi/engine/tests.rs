@@ -1035,7 +1035,10 @@ fn the_removal_ceiling_tracks_the_scan_exactly() {
     ],
     // A SURVIVING mint at the highest working generation does saturate onto the terminal: the id
     // can never reshape again, which is the truthful verdict here.
-    &[(mint(1, Shape::Freeze, MERGED_FLOOR - 1), Some(MERGED_FLOOR))],
+    &[(
+      mint(1, Shape::Freeze, MERGED_FLOOR - 2),
+      Some(MERGED_FLOOR - 1),
+    )],
   ];
 
   for (v, steps) in vectors.iter().enumerate() {
@@ -1130,13 +1133,14 @@ fn a_superseded_mint_cannot_forge_the_terminal_floor() {
     let (log, _) = eng.stores(&1).unwrap();
     log.submit_append(
       OpId::new(2),
-      &[shape_entry(2, Shape::Split, MERGED_FLOOR - 1)],
+      &[shape_entry(2, Shape::Split, MERGED_FLOOR - 2)],
     );
   }
   assert_eq!(
     eng.removal_floor(&1),
-    MERGED_FLOOR,
-    "while it stands the saturation is truthful — the id could not reshape again"
+    MERGED_FLOOR - 1,
+    "the top working generation fences with the headroom below the sentinel, never the sentinel \
+     itself — a terminal floor is a GLOBAL absorbed-away verdict, not a local removal's"
   );
   {
     let (log, _) = eng.stores(&1).unwrap();
