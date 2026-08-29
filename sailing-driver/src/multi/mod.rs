@@ -632,9 +632,16 @@ where
   /// Recover a group from the host's shared storage engine and await the admission verdict. The
   /// driver derives the boot epoch from the engine's per-group counter, so restarts never reuse an
   /// incarnation's operation ids. `generation` comes from the embedder's catalog — the
-  /// cross-restart incarnation authority (pass 0 unless the embedder reshapes ids): a restore
-  /// that lies about it collapses two incarnations into one identity for every gen-keyed
-  /// observer, voiding exactly what the admission floor exists to distinguish.
+  /// cross-restart incarnation authority: a restore that lies about it collapses two incarnations
+  /// into one identity for every gen-keyed observer, voiding exactly what the admission floor
+  /// exists to distinguish.
+  ///
+  /// PASS THE ID'S RECORDED INCARNATION, at or above the engine's lineage record for it. `0` is
+  /// correct only for a group that has never reshaped: that record advances on every APPLIED shape
+  /// move — a split's bump, a merge freeze, a thaw — so any group that has ever split refuses a
+  /// restore at `0` (`CreateGroupError::BelowLineageRecord`). The value is validated, never
+  /// installed: the booted generation comes from the stores, so passing the recorded incarnation
+  /// costs nothing and passing a stale one refuses rather than silently downgrading.
   ///
   /// Fails closed with [`DriverError::NoStoredState`] when the host holds no stored state for
   /// `gid` (never staged, or torn down and its volatile state gone with the in-memory engine): a

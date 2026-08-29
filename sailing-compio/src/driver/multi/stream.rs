@@ -1276,19 +1276,56 @@ where
     if !added && self.coord.group(&gid).is_none() {
       return Err(DriverError::StoredStateExists);
     }
-    match self.coord.create_group(
-      gid.cheap_clone(),
-      config,
-      now,
-      seed,
-      fsm,
-      generation,
-      &self.engine,
-    ) {
+    // A NONZERO FOUNDING GENERATION IS PERSISTED, not merely seeded: the counter has no other
+    // durable home until the group's first capture, so it goes through the store-taking door and
+    // its stamp rides the barrier below, before this admission is acknowledged. Generation zero
+    // is the value every replica reconstructs by default and needs no stamp, so it keeps the
+    // storeless door untouched. The floors are snapshotted first — the door needs the engine
+    // mutably for the stores, and the gate reads it immutably.
+    let outcome = if generation == 0 {
+      self.coord.create_group(
+        gid.cheap_clone(),
+        config,
+        now,
+        seed,
+        fsm,
+        generation,
+        &self.engine,
+      )
+    } else {
+      let floors = FloorSnapshot {
+        floor: sailing_proto::FloorStore::floor(&self.engine, &gid),
+        lineage: sailing_proto::FloorStore::lineage(&self.engine, &gid),
+      };
+      // The op-id floor for a founding incarnation, from the same per-group counter a restore or
+      // a fork draws on: a completion left over from a prior incarnation of this id then sorts
+      // below everything this one mints.
+      let Some(epoch) = self.engine.next_boot_epoch(&gid) else {
+        return Err(rejected("boot epoch counter exhausted for this group"));
+      };
+      match self.engine.stores(&gid) {
+        Some((log, stable)) => self.coord.create_group_founded_at(
+          gid.cheap_clone(),
+          config,
+          now,
+          seed,
+          fsm,
+          generation,
+          &floors,
+          epoch,
+          &*log,
+          stable,
+        ),
+        // `add_group` above admitted the storage, so this is unreachable; refuse rather than
+        // found an incarnation whose seed nothing recorded.
+        None => Err(sailing_proto::CreateGroupError::NoStoredState),
+      }
+    };
+    match outcome {
       Ok(()) => {
         self.engine.set_group_gen(&gid, generation);
         if generation > 0 {
-          // The staged lineage record rides the next barrier like any stable write.
+          // The staged lineage record and the founding stamp ride the next barrier together.
           self.flush_pending = true;
         }
         self.election.insert(gid.cheap_clone(), election);
@@ -1361,10 +1398,11 @@ where
     };
     match result {
       Ok(()) => {
-        // Re-sync to the LIVE restored counter (see the reactor hosts): replay re-applies
-        // lineage moves whose event-time mirror may have died with the crash.
+        // Re-sync to the LIVE restored counter, and to NOTHING ELSE (see the reactor hosts):
+        // replay re-applies lineage moves whose event-time mirror may have died with the crash, and
+        // the admitted `generation` is a catalog claim the evidence record must never carry.
         let live = self.coord.group(&gid).map_or(0, Endpoint::shape_gen);
-        self.engine.set_group_gen(&gid, generation.max(live));
+        self.engine.set_group_gen(&gid, live);
         // The restore may leave one staged stable write (a recovered lease floor): barrier it.
         self.flush_pending = true;
         self.election.insert(gid.cheap_clone(), election);
