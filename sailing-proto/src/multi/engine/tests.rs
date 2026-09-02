@@ -607,6 +607,49 @@ fn next_boot_epoch_refuses_exhaustion() {
   );
 }
 
+/// THE BOOT-EPOCH COUNTER SURVIVES A REMOVAL. An id removed and re-created in the same process is
+/// a NEW incarnation, and it must be handed an epoch strictly above every epoch the earlier ones
+/// were issued: a counter that restarted at 1 would give two incarnations the same
+/// `(group, epoch)` identity, which is the exact collision the epoch exists to prevent, and every
+/// gen-keyed observer (completions, ids, the restore seam) would fold them onto one. The counter
+/// therefore lives beside the hosted groups, not inside the storage a removal drops — the same
+/// placement, for the same reason, that keeps a lineage record readable after its group is gone.
+#[test]
+fn a_boot_epoch_counter_is_not_reset_by_a_removal() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  assert!(eng.add_group(1));
+  assert_eq!(eng.next_boot_epoch(&1), Some(1));
+  let issued_before = eng.next_boot_epoch(&1).expect("a second incarnation");
+  assert_eq!(issued_before, 2);
+
+  assert!(eng.remove_group(&1), "the id was hosted");
+  assert_eq!(
+    eng.next_boot_epoch(&1),
+    None,
+    "hosting still gates the ANSWER — an unhosted id has no incarnation to hand an epoch to"
+  );
+
+  assert!(eng.add_group(1), "the same id, re-created in this process");
+  let after = eng
+    .next_boot_epoch(&1)
+    .expect("the re-created incarnation takes an epoch");
+  assert!(
+    after > issued_before,
+    "a re-created id must resume STRICTLY ABOVE the epochs its earlier incarnations were issued: \
+     got {after} after {issued_before}"
+  );
+
+  // The refusal is per id, not global: a neighbour that was never hosted still answers `None`, and
+  // a fresh id still starts at 1 — the surviving counter fences only the id that earned it.
+  assert_eq!(eng.next_boot_epoch(&9), None, "no such group");
+  assert!(eng.add_group(2));
+  assert_eq!(
+    eng.next_boot_epoch(&2),
+    Some(1),
+    "an id with no removed incarnation behind it still starts at 1"
+  );
+}
+
 /// `remove_group` is the teardown seam: the storage (including staged work) is dropped, the id is
 /// re-admissible with FRESH empty storage, and an unknown group resolves to `None` — the
 /// coordinator's deliberate unhosted-drop path.

@@ -49,12 +49,12 @@ pub enum EngineStorageError {
 }
 
 /// One group's hosted storage. `log` and `stable` are separate fields so [`GroupEngine::stores`]
-/// can lend both mutably at once; `boot_epochs` backs [`GroupEngine::next_boot_epoch`].
+/// can lend both mutably at once. The boot-epoch counter is deliberately NOT here: it must outlive
+/// this storage (see [`GroupEngine::next_boot_epoch`]).
 #[derive(Debug)]
 struct GroupStorage<I> {
   log: EngineLog,
   stable: EngineStable<I>,
-  boot_epochs: u64,
 }
 
 impl<I> GroupStorage<I> {
@@ -62,7 +62,6 @@ impl<I> GroupStorage<I> {
     Self {
       log: EngineLog::new(),
       stable: EngineStable::new(staging_cap),
-      boot_epochs: 0,
     }
   }
 }
@@ -206,6 +205,11 @@ where
   /// makes each incarnation's [`OpId`]s strictly exceed every prior incarnation's. `None` if no
   /// such group is hosted, or if the counter is exhausted; the increment must never wrap, since a
   /// wrapped epoch folds two incarnations onto one identity.
+  ///
+  /// The counter SURVIVES [`remove_group`](Self::remove_group), for that same reason: an id
+  /// removed and re-created must resume strictly above the epochs its earlier incarnations were
+  /// issued, or two of them share one `(group, epoch)` identity. Hosting still gates the ANSWER —
+  /// an unhosted id has no incarnation to hand an epoch to — but it does not gate the counter.
   #[must_use = "`None` means no such group or an exhausted counter; the returned epoch is the restore_group argument"]
   fn next_boot_epoch(&mut self, gid: &G) -> Option<u64>;
 
@@ -269,6 +273,10 @@ pub struct GroupEngine<G, I> {
   /// Lineage writes staged since the last barrier, monotone-max folded into `lineage` by
   /// [`flush`](Self::flush).
   lineage_staged: BTreeMap<G, LineageRecord>,
+  /// Boot-epoch counters, kept BESIDE the hosted groups — like `lineage` — so a removal cannot
+  /// reset one. A counter that restarted with a re-created id would hand two incarnations the same
+  /// `(group, epoch)` identity, which is the collision the epoch exists to prevent.
+  boot_epochs: BTreeMap<G, u64>,
   barriers: u64,
   ops_batched: u64,
   /// The per-group snapshot-staging byte cap (see
@@ -287,6 +295,7 @@ impl<G, I> GroupEngine<G, I> {
       groups: BTreeMap::new(),
       lineage: BTreeMap::new(),
       lineage_staged: BTreeMap::new(),
+      boot_epochs: BTreeMap::new(),
       barriers: 0,
       ops_batched: 0,
       staging_cap: usize::MAX,
@@ -407,10 +416,12 @@ where
     }
   }
 
-  /// Drop `gid`'s storage — log, stable state, staged and released completions, and its
-  /// boot-epoch counter (the Phase-5 teardown seam). The id's LINEAGE record (gen, floor, and the
-  /// removal ceiling the departing stores had folded) is deliberately retained: a floor exists
-  /// precisely to outlive the group it fences. Returns `false` if no such group.
+  /// Drop `gid`'s storage — log, stable state, and staged and released completions (the Phase-5
+  /// teardown seam). The id's LINEAGE record (gen, floor, and the removal ceiling the departing
+  /// stores had folded) and its BOOT-EPOCH counter are deliberately retained: a floor exists
+  /// precisely to outlive the group it fences, and a counter reset here would hand a re-created id
+  /// an epoch a prior incarnation already issued — two incarnations on one `(group, epoch)`
+  /// identity, the collision the epoch exists to prevent. Returns `false` if no such group.
   ///
   /// The inherited ceiling is STAGED, exactly as [`set_group_floor`](Self::set_group_floor) and
   /// [`set_group_gen`](Self::set_group_gen) stage theirs. Folding it straight into the durable slot
@@ -461,23 +472,38 @@ where
   /// two incarnations onto ONE `(group, epoch)` identity for every gen-keyed observer — the same
   /// identity fail-stop class as the [`OpId`]/read-round ceilings. Exhaustion is unreachable in
   /// practice (2^64 restarts of one group), so a caller surfaces the refusal rather than wrapping.
+  ///
+  /// HOSTING GATES THE ANSWER; REMOVAL DOES NOT RESET THE COUNTER. An unhosted id is refused —
+  /// there is no incarnation to hand an epoch to — but the counter itself is kept beside the
+  /// hosted groups, so an id removed and re-created in this process resumes STRICTLY ABOVE every
+  /// epoch its earlier incarnations were issued. Resetting it would hand two incarnations the same
+  /// `(group, epoch)` identity, which is exactly what the epoch exists to prevent.
   #[must_use = "`None` means no such group or an exhausted counter; the returned epoch is the restore_group argument"]
-  pub fn next_boot_epoch(&mut self, gid: &G) -> Option<u64> {
-    let storage = self.groups.get_mut(gid)?;
-    let next = storage.boot_epochs.checked_add(1)?;
-    storage.boot_epochs = next;
+  pub fn next_boot_epoch(&mut self, gid: &G) -> Option<u64>
+  where
+    G: Clone,
+  {
+    if !self.groups.contains_key(gid) {
+      return None;
+    }
+    let counter = self.boot_epochs.entry(gid.clone()).or_default();
+    let next = counter.checked_add(1)?;
+    *counter = next;
     Some(next)
   }
 
   /// Seed `gid`'s boot-epoch counter so the exhaustion fail-stop can be exercised without 2^64
   /// calls. Panics if no such group is hosted — a test must admit the group first.
   #[cfg(test)]
-  fn set_boot_epochs_for_test(&mut self, gid: &G, boot_epochs: u64) {
-    self
-      .groups
-      .get_mut(gid)
-      .expect("group must be hosted to seed its boot epoch")
-      .boot_epochs = boot_epochs;
+  fn set_boot_epochs_for_test(&mut self, gid: &G, boot_epochs: u64)
+  where
+    G: Clone,
+  {
+    assert!(
+      self.groups.contains_key(gid),
+      "group must be hosted to seed its boot epoch"
+    );
+    self.boot_epochs.insert(gid.clone(), boot_epochs);
   }
 
   /// This reference engine's INTERNAL floor accessor — how it composes `max(durable, staged)` to
