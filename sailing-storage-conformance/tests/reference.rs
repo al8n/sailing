@@ -125,6 +125,17 @@ fn the_in_memory_reference_engine_conforms() {
     report.passed_check("engine/lineage-record-rejects-the-reserved-band"),
     "the caller's half of the set_group_gen contract is answerable on either tier"
   );
+  for check in [
+    "engine/removal-ceiling-folds-a-shape-entry",
+    "engine/removal-ceiling-retracts-a-truncated-shape-entry",
+    "engine/removal-ceiling-caps-on-an-invalid-shape-entry",
+  ] {
+    assert!(
+      report.passed_check(check),
+      "the log leg of the removal ceiling is answerable by every engine now, so {check} must \
+       GRADE rather than skip"
+    );
+  }
   assert!(
     report.passed_check("engine/removal-ceiling-never-reaches-the-terminal"),
     "the fold is engine-level state, so the boundary is answerable on either tier — which is why \
@@ -177,6 +188,9 @@ fn the_journalling_reference_engine_conforms() {
     "engine/durable-index-covers-a-released-append",
     "engine/lineage-record-rejects-the-reserved-band",
     "engine/removal-ceiling-never-reaches-the-terminal",
+    "engine/removal-ceiling-folds-a-shape-entry",
+    "engine/removal-ceiling-retracts-a-truncated-shape-entry",
+    "engine/removal-ceiling-caps-on-an-invalid-shape-entry",
     "restore/an-unrecoverable-incarnation-refuses-typed",
     "completion/loss-heals-through-the-log-probe",
     "completion/loss-heals-through-the-hard-state-probe",

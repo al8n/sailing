@@ -92,8 +92,19 @@ pub trait EngineSubject {
   /// the removal ceiling.
   ///
   /// `None` (the default) when the subject cannot mint one, and the suite then SKIPS that leg
-  /// rather than passing it. Minting a shape entry needs the payload codec that decodes it, so
-  /// only an implementation that owns that codec can answer.
+  /// rather than passing it — but the engine suite NO LONGER ALLOW-LISTS that skip. Reading a
+  /// lineage move out of an entry once needed a codec `sailing-proto` kept to itself, which is
+  /// what made the leg unanswerable and the skip legitimate;
+  /// [`shape_entry_move`](sailing_proto::shape_entry_move) is public now, every engine owes the
+  /// leg, and [`mint_shape_entry`](crate::fault::mint_shape_entry) mints exactly what this method
+  /// must return. Override it with that call unless the subject genuinely cannot accept an
+  /// arbitrary entry, and expect a declined answer to be reported as a coverage violation rather
+  /// than a pass.
+  ///
+  /// Only the VALID half runs through here. A shape entry the apply path will refuse is invalid for
+  /// every engine alike, so the kit mints those centrally
+  /// ([`mint_invalid_shape_entry`](crate::fault::mint_invalid_shape_entry)) and no subject can
+  /// decline the question.
   /// # Lineage generations this suite writes
   ///
   /// Every generation the kit hands `MultiEngine::set_group_gen` is a WORKING one — strictly below
