@@ -118,7 +118,8 @@ pub use multi::{
   EngineLog, EngineStable, EngineStorageError, FORK_BASE_INDEX, FORK_BASE_TERM, FloorStore,
   ForkGate, ForkView, GroupEngine, GroupId, GroupStores, HIGHEST_WORKING_GENERATION,
   InstallOutcome, MERGED_FLOOR, MergeBlocked, MergeBlockedCause, MergeResolution, MultiEngine,
-  MultiRaft, NoFloors, NoHold, floor_admits, reshape_born_prevention, validate_restore,
+  MultiRaft, NoFloors, NoHold, ShapeFault, ShapeMove, floor_admits, reshape_born_prevention,
+  shape_entry_move, validate_restore,
 };
 
 mod tracker;
@@ -166,6 +167,59 @@ pub mod fuzz_internals {
   /// The frame-length bound, for the frame-decoder harness's post-condition.
   #[cfg(feature = "tcp")]
   pub const MAX_FRAME_LEN: usize = crate::transport::frame::MAX_FRAME_LEN;
+
+  /// The four SHAPE payload encoders, so a harness can MINT a lineage-bearing entry payload.
+  ///
+  /// Reading a shape entry's lineage move is public
+  /// ([`shape_entry_move`](crate::shape_entry_move)) because every engine must fold
+  /// that leg. WRITING one is not: outside this crate a shape payload is minted by the consensus
+  /// core alone, on the propose path that already holds the lineage invariants, and a public
+  /// encoder would let a caller hand its engine a generation no move ever named. These wrappers
+  /// exist so a conformance harness can build the entry it must feed an engine under test, and
+  /// they carry the same no-semver, do-not-depend status as the rest of this module.
+  ///
+  /// Pair with [`Entry::new`](crate::Entry::new) and the matching
+  /// [`EntryKind`](crate::EntryKind): the returned `Bytes` is the entry's `data`.
+  pub mod shape_payload {
+    use bytes::Bytes;
+    use std::vec::Vec;
+
+    /// Encode an [`EntryKind::Split`](crate::EntryKind::Split) payload; its lineage move is
+    /// `parent_gen_after`.
+    #[must_use]
+    pub fn split(p: &crate::SplitPayload) -> Bytes {
+      let mut buf = Vec::new();
+      crate::wire::encode_split_payload(p, &mut buf);
+      Bytes::from(buf)
+    }
+
+    /// Encode an [`EntryKind::PrepareMerge`](crate::EntryKind::PrepareMerge) payload; its lineage
+    /// move is `source_gen_after`.
+    #[must_use]
+    pub fn prepare_merge(p: &crate::PrepareMergePayload) -> Bytes {
+      let mut buf = Vec::new();
+      crate::wire::encode_prepare_merge_payload(p, &mut buf);
+      Bytes::from(buf)
+    }
+
+    /// Encode an [`EntryKind::CommitMerge`](crate::EntryKind::CommitMerge) payload; its lineage
+    /// move is `target_gen_after`.
+    #[must_use]
+    pub fn commit_merge(p: &crate::CommitMergePayload) -> Bytes {
+      let mut buf = Vec::new();
+      crate::wire::encode_commit_merge_payload(p, &mut buf);
+      Bytes::from(buf)
+    }
+
+    /// Encode an [`EntryKind::RollbackMerge`](crate::EntryKind::RollbackMerge) payload; its lineage
+    /// move is `source_gen_after` in the unfreeze role and `target_gen_after` in the abort role.
+    #[must_use]
+    pub fn rollback_merge(p: &crate::RollbackMergePayload) -> Bytes {
+      let mut buf = Vec::new();
+      crate::wire::encode_rollback_merge_payload(p, &mut buf);
+      Bytes::from(buf)
+    }
+  }
 }
 
 #[cfg(any(feature = "tcp", feature = "quic"))]

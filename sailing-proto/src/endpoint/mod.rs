@@ -2146,10 +2146,15 @@ where
   /// the band was reserved. The population of such logs is empty for any published version — the
   /// reservation ships in the first one — but corruption and skew do not depend on that argument,
   /// which is why this is a guard rather than a comment.
+  ///
+  /// The band comes from `generation_is_working`, the same symbol the removal ceiling's log leg
+  /// ([`shape_entry_move`](crate::shape_entry_move)) reads. That leg judges an entry BEFORE this
+  /// arm ever runs — a removal reads the log in the append-before-apply window — so the two must
+  /// draw the line in the same place by construction, not by two copies of one comparison.
   fn shape_payload_reserves(gens: impl IntoIterator<Item = u64>) -> bool {
     gens
       .into_iter()
-      .any(|g| g >= crate::HIGHEST_WORKING_GENERATION)
+      .any(|g| !crate::multi::generation_is_working(g))
   }
 
   /// Mint a unique, monotonically-increasing operation id for a storage submission.

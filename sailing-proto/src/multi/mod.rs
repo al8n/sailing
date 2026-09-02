@@ -21,7 +21,10 @@
 //! delegate here.
 
 mod engine;
-pub use engine::{EngineLog, EngineStable, EngineStorageError, GroupEngine, MultiEngine};
+pub use engine::{
+  EngineLog, EngineStable, EngineStorageError, GroupEngine, MultiEngine, ShapeFault, ShapeMove,
+  shape_entry_move,
+};
 
 mod group_id;
 pub use group_id::GroupId;
@@ -239,13 +242,27 @@ pub const MERGED_FLOOR: u64 = u64::MAX;
 /// generation out of a `u64`.
 pub const HIGHEST_WORKING_GENERATION: u64 = MERGED_FLOOR - 1;
 
+/// Whether `generation` is a WORKING one — strictly below [`HIGHEST_WORKING_GENERATION`], and so
+/// clear of the reserved band that generation and the [`MERGED_FLOOR`] sentinel occupy.
+///
+/// THE ONE SPELLING OF THE BAND. Every gate with a reserved-generation leg reads it from here:
+/// [`floor_admits`]'s floor-independent half, the core constructors' [`validate_working_generation`],
+/// the apply path's `Endpoint::shape_payload_reserves`, and the removal ceiling's log leg
+/// ([`shape_entry_move`]). Their agreement is then STRUCTURAL rather than asserted, which is what
+/// the log leg needs: it judges an entry in the window BEFORE the apply path judges it, so a leg
+/// reading a NARROWER band would refuse an entry the apply path accepts and drop a real fence,
+/// while a WIDER one would let an entry the apply path refuses fence a live id.
+pub(crate) const fn generation_is_working(generation: u64) -> bool {
+  generation < HIGHEST_WORKING_GENERATION
+}
+
 /// The floor-admission predicate every admission gate applies — the multi coordinators'
 /// create/restore checks and the drivers' factory pre-build gate: `generation` is admissible
 /// against `floor` iff it clears the floor AND is not the reserved [`MERGED_FLOOR`] sentinel
 /// (never a working incarnation). The second leg makes a `MERGED_FLOOR` fence refuse EVERY
 /// generation, the sentinel itself included.
 pub const fn floor_admits(floor: u64, generation: u64) -> bool {
-  generation < HIGHEST_WORKING_GENERATION && generation >= floor
+  generation_is_working(generation) && generation >= floor
 }
 
 /// The floor-INDEPENDENT admission leg of [`floor_admits`], enforced by the CORE group
@@ -256,7 +273,7 @@ pub const fn floor_admits(floor: u64, generation: u64) -> bool {
 /// nor the generation below it, which that id's own removal fence needs (see
 /// [`HIGHEST_WORKING_GENERATION`]).
 const fn validate_working_generation(generation: u64) -> Result<(), CreateGroupError> {
-  if generation < HIGHEST_WORKING_GENERATION {
+  if generation_is_working(generation) {
     Ok(())
   } else {
     Err(CreateGroupError::ReservedGeneration)
