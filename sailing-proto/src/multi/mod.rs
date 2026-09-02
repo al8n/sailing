@@ -1766,14 +1766,33 @@ where
   ///
   /// - APPLIED — the source's [`frozen_for`](Endpoint::frozen_for) claim decodes to `gid`. A pure
   ///   in-memory read, exact once the freeze applies.
-  /// - APPEND-PENDING — the source's freeze is only append-observed (freeze-pending, not yet
-  ///   applied), so its claim is still undecoded in-memory; decode it from the source's own log with
-  ///   [`scan_freeze_claim`](Endpoint::scan_freeze_claim). Gated on freeze-pending so the bounded
-  ///   walk runs ONLY for a source mid-freeze, never on an idle group's suffix. A read/decode fault
-  ///   REFUSES (returns `true`): the gate treats a claim it cannot rule out as present rather than
-  ///   risk removing a target out from under a source it could not inspect. Off the append hot path —
-  ///   this decode is paid per (rare) removal, not per append.
-  fn some_source_claims_target<L, S, St>(&self, gid: &G, stores: &mut St) -> bool
+  /// - APPEND-PENDING — the source has a `PrepareMerge` observed at append and not yet applied
+  ///   ([`freeze_pending`](Endpoint::freeze_pending)), so its claim is still undecoded in-memory;
+  ///   decode EVERY queued claim from the source's own log with
+  ///   [`scan_freeze_claims`](Endpoint::scan_freeze_claims) — one single-entry read per queued
+  ///   freeze, exactly the entries the source's freeze queue names, never a walk of its suffix,
+  ///   and each read once (the verdicts are cached on the source, so a cold page costs only the
+  ///   indices above it and the walk resumes rather than restarts) — and not the first alone: an
+  ///   apply-starved replica's committed suffix can hold several
+  ///   freeze cycles, and each later freeze's claim stands in turn as the drain catches up. Keyed
+  ///   on the PENDING freeze alone — never on
+  ///   `!is_frozen()`, which does not exclude it: a lagging replica keeps an APPLIED freeze naming
+  ///   one target while a committed unfreeze and a later `PrepareMerge` naming another wait behind
+  ///   its apply budget, and only this scan sees that later claim (the applied leg reads the old
+  ///   one). The bounded walk still runs only for a source with a pending freeze, never on an idle
+  ///   group's suffix. An UNREADABLE queued entry (a cold page, a read fault) REFUSES
+  ///   (returns `true`), and so do stores that cannot be RESOLVED for such a source
+  ///   (`GroupStores::stores` may answer `None` for a hosted, starved group): the gate treats a
+  ///   claim it cannot rule out as present rather than risk removing a target out from under a
+  ///   source it could not inspect. A COMMITTED refused entry claims nothing: a `PrepareMerge` the
+  ///   apply path will not accept poisons its source at apply instead of freezing it, so no claim
+  ///   can ever materialize from it or from anything queued above it, and the scan ends there —
+  ///   fencing `gid` on it would strand a target forever against a merge that can never run. An
+  ///   UNCOMMITTED refused entry refuses
+  ///   like a read fault: a conflicting append can still replace it at the same index with a valid
+  ///   freeze naming `gid`, so until it is truncated or committed the gate cannot rule that claim
+  ///   out. Off the append hot path — this decode is paid per (rare) removal, not per append.
+  fn some_source_claims_target<L, S, St>(&mut self, gid: &G, stores: &mut St) -> bool
   where
     St: GroupStores<G, L, S>,
     L: LogStore,
@@ -1784,27 +1803,36 @@ where
       return true;
     }
     // APPEND-PENDING leg: the freeze is observed only at append (its payload undecoded until
-    // apply), so read the claim off the source's log. A faulted scan/decode fails closed.
+    // apply), so read the claim off the source's log, judged against the source's own commit. A
+    // read fault refuses; a committed refused entry claims nothing; an uncommitted refused entry
+    // is indeterminate and refuses too.
     let mut target_key = Vec::new();
     gid.encode(&mut target_key);
     let target_key = Bytes::from(target_key);
-    for (g, ep) in self.groups.iter() {
+    for (g, ep) in self.groups.iter_mut() {
       if g == gid {
         continue;
       }
-      if ep.merge_freeze_active() && !ep.is_frozen() {
-        let Some((log, _)) = stores.stores(g) else {
-          continue;
-        };
-        match Endpoint::<I, F, R>::scan_freeze_claim(&*log, ep.applied_index()) {
-          Ok(Some(claim)) => {
-            if claim == target_key {
-              return true;
-            }
+      // Keyed on the PENDING freeze alone, never on `!is_frozen()`: the two are not exclusive. A
+      // lagging replica keeps an old APPLIED freeze (the applied leg above read its target) while
+      // a committed unfreeze and a later `PrepareMerge` naming ANOTHER target wait behind its
+      // apply budget, and that later claim is visible nowhere but this scan.
+      if ep.freeze_pending().is_none() {
+        continue;
+      }
+      // `GroupStores::stores` may answer `None` for a hosted group — the contract names the
+      // starved shape — and the pending claim lives only in that group's log, so a claim that
+      // cannot be read cannot be ruled out: refuse, exactly as on an unreadable page.
+      let Some((log, _)) = stores.stores(g) else {
+        return true;
+      };
+      match ep.scan_freeze_claims(&*log) {
+        Ok(claims) => {
+          if claims.contains(&target_key) {
+            return true;
           }
-          Ok(None) => {}
-          Err(_) => return true,
         }
+        Err(_) => return true,
       }
     }
     false

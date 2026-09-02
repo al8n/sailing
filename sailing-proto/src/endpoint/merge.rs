@@ -1,13 +1,14 @@
 //! The endpoint-resident merge state: the append-observed freeze, the applied `Frozen` fold, and
 //! the parked `CommitMerge` apply the container resolves from local facts.
 //!
-//! The lease SAFETY gate moves to APPEND observation (`freeze_pending`): every lease-serve and
+//! The lease SAFETY gate moves to APPEND observation (`freeze_queue`): every lease-serve and
 //! lease-formation gate fails closed from the moment a `PrepareMerge` entry ENTERS the local log
 //! — the proposing leader appends before it replicates, and every lease is served leader-side, so
 //! the total order `emit(read) < append(freeze) < commit < apply < absorb < accept(write)` holds
 //! with NO commit-wait and NO cross-node clock anywhere. The remaining freeze semantics stay
 //! apply-time (the membership-apply-time doctrine's shape).
 use super::*;
+use std::collections::VecDeque;
 
 /// One committed `CommitMerge`, parked at the target's apply until the container resolves it: the
 /// endpoint alone CANNOT apply it — the absorbed half lives in another group's endpoint, which
@@ -123,16 +124,6 @@ impl PendingMergeApply {
   }
 }
 
-/// A log walk's interruption class: a BENIGN unreadable page (cold read, briefly-empty — legal
-/// under the store contract, retried) versus a genuine store fault (fail-stop).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ScanInterrupt {
-  /// Legal transient unreadiness — defer and retry.
-  Retry,
-  /// A store error — poison.
-  Fault,
-}
-
 /// The resolve arm's fence classification at a parked absorb — see
 /// [`Endpoint::absorb_capture_block`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,23 +149,60 @@ pub(crate) enum CaptureFence {
   Abort,
 }
 
+/// One queued freeze's READ VERDICT — the value of [`MergeState::claim_cache`]: what a Ready
+/// single-entry read of that `PrepareMerge` yields, judged at the commit it was read under.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimRead {
+  /// A valid `PrepareMerge`: the target it claims. Fixed for as long as the entry survives.
+  Claim(Bytes),
+  /// A refused entry read at-or-below `commit`: it poisons this source at apply and nothing
+  /// above it ever applies, so the claim walk ends here for good.
+  RefusedCommitted,
+  /// A refused entry read ABOVE `commit` — indeterminate, since a conflicting append may still
+  /// replace it, so the walk fails closed on it. `judged_at` is the commit it was read under;
+  /// once `commit` reaches the index the verdict is re-read (it becomes `RefusedCommitted`).
+  RefusedAbove { judged_at: Index },
+}
+
 /// The endpoint-resident merge state. One instance per endpoint, defaulted inert; every field is
-/// DERIVED from the log and re-derivable at restart (`freeze_pending` from the unapplied suffix,
+/// DERIVED from the log and re-derivable at restart (`freeze_queue` from the unapplied suffix,
 /// `frozen`/`freeze_index` from replaying the applied prefix, the park from re-encountering its
 /// entry), so nothing here is persisted. The lineage counter deliberately does NOT live here —
 /// incarnation and shape share ONE monotone per-id counter (`SplitState::shape_gen`).
 #[derive(Debug, Default)]
 pub(crate) struct MergeState {
-  /// The LOWEST unresolved `PrepareMerge` index in the local log, observed at APPEND (leader
-  /// propose-append / follower append-accept; a kind check only — never a payload decode on the
-  /// hot path). While set, every lease-serve and lease-formation gate fails closed. Cleared by a
-  /// conflict truncation covering it, by a log re-baseline discarding it (snapshot install), by
-  /// its entry applying (subsumed into `frozen`), or by a `RollbackMerge` applying (which
-  /// re-derives it — a later freeze may still sit in the unapplied suffix). Restart re-derives it
-  /// from one bounded kind-only pass over the unapplied suffix, so a committed-but-unapplied
-  /// freeze is re-armed before the replica can win an election and form a fresh lease; an
-  /// election itself never clears it (log-derived state — a new leader inherits it with the log).
-  pub(crate) freeze_pending: Option<Index>,
+  /// Every `PrepareMerge` in the UNAPPLIED suffix `(applied, last]`, in log order — the
+  /// APPEND-MAINTAINED index of pending freezes. INVARIANT, pinned by the tests: after every
+  /// append, truncation, apply and restore of a LIVE endpoint this queue equals the ordered set of
+  /// `PrepareMerge` indices in `(applied, last]`. Maintained kind-only on the hot path — never a
+  /// payload decode, never a walk of the suffix: the two append arms push every `PrepareMerge` of
+  /// the appended suffix in order, a conflict truncation pops from the back while at-or-above the
+  /// truncation point, a snapshot re-baseline clears it, the `PrepareMerge` fold pops its own index
+  /// (the front), and a restart or a cure adopt REBUILDS it from one scan of the surviving suffix —
+  /// the only suffix walks it ever costs. A REFUSED `PrepareMerge` clears it whole: the poison halts
+  /// the drain, so nothing queued above the refusal ever applies and no claim can materialize from
+  /// it; a poisoned endpoint is the one place the invariant is deliberately broken, in the empty
+  /// direction. The FRONT is the lowest pending freeze, the append-observed lease kill: while the
+  /// queue is non-empty every lease-serve and lease-formation gate fails closed, and the container's
+  /// claim gate reads the queued indices — and only those — to learn which targets the pending
+  /// freezes claim. Restart re-derives it before the replica can win an election and form a fresh
+  /// lease; an election itself never clears it (log-derived state — a new leader inherits it with
+  /// the log).
+  pub(crate) freeze_queue: VecDeque<Index>,
+  /// The claim gate's per-index READ VERDICTS for the queued freezes — DERIVED state, a pure
+  /// function of the surviving entries and `commit`: its keys are a subset of `freeze_queue`, and
+  /// each value is what a Ready single-entry read of that entry yields under the recorded commit.
+  /// It exists so the gate's walk RESUMES rather than restarts. A bounded cache that pages the
+  /// suffix in and out makes a walk that re-reads every queued entry after a cold page livelock —
+  /// two required pages and one page of cache: each read evicts the other's — and the gate would
+  /// answer a standing refusal forever. With the cache every queued index needs exactly one Ready
+  /// read, ever, and a cold page costs only the indices at and above it. Invalidated wherever the
+  /// queue changes: a conflict truncation drops the verdicts at-or-above its point (the entry may
+  /// come back with a different claim), the fold drops the popped index, a refusal and a
+  /// re-baseline empty it with the queue, a cure adopt keeps only the indices above its boundary,
+  /// and a boot starts empty. A `RefusedAbove` verdict is re-read once `commit` reaches its index.
+  /// ONE reader, [`Endpoint::scan_freeze_claims`], which is also its only filler.
+  pub(crate) claim_cache: BTreeMap<Index, ClaimRead>,
   /// Whether a committed `PrepareMerge` has APPLIED and no later `RollbackMerge` has undone it:
   /// the full freeze — proposals, conf changes, transfers, and reads refuse typed; heartbeats,
   /// appends, elections, and snapshot sends run UNCHANGED (the group must stay live to propagate
@@ -468,6 +496,50 @@ where
     self.merge.frozen_for.as_ref()
   }
 
+  /// The index of the LOWEST unapplied `PrepareMerge` this endpoint observed at append, or `None`
+  /// — the append-observed kill, read INDEPENDENTLY of [`is_frozen`](Self::is_frozen): the two
+  /// are not exclusive. A lagging replica can hold an APPLIED freeze and a PENDING one at once (a
+  /// committed unfreeze and a later freeze waiting behind its apply budget), and the pending one
+  /// may name a different target. The container's claim gate keys its pending-claim scan on
+  /// exactly this, so that later claim is never hidden behind the applied one — which is why an
+  /// earlier freeze's fold re-derives it from the suffix above rather than clearing it.
+  pub(crate) fn freeze_pending(&self) -> Option<Index> {
+    self.merge.freeze_queue.front().copied()
+  }
+
+  /// Every pending freeze, lowest first — the queued `PrepareMerge` indices of the unapplied
+  /// suffix. The claim gate reads exactly these entries and nothing else.
+  pub(crate) fn freeze_queue(&self) -> impl Iterator<Item = Index> + '_ {
+    self.merge.freeze_queue.iter().copied()
+  }
+
+  /// The apply drain reached the `PrepareMerge` at `index`: it leaves the unapplied suffix, so it
+  /// leaves the queue. It is the front by the invariant — the drain applies in log order and every
+  /// lower `PrepareMerge` was popped by its own fold — and the next queued index, if any, is the
+  /// pending state from here on. Nothing is read from the log.
+  pub(crate) fn pop_applied_freeze(&mut self, index: Index) {
+    debug_assert_eq!(
+      self.merge.freeze_queue.front(),
+      Some(&index),
+      "the applied PrepareMerge is the freeze queue's front"
+    );
+    while let Some(popped) = self.merge.freeze_queue.front().copied() {
+      if popped > index {
+        break;
+      }
+      self.merge.freeze_queue.pop_front();
+      self.merge.claim_cache.remove(&popped);
+    }
+  }
+
+  /// A refused `PrepareMerge` poisons this endpoint: nothing queued above it ever applies, so the
+  /// queue and its read verdicts empty together — the one deliberate break of the queue invariant,
+  /// in the empty direction.
+  pub(crate) fn clear_freeze_queue(&mut self) {
+    self.merge.freeze_queue.clear();
+    self.merge.claim_cache.clear();
+  }
+
   /// Whether this group still owes ANY aborted source a thaw — it applied a merge abort as a TARGET
   /// whose durable `abandoned` obligation the container's per-crank thaw pass has not yet discharged.
   /// The service reads it as the thaw pass's per-crank filter and the removal purge's guard, and the
@@ -554,41 +626,62 @@ where
   /// ever disagree about a freeze.
   #[must_use]
   pub fn merge_freeze_active(&self) -> bool {
-    self.merge.freeze_pending.is_some() || self.merge.frozen
+    !self.merge.freeze_queue.is_empty() || self.merge.frozen
   }
 
-  /// Observe a `PrepareMerge` entering the local log at `index` — the APPEND-time lease kill.
-  /// Keeps the LOWEST unresolved index: the clear-by-truncation predicate compares against the
-  /// first freeze still in the log, and any higher duplicate dies with the same (or a later)
-  /// truncation.
+  /// Observe a `PrepareMerge` entering the local log at `index` — the APPEND-time lease kill, and
+  /// the freeze queue's push. Appends enter in increasing index order (a conflicting suffix is
+  /// retracted by [`note_freeze_truncated`](Self::note_freeze_truncated) before its replacement is
+  /// pushed), so the queue stays sorted and the front stays the lowest pending freeze.
+  ///
+  /// A KIND check arms it, so nothing about the payload has been judged yet, and a queued freeze
+  /// has three releases. A truncation covering the entry and the entry's fold at apply (popped
+  /// into `frozen`; the next queued index, if any, is the pending state — the queue already holds
+  /// every later freeze, so nothing is re-derived from the log) are the ordinary two. The third is
+  /// the apply arm's REFUSAL of the entry — a payload that will not decode, or one naming a
+  /// reserved generation — which poisons this endpoint and clears the whole queue with it: a
+  /// refused entry creates no merge state, nothing queued above it ever applies, and a kill left
+  /// armed on a poisoned replica would present as an active freeze to the container's teardown
+  /// gate for the lifetime of a committed entry that never leaves the log.
   pub(crate) fn note_freeze_appended(&mut self, index: Index) {
-    if self.merge.freeze_pending.is_none_or(|cur| index < cur) {
-      self.merge.freeze_pending = Some(index);
+    debug_assert!(
+      self.merge.freeze_queue.back().is_none_or(|b| *b < index),
+      "freezes are observed in increasing index order"
+    );
+    if self.merge.freeze_queue.back().is_none_or(|b| *b < index) {
+      self.merge.freeze_queue.push_back(index);
     }
+    // A fresh index can carry no verdict: its entry was never read as this queue member.
+    self.merge.claim_cache.remove(&index);
   }
 
-  /// A §5.3 conflict truncation overwrote `[truncate_from, ..]`: a pending freeze at-or-above it
-  /// no longer exists in the log, so the append-observed kill releases. (A truncation strictly
-  /// above the pending index leaves it standing — the freeze entry survived.)
+  /// A §5.3 conflict truncation overwrote `[truncate_from, ..]`: every queued freeze at-or-above
+  /// it no longer exists in the log, so it leaves the queue (the new suffix's own freezes are
+  /// pushed by the append that follows). A truncation strictly above every queued index leaves
+  /// the queue standing — those freeze entries survived.
   pub(crate) fn note_freeze_truncated(&mut self, truncate_from: Index) {
-    if self
+    while self
       .merge
-      .freeze_pending
-      .is_some_and(|fp| truncate_from <= fp)
+      .freeze_queue
+      .back()
+      .is_some_and(|b| *b >= truncate_from)
     {
-      self.merge.freeze_pending = None;
+      self.merge.freeze_queue.pop_back();
     }
+    // The overwritten entries may come back with different claims: their verdicts go with them.
+    self.merge.claim_cache.retain(|i, _| *i < truncate_from);
   }
 
   /// A snapshot install re-baselined the log to `boundary`, discarding every entry above it: a
-  /// pending freeze above the boundary was discarded with them — clear it; the ordinary append
-  /// re-delivery of a still-live freeze re-arms it at accept. (A pending freeze at-or-below the
-  /// boundary is structurally impossible — compaction happens only at applied indexes, and an
-  /// applied `PrepareMerge` already cleared the pending state into `frozen` — so the clear is
-  /// total rather than conditional; a stale flag surviving here would kill leases forever on a
-  /// node whose freeze entry no longer exists.)
+  /// queued freeze above the boundary was discarded with them — clear the queue; the ordinary
+  /// append re-delivery of a still-live freeze re-queues it at accept. (A queued freeze at-or-below
+  /// the boundary is structurally impossible — compaction happens only at applied indexes, and an
+  /// applied `PrepareMerge` already left the queue at its fold — so the clear is total rather than
+  /// conditional; a stale entry surviving here would kill leases forever on a node whose freeze
+  /// entry no longer exists.)
   pub(crate) fn note_freeze_rebaselined(&mut self) {
-    self.merge.freeze_pending = None;
+    self.merge.freeze_queue.clear();
+    self.merge.claim_cache.clear();
   }
 
   /// A snapshot install re-baselined the log to `boundary`, discarding every abort entry at-or-below
@@ -616,64 +709,17 @@ where
       .retain(|_, (_, abort_index)| *abort_index > boundary);
   }
 
-  /// One bounded, kind-only pass over the UNAPPLIED suffix `(applied, last]` for the lowest
-  /// `PrepareMerge` — the restart re-derivation of [`MergeState::freeze_pending`] and the
-  /// re-derivation a `RollbackMerge` apply runs (a LATER freeze may already sit above it in the
-  /// suffix). FAIL-STOP on any read fault, like the restart lease-floor scans: under-deriving
-  /// the kill would let a restarted replica win an election and serve a lease inside a pending
-  /// freeze — a stale read.
+  /// One bounded, kind-only pass over the UNAPPLIED suffix `(applied, last]` collecting EVERY
+  /// `PrepareMerge` index in log order — the REBUILD of [`MergeState::freeze_queue`] at restart,
+  /// and the only suffix walk the queue ever costs: every live path maintains it at append, and a
+  /// cure adopt keeps the log and so keeps the queue's own entries above its boundary. FAIL-STOP
+  /// on any read fault, like the restart lease-floor scans: under-deriving the kill would let a
+  /// restarted replica win an election and serve a lease inside a pending freeze — a stale read.
   pub(crate) fn scan_freeze_pending<L: LogStore>(
     log: &L,
     applied: Index,
-  ) -> Result<Option<Index>, PoisonReason> {
-    Self::scan_freeze_pending_read(log, applied).map_err(|_| PoisonReason::LogRead)
-  }
-
-  /// The read-detailed form of [`scan_freeze_pending`](Self::scan_freeze_pending), for callers
-  /// that must tell a BENIGN unreadable page (defer byte-unchanged, retry later) from a genuine
-  /// store fault (fail-stop): a parked drain never reaches the suffix to raise the fault
-  /// itself, so a caller that collapsed the two would retry a broken store forever.
-  pub(crate) fn scan_freeze_pending_read<L: LogStore>(
-    log: &L,
-    applied: Index,
-  ) -> Result<Option<Index>, ScanInterrupt> {
-    let last = log.last_index();
-    let mut idx = applied.next();
-    while idx <= last {
-      let read_end = last
-        .next()
-        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
-      let chunk = match log.entries(idx..read_end, 1 << 20) {
-        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
-        Ok(_) => return Err(ScanInterrupt::Retry),
-        Err(_) => return Err(ScanInterrupt::Fault),
-      };
-      for e in chunk.iter() {
-        if e.kind() == EntryKind::PrepareMerge {
-          return Ok(Some(e.index()));
-        }
-      }
-      idx = chunk
-        .last()
-        .map(|e| e.index().next())
-        .ok_or(ScanInterrupt::Retry)?;
-    }
-    Ok(None)
-  }
-
-  /// The TARGET claim of the lowest `PrepareMerge` in the UNAPPLIED suffix `(applied, last]`, decoded
-  /// — the [`scan_freeze_pending`](Self::scan_freeze_pending) walk carried one step further, from the
-  /// entry's index to its payload's `target_bytes`. The container's teardown gate runs it against a
-  /// freeze-pending SOURCE to learn which target that not-yet-applied freeze claims, closing the
-  /// pre-park window an applied [`frozen_for`](Self::frozen_for) read cannot see (the payload is
-  /// undecoded until the freeze applies). FAIL-STOP on any read fault, and on a payload that will not
-  /// decode (a committed-corrupt freeze, mirrored from the apply arm's own `MergeDecode`): the gate
-  /// reads a fault as a claim it cannot rule out and REFUSES, never risking a stranded source. Off
-  /// the hot path — appends stay kind-only, and this pays a decode only per (rare) removal.
-  pub(crate) fn scan_freeze_claim<L: LogStore>(
-    log: &L,
-    applied: Index,
-  ) -> Result<Option<Bytes>, PoisonReason> {
+  ) -> Result<VecDeque<Index>, PoisonReason> {
+    let mut queue = VecDeque::new();
     let last = log.last_index();
     let mut idx = applied.next();
     while idx <= last {
@@ -686,9 +732,7 @@ where
       };
       for e in chunk.iter() {
         if e.kind() == EntryKind::PrepareMerge {
-          let payload = crate::wire::decode_prepare_merge_payload(e.data_bytes())
-            .map_err(|_| PoisonReason::MergeDecode)?;
-          return Ok(Some(payload.target_bytes()));
+          queue.push_back(e.index());
         }
       }
       idx = chunk
@@ -696,7 +740,111 @@ where
         .map(|e| e.index().next())
         .ok_or(PoisonReason::LogRead)?;
     }
-    Ok(None)
+    Ok(queue)
+  }
+
+  /// The TARGET claims of the queued pending freezes ([`freeze_queue`](Self::freeze_queue)),
+  /// decoded in log order. The container's claim gate runs it against a freeze-pending SOURCE to
+  /// learn which targets its not-yet-applied freezes claim, closing the pre-park window an applied
+  /// [`frozen_for`](Self::frozen_for) read cannot see (a payload is undecoded until its freeze
+  /// applies). EVERY queued claim, not the first: an apply-starved replica's committed suffix can
+  /// hold several freeze cycles (`Unfreeze0, Prepare1, Unfreeze1, Prepare2` behind an applied
+  /// freeze for a target 0), and each later freeze's claim stands in turn as the drain catches up,
+  /// so a gate that read only the lowest would leave every later target undefended. Run for every
+  /// source with a pending freeze, applied-frozen or not.
+  ///
+  /// Reads EXACTLY the queued entries, one single-entry read each — never a walk of the suffix —
+  /// and each of them ONCE: every Ready verdict is cached on this endpoint
+  /// ([`MergeState::claim_cache`]) and only the uncached indices are read, so the walk RESUMES
+  /// after a cold page instead of restarting. Against a bounded cache that pages the suffix in
+  /// and out a restarting walk livelocks (two required pages, one page of cache: each read evicts
+  /// the other's) and the gate answers a standing refusal forever; here a cold page costs only the
+  /// indices at and above it, and the next attempt makes progress. A queued entry that is not
+  /// readable (a cold page, an empty read, a store error) ends the attempt at once with `LogRead`,
+  /// which the caller treats as a claim it cannot rule out and refuses on — it retries on its own
+  /// cadence, never here.
+  ///
+  /// Each entry is judged with [`shape_entry_move`](crate::shape_entry_move) — the apply arm's own
+  /// admission, run ahead of it — and what a refused entry means depends on whether it is
+  /// COMMITTED. At-or-below `commit` it ENDS the walk: a payload that will not decode, or one
+  /// naming a reserved generation, is the entry that poisons this source the moment the drain
+  /// reaches it, so nothing above it ever applies and only the claims collected below it can still
+  /// materialize — reading it, or anything past it, as a claim would fence a target forever against
+  /// a source that can never absorb into it. ABOVE `commit` the same entry is indeterminate: a
+  /// conflicting append may truncate it and put a VALID freeze at the same index, one that re-arms
+  /// the kill and creates the very claim a "no claim" answer would have let the gate act on —
+  /// removing the target that freeze names, or freezing it as another merge's source, and
+  /// stranding the claimant with no target log for its commit or rollback. So an uncommitted
+  /// refused entry stays FAIL-CLOSED (`Err(MergeDecode)`; nothing poisons) until it is truncated
+  /// or committed. Off the hot path — appends stay kind-only, and this pays its decodes only per
+  /// (rare) removal or freeze proposal.
+  pub(crate) fn scan_freeze_claims<L: LogStore>(
+    &mut self,
+    log: &L,
+  ) -> Result<Vec<Bytes>, PoisonReason> {
+    let commit = self.commit;
+    let mut claims = Vec::new();
+    // Walked by value: each step may write the cache.
+    let queued: Vec<Index> = self.freeze_queue().collect();
+    for idx in queued {
+      let cached = match self.merge.claim_cache.get(&idx) {
+        // Judged above the commit of its day and committed since: the same bytes now poison this
+        // source at apply. Re-read rather than promoted, so no verdict here is ever inferred.
+        Some(ClaimRead::RefusedAbove { judged_at }) if commit >= idx => {
+          debug_assert!(*judged_at < idx);
+          None
+        }
+        cached => cached.cloned(),
+      };
+      let verdict = match cached {
+        Some(verdict) => verdict,
+        None => {
+          let verdict = Self::read_claim(log, idx, commit)?;
+          self.merge.claim_cache.insert(idx, verdict.clone());
+          verdict
+        }
+      };
+      match verdict {
+        ClaimRead::Claim(claim) => claims.push(claim),
+        ClaimRead::RefusedCommitted => return Ok(claims),
+        ClaimRead::RefusedAbove { .. } => return Err(PoisonReason::MergeDecode),
+      }
+    }
+    Ok(claims)
+  }
+
+  /// ONE Ready single-entry read of the queued `PrepareMerge` at `idx`, judged under `commit` —
+  /// the read [`scan_freeze_claims`](Self::scan_freeze_claims) caches. Anything but a Ready read
+  /// of a `PrepareMerge` at exactly `idx` is `LogRead`: the gate cannot rule the claim out.
+  fn read_claim<L: LogStore>(
+    log: &L,
+    idx: Index,
+    commit: Index,
+  ) -> Result<ClaimRead, PoisonReason> {
+    let read = match log.entries(idx..idx.next(), 1 << 20) {
+      Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
+      _ => return Err(PoisonReason::LogRead),
+    };
+    let Some(e) = read
+      .iter()
+      .find(|e| e.index() == idx && e.kind() == EntryKind::PrepareMerge)
+    else {
+      return Err(PoisonReason::LogRead);
+    };
+    Ok(match crate::shape_entry_move(e) {
+      // A `Valid` verdict already decoded these bytes, so the decode cannot fail; a store that
+      // somehow contradicts it is read as unreadable, never as a claim.
+      crate::ShapeMove::Valid(_) => {
+        let payload = crate::wire::decode_prepare_merge_payload(e.data_bytes())
+          .map_err(|_| PoisonReason::LogRead)?;
+        ClaimRead::Claim(payload.target_bytes())
+      }
+      // Refused: committed, it poisons this source at apply and nothing above it ever applies;
+      // uncommitted, a valid freeze can still replace it at this very index, so it is not a
+      // "no" — and the verdict remembers the commit it was judged under.
+      _ if idx <= commit => ClaimRead::RefusedCommitted,
+      _ => ClaimRead::RefusedAbove { judged_at: commit },
+    })
   }
 }
 
@@ -770,7 +918,7 @@ where
         .is_some_and(|cap| *cap <= boundary)
       || self.abort_relay_fences(boundary)
       || self.merge.frozen
-      || self.merge.freeze_pending.is_some_and(|f| f <= boundary)
+      || self.freeze_pending().is_some_and(|f| f <= boundary)
   }
 
   /// Which STRUCTURAL leg of [`capture_blocked_at`](Self::capture_blocked_at) stands at
@@ -781,7 +929,7 @@ where
   /// neither. Precedence mirrors [`absorb_capture_block`](Self::absorb_capture_block): the freeze
   /// is a HOLD leg and outranks the two replay fences it can stand alongside.
   pub(crate) fn capture_fence_at(&self, boundary: Index) -> Option<CaptureFence> {
-    if self.merge.frozen || self.merge.freeze_pending.is_some_and(|f| f <= boundary) {
+    if self.merge.frozen || self.freeze_pending().is_some_and(|f| f <= boundary) {
       Some(CaptureFence::Frozen)
     } else if self
       .split
@@ -833,7 +981,7 @@ where
     let verdict = if self.snapshot.pending_compact.is_some()
       || self.snapshot.pending_install.is_some()
       || self.merge.frozen
-      || self.merge.freeze_pending.is_some_and(|f| f <= pending.at())
+      || self.freeze_pending().is_some_and(|f| f <= pending.at())
     {
       AbsorbCaptureBlock::Hold
     } else if self

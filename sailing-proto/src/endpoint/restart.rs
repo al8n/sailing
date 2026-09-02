@@ -674,22 +674,16 @@ where
       cure_cursor: None,
       cure_served: BTreeMap::new(),
     };
-    // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
-    // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
-    if !ep.poison.poisoned {
-      // Boot replay must COMPLETE before serving: `scan_freeze_pending` below derives the
-      // append-observed lease kill from the FINAL `applied`, so the per-crank budget (a
-      // steady-state fairness bound, not a boot bound) must not leave a partial replay here.
-      while matches!(ep.apply_committed(log), ApplyDrain::BudgetCut) {}
-    }
-    // Re-derive the append-observed lease kill from the UNAPPLIED suffix: a committed-but-
-    // unapplied PrepareMerge must re-arm `freeze_pending` BEFORE this replica can win an
-    // election and form a fresh lease (the replay above already re-froze any APPLIED freeze).
-    // Fail-stop on a read fault, like the lease-floor scans: an under-derived kill is a stale
-    // read, not a recoverable degradation.
+    // Rebuild the freeze queue from the UNAPPLIED suffix BEFORE the replay: the replay's own
+    // freeze folds pop from it in log order (a fold reads nothing from the suffix), so the queue
+    // must already name every PrepareMerge the replay will meet, and a committed-but-unapplied
+    // PrepareMerge must re-arm the append-observed kill before this replica can win an election
+    // and form a fresh lease. The one suffix walk the queue costs at boot; every live path
+    // maintains it at append. Fail-stop on a read fault, like the lease-floor scans: an
+    // under-derived kill is a stale read, not a recoverable degradation.
     if !ep.poison.poisoned {
       match Self::scan_freeze_pending(log, ep.applied) {
-        Ok(fp) => ep.merge.freeze_pending = fp,
+        Ok(queue) => ep.merge.freeze_queue = queue,
         // THROUGH `poison`, never the fields. The endpoint EXISTS by now, so this is a live
         // transition and owes what every live transition owes: the fork provenance token dropped
         // with it. Assigning the fields directly left a fork-born child inert but still certifying
@@ -698,6 +692,13 @@ where
         // first-cause-wins, which the direct overwrite silently lost.
         Err(reason) => ep.poison(reason),
       }
+    }
+    // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
+    // snapshot restore failed (the SM is in an unknown state and the node is poisoned). Boot
+    // replay must COMPLETE before serving: the per-crank budget is a steady-state fairness bound,
+    // not a boot bound, so a partial replay must not be left here.
+    if !ep.poison.poisoned {
+      while matches!(ep.apply_committed(log), ApplyDrain::BudgetCut) {}
     }
     // if this incarnation's enforcement window GREW the durable floor (a config grow, or a legacy
     // record being recorded for the first time under an enforcing config), persist the raised floor ONCE

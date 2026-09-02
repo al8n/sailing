@@ -715,7 +715,12 @@ where
     // way would refuse to re-append and leave a source wedged if the previous leader's thaw was
     // appended then truncated before it committed. A fresh source leader must be free to re-drive
     // the thaw, so it starts with none in flight — the guard suppresses only this leader's own
-    // duplicate, never an inherited one.
+    // duplicate, never an inherited one. The reset can also let this leader append a duplicate
+    // thaw ABOVE a newer, still-unapplied freeze in its own tail (its live state still shows the
+    // old freeze, so the drive's incarnation check passes); that duplicate is harmless — the
+    // source-role lineage guard at apply no-ops a thaw minted for a generation the log has moved
+    // past — and deriving a thaw-in-flight from the tail here would cost a payload walk of the
+    // suffix on the election path, which nothing else pays.
     self.merge.thaw_pending_index = Index::ZERO;
     // The witness idempotence guard re-seats the SAME way as the thaw guard, and for the same
     // reason: a `ThawDischarged` appended then truncated before it committed must be re-appendable

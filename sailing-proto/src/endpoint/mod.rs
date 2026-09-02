@@ -3656,18 +3656,39 @@ where
             }
           }
           EntryKind::PrepareMerge => {
-            // A committed PrepareMerge whose payload won't decode is corrupt — mirror Split.
+            // A committed PrepareMerge whose payload won't decode is corrupt — mirror Split. Either
+            // refusal CLEARS the freeze queue before it poisons: the queue was armed by KIND at
+            // append, ahead of any judgment of the payload, and a refused entry creates no merge
+            // state — it never freezes and never claims — while the poison halts the drain here,
+            // so nothing queued above it ever applies either. Left armed, the queue would read as
+            // an active freeze to the container's teardown gate for as long as this committed
+            // entry sits in the log, which is forever: the poisoned source could never be removed,
+            // and removal under the ceiling's release cap is the one recovery the poison exists to
+            // hand the operator.
             let payload = match crate::wire::decode_prepare_merge_payload(entry.data_bytes()) {
               Ok(p) => p,
               Err(_) => {
+                self.clear_freeze_queue();
                 self.poison(PoisonReason::MergeDecode);
                 break;
               }
             };
             if Self::shape_payload_reserves([payload.source_gen_after()]) {
+              self.clear_freeze_queue();
               self.poison(PoisonReason::ReservedShapeGen);
               break;
             }
+            // This entry leaves the unapplied suffix, so it leaves the freeze queue; the next
+            // queued index, if any, is the pending state from here on. An apply-starved replica
+            // can hold a later freeze cycle above this one (an unfreeze, then another PrepareMerge
+            // naming a different target), and the container's claim gate keys its pending-claim
+            // reads on the queue: with that later freeze still queued its claim stays readable
+            // while this one is applied. NOTHING is read from the suffix here — the queue was
+            // maintained at append — so a page the store has not made resident above this entry
+            // can neither defer nor poison the fold; the drain's own cold-page deferral governs
+            // the entries it applies. While `frozen` the queued state serves that gate alone; the
+            // lease kill is already active through `frozen`.
+            self.pop_applied_freeze(idx);
             // The freeze fold: full Frozen semantics start HERE (apply-time, the membership
             // doctrine's shape); the lease kill has been live since this entry's APPEND. The
             // gen bump is a max-fold so a restart replay re-walks the same values idempotently;
@@ -3678,7 +3699,6 @@ where
             self.merge.frozen = true;
             self.merge.freeze_index = Some(idx);
             self.merge.freeze_term = Some(entry.term());
-            self.merge.freeze_pending = None;
             self.merge.frozen_for = Some(payload.target_bytes());
             self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
             // The event carries the post-freeze counter so the driver can mirror this lineage
@@ -3781,33 +3801,41 @@ where
               break;
             }
             if payload.is_unfreeze() {
-              // The SOURCE-role thaw (this group was the frozen source; the entry rides its
-              // own log as the container-relayed consequence of the target-side abort).
-              // Leases are NOT resurrected: they re-form from live traffic. The pending kill
-              // is RE-DERIVED rather than cleared: a thaw proposed while a freeze was still
-              // pending shares its fate through truncation, but a LATER freeze may already
-              // sit above this entry in the suffix — scanning keeps the append-observed
-              // invariant exact instead of trusting a single-flag lifecycle.
-              self.merge.frozen = false;
-              self.merge.freeze_index = None;
-              self.merge.freeze_term = None;
-              self.merge.frozen_for = None;
-              self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
-              match Self::scan_freeze_pending(log, idx) {
-                Ok(fp) => self.merge.freeze_pending = fp,
-                Err(reason) => {
-                  self.poison(reason);
-                  break;
-                }
+              // THE SOURCE-ROLE LINEAGE GUARD — the SplitStale shape for the thaw. A thaw applies
+              // only while frozen and only at exactly its minted generation, the successor of the
+              // freeze it releases. A STALE thaw is real: a lagging replica holding a committed
+              // `Unfreeze(g+1)` and a newer `PrepareMerge(g+2)` still unapplied can win leadership,
+              // where its thaw dedup re-seats to none-in-flight while its live state still shows
+              // the OLD freeze, so the target's obligation drive appends a DUPLICATE `Unfreeze(g+1)`
+              // above the newer freeze; applied unguarded, that duplicate would clear the NEWER
+              // freeze with a generation the log has moved past, and the target replicas would
+              // resolve the g+2 `CommitMerge` on opposite sides. Both inputs are log-determined, so
+              // every replica no-ops the same entry identically: no state change, no event,
+              // `applied` advances. The gate runs BEFORE any mutation.
+              if self.merge.frozen
+                && Some(payload.source_gen_after())
+                  == crate::multi::next_lineage(self.split.shape_gen)
+              {
+                // The SOURCE-role thaw (this group was the frozen source; the entry rides its
+                // own log as the container-relayed consequence of the target-side abort).
+                // Leases are NOT resurrected: they re-form from live traffic. The freeze queue
+                // needs nothing here: it already holds every later `PrepareMerge`, so a freeze
+                // queued above this thaw stays armed and the claim gate keeps reading it — no
+                // suffix is re-derived, and no page above this entry is read.
+                self.merge.frozen = false;
+                self.merge.freeze_index = None;
+                self.merge.freeze_term = None;
+                self.merge.frozen_for = None;
+                self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
+                // Post-thaw counter rides the event — the driver's engine mirror (INV-LINEAGE).
+                self
+                  .outputs
+                  .events
+                  .push_back(Event::MergeRolledBack(crate::MergeRolledBack::new(
+                    idx,
+                    self.split.shape_gen,
+                  )));
               }
-              // Post-thaw counter rides the event — the driver's engine mirror (INV-LINEAGE).
-              self
-                .outputs
-                .events
-                .push_back(Event::MergeRolledBack(crate::MergeRolledBack::new(
-                  idx,
-                  self.split.shape_gen,
-                )));
             } else if Some(payload.target_gen_after())
               == crate::multi::next_lineage(self.split.shape_gen)
             {
