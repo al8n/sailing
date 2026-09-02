@@ -252,6 +252,7 @@ const REQUIRED_ALWAYS: &[&str] = &[
   "engine/batch-metrics-count-every-barrier",
   "engine/boot-epoch-refused-for-an-unhosted-id",
   "engine/boot-epoch-strictly-increases",
+  "engine/boot-epoch-survives-a-removal",
   "engine/durable-index-covers-a-released-append",
   "engine/durable-snapshot-advances-at-the-barrier",
   "engine/durable-snapshot-is-never-the-visible-slot",
@@ -1113,6 +1114,29 @@ where
     "engine/boot-epoch-refused-for-an-unhosted-id",
     engine.next_boot_epoch(&subject.group(99)).is_none(),
     "an unhosted group has no boot-epoch counter to advance",
+  );
+
+  // THE COUNTER OUTLIVES THE GROUP IT COUNTS FOR. An id removed and re-created is a NEW
+  // incarnation and must be handed an epoch strictly above every epoch the earlier ones took: a
+  // counter that restarted would give two incarnations the same `(group, epoch)` identity, and
+  // every gen-keyed observer — a completion, an `OpId`, the restore seam — folds them onto one.
+  // That is the precise collision the epoch exists to prevent, so an engine that keeps the counter
+  // inside the storage a removal drops has discarded its own fence. Hosting still gates the ANSWER
+  // (there is no incarnation to hand an epoch to), which is the second half asserted here: a
+  // counter that survives must not make an unhosted id answerable.
+  let issued_before = epochs.iter().flatten().copied().max().unwrap_or(0);
+  engine.remove_group(&d);
+  let while_gone = engine.next_boot_epoch(&d);
+  engine.add_group(d.clone());
+  let after_re_creation = engine.next_boot_epoch(&d);
+  report.require(
+    "engine/boot-epoch-survives-a-removal",
+    while_gone.is_none() && after_re_creation.is_some_and(|epoch| epoch > issued_before),
+    format!(
+      "after issuing up to epoch {issued_before} and then removing and re-creating the id, the \
+       next epoch must be strictly above {issued_before} — it answered {after_re_creation:?}, and \
+       the removed id answered {while_gone:?} while it was gone"
+    ),
   );
 
   // THE STAGING CAP IS A PROMISE ABOUT ALLOCATION. An engine that accepts the call and ignores it

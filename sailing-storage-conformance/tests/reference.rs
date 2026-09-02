@@ -129,6 +129,7 @@ fn the_in_memory_reference_engine_conforms() {
     "engine/removal-ceiling-folds-a-shape-entry",
     "engine/removal-ceiling-retracts-a-truncated-shape-entry",
     "engine/removal-ceiling-caps-on-an-invalid-shape-entry",
+    "engine/boot-epoch-survives-a-removal",
   ] {
     assert!(
       report.passed_check(check),
@@ -191,6 +192,7 @@ fn the_journalling_reference_engine_conforms() {
     "engine/removal-ceiling-folds-a-shape-entry",
     "engine/removal-ceiling-retracts-a-truncated-shape-entry",
     "engine/removal-ceiling-caps-on-an-invalid-shape-entry",
+    "engine/boot-epoch-survives-a-removal",
     "restore/an-unrecoverable-incarnation-refuses-typed",
     "completion/loss-heals-through-the-log-probe",
     "completion/loss-heals-through-the-hard-state-probe",

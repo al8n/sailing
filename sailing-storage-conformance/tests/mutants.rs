@@ -2942,3 +2942,22 @@ fn mutant_folding_a_reserved_shape_entry_fails_the_cap_check() {
     report.violations()
   );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Mutant: the boot-epoch counter is reset by a removal.
+// ---------------------------------------------------------------------------------------------
+
+/// A counter stored inside the storage a removal drops, so a re-created id starts over at epoch 1 —
+/// the shape the in-tree reference engine itself had. Two incarnations of one id then share a
+/// `(group, epoch)` identity, and every gen-keyed observer folds them onto each other: a stale
+/// completion is accepted as the live incarnation's, and the restore seam's whole ordering promise
+/// is void. Nothing else about the engine is wrong, so only the check that asks may catch it.
+#[test]
+fn mutant_resetting_the_boot_epoch_on_removal_fails_the_survival_check() {
+  let report = check::engine(&mut JournalEngineSubject::resetting_epochs_on_removal());
+  assert!(
+    report.failed("engine/boot-epoch-survives-a-removal"),
+    "a counter a removal resets must be caught BY NAME; the report was {:?}",
+    report.violations()
+  );
+}

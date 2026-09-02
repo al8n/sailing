@@ -240,6 +240,11 @@ pub struct JournalDefects {
   /// the cluster-wide verdict that the lineage was absorbed away, which clears a live thaw
   /// obligation on every replica.
   pub unchecked_reserved_shape_entry: bool,
+  /// Drop a group's boot-epoch counter along with its storage. Deliberately WRONG: the counter is
+  /// the only thing keeping a re-created id's incarnations apart, so resetting it hands the new one
+  /// an epoch an earlier one already used and every gen-keyed observer folds the two onto a single
+  /// `(group, epoch)` identity — the exact collision the epoch exists to prevent.
+  pub reset_epoch_on_removal: bool,
   /// Fold the removal ceiling by SATURATING at the reserved terminal instead of respecting the
   /// working bound: an engine that reserves one value rather than two believes the highest working
   /// generation is `MERGED_FLOOR - 1`, so a fence at the real top rounds up to the sentinel.
@@ -1372,6 +1377,10 @@ impl<D: Device> JournalEngine<D> {
     let Some(cell) = self.groups.remove(gid) else {
       return false;
     };
+    if self.sink.borrow().defects.reset_epoch_on_removal {
+      // THE MUTATION: the counter goes with the storage, so a re-created id starts over.
+      self.boot_epochs.remove(gid);
+    }
     // The ceiling the departing stores held is INHERITED by the record: a fence exists to outlive
     // the group it fences, and staging it (rather than folding it straight in) keeps it visible to
     // `has_staged`, so a barrier is still owed for it.
@@ -2095,6 +2104,16 @@ impl JournalEngineSubject {
   pub fn folding_a_reserved_shape_entry() -> Self {
     Self::with_defects(JournalDefects {
       unchecked_reserved_shape_entry: true,
+      ..JournalDefects::default()
+    })
+  }
+
+  /// A subject that drops a group's boot-epoch counter when the group is removed, so a re-created
+  /// id reissues epochs its earlier incarnations already took.
+  #[must_use]
+  pub fn resetting_epochs_on_removal() -> Self {
+    Self::with_defects(JournalDefects {
+      reset_epoch_on_removal: true,
       ..JournalDefects::default()
     })
   }
