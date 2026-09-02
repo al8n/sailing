@@ -7743,42 +7743,84 @@ fn teardown_refuses_a_frozen_source_and_a_parked_target() {
 
 /// The ONE deliberate teardown ESCAPE: an OWED source — a frozen source a hosted target already owes
 /// a thaw — is removable, because the removal PURGE binds every holder's obligation to the departing
-/// incarnation (and the driver floors the id — the catalog recovery for a genuinely-dead frozen
-/// participant). Group 1 freezes into 2 and 2 ABORTS, recording `abandoned[1]` while 1 stays frozen.
-/// `remove_group(&1)` ADMITS despite the active freeze — leg 2 steps aside for exactly this — and the
-/// purge clears 2's now-danging obligation so no stale record can ever back a recreate's thaw.
+/// incarnation and the driver FLOORS the id (the catalog recovery for a genuinely-dead frozen
+/// participant). Source 2 freezes into target 1 and 1 ABORTS, recording `abandoned[2]` while 2 stays
+/// frozen. `remove_group(&2)` ADMITS despite the active freeze — leg 2 steps aside for exactly this —
+/// and the purge clears 1's now-dangling obligation so no stale record can ever back a recreate's
+/// thaw.
+///
+/// THE FLOOR is the escape's other half, so it runs here on the engine the drivers actually read: an
+/// owed frozen source ALWAYS carries a nonzero removal ceiling, which is what forbids the drivers'
+/// `if floor > 0` guard from skipping an escaped removal and leaving the departed incarnation
+/// re-admittable at the very generation the purged obligation named. The ceiling stands on the LOG
+/// alone in the mirror-lost crash window: the applied `PrepareMerge` names the generation the freeze
+/// minted, and a frozen source can never capture, so nothing compacts that entry away.
 #[test]
 fn teardown_admits_an_owed_frozen_source_and_purges_the_obligation() {
-  let (mut m, mut stores) = merge_host_triple(3, 2, 4);
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
   let now = Instant::ORIGIN;
-  let k = freeze_and_park(&mut m, &mut stores);
-  // 2 aborts the merge and APPLIES it: 2 now owes 1 a thaw, and 1 is STILL a frozen source.
+  engine_group(&mut m, &mut engine, 1, 0, now);
+  engine_group(&mut m, &mut engine, 2, 0, now);
+
+  // 2 freezes into 1, and 1 parks the absorb at k.
+  m.prepare_merge(&2, now, &mut engine, &1).unwrap().unwrap();
+  engine_crank(&mut m, &mut engine, 2, now);
+  assert!(m.group(&2).unwrap().is_frozen());
+  let k = {
+    let (log, stable) = engine.stores(&1).unwrap();
+    m.commit_merge(&1, now, log, stable, &2).unwrap().unwrap()
+  };
+  engine_crank(&mut m, &mut engine, 1, now);
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+
+  // 1 aborts the merge and APPLIES it: 1 now owes 2 a thaw, and 2 is STILL a frozen source.
   {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let (log, stable) = engine.stores(&1).unwrap();
     let a = m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
-    assert_eq!(a, k.next());
-    drain_storage(&mut m, 1, now, log, stable);
+    assert_eq!(a, k.next(), "the abort resolves the parked window");
   }
-  m.service_merge_applies(now, &mut stores);
-  {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
-    drain_storage(&mut m, 1, now, log, stable);
-  }
+  engine_crank(&mut m, &mut engine, 1, now);
+  m.service_merge_applies(now, &mut engine);
+  engine_crank(&mut m, &mut engine, 1, now);
   assert!(
     m.group(&2).unwrap().is_frozen(),
-    "1 is still a frozen source"
+    "2 is still a frozen source"
   );
-  assert!(m.group(&1).unwrap().has_abandoned(), "2 owes 1 the thaw");
+  assert!(m.group(&1).unwrap().has_abandoned(), "1 owes 2 the thaw");
+
+  // THE FLOOR, MIRROR-LOST: no lineage mirror landed for 2, so its ceiling rests entirely on the
+  // `PrepareMerge` still resident in its own log.
+  assert_eq!(
+    engine.group_gen(&2),
+    0,
+    "the source carries no lineage record — the crash window the stores leg exists for"
+  );
+  assert!(
+    engine.removal_floor(&2) > 0,
+    "an owed frozen source fences off its own log alone — the drivers' `if floor > 0` guard must \
+     never skip flooring an escaped removal"
+  );
+
+  // THE FLOOR, MIRRORED: the drivers' event fold lands the freeze's generation in the record, which
+  // joins the same ceiling rather than replacing it.
+  fold_lineage_events(&mut m, &mut engine);
+  assert!(engine.group_gen(&2) > 0, "the fold mirrored the freeze");
+  assert!(
+    engine.removal_floor(&2) > m.group(&2).unwrap().shape_gen(),
+    "the floor sits one past the incarnation's ceiling, so the generation the purged obligation \
+     named can never be re-admitted"
+  );
 
   // THE ESCAPE: removing the OWED source ADMITS even though it is frozen (leg 2 suppressed).
   assert!(
-    m.remove_group(&2, &mut stores).unwrap().is_some(),
+    m.remove_group(&2, &mut engine).unwrap().is_some(),
     "an owed frozen source is the designed catalog escape — the removal admits"
   );
   // The removal purge discharged the obligation the departed source can no longer thaw.
   assert!(
     !m.group(&1).unwrap().has_abandoned(),
-    "the R2 purge cleared 2's obligation for the departed incarnation"
+    "the purge cleared the holder's obligation for the departed incarnation"
   );
 }
 
