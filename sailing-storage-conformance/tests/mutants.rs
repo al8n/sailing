@@ -2887,3 +2887,77 @@ fn mutant_corrupting_the_blob_at_the_barrier_fails_by_name() {
     report.violations()
   );
 }
+
+// ---------------------------------------------------------------------------------------------
+// Mutant: the removal ceiling omits its log leg.
+// ---------------------------------------------------------------------------------------------
+
+/// A removal ceiling folded from the lineage record and the snapshot meta alone — the shape this
+/// kit's own durable reference had while reading a lineage move out of an entry needed a codec
+/// `sailing-proto` kept to itself. It under-fences in a window that is not exotic: a move is in the
+/// log the instant it is appended and reaches the record only at apply, so a removal in between
+/// writes a floor BELOW the generation the move already named, and the incarnation the removal
+/// meant to bury is re-admitted by the very fence meant to stop it. Everything else about the
+/// engine is conforming, so only the leg's own check may catch it.
+#[test]
+fn mutant_omitting_the_shape_entry_leg_fails_the_log_legs_check() {
+  let report = check::engine(&mut JournalEngineSubject::omitting_the_shape_entry_leg());
+  assert!(
+    report.failed("engine/removal-ceiling-folds-a-shape-entry"),
+    "an engine that never folds its log leg must be caught BY NAME; the report was {:?}",
+    report.violations()
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mutant: an invalid shape entry reaches the removal ceiling as a number.
+// ---------------------------------------------------------------------------------------------
+
+/// A removal ceiling that reads a shape entry whose payload will not decode as an id that never
+/// reshaped. The window is the whole point: the removal reads the log BEFORE the apply path could
+/// refuse the entry, so nothing challenges the zero and the fence lands below whatever real move
+/// the same log carries — on a log already corrupt enough that someone is removing the group.
+#[test]
+fn mutant_folding_an_undecodable_shape_entry_fails_the_cap_check() {
+  let report = check::engine(&mut JournalEngineSubject::folding_an_undecodable_shape_entry());
+  assert!(
+    report.failed("engine/removal-ceiling-caps-on-an-invalid-shape-entry"),
+    "an engine that reads a corrupt shape entry as generation 0 must be caught BY NAME; the \
+     report was {:?}",
+    report.violations()
+  );
+}
+
+/// The same window, one value higher: an engine that decodes the payload and folds its generation
+/// with no reserved-band check. The band starts one below `MERGED_FLOOR`, so the ceiling's `+ 1`
+/// lands exactly on the terminal — a LOCAL removal forging the cluster-wide verdict that the
+/// lineage was absorbed away, which discharges a live thaw obligation on every replica.
+#[test]
+fn mutant_folding_a_reserved_shape_entry_fails_the_cap_check() {
+  let report = check::engine(&mut JournalEngineSubject::folding_a_reserved_shape_entry());
+  assert!(
+    report.failed("engine/removal-ceiling-caps-on-an-invalid-shape-entry"),
+    "an engine that folds a reserved generation out of a shape entry must be caught BY NAME; the \
+     report was {:?}",
+    report.violations()
+  );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mutant: the boot-epoch counter is reset by a removal.
+// ---------------------------------------------------------------------------------------------
+
+/// A counter stored inside the storage a removal drops, so a re-created id starts over at epoch 1 —
+/// the shape the in-tree reference engine itself had. Two incarnations of one id then share a
+/// `(group, epoch)` identity, and every gen-keyed observer folds them onto each other: a stale
+/// completion is accepted as the live incarnation's, and the restore seam's whole ordering promise
+/// is void. Nothing else about the engine is wrong, so only the check that asks may catch it.
+#[test]
+fn mutant_resetting_the_boot_epoch_on_removal_fails_the_survival_check() {
+  let report = check::engine(&mut JournalEngineSubject::resetting_epochs_on_removal());
+  assert!(
+    report.failed("engine/boot-epoch-survives-a-removal"),
+    "a counter a removal resets must be caught BY NAME; the report was {:?}",
+    report.violations()
+  );
+}

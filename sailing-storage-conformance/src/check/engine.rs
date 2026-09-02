@@ -2,7 +2,7 @@
 //! records, and what a crash leaves behind.
 
 use super::{Durability, EngineSubject, Report};
-use crate::fault::CrashClass;
+use crate::fault::{CrashClass, InvalidShapeEntry};
 use bytes::Bytes;
 use core::time::Duration;
 use sailing_proto::{
@@ -252,6 +252,7 @@ const REQUIRED_ALWAYS: &[&str] = &[
   "engine/batch-metrics-count-every-barrier",
   "engine/boot-epoch-refused-for-an-unhosted-id",
   "engine/boot-epoch-strictly-increases",
+  "engine/boot-epoch-survives-a-removal",
   "engine/durable-index-covers-a-released-append",
   "engine/durable-snapshot-advances-at-the-barrier",
   "engine/durable-snapshot-is-never-the-visible-slot",
@@ -269,6 +270,7 @@ const REQUIRED_ALWAYS: &[&str] = &[
   "engine/poll-no-spurious-error",
   "engine/re-admission-does-not-clear-the-fence",
   "engine/re-admission-lends-empty-stores",
+  "engine/removal-ceiling-caps-on-an-invalid-shape-entry",
   "engine/removal-ceiling-folds-a-shape-entry",
   "engine/removal-ceiling-folds-the-snapshot-meta",
   "engine/removal-ceiling-is-zero-for-an-unreshaped-id",
@@ -311,6 +313,17 @@ const SKIPPABLE_VOLATILE: &[&str] = &["engine/reopen-manufactures-no-completions
 /// Checks a subject may legitimately leave unasked, each for a reason the report states: the
 /// optional durable probes, the legs an at-submit engine answers before the question is posed, and
 /// the torn-tail legs a subject that will not name its medium's boundaries cannot settle.
+///
+/// The SHAPE-ENTRY legs are deliberately NOT here. Two of them were, while reading a lineage move
+/// out of an entry needed a codec `sailing-proto` kept to itself and no subject could mint one to
+/// be asked with — a leg no implementation could answer is a leg no manifest should demand. That is
+/// no longer true: [`shape_entry_move`](sailing_proto::shape_entry_move) is public, every engine
+/// owes the leg, and this kit hands every subject a minter
+/// ([`mint_shape_entry`](crate::fault::mint_shape_entry)). A subject that declines now declines a
+/// question it can answer, and the report says so instead of allowing it. The invalid-entry leg
+/// never had a claim on the list at all: [`mint_invalid_shape_entry`](crate::fault::mint_invalid_shape_entry)
+/// is central rather than a subject hook, so no subject has to be able to mint anything for it to
+/// be asked.
 const SKIPPABLE: &[&str] = &[
   "engine/an-append-acknowledged-before-a-barrier-survives",
   "engine/barrier-is-all-or-nothing-across-a-crash",
@@ -320,8 +333,6 @@ const SKIPPABLE: &[&str] = &[
   "engine/durable-snapshot-is-never-the-visible-slot",
   "engine/exactly-the-maximal-valid-prefix-survives",
   "engine/hard-state-is-last-durable",
-  "engine/removal-ceiling-folds-a-shape-entry",
-  "engine/removal-ceiling-retracts-a-truncated-shape-entry",
   "engine/reopened-durable-hard-state-agrees",
   "engine/reopened-durable-index-never-over-answers",
 ];
@@ -824,6 +835,77 @@ where
     }
   }
 
+  // THE APPEND-BEFORE-APPLY WINDOW, with an entry NO REPLICA CAN APPLY in it. The valid half above
+  // asks the ceiling before any barrier; this asks it before any barrier with a shape entry the
+  // apply path will refuse — which is the only moment such an entry is ever seen, since the apply
+  // path poisons on it the instant it is reached. No subject seam here: an invalid shape entry is
+  // invalid for every engine, so the kit mints it centrally and every subject owes the answer.
+  //
+  // The answer is the release cap, whatever the other legs say. It is NOT the value a fold of this
+  // entry would produce — reading a corrupt payload as generation 0 falls back to the slot below,
+  // and folding the reserved generation it names carries the `+ 1` onto `MERGED_FLOOR` — and both
+  // of those are the failure: one under-fences an incarnation the removal is burying, the other
+  // forges a cluster-wide verdict that the lineage was absorbed away.
+  for (n, form) in [
+    InvalidShapeEntry::EmptyChildId,
+    InvalidShapeEntry::TruncatedEncoding,
+    InvalidShapeEntry::ReservedOwnGeneration,
+    InvalidShapeEntry::ReservedChildGeneration,
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    // Op ids and terms of this leg's own, clear of every fixture above: each round appends the
+    // invalid entry at the log's tip and then truncates it away with a higher-term conflict, so the
+    // next round starts from the same state this one found.
+    let op = 20 + 2 * n as u64;
+    let term = 3 + op;
+    let invalid = crate::fault::mint_invalid_shape_entry(form, Term::new(term), Index::new(5));
+    {
+      let (log, _) = engine.stores(&a).expect("group a is hosted");
+      log.submit_append(OpId::new(op), core::slice::from_ref(&invalid));
+    }
+    let capped = engine.removal_floor(&a);
+    {
+      let (log, _) = engine.stores(&a).expect("group a is hosted");
+      log.submit_append(OpId::new(op + 1), &run(term + 1, 5, 5));
+    }
+    let after_truncation = engine.removal_floor(&a);
+    engine.flush();
+    {
+      let (log, _) = engine.stores(&a).expect("group a is hosted");
+      drain_log(log, report);
+    }
+    report.require(
+      "engine/removal-ceiling-caps-on-an-invalid-shape-entry",
+      capped == HIGHEST_WORKING_GENERATION
+        && capped != MERGED_FLOOR
+        && capped != TOP_WORKING_GENERATION - 9,
+      format!(
+        "a resident {form:?} shape entry is one no conforming replica will ever apply, and this \
+         removal reads the log BEFORE anything has refused it. The fence must be \
+         {HIGHEST_WORKING_GENERATION} — admitting no working generation, and not the reserved \
+         terminal {MERGED_FLOOR} — and it answered {capped}. {} is what folding the entry as a \
+         zero contribution leaves (the snapshot slot alone), which fences below a move the log may \
+         already carry; {MERGED_FLOOR} is what folding the reserved generation it names produces, \
+         a global verdict a local removal has no standing to write",
+        TOP_WORKING_GENERATION - 9
+      ),
+    );
+    report.require(
+      "engine/removal-ceiling-caps-on-an-invalid-shape-entry",
+      after_truncation == TOP_WORKING_GENERATION - 9,
+      format!(
+        "a {form:?} shape entry truncated away never survived, so the cap must lift with it and \
+         the ceiling fall back to what the snapshot slot claims — generation {}, so a ceiling of \
+         {}. It answered {after_truncation}. A latch that outlives the entry retires an id every \
+         later removal touches",
+        TOP_WORKING_GENERATION - 10,
+        TOP_WORKING_GENERATION - 9
+      ),
+    );
+  }
+
   // THE TOP OF THE WORKING RANGE, on an id of its own so the fixture chain above is untouched.
   // Every ceiling leg above is exact but none of them is near the boundary, and the boundary is
   // where the fold's arithmetic stops being free: a fence at the highest generation an id can hold
@@ -1032,6 +1114,29 @@ where
     "engine/boot-epoch-refused-for-an-unhosted-id",
     engine.next_boot_epoch(&subject.group(99)).is_none(),
     "an unhosted group has no boot-epoch counter to advance",
+  );
+
+  // THE COUNTER OUTLIVES THE GROUP IT COUNTS FOR. An id removed and re-created is a NEW
+  // incarnation and must be handed an epoch strictly above every epoch the earlier ones took: a
+  // counter that restarted would give two incarnations the same `(group, epoch)` identity, and
+  // every gen-keyed observer — a completion, an `OpId`, the restore seam — folds them onto one.
+  // That is the precise collision the epoch exists to prevent, so an engine that keeps the counter
+  // inside the storage a removal drops has discarded its own fence. Hosting still gates the ANSWER
+  // (there is no incarnation to hand an epoch to), which is the second half asserted here: a
+  // counter that survives must not make an unhosted id answerable.
+  let issued_before = epochs.iter().flatten().copied().max().unwrap_or(0);
+  engine.remove_group(&d);
+  let while_gone = engine.next_boot_epoch(&d);
+  engine.add_group(d.clone());
+  let after_re_creation = engine.next_boot_epoch(&d);
+  report.require(
+    "engine/boot-epoch-survives-a-removal",
+    while_gone.is_none() && after_re_creation.is_some_and(|epoch| epoch > issued_before),
+    format!(
+      "after issuing up to epoch {issued_before} and then removing and re-creating the id, the \
+       next epoch must be strictly above {issued_before} — it answered {after_re_creation:?}, and \
+       the removed id answered {while_gone:?} while it was gone"
+    ),
   );
 
   // THE STAGING CAP IS A PROMISE ABOUT ALLOCATION. An engine that accepts the call and ignores it

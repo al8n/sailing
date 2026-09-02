@@ -222,6 +222,29 @@ pub struct JournalDefects {
   /// forged global verdict — and every other generation the suite uses is far from the band, so
   /// nothing else notices.
   pub uncapped_reserved_ceiling: bool,
+  /// Fold the removal ceiling from the lineage record and the snapshot meta ALONE, omitting the
+  /// log leg. Deliberately WRONG, and the shape this reference itself had before the leg was
+  /// reachable: a lineage move is in the log from the moment it is appended while the record moves
+  /// only at apply, so a removal landing in that window fences BELOW the generation the move
+  /// already named — and the incarnation the removal meant to bury is re-admitted.
+  pub no_shape_entry_leg: bool,
+  /// Fold a shape entry whose payload will not DECODE as a zero contribution, instead of capping
+  /// the ceiling on it. Deliberately WRONG, and the shape the seam itself had while it answered a
+  /// bare `u64`: the removal reads this leg BEFORE the apply path's poison could refuse the entry,
+  /// so a corrupt payload read as "this id never reshaped" fences below whatever real move the log
+  /// also carries — and it is a corrupt log the operator is most likely removing.
+  pub undecodable_shape_entry_is_zero: bool,
+  /// Fold a shape entry's generation with NO reserved-band check, as an engine that decodes the
+  /// payload and trusts it does. Deliberately WRONG: the band starts one below the terminal
+  /// `MERGED_FLOOR`, so the ceiling's `+ 1` lands exactly on the sentinel — a LOCAL removal forging
+  /// the cluster-wide verdict that the lineage was absorbed away, which clears a live thaw
+  /// obligation on every replica.
+  pub unchecked_reserved_shape_entry: bool,
+  /// Drop a group's boot-epoch counter along with its storage. Deliberately WRONG: the counter is
+  /// the only thing keeping a re-created id's incarnations apart, so resetting it hands the new one
+  /// an epoch an earlier one already used and every gen-keyed observer folds the two onto a single
+  /// `(group, epoch)` identity — the exact collision the epoch exists to prevent.
+  pub reset_epoch_on_removal: bool,
   /// Fold the removal ceiling by SATURATING at the reserved terminal instead of respecting the
   /// working bound: an engine that reserves one value rather than two believes the highest working
   /// generation is `MERGED_FLOOR - 1`, so a fence at the real top rounds up to the sentinel.
@@ -1354,6 +1377,10 @@ impl<D: Device> JournalEngine<D> {
     let Some(cell) = self.groups.remove(gid) else {
       return false;
     };
+    if self.sink.borrow().defects.reset_epoch_on_removal {
+      // THE MUTATION: the counter goes with the storage, so a re-created id starts over.
+      self.boot_epochs.remove(gid);
+    }
     // The ceiling the departing stores held is INHERITED by the record: a fence exists to outlive
     // the group it fences, and staging it (rather than folding it straight in) keeps it visible to
     // `has_staged`, so a barrier is still owed for it.
@@ -1591,10 +1618,50 @@ impl<D: Device + core::fmt::Debug> MultiEngine<u64, u64> for JournalEngine<D> {
         .max(self.lineage_staged.get(gid).map_or(0, |r| r.ceiling)),
     );
     if let Some(cell) = self.groups.get(gid) {
-      // The SHAPE-ENTRY leg is missing here and cannot be supplied: decoding a lineage move out of
-      // an entry's payload needs a codec sailing-proto keeps to itself, so an out-of-tree engine
-      // has only the record and the snapshot meta to fold. The in-tree engine folds all three.
       ceiling = ceiling.max(cell.stable.meta_ceiling());
+      // THE SHAPE-ENTRY LEG, over the entries that SURVIVE — a truncation or a compaction takes a
+      // move's contribution with it, exactly as a scan of the remaining log would find. The record
+      // leg cannot stand in for it: an appended move is in the log immediately and reaches the
+      // record only at apply, so a removal in that window would fence below what was already
+      // named. `shape_entry_move` is the seam that makes this computable outside sailing-proto at
+      // all. A read-time scan needs no latch: "a fault stands" is just "a surviving entry is one",
+      // and the scan sees the survivors by construction.
+      if !self.sink.borrow().defects.no_shape_entry_leg {
+        let zero_for_undecodable = self.sink.borrow().defects.undecodable_shape_entry_is_zero;
+        let fold_reserved = self.sink.borrow().defects.unchecked_reserved_shape_entry;
+        let mut leg = 0u64;
+        let mut faulted = false;
+        for entry in cell.log.inner.view() {
+          match sailing_proto::shape_entry_move(entry) {
+            sailing_proto::ShapeMove::Valid(generation) => leg = leg.max(generation),
+            // THE MUTATION: a payload that will not decode read as an id that never reshaped.
+            sailing_proto::ShapeMove::Invalid(sailing_proto::ShapeFault::Decode)
+              if zero_for_undecodable => {}
+            // THE MUTATION: the reserved band folded as though it were a working generation. The
+            // seam names no generation for a refused entry, so the band's floor stands in for the
+            // one the payload carries. That is EXACT for an entry whose own move is reserved, and
+            // an OVER-APPROXIMATION for one whose reserved field is the child's — an engine that
+            // decoded and skipped the band check would fold the working parent move there and
+            // answer an ordinary-looking fence. The check grades both, because either answer
+            // differs from the cap: this one forges the terminal, that one under-fences.
+            sailing_proto::ShapeMove::Invalid(sailing_proto::ShapeFault::ReservedGeneration)
+              if fold_reserved =>
+            {
+              leg = leg.max(sailing_proto::HIGHEST_WORKING_GENERATION);
+            }
+            sailing_proto::ShapeMove::Invalid(_) => faulted = true,
+            // NotShape, and whatever a later version adds: no contribution, no fault.
+            _ => {}
+          }
+        }
+        // An entry the apply path will refuse is still in this log, and nothing has refused it yet.
+        // The cap is the answer: it admits no working generation and it is not the terminal, so the
+        // removal can neither under-fence the incarnation it buries nor forge a global verdict.
+        if faulted {
+          return sailing_proto::HIGHEST_WORKING_GENERATION;
+        }
+        ceiling = ceiling.max(leg);
+      }
     }
     if ceiling == 0 {
       0
@@ -2009,6 +2076,48 @@ impl JournalEngineSubject {
     })
   }
 
+  /// A subject whose removal ceiling folds only its lineage record and its snapshot meta, never
+  /// the shape entries in its log — the shape this reference itself had while the log leg was
+  /// uncomputable from outside sailing-proto.
+  #[must_use]
+  pub fn omitting_the_shape_entry_leg() -> Self {
+    Self::with_defects(JournalDefects {
+      no_shape_entry_leg: true,
+      ..JournalDefects::default()
+    })
+  }
+
+  /// A subject that reads a shape entry whose payload will not decode as a zero contribution —
+  /// the answer the leg's seam used to give — instead of capping its removal ceiling on it.
+  #[must_use]
+  pub fn folding_an_undecodable_shape_entry() -> Self {
+    Self::with_defects(JournalDefects {
+      undecodable_shape_entry_is_zero: true,
+      ..JournalDefects::default()
+    })
+  }
+
+  /// A subject that folds a shape entry's generation into its removal ceiling with no
+  /// reserved-band check, so an entry no replica will ever apply carries the ceiling's `+ 1` onto
+  /// the terminal floor.
+  #[must_use]
+  pub fn folding_a_reserved_shape_entry() -> Self {
+    Self::with_defects(JournalDefects {
+      unchecked_reserved_shape_entry: true,
+      ..JournalDefects::default()
+    })
+  }
+
+  /// A subject that drops a group's boot-epoch counter when the group is removed, so a re-created
+  /// id reissues epochs its earlier incarnations already took.
+  #[must_use]
+  pub fn resetting_epochs_on_removal() -> Self {
+    Self::with_defects(JournalDefects {
+      reset_epoch_on_removal: true,
+      ..JournalDefects::default()
+    })
+  }
+
   /// A subject whose journal drops entry payloads and snapshot blobs, keeping only their shape.
   #[must_use]
   pub fn losing_payloads() -> Self {
@@ -2135,6 +2244,15 @@ impl crate::check::EngineSubject for JournalEngineSubject {
 
   fn node(&self, n: u64) -> u64 {
     n
+  }
+
+  fn shape_entry(
+    &self,
+    term: sailing_proto::Term,
+    index: sailing_proto::Index,
+    generation: u64,
+  ) -> Option<sailing_proto::Entry> {
+    Some(crate::fault::mint_shape_entry(term, index, generation))
   }
 
   fn tail_len(&self) -> Option<u64> {

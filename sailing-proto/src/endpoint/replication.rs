@@ -1175,12 +1175,13 @@ where
         self.submit_append(log, opid, &entries[i..]);
         appended_opid = Some(opid);
         // The append-observed lease kill (follower-accept site): a PrepareMerge ENTERING the
-        // local log kills lease serving and formation from this moment. A KIND check only —
-        // never a payload decode on the hot path; the apply arm owns decoding.
+        // local log kills lease serving and formation from this moment, and EVERY PrepareMerge of
+        // the appended suffix joins the freeze queue in order — the claim gate reads the queued
+        // entries, and the fold of an earlier one relies on the later ones being queued. A KIND
+        // check only — never a payload decode on the hot path; the apply arm owns decoding.
         for e in &entries[i..] {
           if e.kind() == crate::EntryKind::PrepareMerge {
             self.note_freeze_appended(e.index());
-            break;
           }
         }
         // Apply-time membership (etcd, spec §9): a follower does NOT fold appended ConfChanges into

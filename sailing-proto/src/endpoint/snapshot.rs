@@ -1411,17 +1411,6 @@ where
         None => return false,
       };
     }
-    let freeze_pending = match Self::scan_freeze_pending_read(log, boundary) {
-      Ok(fp) => fp,
-      // Benign transient unreadiness: defer byte-unchanged, the cure re-sends on cooldown.
-      Err(crate::endpoint::merge::ScanInterrupt::Retry) => return false,
-      // A genuine store fault in the kept suffix: the parked drain can never reach it to raise
-      // it, so poisoning HERE is the only surfacing this replica gets.
-      Err(crate::endpoint::merge::ScanInterrupt::Fault) => {
-        self.poison(PoisonReason::LogRead);
-        return false;
-      }
-    };
     let snap = match <F::Snapshot as Data>::decode_exact(data) {
       Ok(s) => s,
       Err(_) => {
@@ -1479,15 +1468,19 @@ where
     // direction: a same-group sender is capture-fenced for its freeze's whole life, so a blob
     // at this boundary PROVES the group was thawed at-or-before it — a quartet still set here
     // reflects a thaw sitting unapplied in the skipped range. Leaving it set would strand this
-    // replica frozen forever with its captures fenced. `freeze_pending` then re-derives against
-    // the KEPT tail (the restore path's blanket clear rests on a discard that did not happen
-    // here — a PrepareMerge above the boundary still exists and its append-observed kill is
-    // legitimately armed).
+    // replica frozen forever with its captures fenced. The freeze queue keeps exactly its own
+    // entries above the boundary — the log is KEPT and the queue is exact, so nothing is scanned
+    // (the restore path's blanket clear rests on a discard that did not happen here — a
+    // PrepareMerge above the boundary still exists and its append-observed kill is legitimately
+    // armed). A scan here restarted from the boundary after every cold page, and against a
+    // one-page cache the adopt never completed; its read verdicts survive with it, since the
+    // entries they describe do.
     self.merge.frozen = false;
     self.merge.freeze_index = None;
     self.merge.freeze_term = None;
     self.merge.frozen_for = None;
-    self.merge.freeze_pending = freeze_pending;
+    self.merge.freeze_queue.retain(|i| *i > boundary);
+    self.merge.claim_cache.retain(|i, _| *i > boundary);
     // Obligations at-or-below the boundary clear on the same boundary-proof the restore path
     // uses — and the restart agrees by construction (a crash before the commit persist lands
     // re-parks and re-derives them; nothing was acked). The retain clause is vacuous here:

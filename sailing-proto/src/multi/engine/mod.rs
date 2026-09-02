@@ -102,30 +102,115 @@ impl LineageRecord {
   }
 }
 
-/// The lineage generation `entry` names for its OWN group, or `0` for an entry that mints none.
-/// Every lineage move rides its group's own log as one of these four shape kinds — which is what
-/// lets [`GroupEngine::removal_floor`] fold its ceiling as entries are staged instead of scanning
-/// the log when a removal asks.
-fn shape_entry_gen(entry: &Entry) -> u64 {
-  match entry.kind() {
-    crate::EntryKind::Split => {
-      crate::wire::decode_split_payload(entry.data_bytes()).map_or(0, |p| p.parent_gen_after())
+/// What [`shape_entry_move`] found in an entry: no lineage move at all, this group's move, or an
+/// entry the apply path will refuse.
+///
+/// THREE-WAY DELIBERATELY. A missing move and a move that cannot be trusted are different facts
+/// about the log, and collapsing them onto one `0` was the whole defect: an engine folding the
+/// collapsed answer reads a corrupt shape entry as an id that never reshaped and fences below the
+/// generation the log already carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShapeMove {
+  /// Not one of the four shape kinds — it contributes nothing, and it is never a fault.
+  NotShape,
+  /// A well-formed shape entry naming only working generations; the value is the generation it
+  /// names for THIS group.
+  Valid(u64),
+  /// A shape entry the apply path will refuse. It names NO generation here — never a zero
+  /// contribution, and never a generation read out of a payload nobody can trust.
+  Invalid(ShapeFault),
+}
+
+/// Why [`shape_entry_move`] refused a shape entry — the two ways an entry of a shape kind fails
+/// the apply path's own admission, in the window before the apply path runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ShapeFault {
+  /// The payload did not decode as its kind's shape payload.
+  Decode,
+  /// A generation the payload names lies in the RESERVED band
+  /// ([`HIGHEST_WORKING_GENERATION`](crate::HIGHEST_WORKING_GENERATION) and above) — including a
+  /// field belonging to the OTHER participant, which the apply path validates too.
+  ReservedGeneration,
+}
+
+/// The lineage move `entry` carries for its OWN group. Every lineage move rides its group's own log
+/// as one of four shape kinds — which is what lets [`GroupEngine::removal_floor`] fold its ceiling
+/// as entries are staged instead of scanning the log when a removal asks.
+///
+/// THE LOG LEG OF THE REMOVAL CEILING, and every [`MultiEngine`] implementor owes it — which is
+/// why it is public rather than an in-tree convenience. A lineage move is in the LOG from the
+/// moment it is appended, while the engine's lineage record moves only when that entry APPLIES; a
+/// removal landing in that window sees a record that has not caught up yet. An engine that folds
+/// only its record and its snapshot meta therefore under-fences exactly there, and
+/// [`removal_floor`](GroupEngine::removal_floor) may not round in either direction: too low
+/// re-admits the incarnation the removal was meant to fence, too high forges a fence over
+/// generations that were never minted. Fold this over the entries as they are appended, and retract
+/// it wherever the log discards them (a conflict truncation) — the surviving shape entries are the
+/// leg, never the whole log.
+///
+/// Decoding the payload is the reason an out-of-tree engine cannot compute this for itself: the
+/// four shape payloads' codecs are the crate's own.
+///
+/// # An invalid shape entry is a FAULT, not a zero
+///
+/// This leg is read in the append-before-apply window, so the apply path's poison has not run yet
+/// and cannot protect it. An entry whose payload will not decode, or which names a generation in
+/// the reserved band, is therefore judged HERE against the same bounds the apply path uses — one
+/// in-crate predicate is the single spelling both read, so they agree by construction rather than
+/// by two copies of one comparison — and the verdict is [`ShapeMove::Invalid`]. It contributes no
+/// generation at all: a fabricated `0` would fence over a move nobody made and drop a fence the
+/// log's own contents demand, while passing a reserved generation through would carry the ceiling's
+/// `+ 1` onto the terminal [`MERGED_FLOOR`](crate::MERGED_FLOOR) and forge a global verdict.
+///
+/// An engine that holds such an entry answers [`removal_floor`](GroupEngine::removal_floor) with
+/// the release cap [`HIGHEST_WORKING_GENERATION`](crate::HIGHEST_WORKING_GENERATION) for as long as
+/// it survives in the log — a fence that admits no working generation and is not the terminal —
+/// rather than deriving a number from it. The fault clears only when the entry leaves the surviving
+/// log; the apply path never clears it, because that dependency is exactly the window.
+#[must_use]
+pub fn shape_entry_move(entry: &Entry) -> ShapeMove {
+  /// One decoded payload's verdict: `named` is the FULL set of generations the apply path
+  /// validates for this kind, `own` the single field this group's ceiling may fold.
+  fn judged(own: u64, named: &[u64]) -> ShapeMove {
+    if named
+      .iter()
+      .all(|g| crate::multi::generation_is_working(*g))
+    {
+      ShapeMove::Valid(own)
+    } else {
+      ShapeMove::Invalid(ShapeFault::ReservedGeneration)
     }
+  }
+
+  let decoded = match entry.kind() {
+    crate::EntryKind::Split => crate::wire::decode_split_payload(entry.data_bytes())
+      .map(|p| judged(p.parent_gen_after(), &[p.parent_gen_after(), p.child_gen()])),
     crate::EntryKind::PrepareMerge => crate::wire::decode_prepare_merge_payload(entry.data_bytes())
-      .map_or(0, |p| p.source_gen_after()),
+      .map(|p| judged(p.source_gen_after(), &[p.source_gen_after()])),
     crate::EntryKind::CommitMerge => crate::wire::decode_commit_merge_payload(entry.data_bytes())
-      .map_or(0, |p| p.target_gen_after()),
+      .map(|p| {
+        judged(
+          p.target_gen_after(),
+          &[p.source_gen_after(), p.target_gen_after()],
+        )
+      }),
     crate::EntryKind::RollbackMerge => {
-      crate::wire::decode_rollback_merge_payload(entry.data_bytes()).map_or(0, |p| {
-        if p.is_unfreeze() {
+      crate::wire::decode_rollback_merge_payload(entry.data_bytes()).map(|p| {
+        // The roles split the contribution: an unfreeze rides the SOURCE's log, an abort the
+        // TARGET's. Both name both generations, and the apply path validates both.
+        let own = if p.is_unfreeze() {
           p.source_gen_after()
         } else {
           p.target_gen_after()
-        }
+        };
+        judged(own, &[p.source_gen_after(), p.target_gen_after()])
       })
     }
-    _ => 0,
-  }
+    _ => return ShapeMove::NotShape,
+  };
+  decoded.unwrap_or(ShapeMove::Invalid(ShapeFault::Decode))
 }
 
 /// The multi-group storage surface a multi-Raft host drives: every co-located group's
@@ -248,6 +333,13 @@ where
   /// gen-0 rejoin, and a discarded mint at the highest working generation would carry the
   /// implementation's `+ 1` onto the reserved terminal [`MERGED_FLOOR`](crate::MERGED_FLOOR),
   /// forging a globally terminal verdict the merge service reads as authoritative.
+  ///
+  /// A RESIDENT SHAPE ENTRY THE APPLY PATH WILL REFUSE ([`ShapeMove::Invalid`]) overrides all of
+  /// that: answer [`HIGHEST_WORKING_GENERATION`](crate::HIGHEST_WORKING_GENERATION) — a fence that
+  /// admits no working generation and is never the terminal — for as long as such an entry
+  /// survives in the group's log, whatever the other legs say and including for the id that would
+  /// otherwise answer `0`. This method is read in the append-before-apply window, so the corrupt
+  /// entry has been refused nowhere yet and no number derived from it can be trusted.
   #[must_use]
   fn removal_floor(&self, gid: &G) -> u64;
 }
@@ -612,6 +704,23 @@ where
   /// rather than wrapping past the terminal to `0`.
   #[must_use]
   pub fn removal_floor(&self, gid: &G) -> u64 {
+    // A SHAPE ENTRY THE APPLY PATH WILL REFUSE outranks every leg below, and the `ceiling == 0`
+    // early return with them: this method reads the log in the window BEFORE any apply, so nothing
+    // else has judged that entry yet, and no number derived from it can be trusted in either
+    // direction. Answering the release cap instead is a fence that admits no working generation
+    // and is never the terminal, so the removal proceeds — it can neither under-fence the
+    // incarnation it buries nor forge a global verdict.
+    //
+    // NOT a refusal. A removal is how an operator recovers from exactly this state, and a refusal
+    // keyed on a resident entry would wedge that recovery forever: a COMMITTED corrupt shape entry
+    // never leaves the log, and a lingering uncommitted one on a leaderless group never does
+    // either. The cost of proceeding — this host retiring the id when a removal races an
+    // uncommitted corrupt entry — is the conservative outcome for a log already known to be sick.
+    if let Some(storage) = self.groups.get(gid)
+      && storage.log.shape_faulted()
+    {
+      return crate::HIGHEST_WORKING_GENERATION;
+    }
     // Staged ⊔ durable, the read every other lineage leg uses: a ceiling written this crank fences
     // before its barrier lands, which is safe because the record is monotone — early visibility
     // can only refuse what durability would refuse too.
@@ -645,9 +754,10 @@ where
       // ceiling the cap is the identity. On an impossible one it yields a fence that still admits
       // NOTHING — `floor_admits` requires a generation strictly below
       // `HIGHEST_WORKING_GENERATION`, so a floor at it refuses every working generation — while
-      // never being the terminal. That is deliberately not "an answer chosen for corrupt input":
-      // the corrupt input is refused at the doors that own it, and this only bounds the output so
-      // no path can forge a global verdict.
+      // never being the terminal. That cap IS the answer this method gives for a faulted log leg
+      // (the early return above returns the same value deliberately): the pre-apply removal path
+      // meets corrupt input before any door has refused it, so bounding the output here is not
+      // merely belt-and-braces over the record legs.
       ceiling
         .saturating_add(1)
         .min(crate::HIGHEST_WORKING_GENERATION)
@@ -771,6 +881,14 @@ pub struct EngineLog {
   /// RETRACTED wherever the log discards content, so it stays exactly what a scan of the surviving
   /// entries would find. Holds shape entries ONLY — never the ordinary traffic.
   shape_contribs: VecDeque<(Index, u64)>,
+  /// The RESIDENT shape entries the apply path will refuse ([`ShapeMove::Invalid`]), keyed and
+  /// retracted exactly as `shape_contribs` — the same `pop_back` on a conflict truncation, the same
+  /// `pop_front` on a compaction, the same `clear` on a restore. The latch behind
+  /// [`GroupEngine::removal_floor`]'s cap is therefore a PURE FUNCTION of the surviving entries: it
+  /// is set by an entry arriving, and it clears only by that entry leaving the log — never by the
+  /// apply path (the removal reads this leg before any apply runs, which is the whole window) and
+  /// never by time. A reopened engine re-derives it by replaying the same append path.
+  shape_faults: VecDeque<(Index, ShapeFault)>,
 }
 
 impl EngineLog {
@@ -782,6 +900,7 @@ impl EngineLog {
       staged: VecDeque::new(),
       ready: VecDeque::new(),
       shape_contribs: VecDeque::new(),
+      shape_faults: VecDeque::new(),
     }
   }
 
@@ -796,6 +915,13 @@ impl EngineLog {
       .map(|(_, generation)| *generation)
       .max()
       .unwrap_or(0)
+  }
+
+  /// Whether any SURVIVING entry is a shape entry the apply path will refuse — the latch behind
+  /// [`GroupEngine::removal_floor`]'s cap. Derived state, not a flag: it is true exactly while such
+  /// an entry is resident, so the retractions that keep `shape_contribs` exact keep this exact too.
+  fn shape_faulted(&self) -> bool {
+    !self.shape_faults.is_empty()
   }
 
   /// Release every staged completion into the poll FIFO (the barrier), returning how many.
@@ -895,14 +1021,30 @@ impl LogStore for EngineLog {
       {
         self.shape_contribs.pop_back();
       }
+      // A fault is a fact about a RESIDENT entry, so it retracts on the same discipline: an entry
+      // the log never kept must not go on capping this id's removal fence.
+      while self
+        .shape_faults
+        .back()
+        .is_some_and(|(index, _)| *index >= fi_idx)
+      {
+        self.shape_faults.pop_back();
+      }
     }
     // The removal ceiling folds HERE, while the entries are in hand: a durable engine cannot
     // re-read its own log from `&self` to answer a removal, and this host's log is exactly where
     // every one of its lineage moves rides.
     for entry in entries {
-      let generation = shape_entry_gen(entry);
-      if generation != 0 {
-        self.shape_contribs.push_back((entry.index(), generation));
+      match shape_entry_move(entry) {
+        ShapeMove::NotShape => {}
+        ShapeMove::Valid(generation) => {
+          if generation != 0 {
+            self.shape_contribs.push_back((entry.index(), generation));
+          }
+        }
+        // An entry the apply path will refuse names no generation to fold. Recording the FAULT
+        // instead is what keeps the ceiling honest in the window before that refusal runs.
+        ShapeMove::Invalid(fault) => self.shape_faults.push_back((entry.index(), fault)),
       }
     }
     self.entries.extend_from_slice(entries);
@@ -932,6 +1074,16 @@ impl LogStore for EngineLog {
     {
       self.shape_contribs.pop_front();
     }
+    // Unreachable in a conforming run — compaction covers only the APPLIED prefix, and the apply
+    // path poisons on an entry this leg calls a fault long before it could be compacted away. Kept
+    // so the latch stays a pure function of the surviving entries whatever order a caller uses.
+    while self
+      .shape_faults
+      .front()
+      .is_some_and(|(index, _)| *index <= up_to)
+    {
+      self.shape_faults.pop_front();
+    }
     self.staged.push_back(StagedLog::Compacted(up_to));
   }
 
@@ -942,9 +1094,10 @@ impl LogStore for EngineLog {
     self.entries.clear();
     self.staged.clear();
     self.ready.clear();
-    // No entry survives, so no entry contributes: the installing snapshot's meta carries this
-    // group's lineage across the re-baseline, which is the meta leg's whole job.
+    // No entry survives, so no entry contributes and no entry faults: the installing snapshot's
+    // meta carries this group's lineage across the re-baseline, which is the meta leg's whole job.
     self.shape_contribs.clear();
+    self.shape_faults.clear();
     self.offset = last_index;
     self.compacted_term = last_term;
   }

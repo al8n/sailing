@@ -71,7 +71,7 @@ fn leader_propose_arms_freeze_pending_at_append() {
       prepare_payload(b"\x2b", 1),
     )
     .expect("leader appends the freeze");
-  assert_eq!(ep.merge.freeze_pending, Some(idx), "armed at append");
+  assert_eq!(ep.freeze_pending(), Some(idx), "armed at append");
   assert!(
     !ep.is_frozen(),
     "full Frozen is apply-time, not append-time"
@@ -105,7 +105,7 @@ fn follower_arms_freeze_pending_at_accept_without_decoding() {
       Index::ZERO,
     )),
   );
-  assert_eq!(ep.merge.freeze_pending, Some(Index::new(1)));
+  assert_eq!(ep.freeze_pending(), Some(Index::new(1)));
   assert!(!ep.is_poisoned(), "no payload decode on the accept path");
   assert!(!ep.is_frozen());
 }
@@ -150,7 +150,7 @@ fn conflict_truncation_clears_freeze_pending_only_at_or_below() {
       Index::ZERO,
     )),
   );
-  assert_eq!(ep.merge.freeze_pending, Some(Index::new(2)));
+  assert_eq!(ep.freeze_pending(), Some(Index::new(2)));
 
   // A term-2 leader overwrites index 3 ONLY: the freeze at 2 survives, the kill stays armed.
   ep.handle_message(
@@ -173,7 +173,7 @@ fn conflict_truncation_clears_freeze_pending_only_at_or_below() {
     )),
   );
   assert_eq!(
-    ep.merge.freeze_pending,
+    ep.freeze_pending(),
     Some(Index::new(2)),
     "a truncation strictly above the freeze leaves it armed"
   );
@@ -199,7 +199,8 @@ fn conflict_truncation_clears_freeze_pending_only_at_or_below() {
     )),
   );
   assert_eq!(
-    ep.merge.freeze_pending, None,
+    ep.freeze_pending(),
+    None,
     "truncating the freeze entry releases the append-observed kill"
   );
 }
@@ -248,7 +249,7 @@ fn restart_rederives_freeze_pending_from_the_unapplied_suffix() {
   assert!(!ep.is_poisoned());
   assert_eq!(ep.applied_index(), Index::new(1), "replay stops at commit");
   assert_eq!(
-    ep.merge.freeze_pending,
+    ep.freeze_pending(),
     Some(Index::new(2)),
     "the unapplied-suffix scan re-arms the kill"
   );
@@ -279,7 +280,7 @@ fn election_does_not_clear_freeze_pending() {
       Index::ZERO,
     )),
   );
-  assert_eq!(ep.merge.freeze_pending, Some(Index::new(1)));
+  assert_eq!(ep.freeze_pending(), Some(Index::new(1)));
   // The election timeout fires: the follower campaigns (term moves, role changes) — the
   // append-observed kill must survive the transition.
   let d = ep.poll_timeout().unwrap();
@@ -290,7 +291,7 @@ fn election_does_not_clear_freeze_pending() {
     "the timeout must have started a campaign"
   );
   assert_eq!(
-    ep.merge.freeze_pending,
+    ep.freeze_pending(),
     Some(Index::new(1)),
     "an election never clears the pending freeze"
   );
@@ -324,7 +325,7 @@ fn snapshot_install_clears_a_discarded_freeze_pending() {
     )),
   );
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
-  assert_eq!(ep.merge.freeze_pending, Some(Index::new(1)));
+  assert_eq!(ep.freeze_pending(), Some(Index::new(1)));
 
   // A divergent-history install at boundary 10 re-baselines the log wholesale — the freeze
   // entry is discarded with the tail, so the kill releases.
@@ -348,7 +349,8 @@ fn snapshot_install_clears_a_discarded_freeze_pending() {
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   assert_eq!(ep.applied_index(), Index::new(10), "install landed");
   assert_eq!(
-    ep.merge.freeze_pending, None,
+    ep.freeze_pending(),
+    None,
     "the discarded freeze releases the kill"
   );
 }
@@ -666,10 +668,7 @@ fn prepare_merge_apply_freezes_and_bumps_gen() {
   assert!(ep.is_frozen(), "the committed freeze applied");
   assert_eq!(ep.freeze_index(), Some(f));
   assert_eq!(ep.shape_gen(), 1, "lineage bumped to the minted gen");
-  assert_eq!(
-    ep.merge.freeze_pending, None,
-    "pending subsumed into frozen"
-  );
+  assert_eq!(ep.freeze_pending(), None, "pending subsumed into frozen");
   let mut frozen_gen = None;
   while let Some(ev) = ep.poll_event() {
     if let crate::Event::MergeFrozen(e) = ev {
@@ -1007,7 +1006,7 @@ fn rollback_rederives_a_later_pending_freeze() {
   ack_through(&mut ep, &mut log, &mut stable, r);
   assert!(!ep.is_frozen(), "thawed at the rollback");
   assert_eq!(
-    ep.merge.freeze_pending,
+    ep.freeze_pending(),
     Some(f2),
     "the rollback re-derived the LATER pending freeze"
   );
@@ -1049,7 +1048,7 @@ fn freeze_replay_is_idempotent_across_restart() {
     assert!(ep.is_frozen(), "replay re-froze (boot {boot})");
     assert_eq!(ep.freeze_index(), Some(Index::new(1)));
     assert_eq!(ep.shape_gen(), 1, "gen max-fold is idempotent");
-    assert_eq!(ep.merge.freeze_pending, None);
+    assert_eq!(ep.freeze_pending(), None);
   }
 }
 
@@ -2110,7 +2109,7 @@ fn a_pending_freeze_fences_only_at_or_past_its_own_index() {
     )),
   );
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
-  assert_eq!(ep.merge.freeze_pending, Some(Index::new(3)));
+  assert_eq!(ep.freeze_pending(), Some(Index::new(3)));
   assert!(
     !ep.absorb_capture_blocked(),
     "a pending freeze ABOVE the park boundary leaves the earlier fold free"
@@ -2143,7 +2142,8 @@ fn a_pending_freeze_fences_only_at_or_past_its_own_index() {
   );
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   assert_eq!(
-    ep.merge.freeze_pending, None,
+    ep.freeze_pending(),
+    None,
     "the truncation released the kill"
   );
   assert!(!ep.capture_blocked_at(Index::new(3)));
@@ -2812,7 +2812,8 @@ fn the_adopt_thaws_a_frozen_and_parked_target() {
     "the boundary proves the freeze thawed — exiting frozen would strand this replica forever"
   );
   assert_eq!(
-    ep.merge.freeze_pending, None,
+    ep.freeze_pending(),
+    None,
     "re-derived against the kept tail: no freeze above"
   );
   assert_eq!(ep.applied_index(), Index::new(4));
@@ -3749,5 +3750,650 @@ fn a_rotating_advertiser_population_is_globally_rate_bounded() {
     served.len(),
     69,
     "every advertiser is served under sustained over-cap churn: {served:?}"
+  );
+}
+
+/// A follower (node 1, peer 2 leading at term 1) holding `entries` delivered by `AppendEntries`
+/// with NOTHING committed: the pending kill armed by kind, nothing applied.
+fn follower_with_appended(
+  entries: Vec<Entry>,
+) -> (
+  Endpoint<u64, CountSm>,
+  crate::testkit::FailTermLog,
+  NoopStable,
+) {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = crate::testkit::FailTermLog::default();
+  let mut stable = NoopStable::default();
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::ZERO,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  (ep, log, stable)
+}
+
+/// The leader's commit index reaches the follower — an empty `AppendEntries` after `last` — and
+/// the follower's message-path apply drain runs on it.
+fn deliver_commit(
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut crate::testkit::FailTermLog,
+  stable: &mut NoopStable,
+  last: Index,
+  commit: Index,
+) {
+  ep.handle_message(
+    Instant::ORIGIN,
+    log,
+    stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      2u64,
+      last,
+      Term::new(1),
+      std::vec![],
+      commit,
+    )),
+  );
+}
+
+/// A term-`term` `Normal` entry at `index` carrying one `CountSm` command.
+fn normal_entry(term: u64, index: u64) -> Entry {
+  let mut buf = Vec::new();
+  crate::Data::encode(&bytes::Bytes::from_static(b"c"), &mut buf);
+  Entry::new(
+    Term::new(term),
+    Index::new(index),
+    EntryKind::Normal,
+    bytes::Bytes::from(buf),
+  )
+}
+
+/// A term-`term` `PrepareMerge` at `index` naming target bytes `target` with `source_gen_after`.
+fn freeze_entry(term: u64, index: u64, target: &'static [u8], source_gen_after: u64) -> Entry {
+  Entry::new(
+    Term::new(term),
+    Index::new(index),
+    EntryKind::PrepareMerge,
+    prepare_payload(target, source_gen_after),
+  )
+}
+
+/// Deliver one `AppendEntries` from peer 2 at `term` — `entries` after `(prev, prev_term)`, the
+/// commit advertised at `commit` — and let the follower's message-path work run.
+#[allow(clippy::too_many_arguments)]
+fn follower_deliver(
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut crate::testkit::FailTermLog,
+  stable: &mut NoopStable,
+  term: u64,
+  prev: Index,
+  prev_term: u64,
+  entries: Vec<Entry>,
+  commit: Index,
+) {
+  ep.handle_message(
+    Instant::ORIGIN,
+    log,
+    stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(term),
+      2u64,
+      prev,
+      Term::new(prev_term),
+      entries,
+      commit,
+    )),
+  );
+}
+
+/// The endpoint's queued freezes, lowest first.
+fn queue(ep: &Endpoint<u64, CountSm>) -> Vec<Index> {
+  ep.freeze_queue().collect()
+}
+
+/// The ordered `PrepareMerge` indices in `(applied, last]`, read off the log by a scan the product
+/// never runs — the ground truth of the freeze queue invariant.
+fn expected_queue<L: crate::LogStore>(log: &L, applied: Index) -> Vec<Index> {
+  let last = log.last_index();
+  let from = applied.next().max(log.first_index());
+  if from > last {
+    return Vec::new();
+  }
+  match log.entries(from..last.next(), u64::MAX) {
+    Ok(crate::EntriesRead::Ready(c)) => c
+      .iter()
+      .filter(|e| e.kind() == EntryKind::PrepareMerge)
+      .map(|e| e.index())
+      .collect(),
+    _ => panic!("the ground-truth scan must read"),
+  }
+}
+
+/// THE FOLD READS NO SUFFIX PAGE. The pending state a freeze fold leaves behind comes from the
+/// append-maintained freeze queue, never from a walk of the suffix above the entry, so a page the
+/// store has not made resident — here the entry two above, in an uncommitted tail — neither defers
+/// nor poisons the fold. Earlier folds re-derived the pending state by scanning that suffix: a
+/// paged store then fail-stopped a HEALTHY replica mid-backlog, and the deferral that replaced the
+/// poison handed a bounded cache evicting alternately a livelock. Now the fold completes on the
+/// apply fetch alone — frozen for the named target, the queued freeze above it the pending state,
+/// exactly one `MergeFrozen` — whether the page above is cold or faulting; the drain's own
+/// cold-page deferral still governs the entries it applies.
+#[test]
+fn a_freeze_fold_reads_no_suffix_page() {
+  let entries = || {
+    std::vec![
+      freeze_entry(1, 1, b"\x2b", 1),
+      normal_entry(1, 2),
+      freeze_entry(1, 3, b"\x2c", 2),
+    ]
+  };
+
+  // A COLD page above the freeze.
+  let (mut ep, mut log, mut stable) = follower_with_appended(entries());
+  assert_eq!(
+    ep.freeze_pending(),
+    Some(Index::new(1)),
+    "the kill is armed by kind at append"
+  );
+  log.cold_entries_at(Some(Index::new(2)));
+  deliver_commit(&mut ep, &mut log, &mut stable, Index::new(3), Index::new(1));
+  assert!(
+    ep.poison_reason().is_none(),
+    "a page above the freeze is never read by the fold"
+  );
+  assert!(
+    ep.is_frozen()
+      && ep.frozen_for() == Some(&bytes::Bytes::from_static(b"\x2b"))
+      && ep.applied_index() == Index::new(1)
+      && ep.shape_gen() == 1,
+    "the fold completed on the apply fetch alone"
+  );
+  assert_eq!(
+    ep.freeze_pending(),
+    Some(Index::new(3)),
+    "the queue supplies the pending state"
+  );
+  assert_eq!(
+    core::iter::from_fn(|| ep.poll_event())
+      .filter(|e| matches!(e, crate::Event::MergeFrozen(_)))
+      .count(),
+    1,
+    "exactly one MergeFrozen"
+  );
+
+  // A FAULTING page above the freeze: equally untouched.
+  let (mut ep, mut log, mut stable) = follower_with_appended(entries());
+  log.fail_entries_at(Some(Index::new(2)));
+  deliver_commit(&mut ep, &mut log, &mut stable, Index::new(3), Index::new(1));
+  assert!(
+    ep.poison_reason().is_none() && ep.is_frozen() && ep.freeze_pending() == Some(Index::new(3)),
+    "a faulting page above the freeze is never read by the fold either"
+  );
+}
+
+/// THE SOURCE-ROLE LINEAGE GUARD, in the re-election shape that needs it. Node 1 applied a freeze
+/// for target A (gen 1); a committed `Unfreeze(2)` and a newer `PrepareMerge(→B, 3)` sit unapplied
+/// behind a cold page. It wins leadership: its thaw dedup re-seats to none-in-flight while its
+/// live state still shows the OLD freeze, so the target's obligation drive appends a DUPLICATE
+/// `Unfreeze(2)` above the newer freeze. Once the page warms the drain applies the original thaw,
+/// the newer freeze, and then the duplicate — which, unguarded, cleared the NEWER freeze with a
+/// stale generation and left the target replicas to resolve the g+2 `CommitMerge` on opposite
+/// sides. A thaw applies only while frozen and only at its minted generation, the successor of the
+/// freeze it releases: the duplicate is a silent no-op (no state change, no event) and the source
+/// ends FROZEN for B at gen 3.
+#[test]
+fn a_stale_unfreeze_is_a_no_op_after_a_cold_tail_re_election() {
+  use crate::{AppendResponse, RollbackMergePayload};
+  use core::time::Duration;
+  let unfreeze = |source_gen_after: u64| {
+    let p = RollbackMergePayload::unfreeze(source_gen_after);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    bytes::Bytes::from(buf)
+  };
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = crate::testkit::FailTermLog::default();
+  let mut stable = AsyncStable::default();
+  let d = Instant::ORIGIN;
+  let deliver = |ep: &mut Endpoint<u64, CountSm>,
+                 log: &mut crate::testkit::FailTermLog,
+                 stable: &mut AsyncStable,
+                 prev: u64,
+                 entries: Vec<Entry>,
+                 commit: u64| {
+    ep.handle_message(
+      d,
+      log,
+      stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        2u64,
+        Index::new(prev),
+        if prev == 0 { Term::ZERO } else { Term::new(1) },
+        entries,
+        Index::new(commit),
+      )),
+    );
+    ep.handle_storage(d, log, stable);
+  };
+  // The old freeze, applied: frozen for A at gen 1.
+  deliver(
+    &mut ep,
+    &mut log,
+    &mut stable,
+    0,
+    std::vec![freeze_entry(1, 1, b"\x2b", 1)],
+    1,
+  );
+  assert!(
+    ep.is_frozen() && ep.shape_gen() == 1,
+    "frozen for A at gen 1"
+  );
+  while ep.poll_event().is_some() {}
+  // The committed tail behind a cold page: the thaw, then the newer freeze.
+  log.cold_entries_at(Some(Index::new(2)));
+  deliver(
+    &mut ep,
+    &mut log,
+    &mut stable,
+    1,
+    std::vec![
+      normal_entry(1, 2),
+      Entry::new(
+        Term::new(1),
+        Index::new(3),
+        EntryKind::RollbackMerge,
+        unfreeze(2)
+      ),
+      freeze_entry(1, 4, b"\x2c", 3),
+    ],
+    4,
+  );
+  assert!(
+    ep.is_frozen() && ep.applied_index() == Index::new(1) && ep.poison_reason().is_none(),
+    "parked below the cold page, still at the old freeze"
+  );
+  assert_eq!(ep.freeze_pending(), Some(Index::new(4)));
+
+  // Leadership at term 2: the thaw dedup re-seats to none in flight.
+  let t = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t, &mut log, &mut stable);
+  ep.handle_storage(t, &mut log, &mut stable);
+  ep.handle_message(
+    t,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(2), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader(), "won leadership at term 2");
+  assert_eq!(
+    ep.thaw_in_flight(),
+    None,
+    "the dedup re-seated: this leader knows of no thaw in flight"
+  );
+  ep.handle_storage(t, &mut log, &mut stable);
+  // The drive's duplicate thaw, minted against the live (old) freeze: gen 2 again, above the
+  // newer freeze the leader has not applied.
+  let dup = ep
+    .propose_merge_entry(t, &mut log, EntryKind::RollbackMerge, unfreeze(2))
+    .expect("the leader appends the duplicate thaw");
+  ep.handle_storage(t, &mut log, &mut stable);
+  ep.handle_message(
+    t,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(2),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      dup,
+    )),
+  );
+  ep.handle_storage(t, &mut log, &mut stable);
+  assert!(ep.commit_index() >= dup, "the duplicate committed");
+
+  // The page warms: the drain applies the original thaw, the newer freeze, then the duplicate.
+  log.cold_entries_at(None);
+  ep.handle_storage(t, &mut log, &mut stable);
+  assert_eq!(
+    ep.applied_index(),
+    dup,
+    "the drain applied through the duplicate"
+  );
+  assert!(ep.poison_reason().is_none());
+  assert!(
+    ep.is_frozen()
+      && ep.frozen_for() == Some(&bytes::Bytes::from_static(b"\x2c"))
+      && ep.shape_gen() == 3
+      && ep.freeze_index() == Some(Index::new(4)),
+    "frozen for B at gen 3: the stale thaw was a no-op"
+  );
+  let (mut thaws, mut freezes) = (0, 0);
+  while let Some(ev) = ep.poll_event() {
+    match ev {
+      crate::Event::MergeRolledBack(_) => thaws += 1,
+      crate::Event::MergeFrozen(_) => freezes += 1,
+      _ => {}
+    }
+  }
+  assert_eq!(
+    (thaws, freezes),
+    (1, 1),
+    "one thaw and one freeze — the duplicate emitted nothing"
+  );
+}
+
+/// THE FREEZE QUEUE INVARIANT: after every append, truncation, apply and restore of a live
+/// endpoint the queue equals the ordered set of `PrepareMerge` indices in `(applied, last]` — the
+/// ground truth `expected_queue` reads off the log by a scan the product never runs. Append queues
+/// every freeze of the suffix in order; a conflict truncation above a queued freeze retracts only
+/// what it overwrote and the replacement's own freeze re-queues; a truncation below one retracts
+/// everything at-or-above it; the fold pops its own index and the next is the pending state; a
+/// re-baseline clears and the re-delivered freeze re-queues; a restart rebuilds from the surviving
+/// suffix. A REFUSED freeze clears the queue whole — the poison halts the drain, so nothing queued
+/// above it ever applies: a poisoned endpoint breaks the invariant in the empty direction, by
+/// design.
+#[test]
+fn the_freeze_queue_tracks_the_unapplied_suffix_exactly() {
+  use core::time::Duration;
+  fn assert_invariant(ep: &Endpoint<u64, CountSm>, log: &crate::testkit::FailTermLog, stage: &str) {
+    assert_eq!(
+      queue(ep),
+      expected_queue(log, ep.applied_index()),
+      "{stage}: the queue is the ordered PrepareMerge set of (applied, last]"
+    );
+  }
+  let at = |indices: &[u64]| indices.iter().map(|i| Index::new(*i)).collect::<Vec<_>>();
+
+  // APPEND: three freezes among ordinary entries, nothing committed.
+  let (mut ep, mut log, mut stable) = follower_with_appended(std::vec![
+    freeze_entry(1, 1, b"a", 1),
+    normal_entry(1, 2),
+    freeze_entry(1, 3, b"b", 2),
+    normal_entry(1, 4),
+    freeze_entry(1, 5, b"c", 3),
+  ]);
+  assert_invariant(&ep, &log, "after the append");
+  assert_eq!(queue(&ep), at(&[1, 3, 5]));
+
+  // TRUNCATION ABOVE a queued freeze: a newer leader's suffix replaces 4 and up — 5 leaves, 1 and
+  // 3 stand — and the replacement's own freeze re-queues.
+  follower_deliver(
+    &mut ep,
+    &mut log,
+    &mut stable,
+    2,
+    Index::new(3),
+    1,
+    std::vec![normal_entry(2, 4)],
+    Index::ZERO,
+  );
+  assert_invariant(&ep, &log, "after a truncation above a queued freeze");
+  assert_eq!(queue(&ep), at(&[1, 3]));
+  follower_deliver(
+    &mut ep,
+    &mut log,
+    &mut stable,
+    2,
+    Index::new(4),
+    2,
+    std::vec![freeze_entry(2, 5, b"c", 3)],
+    Index::ZERO,
+  );
+  assert_invariant(&ep, &log, "after the replacement suffix's freeze");
+  assert_eq!(queue(&ep), at(&[1, 3, 5]));
+
+  // TRUNCATION BELOW a queued freeze: a suffix from 2 overwrites 3 and 5 together; only the new 3
+  // re-queues.
+  follower_deliver(
+    &mut ep,
+    &mut log,
+    &mut stable,
+    3,
+    Index::new(1),
+    1,
+    std::vec![normal_entry(3, 2), freeze_entry(3, 3, b"b", 2)],
+    Index::ZERO,
+  );
+  assert_invariant(&ep, &log, "after a truncation below a queued freeze");
+  assert_eq!(queue(&ep), at(&[1, 3]));
+
+  // THE FOLD: the freeze at 1 applies and leaves; 3 is the pending state.
+  follower_deliver(
+    &mut ep,
+    &mut log,
+    &mut stable,
+    3,
+    Index::new(3),
+    3,
+    std::vec![],
+    Index::new(1),
+  );
+  assert!(ep.is_frozen() && ep.applied_index() == Index::new(1));
+  assert_invariant(&ep, &log, "after the fold");
+  assert_eq!(queue(&ep), at(&[3]));
+  assert_eq!(ep.freeze_pending(), Some(Index::new(3)));
+
+  // RESTORE: a re-baseline discards the suffix and the queue with it; the re-delivered freeze
+  // re-queues (the install path calls exactly these two seams).
+  crate::LogStore::restore(&mut log, Index::new(3), Term::new(3));
+  ep.note_freeze_rebaselined();
+  assert_invariant(&ep, &log, "after the re-baseline");
+  assert!(queue(&ep).is_empty());
+  follower_deliver(
+    &mut ep,
+    &mut log,
+    &mut stable,
+    3,
+    Index::new(3),
+    3,
+    std::vec![freeze_entry(3, 4, b"d", 4)],
+    Index::ZERO,
+  );
+  assert_invariant(&ep, &log, "after the re-delivery");
+  assert_eq!(queue(&ep), at(&[4]));
+
+  // THE REFUSAL: a refused freeze at the front and a valid one queued above it — the poison
+  // clears the queue whole.
+  let (mut ep, mut log, mut stable) = follower_with_appended(std::vec![
+    freeze_entry(1, 1, b"", 1),
+    freeze_entry(1, 2, b"e", 2),
+  ]);
+  assert_eq!(queue(&ep), at(&[1, 2]));
+  deliver_commit(&mut ep, &mut log, &mut stable, Index::new(2), Index::new(1));
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::MergeDecode));
+  assert!(
+    queue(&ep).is_empty() && !ep.merge_freeze_active(),
+    "a refused freeze clears the queue whole: nothing above it ever applies"
+  );
+
+  // RESTART: the boot rebuild collects every freeze above the replayed prefix.
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut vlog = VecLog::default();
+  vlog.force_append(&[
+    freeze_entry(1, 1, b"a", 1),
+    normal_entry(1, 2),
+    freeze_entry(1, 3, b"b", 2),
+    normal_entry(1, 4),
+    freeze_entry(1, 5, b"c", 3),
+  ]);
+  let mut vstable = AsyncStable::default();
+  vstable.force_state(Term::new(1), None, Index::new(1));
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+    1,
+    &mut vlog,
+    &mut vstable,
+  );
+  assert!(ep.is_frozen() && ep.poison_reason().is_none());
+  assert_eq!(queue(&ep), at(&[3, 5]), "the boot scan rebuilt the queue");
+  assert_eq!(queue(&ep), expected_queue(&vlog, ep.applied_index()));
+}
+
+/// A BOUNDED CACHE THAT EVICTS ALTERNATELY cannot stall the fold: the fold reads no suffix page
+/// at all, so it completes on the apply fetch alone — one read — where a fold that re-derived its
+/// pending state by walking the suffix found a cold page on every attempt and never completed
+/// (each attempt's fetch warmed the very page the walk then found cold).
+#[test]
+fn a_freeze_fold_survives_an_alternately_cold_cache() {
+  let (mut ep, mut log, mut stable) = follower_with_appended(std::vec![
+    freeze_entry(1, 1, b"a", 1),
+    normal_entry(1, 2),
+    freeze_entry(1, 3, b"b", 2),
+  ]);
+  log.alternate_cold_on_read();
+  let before = log.observed_entries_calls();
+  deliver_commit(&mut ep, &mut log, &mut stable, Index::new(3), Index::new(1));
+  // A few more cranks — more than a driver would spend before calling the replica stuck.
+  for _ in 0..4 {
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  }
+  assert!(
+    ep.is_frozen() && ep.poison_reason().is_none(),
+    "the fold completed against an alternately cold cache"
+  );
+  assert_eq!(ep.freeze_pending(), Some(Index::new(3)));
+  assert_eq!(
+    log.observed_entries_calls() - before,
+    1,
+    "exactly one read — the apply fetch; the fold touched no suffix page"
+  );
+}
+
+/// THE ADOPT READS NO PAGE FOR THE QUEUE. The freeze queue is exact and the log is kept, so the
+/// post-boundary queue is the queue's own entries above the boundary — a retain, not a scan. A
+/// scan there restarted from the boundary after every cold page, and against a one-page cache the
+/// adopt never completed: the park it was to clear stood, and with apply pinned by it nothing
+/// shrank. The kept tail here holds a queued freeze above the boundary: the adopt performs zero
+/// entry reads and leaves that freeze pending.
+#[test]
+fn the_adopt_keeps_the_queue_above_the_boundary_without_a_read() {
+  use crate::{InstallSnapshot, SnapshotMeta, conf::ConfState};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = crate::testkit::FailTermLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(5), 1, 2),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(3),
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2c", 3),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(2));
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(
+    ep.is_frozen() && ep.pending_merge().is_some(),
+    "frozen below the park, parked"
+  );
+  assert_eq!(
+    ep.freeze_pending(),
+    Some(Index::new(3)),
+    "the freeze above the park is queued"
+  );
+  ep.advance_crossing_scan(&log);
+  ep.note_merge_park_unresolvable(true);
+  let meta = SnapshotMeta::new(
+    Index::new(2),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  )
+  .with_shape_gen(2);
+  let before = log.observed_entries_calls();
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      2u64,
+      meta,
+      encode_snapshot(9),
+    )),
+  );
+  assert!(
+    !ep.is_poisoned() && ep.pending_merge().is_none() && !ep.is_frozen(),
+    "the adopt cleared the park and the freeze quartet"
+  );
+  assert_eq!(ep.applied_index(), Index::new(2));
+  assert_eq!(
+    ep.freeze_pending(),
+    Some(Index::new(3)),
+    "the queued freeze above the boundary stands"
+  );
+  assert_eq!(
+    log.observed_entries_calls() - before,
+    0,
+    "zero entry reads: the queue was kept, never rescanned"
   );
 }

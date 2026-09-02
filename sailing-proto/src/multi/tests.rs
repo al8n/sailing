@@ -9751,6 +9751,1549 @@ fn removal_floor_reads_the_stores_when_the_mirror_never_landed() {
   );
 }
 
+/// One way a `PrepareMerge` fails the apply path's own admission — the forms a hosted replica can
+/// meet in its log, none of which a conforming leader mints: the target id EMPTY (the decoder
+/// refuses the group-tag bound), a valid encode cut short (a torn record), and a well-formed
+/// payload whose `source_gen_after` sits in the reserved band.
+#[derive(Debug, Clone, Copy)]
+enum RefusedFreeze {
+  EmptyTarget,
+  TruncatedEncoding,
+  ReservedSourceGen,
+}
+
+const REFUSED_FREEZE_FORMS: [RefusedFreeze; 3] = [
+  RefusedFreeze::EmptyTarget,
+  RefusedFreeze::TruncatedEncoding,
+  RefusedFreeze::ReservedSourceGen,
+];
+
+impl RefusedFreeze {
+  /// The poison the apply arm answers this form with.
+  fn poison(self) -> PoisonReason {
+    match self {
+      Self::EmptyTarget | Self::TruncatedEncoding => PoisonReason::MergeDecode,
+      Self::ReservedSourceGen => PoisonReason::ReservedShapeGen,
+    }
+  }
+}
+
+/// A term-1 `PrepareMerge` at `index` the apply path will refuse, naming `target` where the form
+/// carries a target at all. `source_gen_after` is nonzero in every form so the truncated encode
+/// loses a byte of a field that is PRESENT — cut from an absent trailing field, the bytes would
+/// still decode.
+fn refused_prepare_merge(form: RefusedFreeze, index: u64, target: u64) -> crate::Entry {
+  let mut target_bytes = Vec::new();
+  Data::encode(&target, &mut target_bytes);
+  let target_bytes = Bytes::from(target_bytes);
+  let payload = match form {
+    RefusedFreeze::EmptyTarget => crate::PrepareMergePayload::new(Bytes::new(), 1),
+    RefusedFreeze::TruncatedEncoding => crate::PrepareMergePayload::new(target_bytes, 1),
+    RefusedFreeze::ReservedSourceGen => {
+      crate::PrepareMergePayload::new(target_bytes, crate::HIGHEST_WORKING_GENERATION)
+    }
+  };
+  let mut data = Vec::new();
+  crate::wire::encode_prepare_merge_payload(&payload, &mut data);
+  if matches!(form, RefusedFreeze::TruncatedEncoding) {
+    data.truncate(data.len() - 1);
+  }
+  let entry = crate::Entry::new(
+    Term::new(1),
+    Index::new(index),
+    crate::EntryKind::PrepareMerge,
+    Bytes::from(data),
+  );
+  assert!(
+    matches!(shape_entry_move(&entry), ShapeMove::Invalid(_)),
+    "{form:?}: the fixture must be an entry the apply path refuses"
+  );
+  entry
+}
+
+/// Node 1 with phantom peer 2 as the other voter: never elected, so the replica's log is fed by
+/// `AppendEntries` alone.
+fn follower_cfg() -> Config<u64> {
+  Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+}
+
+/// Admit one engine-hosted group whose local replica FOLLOWS phantom peer 2 — the only way an
+/// entry no conforming leader would mint reaches a hosted replica through the engine's own append
+/// path, where the removal ceiling's fault latch folds.
+fn engine_follower(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  engine: &mut GroupEngine<u64, u64>,
+  gid: u64,
+  now: Instant,
+) {
+  assert!(engine.add_group(gid));
+  m.create_group(gid, 0, follower_cfg(), now, 7, CountSm::default())
+    .unwrap();
+  engine.set_group_gen(&gid, 0);
+  assert!(m.group(&gid).unwrap().role().is_follower());
+}
+
+/// Deliver one `AppendEntries` from phantom leader 2 at `term` to engine-hosted follower `gid` —
+/// `entries` after `(prev, prev_term)`, the commit advertised at `leader_commit` — WITHOUT
+/// cranking: the follower's own message-path work runs (the append, the commit advance, the apply
+/// drain up to its budget) and nothing else, which is how a fixture parks a replica mid-drain.
+#[allow(clippy::too_many_arguments)]
+fn engine_follower_deliver(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  engine: &mut GroupEngine<u64, u64>,
+  gid: u64,
+  term: Term,
+  prev: Index,
+  prev_term: Term,
+  entries: Vec<crate::Entry>,
+  leader_commit: Index,
+  now: Instant,
+) {
+  let (log, stable) = engine.stores(&gid).unwrap();
+  m.handle_message(
+    &gid,
+    now,
+    log,
+    stable,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      term,
+      2u64,
+      prev,
+      prev_term,
+      entries,
+      leader_commit,
+    )),
+  )
+  .unwrap();
+}
+
+/// [`engine_follower_deliver`], then a crank of the engine.
+#[allow(clippy::too_many_arguments)]
+fn engine_follower_append(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  engine: &mut GroupEngine<u64, u64>,
+  gid: u64,
+  term: Term,
+  prev: Index,
+  prev_term: Term,
+  entries: Vec<crate::Entry>,
+  leader_commit: Index,
+  now: Instant,
+) {
+  engine_follower_deliver(
+    m,
+    engine,
+    gid,
+    term,
+    prev,
+    prev_term,
+    entries,
+    leader_commit,
+    now,
+  );
+  engine_crank(m, engine, gid, now);
+}
+
+/// ONE driver crank of an engine-hosted group — a barrier, then a single `handle_storage`, which
+/// re-drives the apply backlog by exactly one budget: the granularity a fixture uses to park a
+/// replica between two committed entries.
+fn engine_step(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  engine: &mut GroupEngine<u64, u64>,
+  gid: u64,
+  now: Instant,
+) {
+  engine.flush();
+  let (log, stable) = engine.stores(&gid).unwrap();
+  let _ = m.handle_storage(&gid, now, log, stable);
+}
+
+/// Ordinary term-1 `Normal` entries `[from, to]`, one `CountSm` command each — the load that
+/// exhausts one apply drain's budget, so an entry delivered committed behind it is COMMITTED but
+/// not yet APPLIED when the drain cuts.
+fn normal_load(from: u64, to: u64) -> Vec<crate::Entry> {
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  (from..=to)
+    .map(|i| {
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(i),
+        crate::EntryKind::Normal,
+        cmd.clone(),
+      )
+    })
+    .collect()
+}
+
+/// A VALID `PrepareMerge` at `index` in `term`, naming `target` and moving the source's counter to
+/// `source_gen_after` — what a conforming leader mints.
+fn valid_prepare_merge(term: Term, index: u64, target: u64, source_gen_after: u64) -> crate::Entry {
+  let payload = crate::PrepareMergePayload::new(gid_key(target), source_gen_after);
+  let mut data = Vec::new();
+  crate::wire::encode_prepare_merge_payload(&payload, &mut data);
+  let entry = crate::Entry::new(
+    term,
+    Index::new(index),
+    crate::EntryKind::PrepareMerge,
+    Bytes::from(data),
+  );
+  assert_eq!(shape_entry_move(&entry), ShapeMove::Valid(source_gen_after));
+  entry
+}
+
+/// A term-1 SOURCE-side unfreeze at `index`, moving the source's counter to `source_gen_after`.
+fn unfreeze_entry(index: u64, source_gen_after: u64) -> crate::Entry {
+  let payload = crate::RollbackMergePayload::unfreeze(source_gen_after);
+  let mut data = Vec::new();
+  crate::wire::encode_rollback_merge_payload(&payload, &mut data);
+  crate::Entry::new(
+    Term::new(1),
+    Index::new(index),
+    crate::EntryKind::RollbackMerge,
+    Bytes::from(data),
+  )
+}
+
+/// A COMMITTED `PrepareMerge` the apply path refuses leaves its source POISONED and REMOVABLE,
+/// under the release cap. The kind-only append arm armed the lease kill before anything judged
+/// the payload; the apply arm then refuses the entry — a payload that will not decode, or a
+/// reserved `source_gen_after` — and must release that kill as it poisons. Left armed, the
+/// container's teardown gate reads the poisoned replica as an active merge source and refuses
+/// `Frozen` for as long as the committed entry sits in the log, which is forever: the operator's
+/// one recovery, removing the id under the ceiling's release cap, is exactly the door that stays
+/// shut. The cap is read BEFORE the removal, in the order every driver runs (coordinator gate,
+/// then floor, then the floor write): `HIGHEST_WORKING_GENERATION`, admitting no working
+/// generation and never the terminal. The negative pin — a VALID committed freeze still refuses
+/// `Frozen` — is `teardown_refuses_a_frozen_source_and_a_parked_target`.
+#[test]
+fn a_refused_prepare_merge_leaves_its_poisoned_source_removable_under_the_cap() {
+  let mut fenced: Vec<(RefusedFreeze, Result<bool, RemoveError>)> = Vec::new();
+  for form in REFUSED_FREEZE_FORMS {
+    let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+    let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+    let now = Instant::ORIGIN;
+    engine_follower(&mut m, &mut engine, 2, now);
+    // The entry reaches the engine's log through the follower's append path — the fault latch
+    // folds there — and the advertised commit drives it to apply.
+    engine_follower_append(
+      &mut m,
+      &mut engine,
+      2,
+      Term::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![refused_prepare_merge(form, 1, 1)],
+      Index::new(1),
+      now,
+    );
+    let ep = m.group(&2).unwrap();
+    assert_eq!(
+      ep.poison_reason(),
+      Some(form.poison()),
+      "{form:?}: the committed entry is refused at apply"
+    );
+    assert!(!ep.is_frozen(), "{form:?}: a refused freeze never folds");
+    // THE CAP, read before the removal as the drivers do.
+    let floor = engine.removal_floor(&2);
+    assert_eq!(
+      floor,
+      crate::HIGHEST_WORKING_GENERATION,
+      "{form:?}: the resident refused entry caps the removal fence at the release cap"
+    );
+    assert_ne!(
+      floor, MERGED_FLOOR,
+      "{form:?}: the cap is never the terminal"
+    );
+    // THE RULE: a refused entry armed no freeze, so the teardown gate has nothing to refuse.
+    // COLLECTED, not asserted in place: every form must show failing on a red run, and a loop
+    // that stopped at the first would look identical whether one form wedged or all of them.
+    let removed = m.remove_group(&2, &mut engine).map(|ep| ep.is_some());
+    if removed != Ok(true) {
+      fenced.push((form, removed));
+    }
+  }
+  assert!(
+    fenced.is_empty(),
+    "these refused freezes fenced their poisoned source instead of releasing it: {fenced:?}"
+  );
+}
+
+/// A COMMITTED but not yet APPLIED `PrepareMerge` the apply path will refuse CLAIMS NO TARGET —
+/// the claim scan's committed arm. Source 2's freeze rides an `AppendEntries` whose commit covers
+/// it behind exactly one apply budget of ordinary load, so the follower's commit advance applies
+/// the load, cuts the drain, and leaves the entry committed, unapplied, and judged by nothing
+/// (freeze-pending, not frozen, not poisoned). The teardown gate's claim leg reads the payload off
+/// 2's log: a committed refused entry can only poison 2 when the drain resumes, so no claim can
+/// ever materialize from it, and `remove_group(&1)` admits — the resumed drain then refuses the
+/// entry and poisons 2, confirming the answer. The budget cut is how the harness reaches the
+/// window (a commit delivered within budget applies in the same step); the product reaches it the
+/// same way, or through a cold committed read. The uncommitted twin refuses —
+/// `an_uncommitted_refused_prepare_merge_still_fences_its_target`.
+#[test]
+fn a_refused_pending_prepare_merge_claims_no_target() {
+  let load = crate::endpoint::APPLY_BUDGET_ENTRIES;
+  let freeze_at = Index::new(load + 1);
+  let mut fenced: Vec<(RefusedFreeze, Result<bool, RemoveError>)> = Vec::new();
+  for form in REFUSED_FREEZE_FORMS {
+    let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+    let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+    let now = Instant::ORIGIN;
+    engine_group(&mut m, &mut engine, 1, 0, now);
+    engine_follower(&mut m, &mut engine, 2, now);
+    let mut entries = normal_load(1, load);
+    entries.push(refused_prepare_merge(form, load + 1, 1));
+    // Delivered committed and NOT cranked: the drain applies the load, cuts at its budget, and
+    // leaves the freeze committed but unapplied.
+    engine_follower_deliver(
+      &mut m,
+      &mut engine,
+      2,
+      Term::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      freeze_at,
+      now,
+    );
+    let source = m.group(&2).unwrap();
+    assert_eq!(
+      (source.commit_index(), source.applied_index()),
+      (freeze_at, Index::new(load)),
+      "{form:?}: the drain cut at its budget with the freeze committed and unapplied"
+    );
+    assert!(
+      source.merge_freeze_active() && !source.is_frozen() && !source.is_poisoned(),
+      "{form:?}: the source is freeze-pending, unapplied, unjudged"
+    );
+    // COLLECTED, not asserted in place, so a red run shows every form that fenced the target.
+    let removed = m.remove_group(&1, &mut engine).map(|ep| ep.is_some());
+    if removed != Ok(true) {
+      fenced.push((form, removed));
+      continue;
+    }
+    // The resumed drain refuses the entry: the gate's answer is the one apply confirms.
+    engine_crank(&mut m, &mut engine, 2, now);
+    assert_eq!(
+      m.group(&2).unwrap().poison_reason(),
+      Some(form.poison()),
+      "{form:?}: the committed entry was refused once the drain reached it"
+    );
+  }
+  assert!(
+    fenced.is_empty(),
+    "these committed refused freezes fenced the target they can never absorb into: {fenced:?}"
+  );
+}
+
+/// An UNCOMMITTED `PrepareMerge` the apply path will refuse is NOT "no claim" — it is a claim
+/// the gate cannot rule out yet. Above the source's commit the entry has no fixed fate: a
+/// conflicting append from a newer leader may truncate it and put a VALID freeze at the same
+/// index, re-arming the kill and naming a target, and a teardown taken on "no claim" would
+/// already have removed that target — the claimant then freezes for a log that no longer exists,
+/// with no home for its commit or its rollback. So the claim scan fails closed on it exactly as
+/// on an unreadable page, and `remove_group(&1)` refuses `Claimed`. Once the leader's commit
+/// reaches the entry its fate is fixed: the drain refuses it, poisons 2, releases the kill, and
+/// the SAME removal admits.
+#[test]
+fn an_uncommitted_refused_prepare_merge_still_fences_its_target() {
+  let mut admitted: Vec<(RefusedFreeze, Result<bool, RemoveError>)> = Vec::new();
+  for form in REFUSED_FREEZE_FORMS {
+    let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+    let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+    let now = Instant::ORIGIN;
+    engine_group(&mut m, &mut engine, 1, 0, now);
+    engine_follower(&mut m, &mut engine, 2, now);
+    // Appended, not committed: the freeze is pending and the entry's fate is open.
+    engine_follower_append(
+      &mut m,
+      &mut engine,
+      2,
+      Term::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![refused_prepare_merge(form, 1, 1)],
+      Index::ZERO,
+      now,
+    );
+    let source = m.group(&2).unwrap();
+    assert!(
+      source.merge_freeze_active() && !source.is_frozen() && !source.is_poisoned(),
+      "{form:?}: the source is freeze-pending, uncommitted, unjudged"
+    );
+    // COLLECTED, not asserted in place, so a red run shows every form that was read as no claim.
+    let removed = m.remove_group(&1, &mut engine).map(|ep| ep.is_some());
+    if removed != Err(RemoveError::Claimed) {
+      admitted.push((form, removed));
+      continue;
+    }
+    assert!(
+      m.contains_group(&1),
+      "{form:?}: the refusal left the target hosted"
+    );
+    // The commit reaches the entry: refused at apply, the source poisons and the kill releases.
+    engine_follower_append(
+      &mut m,
+      &mut engine,
+      2,
+      Term::new(1),
+      Index::new(1),
+      Term::new(1),
+      std::vec![],
+      Index::new(1),
+      now,
+    );
+    let source = m.group(&2).unwrap();
+    assert_eq!(
+      source.poison_reason(),
+      Some(form.poison()),
+      "{form:?}: the committed entry was refused at apply"
+    );
+    assert!(
+      !source.merge_freeze_active(),
+      "{form:?}: the refusal released the kill"
+    );
+    assert_eq!(
+      m.remove_group(&1, &mut engine).map(|ep| ep.is_some()),
+      Ok(true),
+      "{form:?}: committed and refused, the entry fences nothing"
+    );
+  }
+  assert!(
+    admitted.is_empty(),
+    "these uncommitted refused freezes were read as no claim: {admitted:?}"
+  );
+}
+
+/// THE REPLACEMENT RACE the uncommitted refusal guards against, run to its end. Source 2 holds an
+/// uncommitted refused `PrepareMerge` at index 1 (term 1); a newer leader's conflicting append
+/// truncates it and puts a VALID freeze naming target 1 at the same index (term 2). Had the gate
+/// read the refused entry as "no claim", a removal of 1 taken on it would have stood, and the
+/// replacement's claim — the one that actually materializes — would name a target that no longer
+/// exists. The gate refuses 1 throughout: on the uncommitted refused entry (fail-closed), on the
+/// valid pending claim (decoded), and once the freeze commits and applies (the applied leg); 2
+/// freezes normally, refused `Frozen` at its own removal with its counter moved. The engine's
+/// fence follows the log: the release cap while the refused entry is resident, one past the valid
+/// freeze's generation once it is replaced.
+#[test]
+fn a_replaced_refused_prepare_merge_claims_the_target_its_replacement_names() {
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  engine_group(&mut m, &mut engine, 1, 0, now);
+  engine_follower(&mut m, &mut engine, 2, now);
+  engine_follower_append(
+    &mut m,
+    &mut engine,
+    2,
+    Term::new(1),
+    Index::ZERO,
+    Term::ZERO,
+    std::vec![refused_prepare_merge(RefusedFreeze::EmptyTarget, 1, 1)],
+    Index::ZERO,
+    now,
+  );
+  assert_eq!(
+    engine.removal_floor(&2),
+    crate::HIGHEST_WORKING_GENERATION,
+    "the resident refused entry caps the fence"
+  );
+  assert_eq!(
+    m.remove_group(&1, &mut engine).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "uncommitted and refused, the entry is a claim the gate cannot rule out"
+  );
+
+  // The newer leader's conflicting append: the refused entry is truncated away and a valid freeze
+  // naming 1 takes its index.
+  let valid = valid_prepare_merge(Term::new(2), 1, 1, 1);
+  engine_follower_append(
+    &mut m,
+    &mut engine,
+    2,
+    Term::new(2),
+    Index::ZERO,
+    Term::ZERO,
+    std::vec![valid],
+    Index::ZERO,
+    now,
+  );
+  let source = m.group(&2).unwrap();
+  assert!(
+    source.merge_freeze_active() && !source.is_frozen() && !source.is_poisoned(),
+    "the replacement re-armed the pending freeze"
+  );
+  assert_eq!(
+    engine.removal_floor(&2),
+    2,
+    "the fence retracted with the discarded entry and folds the valid freeze's move instead"
+  );
+  assert_eq!(
+    m.remove_group(&1, &mut engine).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "the replacement's claim is real, decoded off the pending entry"
+  );
+
+  // Commit and apply: the freeze folds, and both participants are refused through the applied
+  // legs.
+  engine_follower_append(
+    &mut m,
+    &mut engine,
+    2,
+    Term::new(2),
+    Index::new(1),
+    Term::new(2),
+    std::vec![],
+    Index::new(1),
+    now,
+  );
+  let source = m.group(&2).unwrap();
+  assert!(
+    source.is_frozen() && !source.is_poisoned(),
+    "the source froze normally"
+  );
+  assert_eq!(
+    source.shape_gen(),
+    1,
+    "the freeze moved the lineage counter"
+  );
+  assert_eq!(
+    m.remove_group(&1, &mut engine).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "the applied claim keeps refusing the target"
+  );
+  assert_eq!(
+    m.remove_group(&2, &mut engine).map(|ep| ep.is_some()),
+    Err(RemoveError::Frozen),
+    "a valid frozen source is refused Frozen — leg 2 unchanged"
+  );
+}
+
+/// `frozen` AND `freeze_pending` AT ONCE — the lagging replica the claim gate must read both of.
+/// Source 9 applied a freeze naming target 1; behind three apply budgets of load sit a committed
+/// unfreeze and, above it, a `PrepareMerge` naming target 3 — first a refused uncommitted entry
+/// at that index, then its valid replacement from a newer leader (every delivery re-drives one
+/// budget of the committed backlog, so the thaw must still be ahead after the third). The pending
+/// kill is armed by
+/// kind while `is_frozen()` is still true, so a gate that ran the pending scan only for an
+/// UNFROZEN source never read the claim on 3: the applied leg saw only 1, and both doors on 3
+/// stood open — `remove_group(&3)` and a freeze of 3 as another merge's SOURCE — until the drain
+/// caught up and 9 was frozen for a target already gone or dissolving. Keyed on the pending
+/// freeze alone, both doors refuse on the pending claim; once the follower drains (the unfreeze
+/// thaws 9 and re-derives the kill, the replacement folds) they refuse on the applied claim, and
+/// target 1's claim is released with the thaw.
+#[test]
+fn a_pending_claim_behind_an_applied_freeze_is_still_read() {
+  let budget = crate::endpoint::APPLY_BUDGET_ENTRIES;
+  let load = 3 * budget;
+  let unfreeze_at = load + 2;
+  let refreeze_at = load + 3;
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  engine_group(&mut m, &mut engine, 1, 0, now);
+  engine_group(&mut m, &mut engine, 3, 0, now);
+  engine_group(&mut m, &mut engine, 2, 0, now);
+  engine_follower(&mut m, &mut engine, 9, now);
+  // The old freeze, applied: 9 is frozen for 1.
+  engine_follower_append(
+    &mut m,
+    &mut engine,
+    9,
+    Term::new(1),
+    Index::ZERO,
+    Term::ZERO,
+    std::vec![valid_prepare_merge(Term::new(1), 1, 1, 1)],
+    Index::new(1),
+    now,
+  );
+  let source = m.group(&9).unwrap();
+  assert!(
+    source.is_frozen() && source.frozen_for() == Some(&gid_key(1)),
+    "9 applied its freeze for 1"
+  );
+  // Behind the budgets: the load, then the committed unfreeze — delivered, not cranked, so this
+  // delivery's drain cuts one budget in, far short of the thaw.
+  let mut entries = normal_load(2, load + 1);
+  entries.push(unfreeze_entry(unfreeze_at, 2));
+  engine_follower_deliver(
+    &mut m,
+    &mut engine,
+    9,
+    Term::new(1),
+    Index::new(1),
+    Term::new(1),
+    entries,
+    Index::new(unfreeze_at),
+    now,
+  );
+  let source = m.group(&9).unwrap();
+  assert_eq!(
+    (source.commit_index(), source.applied_index()),
+    (Index::new(unfreeze_at), Index::new(1 + budget)),
+    "the drain cut with the unfreeze committed and unapplied"
+  );
+  assert!(
+    source.is_frozen() && source.freeze_pending().is_none(),
+    "still frozen for 1, nothing pending yet"
+  );
+  // The new freeze's index first carries a refused uncommitted entry, then its valid replacement
+  // from a newer leader, naming 3.
+  engine_follower_deliver(
+    &mut m,
+    &mut engine,
+    9,
+    Term::new(1),
+    Index::new(unfreeze_at),
+    Term::new(1),
+    std::vec![refused_prepare_merge(
+      RefusedFreeze::EmptyTarget,
+      refreeze_at,
+      3
+    )],
+    Index::new(unfreeze_at),
+    now,
+  );
+  engine_follower_deliver(
+    &mut m,
+    &mut engine,
+    9,
+    Term::new(2),
+    Index::new(unfreeze_at),
+    Term::new(1),
+    std::vec![valid_prepare_merge(Term::new(2), refreeze_at, 3, 3)],
+    Index::new(unfreeze_at),
+    now,
+  );
+  let source = m.group(&9).unwrap();
+  assert_eq!(
+    (source.commit_index(), source.applied_index()),
+    (Index::new(unfreeze_at), Index::new(unfreeze_at - 1)),
+    "two more deliveries re-drove two more budgets; the thaw is the next entry to apply"
+  );
+  assert!(
+    source.is_frozen() && source.freeze_pending() == Some(Index::new(refreeze_at)),
+    "frozen for 1 AND freeze-pending toward 3, at once"
+  );
+  // BOTH DOORS on 3 refuse on the pending claim, read past the applied freeze on 1.
+  assert_eq!(
+    m.remove_group(&3, &mut engine).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "the pending claim on 3 is read past the applied freeze on 1"
+  );
+  assert!(
+    matches!(
+      m.prepare_merge(&3, now, &mut engine, &2),
+      Some(Err(MergeError::SourceClaimedAsTarget))
+    ),
+    "the freeze door reads the same pending claim"
+  );
+  // The follower drains: the unfreeze thaws 9 and re-derives the kill, the replacement folds.
+  engine_follower_append(
+    &mut m,
+    &mut engine,
+    9,
+    Term::new(2),
+    Index::new(refreeze_at),
+    Term::new(2),
+    std::vec![],
+    Index::new(refreeze_at),
+    now,
+  );
+  let source = m.group(&9).unwrap();
+  assert!(
+    source.is_frozen()
+      && source.frozen_for() == Some(&gid_key(3))
+      && source.freeze_pending().is_none(),
+    "9 is frozen for 3"
+  );
+  assert_eq!(
+    source.shape_gen(),
+    3,
+    "thaw and re-freeze both moved the counter"
+  );
+  assert_eq!(
+    m.remove_group(&3, &mut engine).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "the applied claim on 3 keeps the teardown door shut"
+  );
+  assert!(
+    matches!(
+      m.prepare_merge(&3, now, &mut engine, &2),
+      Some(Err(MergeError::SourceClaimedAsTarget))
+    ),
+    "and the freeze door"
+  );
+  assert_eq!(
+    m.remove_group(&1, &mut engine).map(|ep| ep.is_some()),
+    Ok(true),
+    "target 1's claim was released by the thaw"
+  );
+}
+
+/// A `GroupStores` over the engine that answers `None` for one hosted group — the starved shape
+/// the trait's contract names ("returning `None` for a hosted group starves it").
+struct Starved<'a> {
+  engine: &'a mut GroupEngine<u64, u64>,
+  withheld: u64,
+}
+
+impl crate::GroupStores<u64, EngineLog, EngineStable<u64>> for Starved<'_> {
+  fn stores(&mut self, group: &u64) -> Option<(&mut EngineLog, &mut EngineStable<u64>)> {
+    if *group == self.withheld {
+      None
+    } else {
+      self.engine.stores(group)
+    }
+  }
+}
+
+/// A freeze-pending source whose stores CANNOT BE RESOLVED is a claim the gate cannot rule out.
+/// `GroupStores::stores` may answer `None` for a hosted group — the contract names that shape, a
+/// starved group — and the pending claim lives only in that group's log, so a gate that skipped
+/// the source on `None` read "unreadable" as "claims nothing" and let the target go. Source 5's
+/// pending freeze names 3, not 1: with 5's stores withheld, `remove_group(&1)` REFUSES all the
+/// same (fail-closed, exactly as on an unreadable page); with them resolvable the readable claim
+/// refuses 3 and admits 1 — the refusal was the missing read, not a match.
+#[test]
+fn an_unresolvable_freeze_pending_source_fences_every_target() {
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  engine_group(&mut m, &mut engine, 1, 0, now);
+  engine_group(&mut m, &mut engine, 3, 0, now);
+  engine_follower(&mut m, &mut engine, 5, now);
+  engine_follower_append(
+    &mut m,
+    &mut engine,
+    5,
+    Term::new(1),
+    Index::ZERO,
+    Term::ZERO,
+    std::vec![valid_prepare_merge(Term::new(1), 1, 3, 1)],
+    Index::ZERO,
+    now,
+  );
+  assert!(
+    m.group(&5).unwrap().freeze_pending().is_some(),
+    "5's freeze toward 3 is pending"
+  );
+  assert_eq!(
+    m.remove_group(
+      &1,
+      &mut Starved {
+        engine: &mut engine,
+        withheld: 5,
+      },
+    )
+    .map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "a claim that cannot be read cannot be ruled out"
+  );
+  assert!(m.contains_group(&1), "the refusal left the target hosted");
+  // Readable, the claim is exact.
+  assert_eq!(
+    m.remove_group(&3, &mut engine).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "the readable pending claim refuses the target it names"
+  );
+  assert_eq!(
+    m.remove_group(&1, &mut engine).map(|ep| ep.is_some()),
+    Ok(true),
+    "and admits the target it does not"
+  );
+}
+
+/// EVERY QUEUED CLAIM, NOT THE FIRST. Source 9 applied a freeze for target 1; behind its apply
+/// budgets sit two more freeze cycles, committed: `Unfreeze0`, `Prepare1` (naming 3), `Unfreeze1`,
+/// `Prepare2` (naming 5), each boundary placed one budget apart so the drain can be parked exactly
+/// after any of them. A gate that read the LOWEST pending claim answered 3 and left 5 undefended
+/// through the whole backlog; and a fold that CLEARED the pending state at `Prepare1`'s apply
+/// left the gate not even scanning until `Unfreeze1` applied. Both doors on 5 —
+/// `remove_group(&5)` and a freeze of 5 as another merge's SOURCE — refuse at every stage: on the
+/// collected pending claims while the drain is parked before `Unfreeze0`, still with `Prepare1`
+/// applied (the fold re-derived the pending state from `Prepare2`), still through `Unfreeze1`,
+/// and on the applied claim once `Prepare2` folds. The released targets admit as each cycle
+/// resolves: 1 after `Prepare1` replaces its freeze, 3 after `Unfreeze1` thaws it.
+#[test]
+fn every_queued_claim_is_read_across_an_apply_starved_backlog() {
+  let budget = crate::endpoint::APPLY_BUDGET_ENTRIES;
+  // Phase B's own message-path pass applies one budget from index 2; each `engine_step` applies one
+  // more. The boundaries below land the second pass exactly on `Prepare1` and the third exactly
+  // on `Unfreeze1`.
+  let unfreeze0_at = 2 * budget;
+  let prepare1_at = 2 * budget + 1;
+  let unfreeze1_at = 3 * budget + 1;
+  let prepare2_at = 3 * budget + 2;
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  for target in [1u64, 3, 4, 5] {
+    engine_group(&mut m, &mut engine, target, 0, now);
+  }
+  engine_follower(&mut m, &mut engine, 9, now);
+  engine_follower_append(
+    &mut m,
+    &mut engine,
+    9,
+    Term::new(1),
+    Index::ZERO,
+    Term::ZERO,
+    std::vec![valid_prepare_merge(Term::new(1), 1, 1, 1)],
+    Index::new(1),
+    now,
+  );
+  assert!(
+    m.group(&9).unwrap().frozen_for() == Some(&gid_key(1)),
+    "9 applied its freeze for 1"
+  );
+  // The committed backlog, delivered and not cranked: the drain parks one budget in, before
+  // `Unfreeze0`.
+  let mut entries = normal_load(2, unfreeze0_at - 1);
+  entries.push(unfreeze_entry(unfreeze0_at, 2));
+  entries.push(valid_prepare_merge(Term::new(1), prepare1_at, 3, 3));
+  entries.extend(normal_load(prepare1_at + 1, unfreeze1_at - 1));
+  entries.push(unfreeze_entry(unfreeze1_at, 4));
+  entries.push(valid_prepare_merge(Term::new(1), prepare2_at, 5, 5));
+  engine_follower_deliver(
+    &mut m,
+    &mut engine,
+    9,
+    Term::new(1),
+    Index::new(1),
+    Term::new(1),
+    entries,
+    Index::new(prepare2_at),
+    now,
+  );
+  let source = m.group(&9).unwrap();
+  assert_eq!(
+    (source.commit_index(), source.applied_index()),
+    (Index::new(prepare2_at), Index::new(1 + budget)),
+    "the drain parked one budget in, before Unfreeze0"
+  );
+  assert!(
+    source.is_frozen() && source.freeze_pending() == Some(Index::new(prepare1_at)),
+    "frozen for 1, the lowest pending freeze is Prepare1"
+  );
+  let doors_refuse_5 =
+    |m: &mut MultiRaft<u64, u64, CountSm>, engine: &mut GroupEngine<u64, u64>, stage: &str| {
+      assert_eq!(
+        m.remove_group(&5, engine).map(|ep| ep.is_some()),
+        Err(RemoveError::Claimed),
+        "{stage}: the teardown door reads the queued claim on 5"
+      );
+      assert!(
+        matches!(
+          m.prepare_merge(&5, now, engine, &4),
+          Some(Err(MergeError::SourceClaimedAsTarget))
+        ),
+        "{stage}: the freeze door reads the queued claim on 5"
+      );
+    };
+  doors_refuse_5(&mut m, &mut engine, "parked before Unfreeze0");
+
+  // Exactly through `Prepare1`'s apply: the fold must re-derive the pending state from `Prepare2`.
+  engine_step(&mut m, &mut engine, 9, now);
+  let source = m.group(&9).unwrap();
+  assert_eq!(
+    source.applied_index(),
+    Index::new(prepare1_at),
+    "the step applied exactly through Prepare1"
+  );
+  assert!(
+    source.is_frozen() && source.frozen_for() == Some(&gid_key(3)),
+    "9 is frozen for 3 now"
+  );
+  assert_eq!(
+    source.freeze_pending(),
+    Some(Index::new(prepare2_at)),
+    "Prepare1's fold re-derived the pending state from the queued Prepare2"
+  );
+  doors_refuse_5(&mut m, &mut engine, "Prepare1 applied");
+  assert_eq!(
+    m.remove_group(&1, &mut engine).map(|ep| ep.is_some()),
+    Ok(true),
+    "1's claim was replaced by Prepare1"
+  );
+
+  // Exactly through `Unfreeze1`: thawed, the pending state re-derived once more.
+  engine_step(&mut m, &mut engine, 9, now);
+  let source = m.group(&9).unwrap();
+  assert_eq!(
+    source.applied_index(),
+    Index::new(unfreeze1_at),
+    "the step applied exactly through Unfreeze1"
+  );
+  assert!(
+    !source.is_frozen() && source.freeze_pending() == Some(Index::new(prepare2_at)),
+    "thawed, with Prepare2 still pending"
+  );
+  doors_refuse_5(&mut m, &mut engine, "Unfreeze1 applied");
+  assert_eq!(
+    m.remove_group(&3, &mut engine).map(|ep| ep.is_some()),
+    Ok(true),
+    "3's claim was released by Unfreeze1"
+  );
+
+  // Through `Prepare2`: frozen for 5, and both doors refuse on the applied claim.
+  engine_step(&mut m, &mut engine, 9, now);
+  let source = m.group(&9).unwrap();
+  assert!(
+    source.is_frozen()
+      && source.frozen_for() == Some(&gid_key(5))
+      && source.freeze_pending().is_none(),
+    "9 is frozen for 5, nothing pending"
+  );
+  assert_eq!(source.shape_gen(), 5, "every cycle moved the counter");
+  doors_refuse_5(&mut m, &mut engine, "Prepare2 applied");
+}
+
+/// THE WALK ENDS AT A COMMITTED REFUSAL. Source 5's committed suffix holds a refused `PrepareMerge`
+/// and, above it, a valid one naming target 1; the drain is parked below both. The refused entry
+/// will poison 5 the moment the drain reaches it, so the valid freeze above it never applies and
+/// its claim must NOT be reported: `remove_group(&1)` admits, and the resumed drain poisons 5 as
+/// promised. A walk that skipped the refusal and read on would fence 1 forever against a source
+/// that can never absorb into it. The UNCOMMITTED twin is the opposite edge: a refused entry above
+/// the commit is indeterminate, so the walk fails closed at it — `remove_group(&1)` refuses even
+/// though the only readable claim above names 3, not 1 — a walk that ended with "no claim" there,
+/// or read past it, would let 1 go.
+#[test]
+fn the_claim_walk_ends_at_a_committed_refusal_and_fails_closed_at_an_uncommitted_one() {
+  let budget = crate::endpoint::APPLY_BUDGET_ENTRIES;
+  // COMMITTED: the refused entry and the valid freeze above it both sit behind one budget of load.
+  {
+    let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+    let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+    let now = Instant::ORIGIN;
+    engine_group(&mut m, &mut engine, 1, 0, now);
+    engine_follower(&mut m, &mut engine, 5, now);
+    let mut entries = normal_load(1, budget);
+    entries.push(refused_prepare_merge(
+      RefusedFreeze::EmptyTarget,
+      budget + 1,
+      1,
+    ));
+    entries.push(valid_prepare_merge(Term::new(1), budget + 2, 1, 2));
+    engine_follower_deliver(
+      &mut m,
+      &mut engine,
+      5,
+      Term::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(budget + 2),
+      now,
+    );
+    let source = m.group(&5).unwrap();
+    assert!(
+      source.applied_index() == Index::new(budget)
+        && source.freeze_pending() == Some(Index::new(budget + 1))
+        && !source.is_poisoned(),
+      "parked below the committed refusal, freeze-pending, unjudged"
+    );
+    assert_eq!(
+      m.remove_group(&1, &mut engine).map(|ep| ep.is_some()),
+      Ok(true),
+      "the claim queued above a committed refusal is never reported"
+    );
+    engine_crank(&mut m, &mut engine, 5, now);
+    assert_eq!(
+      m.group(&5).unwrap().poison_reason(),
+      Some(PoisonReason::MergeDecode),
+      "the resumed drain refused the entry, as the walk promised"
+    );
+  }
+  // UNCOMMITTED: the refused entry is above the commit; the valid freeze above it names 3.
+  {
+    let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+    let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+    let now = Instant::ORIGIN;
+    engine_group(&mut m, &mut engine, 1, 0, now);
+    engine_group(&mut m, &mut engine, 3, 0, now);
+    engine_follower(&mut m, &mut engine, 5, now);
+    engine_follower_append(
+      &mut m,
+      &mut engine,
+      5,
+      Term::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        refused_prepare_merge(RefusedFreeze::EmptyTarget, 1, 1),
+        valid_prepare_merge(Term::new(1), 2, 3, 2),
+      ],
+      Index::ZERO,
+      now,
+    );
+    assert_eq!(
+      m.remove_group(&1, &mut engine).map(|ep| ep.is_some()),
+      Err(RemoveError::Claimed),
+      "an uncommitted refusal below the queue fails closed for every target"
+    );
+    assert!(m.contains_group(&1), "the refusal left the target hosted");
+  }
+}
+
+/// `GroupStores` over paged `FailTermLog`s — the store whose reads a test can count, cold, or
+/// alternate, per group.
+struct PagedStores(std::collections::BTreeMap<u64, (crate::testkit::FailTermLog, AsyncStable)>);
+
+impl crate::GroupStores<u64, crate::testkit::FailTermLog, AsyncStable> for PagedStores {
+  fn stores(
+    &mut self,
+    group: &u64,
+  ) -> Option<(&mut crate::testkit::FailTermLog, &mut AsyncStable)> {
+    self.0.get_mut(group).map(|(l, s)| (l, s))
+  }
+}
+
+/// Admit and elect single-voter group `gid` over paged stores.
+fn paged_leader(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  stores: &mut PagedStores,
+  gid: u64,
+  now: Instant,
+) {
+  stores.0.insert(
+    gid,
+    (
+      crate::testkit::FailTermLog::default(),
+      AsyncStable::default(),
+    ),
+  );
+  m.create_group(gid, 0, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  let (log, stable) = stores.0.get_mut(&gid).unwrap();
+  let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&gid, d, log, stable).unwrap();
+  while matches!(
+    m.handle_storage(&gid, d, log, stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert!(m.group(&gid).unwrap().role().is_leader());
+}
+
+/// Admit follower group `gid` (node 1 following phantom peer 2) over paged stores.
+fn paged_follower(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  stores: &mut PagedStores,
+  gid: u64,
+  now: Instant,
+) {
+  stores.0.insert(
+    gid,
+    (
+      crate::testkit::FailTermLog::default(),
+      AsyncStable::default(),
+    ),
+  );
+  m.create_group(gid, 0, follower_cfg(), now, 7, CountSm::default())
+    .unwrap();
+}
+
+/// Deliver one term-1 `AppendEntries` from phantom leader 2 to paged follower `gid` — `entries`
+/// after `prev`, the commit advertised at `commit` — WITHOUT draining its storage afterwards.
+fn paged_deliver(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  stores: &mut PagedStores,
+  gid: u64,
+  prev: Index,
+  entries: Vec<crate::Entry>,
+  commit: Index,
+  now: Instant,
+) {
+  let (log, stable) = stores.0.get_mut(&gid).unwrap();
+  let prev_term = if prev == Index::ZERO {
+    Term::ZERO
+  } else {
+    Term::new(1)
+  };
+  m.handle_message(
+    &gid,
+    now,
+    log,
+    stable,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      prev,
+      prev_term,
+      entries,
+      commit,
+    )),
+  )
+  .unwrap();
+}
+
+/// How many `entries` reads paged group `gid`'s log has served.
+fn paged_reads(stores: &PagedStores, gid: u64) -> u64 {
+  stores.0.get(&gid).unwrap().0.observed_entries_calls()
+}
+
+/// THE CLAIM GATE READS EXACTLY THE QUEUED ENTRIES, EACH ONCE. Source 5 holds three uncommitted
+/// freezes among ordinary entries — at 1 (naming 1), 3 (naming 3) and 5 (naming 4) — and nothing
+/// is committed, so no apply read runs on its log. With the page at 3 cold, the gate reads the
+/// first entry, meets the cold page at the second, and refuses: the third is never read — bounded
+/// by the queue, never a walk restarted from its origin. Warm again, it reads only the two entries
+/// it could not before, each as a single-entry range (a suffix walk read the whole range in one
+/// wide chunk), and answers; from then on every attempt answers from the cached verdicts with no
+/// read at all.
+#[test]
+fn the_claim_gate_reads_exactly_the_queued_entries() {
+  use crate::testkit::FailTermLog;
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = PagedStores(std::collections::BTreeMap::new());
+  let now = Instant::ORIGIN;
+  for gid in [1u64, 3, 4, 6] {
+    stores
+      .0
+      .insert(gid, (FailTermLog::default(), AsyncStable::default()));
+    m.create_group(gid, 0, single_node_cfg(1), now, 7, CountSm::default())
+      .unwrap();
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&gid, d, log, stable).unwrap();
+    while matches!(
+      m.handle_storage(&gid, d, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+    assert!(m.group(&gid).unwrap().role().is_leader());
+  }
+  stores
+    .0
+    .insert(5, (FailTermLog::default(), AsyncStable::default()));
+  m.create_group(5, 0, follower_cfg(), now, 7, CountSm::default())
+    .unwrap();
+  {
+    let (log, stable) = stores.0.get_mut(&5).unwrap();
+    let mut entries = std::vec![valid_prepare_merge(Term::new(1), 1, 1, 1)];
+    entries.extend(normal_load(2, 2));
+    entries.push(valid_prepare_merge(Term::new(1), 3, 3, 2));
+    entries.extend(normal_load(4, 4));
+    entries.push(valid_prepare_merge(Term::new(1), 5, 4, 3));
+    m.handle_message(
+      &5,
+      now,
+      log,
+      stable,
+      2u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        Term::new(1),
+        2u64,
+        Index::ZERO,
+        Term::ZERO,
+        entries,
+        Index::ZERO,
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m.handle_storage(&5, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert_eq!(
+    m.group(&5).unwrap().freeze_queue().collect::<Vec<_>>(),
+    std::vec![Index::new(1), Index::new(3), Index::new(5)],
+    "three freezes queued"
+  );
+  while m.poll_message().is_some() {}
+
+  // COLD at the second queued entry: the first is read and cached, the walk stops at the cold
+  // page, and the third is never read.
+  stores
+    .0
+    .get_mut(&5)
+    .unwrap()
+    .0
+    .cold_entries_at(Some(Index::new(3)));
+  let before = paged_reads(&stores, 5);
+  assert_eq!(
+    m.remove_group(&4, &mut stores).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "an unreadable queued entry refuses every target"
+  );
+  assert_eq!(
+    paged_reads(&stores, 5) - before,
+    2,
+    "the gate stopped at the cold page — the entry above it was never read"
+  );
+
+  // WARM: a target nobody names admits after exactly the two still-uncached entries were read,
+  // each as a single-entry range.
+  stores.0.get_mut(&5).unwrap().0.cold_entries_at(None);
+  let before = paged_reads(&stores, 5);
+  assert_eq!(
+    m.remove_group(&6, &mut stores).map(|ep| ep.is_some()),
+    Ok(true),
+    "6 is named by no queued freeze"
+  );
+  let log5 = &stores.0.get(&5).unwrap().0;
+  assert_eq!(
+    log5.observed_entries_calls() - before,
+    2,
+    "exactly the two entries the cold attempt could not read"
+  );
+  assert_eq!(
+    log5.observed_max_range_width(),
+    1,
+    "each as a single-entry range — never a suffix walk"
+  );
+
+  // CACHED: no further attempt reads.
+  let before = paged_reads(&stores, 5);
+  assert_eq!(
+    m.remove_group(&4, &mut stores).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "4 is named by the third queued freeze"
+  );
+  assert_eq!(
+    paged_reads(&stores, 5) - before,
+    0,
+    "every queued index needed exactly one Ready read, ever"
+  );
+}
+
+/// A ONE-PAGE CACHE THAT EVICTS WHAT IT JUST SERVED cannot livelock the claim gate. Source 5 holds
+/// two queued freezes (naming 1 and 3), nothing committed, and every read of its log flips the
+/// page: a walk that re-read every queued entry after a cold page answered a standing refusal
+/// forever — each attempt's first read evicted the page its second needed. The gate caches each
+/// Ready verdict on the source and reads only the uncached indices: attempt 1 reads both (the
+/// second cold) and refuses; attempt 2 reads only the entry attempt 1 could not and reaches the
+/// terminal verdict; from then on no attempt reads at all.
+#[test]
+fn the_claim_gate_resumes_across_a_one_page_cache() {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = PagedStores(std::collections::BTreeMap::new());
+  let now = Instant::ORIGIN;
+  for gid in [1u64, 3, 6] {
+    paged_leader(&mut m, &mut stores, gid, now);
+  }
+  paged_follower(&mut m, &mut stores, 5, now);
+  let mut entries = std::vec![valid_prepare_merge(Term::new(1), 1, 1, 1)];
+  entries.extend(normal_load(2, 2));
+  entries.push(valid_prepare_merge(Term::new(1), 3, 3, 2));
+  paged_deliver(
+    &mut m,
+    &mut stores,
+    5,
+    Index::ZERO,
+    entries,
+    Index::ZERO,
+    now,
+  );
+  while m.poll_message().is_some() {}
+  stores.0.get_mut(&5).unwrap().0.alternate_cold_on_read();
+
+  let r0 = paged_reads(&stores, 5);
+  assert_eq!(
+    m.remove_group(&6, &mut stores).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "attempt 1: the second queued entry's page is cold — refused, fail-closed"
+  );
+  assert_eq!(
+    paged_reads(&stores, 5) - r0,
+    2,
+    "attempt 1 read both queued entries"
+  );
+  let r1 = paged_reads(&stores, 5);
+  assert_eq!(
+    m.remove_group(&6, &mut stores).map(|ep| ep.is_some()),
+    Ok(true),
+    "attempt 2: the terminal verdict — 6 is named by no queued freeze"
+  );
+  assert_eq!(
+    paged_reads(&stores, 5) - r1,
+    1,
+    "attempt 2 read only the entry attempt 1 could not"
+  );
+  let r2 = paged_reads(&stores, 5);
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|ep| ep.is_some()),
+    Err(RemoveError::Claimed),
+    "the cached claims answer 1"
+  );
+  assert_eq!(
+    paged_reads(&stores, 5) - r2,
+    0,
+    "every queued index needed exactly one Ready read, ever"
+  );
+}
+
+/// THE CLAIM CACHE FOLLOWS THE LOG. A cached claim is a fact about ONE entry: when a conflicting
+/// append replaces that entry with a freeze naming a different target, the verdict goes with it
+/// and the gate re-reads — the stale claim is never answered. And a refusal judged ABOVE the
+/// commit is re-read once the commit reaches it: the same bytes are then a committed refusal,
+/// which ends the walk instead of failing closed.
+#[test]
+fn the_claim_cache_follows_truncation_and_commit() {
+  let now = Instant::ORIGIN;
+  // TRUNCATION: the cached claim on 1 is replaced by a claim on 3.
+  {
+    let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+    let mut stores = PagedStores(std::collections::BTreeMap::new());
+    paged_leader(&mut m, &mut stores, 1, now);
+    paged_leader(&mut m, &mut stores, 3, now);
+    paged_follower(&mut m, &mut stores, 5, now);
+    paged_deliver(
+      &mut m,
+      &mut stores,
+      5,
+      Index::ZERO,
+      std::vec![valid_prepare_merge(Term::new(1), 1, 1, 1)],
+      Index::ZERO,
+      now,
+    );
+    while m.poll_message().is_some() {}
+    assert_eq!(
+      m.remove_group(&1, &mut stores).map(|ep| ep.is_some()),
+      Err(RemoveError::Claimed),
+      "the claim on 1 is read and cached"
+    );
+    // A newer leader's suffix replaces index 1 with a freeze naming 3.
+    {
+      let (log, stable) = stores.0.get_mut(&5).unwrap();
+      m.handle_message(
+        &5,
+        now,
+        log,
+        stable,
+        2u64,
+        Message::AppendEntries(crate::AppendEntries::new(
+          Term::new(2),
+          2u64,
+          Index::ZERO,
+          Term::ZERO,
+          std::vec![valid_prepare_merge(Term::new(2), 1, 3, 1)],
+          Index::ZERO,
+        )),
+      )
+      .unwrap();
+    }
+    while m.poll_message().is_some() {}
+    let r = paged_reads(&stores, 5);
+    assert_eq!(
+      m.remove_group(&1, &mut stores).map(|ep| ep.is_some()),
+      Ok(true),
+      "the replaced entry was re-read: the stale claim on 1 is never answered"
+    );
+    assert_eq!(
+      paged_reads(&stores, 5) - r,
+      1,
+      "one re-read of the replaced index"
+    );
+    assert_eq!(
+      m.remove_group(&3, &mut stores).map(|ep| ep.is_some()),
+      Err(RemoveError::Claimed),
+      "the new claim is answered from that re-read"
+    );
+  }
+  // COMMIT: a refusal judged above the commit is re-read once the commit reaches it.
+  {
+    let budget = crate::endpoint::APPLY_BUDGET_ENTRIES;
+    let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+    let mut stores = PagedStores(std::collections::BTreeMap::new());
+    paged_leader(&mut m, &mut stores, 1, now);
+    paged_follower(&mut m, &mut stores, 5, now);
+    let mut entries = normal_load(1, budget);
+    entries.push(refused_prepare_merge(
+      RefusedFreeze::EmptyTarget,
+      budget + 1,
+      1,
+    ));
+    entries.push(valid_prepare_merge(Term::new(1), budget + 2, 1, 2));
+    paged_deliver(
+      &mut m,
+      &mut stores,
+      5,
+      Index::ZERO,
+      entries,
+      Index::ZERO,
+      now,
+    );
+    while m.poll_message().is_some() {}
+    let r = paged_reads(&stores, 5);
+    assert_eq!(
+      m.remove_group(&1, &mut stores).map(|ep| ep.is_some()),
+      Err(RemoveError::Claimed),
+      "judged above the commit: fail-closed"
+    );
+    assert_eq!(paged_reads(&stores, 5) - r, 1, "the refusal was read once");
+    // The leader's commit reaches past the refusal: the drain applies exactly one budget of load
+    // and parks below it, the refusal committed and unapplied.
+    paged_deliver(
+      &mut m,
+      &mut stores,
+      5,
+      Index::new(budget + 2),
+      std::vec![],
+      Index::new(budget + 2),
+      now,
+    );
+    let source = m.group(&5).unwrap();
+    assert_eq!(
+      (source.commit_index(), source.applied_index()),
+      (Index::new(budget + 2), Index::new(budget)),
+      "parked one budget in, below the committed refusal"
+    );
+    let r = paged_reads(&stores, 5);
+    assert_eq!(
+      m.remove_group(&1, &mut stores).map(|ep| ep.is_some()),
+      Ok(true),
+      "re-read as a committed refusal: the walk ends there, and 1 is claimed by nothing that can apply"
+    );
+    assert_eq!(paged_reads(&stores, 5) - r, 1, "exactly the re-read");
+    // The drain confirms the verdict.
+    {
+      let (log, stable) = stores.0.get_mut(&5).unwrap();
+      while matches!(
+        m.handle_storage(&5, now, log, stable),
+        Some(StorageProgress::MorePending)
+      ) {}
+    }
+    assert_eq!(
+      m.group(&5).unwrap().poison_reason(),
+      Some(PoisonReason::MergeDecode),
+      "the resumed drain refused the entry, as the verdict promised"
+    );
+  }
+}
+
+/// The rule holds across a RESTART, at both crash points the same durable log can be recovered
+/// from. Two sources carry the identical committed refused entry. Source 3's commit floor is
+/// durable past the entry — the persist a budget-cut apply crank writes before its drain reaches
+/// the entry — so boot replay meets the entry, poisons, and restart lands where the live refusal
+/// did: no kill armed, removable under the cap. Source 2 is the state the live refusal actually
+/// leaves behind: the poison stopped the batched commit persist, so nothing durable committed the
+/// entry, boot re-arms the kill by kind (unjudged, exactly as the live append did), and the
+/// leader's re-delivered commit drives the refused apply — which must release what the boot scan
+/// armed, or the restarted replica wedges `Frozen` on an entry that never leaves its log. The
+/// engine's cap is a function of the surviving log, so it holds through both.
+#[test]
+fn a_refused_prepare_merge_arms_no_freeze_across_a_restart_either() {
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  for gid in [2u64, 3] {
+    engine_follower(&mut m, &mut engine, gid, now);
+    engine_follower_append(
+      &mut m,
+      &mut engine,
+      gid,
+      Term::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![refused_prepare_merge(RefusedFreeze::EmptyTarget, 1, 1)],
+      Index::new(1),
+      now,
+    );
+    assert!(m.group(&gid).unwrap().is_poisoned(), "{gid}: refused live");
+  }
+  // Source 3's crash point: the commit floor persisted past the entry before the drain reached it.
+  {
+    let (_, stable) = engine.stores(&3).unwrap();
+    let hs = stable.hard_state().with_commit(Index::new(1));
+    crate::StableStore::submit_write(stable, OpId::first_of_epoch(9), hs);
+  }
+  engine.flush();
+  // Source 2's crash point is the one the live refusal leaves: the poison blocked the persist.
+  assert_eq!(
+    engine.stores(&2).unwrap().1.hard_state().commit(),
+    Index::ZERO,
+    "the poisoned drain never persisted the commit floor"
+  );
+  drop(m);
+
+  let mut m2: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  for gid in [2u64, 3] {
+    let epoch = engine.next_boot_epoch(&gid).unwrap();
+    let (log, stable) = engine.stores(&gid).unwrap();
+    m2.restore_group_unchecked(
+      gid,
+      follower_cfg(),
+      now,
+      7,
+      CountSm::default(),
+      epoch,
+      log,
+      stable,
+    )
+    .unwrap();
+  }
+  // Source 2: nothing durable committed the entry, so boot re-arms the kill by kind, unjudged.
+  let ep = m2.group(&2).unwrap();
+  assert!(
+    !ep.is_poisoned(),
+    "2: no durable commit reached the entry at boot"
+  );
+  assert!(
+    ep.merge_freeze_active() && !ep.is_frozen(),
+    "2: the boot scan re-armed the append-observed kill by kind"
+  );
+  // The leader re-delivers the commit; the refused apply must release what the boot scan armed.
+  engine_follower_append(
+    &mut m2,
+    &mut engine,
+    2,
+    Term::new(1),
+    Index::new(1),
+    Term::new(1),
+    std::vec![],
+    Index::new(1),
+    now,
+  );
+  let ep = m2.group(&2).unwrap();
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::MergeDecode),
+    "2: the re-delivered commit met the refusal"
+  );
+  assert_eq!(
+    engine.removal_floor(&2),
+    crate::HIGHEST_WORKING_GENERATION,
+    "2: the cap still holds"
+  );
+  assert_eq!(
+    m2.remove_group(&2, &mut engine).map(|ep| ep.is_some()),
+    Ok(true),
+    "2: the restarted source tears down — the boot-armed kill released at the refusal"
+  );
+  // Source 3: boot replay reached the entry — poisoned at boot, and no kill survives the refusal.
+  let ep = m2.group(&3).unwrap();
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::MergeDecode),
+    "3: replay refused the entry at boot"
+  );
+  assert!(
+    !ep.merge_freeze_active(),
+    "3: restart lands where the live refusal did — no freeze armed"
+  );
+  assert_eq!(
+    engine.removal_floor(&3),
+    crate::HIGHEST_WORKING_GENERATION,
+    "3: the cap survives the restart"
+  );
+  assert_eq!(
+    m2.remove_group(&3, &mut engine).map(|ep| ep.is_some()),
+    Ok(true),
+    "3: removable after boot"
+  );
+}
+
 /// A committed abort must thaw its frozen source even across source-leader churn. While the source
 /// has NO leader the service's thaw drive refuses (`NotLeader`) and appends nothing, so the durable
 /// `abandoned` obligation must STAY SET — dropping it would wedge the source frozen forever once a

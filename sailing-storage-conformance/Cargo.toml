@@ -9,7 +9,11 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-sailing-proto = { workspace = true, features = ["std"] }
+# The `fuzzing` feature rides the NORMAL dependency, not a dev-dependency: the reference subjects
+# that MINT a shape entry are shipped in this crate's `src/`, so its library target — not only its
+# tests — must see the off-by-default minting seam. `publish = false` is what makes that acceptable:
+# a doc(hidden), no-semver module reaches nothing outside this harness.
+sailing-proto = { workspace = true, features = ["std", "fuzzing"] }
 bytes.workspace = true
 
 [lints]

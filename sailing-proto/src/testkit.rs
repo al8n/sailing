@@ -261,6 +261,17 @@ pub(crate) struct FailTermLog {
   /// When `Some(i)`, `entries(range)` returns `Err(())` for any range CONTAINING `i`; otherwise
   /// delegates to `inner`. Proves a fatal log-read mid-scan fail-stops rather than fabricating a default.
   fail_entries_index: Option<Index>,
+  /// A page at this index answers [`EntriesRead::Pending`] for any range containing it — one cold
+  /// range in an otherwise warm store.
+  cold_entries_index: Option<Index>,
+  /// When `true`, `entries` alternates ready and [`EntriesRead::Pending`] on successive calls — a
+  /// bounded cache that evicts what it just served.
+  alternate_cold: bool,
+  /// The alternation's phase: `true` means the NEXT read is the cold one.
+  alternate_phase: Cell<bool>,
+  /// How many `entries` calls this log has served, so a test can pin exactly which reads a path
+  /// performs.
+  entries_calls: Cell<u64>,
   /// When `true`, `restore` is a NO-OP: it does NOT re-baseline `first_index` to `last_index + 1`,
   /// modelling a store that violates the restore contract — to prove a snapshot install fail-stops.
   skip_restore_rebaseline: bool,
@@ -305,6 +316,26 @@ impl FailTermLog {
   /// Arm the fatal `entries` failure at `index`: any range containing it returns `Err(())`.
   pub(crate) fn fail_entries_at(&mut self, index: Option<Index>) {
     self.fail_entries_index = index;
+  }
+
+  /// Arm ONE cold page at `index`: any `entries` range containing it returns
+  /// [`EntriesRead::Pending`] while every other range serves normally — a paged store with a
+  /// single range not yet resident (cleared with `None`). Distinguishes the per-site dispositions
+  /// a whole-log cold read cannot: the read that succeeds and the one that defers in one drain.
+  pub(crate) fn cold_entries_at(&mut self, index: Option<Index>) {
+    self.cold_entries_index = index;
+  }
+
+  /// Alternate `entries` between ready and [`EntriesRead::Pending`] on successive calls, starting
+  /// ready — a bounded cache that evicts what it just served. A walk that restarts from its origin
+  /// after every cold page never completes against it; a reader that touches each entry once does.
+  pub(crate) fn alternate_cold_on_read(&mut self) {
+    self.alternate_cold = true;
+  }
+
+  /// How many `entries` calls this log has served (`0` if none yet).
+  pub(crate) fn observed_entries_calls(&self) -> u64 {
+    self.entries_calls.get()
   }
 
   /// Make `restore` a no-op (skip the re-baseline) — a contract-violating store, for the install fail-stop.
@@ -374,6 +405,7 @@ impl LogStore for FailTermLog {
   }
 
   fn entries(&self, range: Range<Index>, max_bytes: u64) -> Result<EntriesRead<'_>, Self::Error> {
+    self.entries_calls.set(self.entries_calls.get() + 1);
     self.observed_max_bytes.set(max_bytes);
     self.observed_max_range_width.set(
       self
@@ -381,8 +413,15 @@ impl LogStore for FailTermLog {
         .get()
         .max(range.end.get().saturating_sub(range.start.get())),
     );
-    if self.return_cold {
+    if self.return_cold || self.cold_entries_index.is_some_and(|i| range.contains(&i)) {
       return Ok(EntriesRead::Pending);
+    }
+    if self.alternate_cold {
+      let cold = self.alternate_phase.get();
+      self.alternate_phase.set(!cold);
+      if cold {
+        return Ok(EntriesRead::Pending);
+      }
     }
     if self.fail_entries_index.is_some_and(|i| range.contains(&i)) {
       return Err(());

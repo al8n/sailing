@@ -9,7 +9,7 @@ use crate::{
   check::{Durability, EngineSubject, LogSubject, StableSubject},
   fault::CrashClass,
 };
-use sailing_proto::{EngineLog, EngineStable, GroupEngine};
+use sailing_proto::{EngineLog, EngineStable, Entry, GroupEngine, Index, Term};
 
 /// The group every store-level subject lends its handles from. Which id it is does not matter — a
 /// store suite never looks at group identity — but it has to be SOME id, since a store handle only
@@ -142,5 +142,9 @@ impl EngineSubject for ReferenceEngineSubject {
 
   fn node(&self, n: u64) -> Self::NodeId {
     n
+  }
+
+  fn shape_entry(&self, term: Term, index: Index, generation: u64) -> Option<Entry> {
+    Some(crate::fault::mint_shape_entry(term, index, generation))
   }
 }

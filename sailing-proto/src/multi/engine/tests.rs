@@ -1452,3 +1452,202 @@ mod engine_backed_cluster {
     );
   }
 }
+
+/// THE PUBLIC LOG LEG ANSWERS EACH SHAPE KIND ITS OWN MINT, AND REFUSES WHAT THE APPLY PATH WILL.
+/// Every `MultiEngine` implementor folds this into its removal ceiling, so both halves are a
+/// contract: a kind read through the wrong field would fence at a generation the move never named,
+/// a non-shape entry contributing anything at all would fence an id that never reshaped, and an
+/// entry the apply path refuses must yield a FAULT rather than a number — the leg is read in the
+/// window before that refusal runs, so a `0` under-fences and a reserved generation forges the
+/// terminal.
+#[test]
+fn shape_entry_move_reads_each_kind_from_its_own_field() {
+  fn entry(kind: EntryKind, data: Bytes) -> Entry {
+    Entry::new(Term::new(1), Index::new(1), kind, data)
+  }
+  fn encoded(f: impl FnOnce(&mut std::vec::Vec<u8>)) -> Bytes {
+    let mut buf = std::vec::Vec::new();
+    f(&mut buf);
+    Bytes::from(buf)
+  }
+  fn split(p: &crate::SplitPayload) -> Entry {
+    entry(
+      EntryKind::Split,
+      encoded(|b| crate::wire::encode_split_payload(p, b)),
+    )
+  }
+  fn prepare_merge(p: &crate::PrepareMergePayload) -> Entry {
+    entry(
+      EntryKind::PrepareMerge,
+      encoded(|b| crate::wire::encode_prepare_merge_payload(p, b)),
+    )
+  }
+  fn commit_merge(p: &crate::CommitMergePayload) -> Entry {
+    entry(
+      EntryKind::CommitMerge,
+      encoded(|b| crate::wire::encode_commit_merge_payload(p, b)),
+    )
+  }
+  fn rollback_merge(p: &crate::RollbackMergePayload) -> Entry {
+    entry(
+      EntryKind::RollbackMerge,
+      encoded(|b| crate::wire::encode_rollback_merge_payload(p, b)),
+    )
+  }
+
+  const RESERVED: u64 = crate::HIGHEST_WORKING_GENERATION;
+
+  // THE OWN-GROUP FIELD, per kind.
+  assert_eq!(
+    shape_entry_move(&split(&crate::SplitPayload::new(
+      Bytes::from_static(b"c"),
+      4,
+      7,
+      Bytes::new()
+    ))),
+    ShapeMove::Valid(7),
+    "a split names the PARENT's post-move generation, not the child's claim"
+  );
+  assert_eq!(
+    shape_entry_move(&prepare_merge(&crate::PrepareMergePayload::new(
+      Bytes::from_static(b"t"),
+      9
+    ))),
+    ShapeMove::Valid(9),
+    "a freeze rides the SOURCE's log and names the source's move"
+  );
+  assert_eq!(
+    shape_entry_move(&commit_merge(&crate::CommitMergePayload::new(
+      Bytes::from_static(b"s"),
+      Index::new(3),
+      Term::new(1),
+      9,
+      11
+    ))),
+    ShapeMove::Valid(11),
+    "an absorb rides the TARGET's log and names the target's move"
+  );
+  // THE ROLE SPLIT: one kind, two logs, two fields.
+  assert_eq!(
+    shape_entry_move(&rollback_merge(&crate::RollbackMergePayload::abort(
+      Bytes::from_static(b"s"),
+      9,
+      12
+    ))),
+    ShapeMove::Valid(12),
+    "the abort role rides the target's log"
+  );
+  assert_eq!(
+    shape_entry_move(&rollback_merge(&crate::RollbackMergePayload::unfreeze(13))),
+    ShapeMove::Valid(13),
+    "the unfreeze role rides the SOURCE's log, so the source's move is the one that counts"
+  );
+
+  // THE RESERVED BAND IN THE CONTRIBUTED FIELD. Folded, the `+ 1` would land on `MERGED_FLOOR` —
+  // a cluster-wide verdict that the lineage was absorbed away, forged by a local removal.
+  assert_eq!(
+    shape_entry_move(&split(&crate::SplitPayload::new(
+      Bytes::from_static(b"c"),
+      4,
+      RESERVED,
+      Bytes::new()
+    ))),
+    ShapeMove::Invalid(ShapeFault::ReservedGeneration),
+    "a split whose own move is reserved is refused, and names no generation to fold"
+  );
+  assert_eq!(
+    shape_entry_move(&prepare_merge(&crate::PrepareMergePayload::new(
+      Bytes::from_static(b"t"),
+      RESERVED
+    ))),
+    ShapeMove::Invalid(ShapeFault::ReservedGeneration),
+    "a freeze whose source move is reserved is refused"
+  );
+  assert_eq!(
+    shape_entry_move(&rollback_merge(&crate::RollbackMergePayload::unfreeze(
+      RESERVED
+    ))),
+    ShapeMove::Invalid(ShapeFault::ReservedGeneration),
+    "an unfreeze whose source move is reserved is refused"
+  );
+
+  // THE RESERVED BAND IN A FIELD THIS GROUP DOES NOT CONTRIBUTE. The apply path validates the FULL
+  // set a payload carries and poisons on any of them, so a leg that validated only the field it
+  // folds would hand a live fence to an entry no replica will ever apply.
+  assert_eq!(
+    shape_entry_move(&split(&crate::SplitPayload::new(
+      Bytes::from_static(b"c"),
+      RESERVED,
+      7,
+      Bytes::new()
+    ))),
+    ShapeMove::Invalid(ShapeFault::ReservedGeneration),
+    "a split with a working parent move but a reserved CHILD claim is one the apply path poisons \
+     on, so the leg refuses it too"
+  );
+  assert_eq!(
+    shape_entry_move(&commit_merge(&crate::CommitMergePayload::new(
+      Bytes::from_static(b"s"),
+      Index::new(3),
+      Term::new(1),
+      RESERVED,
+      11
+    ))),
+    ShapeMove::Invalid(ShapeFault::ReservedGeneration),
+    "an absorb naming a reserved SOURCE generation is refused, though the target's is what it folds"
+  );
+  assert_eq!(
+    shape_entry_move(&rollback_merge(&crate::RollbackMergePayload::abort(
+      Bytes::from_static(b"s"),
+      RESERVED,
+      12
+    ))),
+    ShapeMove::Invalid(ShapeFault::ReservedGeneration),
+    "an abort naming a reserved SOURCE generation is refused, though the target's is what it folds"
+  );
+
+  // AN UNDECODABLE PAYLOAD, per kind: a fault, never a zero contribution.
+  for kind in [
+    EntryKind::Split,
+    EntryKind::PrepareMerge,
+    EntryKind::CommitMerge,
+    EntryKind::RollbackMerge,
+  ] {
+    assert_eq!(
+      shape_entry_move(&entry(kind, Bytes::from_static(b"\xff\xff\xff"))),
+      ShapeMove::Invalid(ShapeFault::Decode),
+      "a {kind:?} payload that will not decode is a fault, not a move of generation 0"
+    );
+  }
+  // The decoders' own non-length rejections count as decode faults too: a split's child id must
+  // satisfy the group-tag wire bound, and an empty one never came off a conforming propose path.
+  assert_eq!(
+    shape_entry_move(&split(&crate::SplitPayload::new(
+      Bytes::new(),
+      4,
+      7,
+      Bytes::new()
+    ))),
+    ShapeMove::Invalid(ShapeFault::Decode),
+    "a split whose child id violates the wire bound is refused by its decoder, so the leg reports \
+     a decode fault"
+  );
+
+  // NOT A SHAPE KIND AT ALL: no move, and never a fault — ordinary traffic must not cap anything.
+  assert_eq!(
+    shape_entry_move(&empty_entry(1, 1)),
+    ShapeMove::NotShape,
+    "an entry that mints no lineage contributes nothing"
+  );
+  assert_eq!(
+    shape_entry_move(&entry(
+      EntryKind::Normal,
+      encoded(|b| crate::wire::encode_split_payload(
+        &crate::SplitPayload::new(Bytes::from_static(b"c"), 4, 7, Bytes::new()),
+        b
+      ))
+    )),
+    ShapeMove::NotShape,
+    "the KIND decides: shape bytes under a non-shape kind name no move for this group"
+  );
+}
