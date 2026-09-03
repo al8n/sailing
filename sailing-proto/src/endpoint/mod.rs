@@ -1263,7 +1263,9 @@ struct Reads<I> {
   /// The index of the last appended `SetReadMode` entry — the one-in-flight guard for read-mode
   /// migrations (mirror [`pending_conf_index`](Endpoint::pending_conf_index)). `> applied` ⇒ a migration is
   /// still in flight; recomputed to `last` at `become_leader` so an inherited uncommitted SetReadMode in a
-  /// fresh leader's tail blocks a new proposal until it commits-and-applies.
+  /// fresh leader's tail blocks a new proposal until it commits-and-applies, and re-seated to ZERO by a
+  /// destructive snapshot install with the other in-flight fences (restart parity: the tail it could name
+  /// is discarded).
   pending_read_mode_index: Index,
 }
 
@@ -1507,7 +1509,11 @@ where
   /// — a more precise scan of the durable log to find any pending ConfChange entry is a
   /// future refinement. If a ConfChange entry is in the log but not yet applied after restart,
   /// the one-in-flight guard will be permissive (ZERO <= applied), but correctness is maintained
-  /// because the entry will still be applied exactly once in `apply_committed`.
+  /// because the entry will still be applied exactly once in `apply_committed`. A destructive
+  /// snapshot install re-seats it to ZERO too, with the other in-flight fences: a follower's seat
+  /// above the boundary is a former leader's over the tail the restore discarded, and
+  /// `prepare_merge` reads this guard on the TARGET with no leader gate, so left standing it
+  /// would refuse every merge into this replica until it next led.
   pending_conf_index: Index,
   /// The read machinery (active mode + migration provenance, the ReadIndex tracker, deferred and
   /// forwarded reads, the SetReadMode one-in-flight guard).

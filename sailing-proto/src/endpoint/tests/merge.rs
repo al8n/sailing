@@ -2005,6 +2005,76 @@ fn merge_conf_fence_releases_with_the_capture() {
   );
 }
 
+/// The membership fence's IN-FLIGHT leg across a destructive install: a deposed leader's seat
+/// over a `CommitMerge` the restore discarded is re-seated with the rest of the in-flight
+/// fences, so the fence releases exactly as it would on a plain restart from the same durable
+/// state instead of standing forever against an entry that no longer exists.
+#[test]
+fn a_destructive_install_releases_the_merge_conf_fence() {
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  let cmd = bytes::Bytes::from_static(b"c");
+  let boundary = ep
+    .propose(Instant::ORIGIN, &mut log, &stable, &cmd)
+    .unwrap();
+  let k = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(5), 1, 1),
+    )
+    .unwrap();
+  assert_eq!(k, boundary.next());
+  // The local appends are durable; the peers never ack, so nothing above the accession commits.
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(ep.commit_index() < boundary);
+  assert!(ep.commit_merge_in_flight() && ep.merge_conf_fence(&log));
+  // Deposed with the tail unapplied.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::Heartbeat(crate::Heartbeat::new(
+      Term::new(7),
+      2u64,
+      Index::ZERO,
+      bytes::Bytes::new(),
+    )),
+  );
+  assert!(ep.role().is_follower());
+  assert!(
+    ep.commit_merge_in_flight(),
+    "the seat stands over the deposed leader's tail"
+  );
+  // A covering install at the ordinary entry, below the seat: the restore discards the tail.
+  ep.install_snapshot_now(
+    &mut log,
+    &mut stable,
+    crate::SnapshotMeta::new(
+      boundary,
+      Term::new(2),
+      crate::conf::ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    ),
+    7u64,
+    2u64,
+  );
+  assert!(!ep.is_poisoned());
+  assert_eq!(
+    log.last_index(),
+    boundary,
+    "the tail is gone with the seat's entry"
+  );
+  assert!(
+    !ep.commit_merge_in_flight(),
+    "the seat is re-seated to the restart's value"
+  );
+  assert!(
+    !ep.merge_conf_fence(&log),
+    "the fence releases with the install, as it would on a restart"
+  );
+}
+
 /// A group that owes an aborted-merge thaw deliberately does NOT fence conf changes: a voter may
 /// join it (re-deriving the obligation), and if that obligation becomes a local dead end the resolve
 /// arm's drivability belt drops it at the absorb — so the join never wedges (the container world test

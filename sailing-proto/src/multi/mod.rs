@@ -691,9 +691,11 @@ pub enum MergeResolution<G> {
   /// per-group maps — and PRESERVE the source's stores and floor untouched: no floor write, no
   /// store teardown, no tombstone. `Merged { source, target }` follows from a later crank once
   /// the fence lifts and the capture stages, with its exact contract; `CaptureFailed` follows a
-  /// capture fault instead. A crash in the window re-parks against the restored source (the
-  /// boundary's `CommitMerge` cannot compact away first — compaction past it requires exactly
-  /// the capture still owed).
+  /// capture fault instead. A crash in the window re-parks against the restored source while
+  /// the boundary's `CommitMerge` stands (a capture past it requires exactly the one still
+  /// owed); a covering destructive install is the one thing that compacts it under the live
+  /// debt, which the debt pass then discharges in that crank — a crash before that discharge
+  /// loses the chain, the recorded residual (#134).
   Absorbed {
     /// The absorbed source group, whose stores and floor the driver MUST keep until `Merged`.
     source: G,
@@ -5660,8 +5662,10 @@ where
             // target's capture debt. The per-crank debt pass stages the capture once the fence
             // lifts (or adopts any other capture/install at-or-past the boundary) and only THEN
             // surfaces `Merged`, the floor + teardown permission. A crash meanwhile re-parks
-            // against the restored source: the boundary's `CommitMerge` cannot have compacted
-            // away, since compaction past it requires exactly the capture the debt still owes.
+            // against the restored source while the boundary's `CommitMerge` stands (a capture
+            // past it requires exactly the one the debt owes); a covering destructive install
+            // compacts it under the live debt and the debt pass discharges the chain in that
+            // crank — the crash window before that discharge is the recorded residual (#134).
             if let Some(m) = merged
               && let Some(tep) = self.groups.get_mut(&tgid)
             {

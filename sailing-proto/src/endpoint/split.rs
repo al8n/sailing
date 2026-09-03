@@ -120,18 +120,22 @@ pub(crate) struct SplitState<I, F> {
   /// the SAME bump and lose at the apply-time lineage guard. Derived state, never a sticky flag:
   /// `become_leader` re-seats it at the log's last index (an inherited unapplied split — or any
   /// tail — conservatively holds the gate until applied absorbs the accession point), and a
-  /// deposed proposer's truncated entry cannot wedge anything because the gate is only ever
-  /// consulted on the leader path, behind that re-seat. On restart, ZERO is acceptable exactly
-  /// as on `pending_conf_index`: the gate turns permissive, and the apply-time lineage guard
-  /// remains the safety floor for a stale mint.
+  /// destructive snapshot install re-seats it to ZERO with the other in-flight fences, because
+  /// this gate is NOT leader-only: [`Endpoint::split_reserves`] feeds the public,
+  /// role-independent `MultiRaft::split_reserved`, the coordinators' admission methods and the
+  /// drivers' factory gates, so a deposed proposer's seat over a tail the restore discarded
+  /// would otherwise reserve the child id on this host until it next led. On restart, ZERO is
+  /// acceptable exactly as on `pending_conf_index`: the gate turns permissive, and the apply-time
+  /// lineage guard remains the safety floor for a stale mint.
   pub(crate) pending_split_index: Index,
   /// The encoded child id of the split this leader proposed and has not yet applied — the
   /// PROPOSE-window leg of [`Endpoint::split_reserves`]. Empty ⇔ no id reserved (an empty
   /// encoding is never a legal group id): cleared by `become_leader`'s conservative re-seat,
   /// whose inherited tail holds the propose GATE without knowing any child id — the tail's own
-  /// apply stages (and thereby reserves) whatever forks it carries. Self-releasing like the
-  /// index it rides beside: once `applied` absorbs `pending_split_index`, the window is over
-  /// and these bytes are inert.
+  /// apply stages (and thereby reserves) whatever forks it carries — and by a destructive
+  /// snapshot install's re-seat, which discards the tail the reservation named. Self-releasing
+  /// like the index it rides beside: once `applied` absorbs `pending_split_index`, the window
+  /// is over and these bytes are inert.
   pub(crate) pending_split_child: Bytes,
   /// This group's own fork PROVENANCE — the [`ForkId`](crate::ForkId) of the manufactured baseline
   /// this endpoint was born from (a forked child), `None` for any group created/restored through a

@@ -164,15 +164,19 @@ pub(crate) enum ClaimRead {
   RefusedAbove { judged_at: Index },
 }
 
-/// The endpoint-resident merge state. One instance per endpoint, defaulted inert; every field but
-/// one is DERIVED from the log and re-derivable at restart (`freeze_queue` from the unapplied
-/// suffix, `frozen`/`freeze_index` from replaying the applied prefix, the park from
-/// re-encountering its entry), so nothing here is persisted. The exception is
-/// [`recovery_pins`](Self::recovery_pins): a fail-stopped holder's record of the preserved stores
-/// its failed absorb depends on — the one field a restart CLEARS rather than re-derives, because
-/// the restart's re-derived park (from re-encountering that absorb's `CommitMerge`) is what
-/// replaces it. The lineage counter deliberately does NOT live here — incarnation and shape share
-/// ONE monotone per-id counter (`SplitState::shape_gen`).
+/// The endpoint-resident merge state. One instance per endpoint, defaulted inert; the fields are
+/// DERIVED from the log and re-derivable at restart (`freeze_queue` from the unapplied suffix,
+/// `frozen`/`freeze_index` from replaying the applied prefix, the park from re-encountering its
+/// entry), so nothing here is persisted. Two fall short of that. [`recovery_pins`](Self::recovery_pins),
+/// a fail-stopped holder's record of the preserved stores its failed absorb depends on, is the
+/// field a restart CLEARS rather than re-derives, because the restart's re-derived park (from
+/// re-encountering that absorb's `CommitMerge`) is what replaces it. The capture-debt chain
+/// ([`capture_debt`](Self::capture_debt) with [`inherited_debts`](Self::inherited_debts)) is
+/// re-derived by that same re-park only while the boundary's `CommitMerge` still stands: a
+/// covering destructive install compacts it under the live debt, and the chain is then
+/// discharged in that crank on the install's own evidence or lost in the crash window before the
+/// discharge (#134). The lineage counter deliberately does NOT live here — incarnation and shape
+/// share ONE monotone per-id counter (`SplitState::shape_gen`).
 #[derive(Debug, Default)]
 pub(crate) struct MergeState {
   /// Every `PrepareMerge` in the UNAPPLIED suffix `(applied, last]`, in log order — the
@@ -309,15 +313,23 @@ pub(crate) struct MergeState {
   /// abort obligation) deferred the forced capture — so the consumed source's stores remain the
   /// union's only restart derivation until a capture (or a superseding install) at-or-past the
   /// absorb boundary is staged. Holds the `Merged` payload the discharge will surface; volatile,
-  /// re-derived by the restart re-park (the boundary's `CommitMerge` cannot compact away first —
-  /// compaction past it requires exactly the capture whose absence defines the debt). While set:
-  /// reshape verbs into this target refuse, the container refuses to re-host or tear down either
-  /// named group, and a debt-holding leader is never quiesce-eligible.
+  /// re-derived by the restart re-park while the boundary's `CommitMerge` stands (a capture past
+  /// it requires exactly the one whose absence defines the debt). A covering destructive install
+  /// is the one thing that compacts that entry under a live debt: the chain survives the
+  /// re-baseline and the debt pass discharges it on the install's own durable evidence in the
+  /// same crank, so the debt is lost only in the crash window between the blob's fsync and that
+  /// discharge (#134). While set: reshape verbs into this target refuse, the container refuses to
+  /// re-host or tear down either named group, and a debt-holding leader is never
+  /// quiesce-eligible.
   pub(crate) capture_debt: Option<crate::Merged>,
   /// Log index of the most recently appended (not-yet-applied) `CommitMerge` on THIS leader —
   /// the in-flight leg of the target's membership fence (`> applied` ⇒ a commit-merge is in
   /// flight), mirroring `pending_split_index` exactly: derived state, re-seated conservatively
-  /// at `become_leader`, never a sticky flag.
+  /// at `become_leader`, never a sticky flag. A destructive snapshot install re-seats it to ZERO
+  /// with the other in-flight fences — the restart's value: a follower's seat above the boundary
+  /// is a former leader's over the tail the restore discarded, and left standing it would hold
+  /// `merge_conf_fence` against the install's own evidence indefinitely (it names an index this
+  /// replica's log may never reach again).
   pub(crate) pending_commit_index: Index,
   /// Log index of the most recently appended (not-yet-applied) `RollbackMerge` on THIS leader
   /// (`> applied` ⇒ a rollback is in flight) — `commit_merge`'s LINEAGE fence, the exact analogue
@@ -330,7 +342,9 @@ pub(crate) struct MergeState {
   /// Set for EVERY `RollbackMerge` append (the source-role thaw included — harmlessly, since a
   /// thawing source is `frozen` and `commit_merge` refuses it `AlreadyFrozen` first). Derived,
   /// self-releasing via `> applied`, re-seated conservatively to `last` at `become_leader` like the
-  /// other fences (a truncated-then-re-elected abort must not wedge the merge verbs).
+  /// other fences (a truncated-then-re-elected abort must not wedge the merge verbs), and to ZERO
+  /// by a destructive snapshot install with the rest of them (restart parity: the seat's entry was
+  /// in the discarded tail).
   pub(crate) pending_rollback_index: Index,
   /// Log index of the SOURCE-role `RollbackMerge` (thaw) this leader last appended and not yet
   /// applied (`> applied` ⇒ a thaw is in flight) — the abort-relay's IDEMPOTENT-APPEND guard:
@@ -1512,15 +1526,6 @@ where
   /// Drain the inherited chain at the own debt's discharge.
   pub(crate) fn take_inherited_debts(&mut self) -> std::vec::Vec<crate::Merged> {
     core::mem::take(&mut self.merge.inherited_debts)
-  }
-
-  /// A covering install re-baselined this endpoint: the debt chain is SUPERSEDED, not
-  /// discharged — the blob's producer already ran the teardown barrier the held `Merged`s
-  /// would have authorized, and the prior sources' terminal floors reach this host by
-  /// propagation. Cleared without surfacing anything.
-  pub(crate) fn note_debts_rebaselined(&mut self) {
-    self.merge.capture_debt = None;
-    self.merge.inherited_debts.clear();
   }
 
   /// The staged (submitted, not yet durability-completed) capture's boundary, if one is in

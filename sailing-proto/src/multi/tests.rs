@@ -1495,17 +1495,32 @@ fn the_joiner_lands_on_the_preloaded_state_plus_tail() {
 
 /// A splitting counter: `split` gives away `min(units, instruction[0])` units as the child half;
 /// `apply` adds one unit per command. `Snapshot = u64` keeps the blob the `Data` encoding the
-/// container relay round-trips.
+/// container relay round-trips. `refuse_restore` models a state machine that cannot take an
+/// installed blob: every `restore` fails, so a deferred install's completion poisons
+/// `SnapshotRestore` instead of re-baselining.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct SplitSm {
   units: u64,
+  refuse_restore: bool,
 }
+
+/// The one fault [`SplitSm`] raises: a refused `restore`.
+#[derive(Debug)]
+struct RestoreRefused;
+
+impl core::fmt::Display for RestoreRefused {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("restore refused")
+  }
+}
+
+impl core::error::Error for RestoreRefused {}
 
 impl crate::StateMachine for SplitSm {
   type Command = Bytes;
   type Response = u64;
   type Snapshot = u64;
-  type Error = core::convert::Infallible;
+  type Error = RestoreRefused;
 
   fn apply(&mut self, _index: crate::Index, _cmd: Bytes) -> Result<u64, Self::Error> {
     self.units += 1;
@@ -1517,6 +1532,9 @@ impl crate::StateMachine for SplitSm {
   }
 
   fn restore(&mut self, snapshot: u64) -> Result<(), Self::Error> {
+    if self.refuse_restore {
+      return Err(RestoreRefused);
+    }
     self.units = snapshot;
     Ok(())
   }
@@ -1524,7 +1542,10 @@ impl crate::StateMachine for SplitSm {
   fn split(&mut self, instruction: &[u8]) -> Option<Self> {
     let give = u64::from(*instruction.first()?).min(self.units);
     self.units -= give;
-    Some(Self { units: give })
+    Some(Self {
+      units: give,
+      refuse_restore: false,
+    })
   }
 
   fn absorb(&mut self, source: Self) -> bool {
@@ -16683,6 +16704,21 @@ fn fork_fenced_park_fixture() -> (
   Instant,
   Instant,
 ) {
+  fork_fenced_park_fixture_with_target(SplitSm::default())
+}
+
+/// [`fork_fenced_park_fixture`] with the TARGET's state machine supplied — the poisoning-install
+/// shape seeds one that refuses `restore`.
+fn fork_fenced_park_fixture_with_target(
+  target: SplitSm,
+) -> (
+  MultiRaft<u64, u64, SplitSm>,
+  MapStores,
+  Index,
+  Index,
+  Instant,
+  Instant,
+) {
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let now = Instant::ORIGIN;
   let (mut plog, mut pstable) = (VecLog::default(), AsyncStable::default());
@@ -16692,7 +16728,7 @@ fn fork_fenced_park_fixture() -> (
     single_node_cfg(1).with_snapshot_threshold(1),
     now,
     42,
-    SplitSm::default(),
+    target,
   )
   .unwrap();
   let d = lead_single_split(&mut m, 1, &mut plog, &mut pstable);
@@ -17859,17 +17895,50 @@ fn a_replayed_chain_resolves_the_inner_park_beneath_a_pending_freeze() {
   assert_eq!(tep.state_machine().units, 2, "the union folded first");
 }
 
-/// A covering install SUPERSEDES the debt chain by the rebaseline rule: per-entry obligations
-/// below the blob's boundary were resolved globally by the transferring leader's own discharge
-/// barrier, so the chain clears at the completion WITHOUT surfacing `Merged` — this host
-/// authorizes no teardown it did not run; the prior source's terminal floor reaches it by
-/// propagation, and until then the preserved stores stand exactly as a husk's. The fence never
-/// lifts here: a partitioned debtor whose witness was compacted away has exactly this install
-/// as its only way back, and it flows through the ONE ordinary install path.
+/// Deliver a covering destructive install at index 40 to group `gid` (a single-voter host at
+/// term 1 in these fixtures) and drain its completion: the blob is durable, the destructive body
+/// ran, the log is re-baselined past the absorb point.
+fn covering_install_completes(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  stores: &mut MapStores,
+  gid: u64,
+  d: Instant,
+) {
+  let meta = crate::SnapshotMeta::new(
+    Index::new(40),
+    Term::new(2),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  let (l, s) = stores.0.get_mut(&gid).unwrap();
+  m.handle_message(
+    &gid,
+    d,
+    l,
+    s,
+    9u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(2),
+      9u64,
+      meta,
+      fork_blob(9),
+    )),
+  )
+  .unwrap();
+  drain_storage(m, gid, d, l, s);
+}
+
+/// A covering destructive install DISCHARGES the debt chain instead of dropping it. The blob
+/// at-or-past the absorb boundary is the union's durable form on this host, and the terminal
+/// floor is this host's own write — nothing propagates it — so the held `Merged` is
+/// dischargeable here and only here: the chain survives the re-baseline, and the same crank's
+/// debt pass surfaces exactly one `Merged` (with the app-visible event) on the install's own
+/// durable evidence. Nothing surfaces again, and the naming ends with the discharge.
 #[test]
-fn a_covering_install_supersedes_the_debt_chain() {
+fn a_covering_install_discharges_the_debt_chain() {
   let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
   defer_to_absorbed(&mut m, &mut stores, d);
+  while m.poll_event().is_some() {}
   let units_before = m.group(&1).unwrap().state_machine().units;
   let meta = crate::SnapshotMeta::new(
     Index::new(40),
@@ -17914,16 +17983,575 @@ fn a_covering_install_supersedes_the_debt_chain() {
   }
   let tep = m.group(&1).unwrap();
   assert!(
-    tep.capture_debt().is_none(),
-    "the chain is superseded with the log it rode on"
+    tep.capture_debt().is_some(),
+    "the chain survives the re-baseline: the debt pass discharges it, the install never drops it"
   );
   assert_eq!(tep.state_machine().units, 9, "the blob IS the new baseline");
+  assert!(m.debt_names(&2), "the naming stands until the discharge");
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }],
+    "the install's own durable evidence discharges the debt in the same crank"
+  );
+  let tep = m.group(&1).unwrap();
+  assert!(tep.capture_debt().is_none(), "the debt is discharged");
+  assert!(!m.debt_names(&2), "the naming dies with the discharge");
+  let mut merged_events = 0;
+  while let Some((gid, ev)) = m.poll_event() {
+    if let Event::Merged(e) = ev {
+      assert_eq!(gid, 1);
+      assert_eq!(e.source(), gid_key(2));
+      merged_events += 1;
+    }
+  }
+  assert_eq!(
+    merged_events, 1,
+    "the union event rides the discharge, exactly once"
+  );
   assert!(
     m.service_merge_applies(d, &mut stores).is_empty(),
-    "nothing surfaces: the teardown authority was the transferring leader's"
+    "nothing surfaces twice"
   );
-  // The prior source's stores stay preserved for the propagated-floor teardown, husk-style.
+  // The proto layer never touches stores; the teardown is the driver's, off the resolution.
   assert!(stores.0.contains_key(&2));
+}
+
+/// Two levels up a chain: the debtor is consumed by a fence-deferred absorb (its debt is
+/// inherited), then that holder by another (both are inherited), so the final holder owns one
+/// debt and carries two. One covering install discharges every level on the same evidence —
+/// one `Merged` per source, each exactly once, none the crank after.
+#[test]
+fn a_covering_install_discharges_every_level_of_an_inherited_chain() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  let mut instants = std::collections::BTreeMap::from([(1u64, d)]);
+
+  // Each consuming target's capture is fenced by an undischarged abort obligation for an
+  // unhosted source, so its absorb DEFERS and inherits the consumed holder's chain (the
+  // abort-fenced twin of the fork-fenced shape the fixture starts from).
+  for (holder, target, dead_source) in [(1u64, 3u64, 8u64), (3, 4, 9)] {
+    let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+    m.create_group(target, 0, single_node_cfg(1), d, 45, SplitSm::default())
+      .unwrap();
+    let dt = lead_single_split(&mut m, target, &mut log, &mut stable);
+    instants.insert(target, dt);
+    stores.0.insert(target, (log, stable));
+    {
+      let (l, s) = stores.0.get_mut(&target).unwrap();
+      let abort = crate::RollbackMergePayload::abort(gid_key(dead_source), 1, 1);
+      let mut buf = Vec::new();
+      crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
+      m.group_mut(&target)
+        .unwrap()
+        .propose_merge_entry(dt, l, crate::EntryKind::RollbackMerge, Bytes::from(buf))
+        .unwrap();
+      drain_storage(&mut m, target, dt, l, s);
+    }
+    assert!(
+      m.group(&target).unwrap().owes_live_thaw(),
+      "the abort fence stands on {target}"
+    );
+
+    // The foreign-led freeze on the holder, then its committed absorb into the target.
+    let dh = instants[&holder];
+    let freeze_gen = m.group(&holder).unwrap().shape_gen() + 1;
+    let freeze_idx = {
+      let (l, s) = stores.0.get_mut(&holder).unwrap();
+      let mut fbuf = Vec::new();
+      crate::wire::encode_prepare_merge_payload(
+        &crate::PrepareMergePayload::new(gid_key(target), freeze_gen),
+        &mut fbuf,
+      );
+      m.group_mut(&holder)
+        .unwrap()
+        .propose_merge_entry(dh, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+        .unwrap();
+      let idx = l.last_index();
+      drain_storage(&mut m, holder, dh, l, s);
+      idx
+    };
+    assert!(m.group(&holder).unwrap().is_frozen());
+    {
+      let target_gen = m.group(&target).unwrap().shape_gen() + 1;
+      let (l, s) = stores.0.get_mut(&target).unwrap();
+      m.group_mut(&target)
+        .unwrap()
+        .propose_merge_entry(
+          dt,
+          l,
+          crate::EntryKind::CommitMerge,
+          commit_merge_bytes(holder, freeze_idx, freeze_gen, target_gen),
+        )
+        .unwrap();
+      drain_storage(&mut m, target, dt, l, s);
+    }
+    assert!(
+      m.group(&target).unwrap().pending_merge().is_some(),
+      "parked on {target}"
+    );
+    assert!(
+      m.service_merge_applies(dt, &mut stores).is_empty(),
+      "the first pass only seals the window"
+    );
+    {
+      let (l, s) = stores.0.get_mut(&target).unwrap();
+      drain_storage(&mut m, target, dt, l, s);
+    }
+    if holder == 1 {
+      // The fixture's debtor carries the fork barrier that holds its consumption; release it
+      // only now, so the resolver (which runs ahead of the debt pass) consumes the debtor with
+      // its debt still live.
+      m.remove_group(&200, &mut empty_stores()).unwrap();
+      let split = install_head_fork(&mut m, 1, 200, dt);
+      m.lift_fork_barrier(&1, split);
+    }
+    assert!(
+      m.group(&holder).unwrap().capture_debt().is_some(),
+      "the holder's debt is live at its consumption"
+    );
+    assert_eq!(
+      m.service_merge_applies(dt, &mut stores),
+      std::vec![MergeResolution::Absorbed {
+        source: holder,
+        target
+      }],
+      "the abort fence defers the capture, chaining the holder's debts onto {target}"
+    );
+    {
+      let (l, s) = stores.0.get_mut(&target).unwrap();
+      drain_storage(&mut m, target, dt, l, s);
+    }
+    assert!(!m.contains_group(&holder), "the holder was consumed");
+  }
+  let d4 = instants[&4];
+  let tep = m.group(&4).unwrap();
+  assert_eq!(tep.state_machine().units, 2, "the transitive union");
+  assert_eq!(
+    tep.capture_debt().expect("the own debt").source(),
+    gid_key(3),
+    "the own debt names the consumed holder"
+  );
+  for named in [1u64, 2, 3] {
+    assert!(m.debt_names(&named), "the chain names {named}");
+  }
+  assert!(
+    m.service_merge_applies(d4, &mut stores).is_empty(),
+    "the chain waits: the abort fence still stands"
+  );
+
+  covering_install_completes(&mut m, &mut stores, 4, d4);
+  let tep = m.group(&4).unwrap();
+  assert_eq!(tep.state_machine().units, 9, "the blob IS the new baseline");
+  assert!(
+    tep.capture_debt().is_some(),
+    "the whole chain survives the re-baseline"
+  );
+  let resolutions = m.service_merge_applies(d4, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![
+      MergeResolution::Merged {
+        source: 3,
+        target: 4
+      },
+      MergeResolution::Merged {
+        source: 1,
+        target: 4
+      },
+      MergeResolution::Merged {
+        source: 2,
+        target: 4
+      },
+    ],
+    "one Merged per source on the install's evidence: the own debt, then every inherited level"
+  );
+  assert!(m.group(&4).unwrap().capture_debt().is_none());
+  for named in [1u64, 2, 3] {
+    assert!(
+      !m.debt_names(&named),
+      "the naming of {named} dies with the discharge"
+    );
+    assert!(
+      stores.0.contains_key(&named),
+      "the proto layer never touches {named}'s stores"
+    );
+  }
+  assert!(
+    m.service_merge_applies(d4, &mut stores).is_empty(),
+    "nothing surfaces twice"
+  );
+}
+
+/// A poisoning completion — the state machine refuses the blob, `SnapshotRestore` — discharges
+/// NOTHING: the poison returns before the chain is reached, the pass skips a poisoned debtor, so
+/// the debt and its naming stand exactly as before the install: no `Merged`, the consumed source
+/// still spoken for, its stores intact.
+#[test]
+fn a_poisoning_install_completion_leaves_the_debt_chain_standing() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture_with_target(SplitSm {
+    refuse_restore: true,
+    ..SplitSm::default()
+  });
+  defer_to_absorbed(&mut m, &mut stores, d);
+  while m.poll_event().is_some() {}
+  let units_before = m.group(&1).unwrap().state_machine().units;
+
+  covering_install_completes(&mut m, &mut stores, 1, d);
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.is_poisoned(),
+    "the refused restore fail-stops the completion"
+  );
+  assert_eq!(tep.poison_reason(), Some(PoisonReason::SnapshotRestore));
+  assert_eq!(
+    tep.state_machine().units,
+    units_before,
+    "nothing was restored"
+  );
+  assert!(tep.capture_debt().is_some(), "the chain stands");
+  for _ in 0..3 {
+    assert!(
+      m.service_merge_applies(d, &mut stores).is_empty(),
+      "a poisoned debtor discharges nothing"
+    );
+  }
+  assert!(m.debt_names(&2), "the naming stands with the chain");
+  assert!(
+    matches!(
+      m.remove_group(&2, &mut empty_stores()),
+      Err(RemoveError::SpokenFor)
+    ),
+    "the consumed source is still spoken for: no tombstone, no store teardown"
+  );
+  while let Some((_gid, ev)) = m.poll_event() {
+    assert!(
+      !matches!(ev, Event::Merged(_)),
+      "no union event without a discharge"
+    );
+  }
+  assert!(stores.0.contains_key(&2));
+}
+
+/// THE CRASH WINDOW (#134, recorded, not fixed). The blob is durable before the destructive body
+/// runs, so a crash after its fsync and before the debt pass's discharge restarts the target from
+/// the blob with the chain gone: the consumed source's stores stand redundant under a
+/// non-terminal floor, un-named and re-admittable beside the union. The DESIRED behaviour is
+/// pinned here — the naming survives the restart, the source stays un-admittable, and the
+/// discharge still surfaces exactly once — and the durable-engine program is what delivers it.
+#[test]
+#[ignore = "the install-then-crash window drops the debt chain before its discharge (#134): the restarted target re-derives no debt, so this fails when run until the durable-engine program closes the window"]
+fn a_crash_between_the_install_and_the_discharge_keeps_the_sources_naming() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  covering_install_completes(&mut m, &mut stores, 1, d);
+  assert!(
+    m.group(&1).unwrap().capture_debt().is_some(),
+    "the completion ran with the chain intact and not yet discharged"
+  );
+
+  // Crash: the container dies with the volatile chain; the durable blob and the preserved
+  // source stores survive.
+  drop(m);
+  let now = Instant::ORIGIN;
+  let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  {
+    let (plog, pstable) = stores.0.get_mut(&1).unwrap();
+    m2.restore_group_unchecked(
+      1,
+      single_node_cfg(1),
+      now,
+      42,
+      SplitSm::default(),
+      2,
+      plog,
+      pstable,
+    )
+    .unwrap();
+  }
+  assert_eq!(
+    m2.group(&1).unwrap().state_machine().units,
+    9,
+    "the restart recovers the union from the durable blob"
+  );
+  assert!(
+    m2.debt_names(&2),
+    "the consumed source stays spoken for across the crash"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      matches!(
+        m2.restore_group_unchecked(2, single_node_cfg(1), now, 44, SplitSm::default(), 2, l, s),
+        Err(CreateGroupError::AbsorbPending)
+      ),
+      "the redundant source is not re-admittable beside the union"
+    );
+  }
+  assert_eq!(
+    m2.service_merge_applies(now, &mut stores),
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }],
+    "the discharge surfaces exactly once after the restart"
+  );
+  assert!(m2.service_merge_applies(now, &mut stores).is_empty());
+}
+
+/// Deliver a covering destructive install at `boundary` to the deposed single-voter host `gid`
+/// (a follower after [`step_down`]) and drain its completion. The blob's term is stamped one
+/// past the host's, and the boundary entry's term differs from the meta's, so the completion
+/// classifies NOT redundant and runs the destructive body: the tail above `boundary` is gone.
+fn destructive_install_completes(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  gid: u64,
+  d: Instant,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  boundary: Index,
+) {
+  let term = m.group(&gid).unwrap().term();
+  let meta = crate::SnapshotMeta::new(
+    boundary,
+    Term::new(2),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  );
+  m.handle_message(
+    &gid,
+    d,
+    log,
+    stable,
+    9u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(term.get() + 1),
+      9u64,
+      meta,
+      fork_blob(9),
+    )),
+  )
+  .unwrap();
+  drain_storage(m, gid, d, log, stable);
+  assert_eq!(
+    log.last_index(),
+    boundary,
+    "the restore discarded the deposed leader's tail"
+  );
+  let ep = m.group(&gid).unwrap();
+  assert_eq!(ep.applied_index(), boundary);
+  assert_eq!(ep.state_machine().units, 9, "the blob IS the new baseline");
+  assert!(
+    ep.role().is_follower(),
+    "still a follower: no election re-seated anything"
+  );
+}
+
+/// A FORMER LEADER's stale commit fence must not refuse the install's own evidence. The debt
+/// holder led, appended a `CommitMerge` above what it committed, and was deposed with that tail
+/// unapplied; a covering install then discards the tail. Only a follower installs, and a
+/// follower has no proposals of its own in flight, so the seat above the boundary names an
+/// entry the restore discarded — the value a restart zeroes. Left standing it holds
+/// `merge_conf_fence` for good, and with the popped fork's barrier still fencing a fresh capture
+/// (the driver's pop→flush→lift window) the install's durable evidence is the debt's only
+/// same-crank discharge: the re-seat is what lets it land.
+#[test]
+fn a_former_leaders_stale_commit_fence_does_not_refuse_the_installs_evidence() {
+  let (mut m, mut stores, _k, split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  // Pop the fork (the squatter leaves) but do NOT lift its barrier: a fresh capture at the
+  // boundary stays fenced, so the discharge can only ride the install's evidence.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  assert_eq!(install_head_fork(&mut m, 1, 200, d), split_idx);
+  assert!(
+    m.group(&1).unwrap().fork_barrier_standing(),
+    "the popped fork keeps its barrier until the flush report"
+  );
+  while m.poll_event().is_some() {}
+
+  // The leader's uncommitted tail: an ordinary entry, then a CommitMerge above it, neither
+  // drained (the propose gate refuses a debt holder, so the entry goes through the raw seam).
+  let boundary = {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let normal = m
+      .propose(&1, d, l, s, &Bytes::from_static(b"c"))
+      .unwrap()
+      .unwrap();
+    let commit_idx = m
+      .group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(
+        d,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(7, Index::new(1), 1, 1),
+      )
+      .unwrap();
+    assert_eq!(commit_idx, normal.next());
+    step_down(&mut m, 1, l, s);
+    normal
+  };
+  let tep = m.group(&1).unwrap();
+  assert!(tep.commit_index() < boundary, "the tail never committed");
+  assert!(
+    tep.commit_merge_in_flight(),
+    "the deposed leader's seat stands over its tail"
+  );
+
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    destructive_install_completes(&mut m, 1, d, l, s, boundary);
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.capture_debt().is_some(),
+    "the chain survives the re-baseline"
+  );
+  assert!(
+    tep.fork_barrier_standing(),
+    "the popped fork's barrier stands across the install: a fresh capture is still fenced"
+  );
+  let resolutions = m.service_merge_applies(d, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }],
+    "the debt discharges in the install's own crank, on the install's evidence"
+  );
+  let tep = m.group(&1).unwrap();
+  assert!(
+    !tep.commit_merge_in_flight(),
+    "the seat over the discarded tail is re-seated to the restart's value"
+  );
+  assert!(
+    tep.pending_compact_boundary().is_none(),
+    "no fresh capture was staged: the discharge rode the install"
+  );
+  assert!(tep.capture_debt().is_none());
+  assert!(!m.debt_names(&2));
+}
+
+/// A FORMER LEADER's stale conf fence must not survive a destructive install: `prepare_merge`
+/// reads the TARGET's `conf_change_in_flight` with no leader gate, so a follower target whose
+/// deposed seat names a `ConfChange` the restore discarded would refuse every merge into it
+/// until it next led — a wedge a plain restart from the same durable state never has.
+#[test]
+fn a_former_leaders_stale_conf_fence_does_not_survive_a_destructive_install() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(1, 0, single_node_cfg(1), now, 42, SplitSm::default())
+    .unwrap();
+  let d = lead_single_split(&mut m, 1, &mut log, &mut stable);
+  for _ in 0..3 {
+    commit_one_split(&mut m, 1, d, &mut log, &mut stable);
+  }
+  // The leader's uncommitted tail: an ordinary entry, then a ConfChange above it (through the
+  // seam the propose path appends with), neither drained.
+  let boundary = m
+    .propose(&1, d, &mut log, &stable, &Bytes::from_static(b"c"))
+    .unwrap()
+    .unwrap();
+  let cc = crate::ConfChange::new(crate::ConfChangeType::AddNode, 4u64, Bytes::new()).into_v2();
+  let conf_idx = m
+    .group_mut(&1)
+    .unwrap()
+    .append_conf_change(d.into(), &mut log, &stable, cc)
+    .unwrap();
+  assert_eq!(conf_idx, boundary.next());
+  step_down(&mut m, 1, &mut log, &mut stable);
+  let tep = m.group(&1).unwrap();
+  assert!(tep.commit_index() < boundary, "the tail never committed");
+  assert!(
+    tep.conf_change_in_flight(),
+    "the deposed leader's seat stands over its tail"
+  );
+
+  destructive_install_completes(&mut m, 1, d, &mut log, &mut stable, boundary);
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  stores.0.insert(1, (log, stable));
+  // A source proposing a merge INTO the follower target reads that gate, ungated by role.
+  let (mut log3, mut stable3) = (VecLog::default(), AsyncStable::default());
+  m.create_group(3, 0, single_node_cfg(1), now, 45, SplitSm::default())
+    .unwrap();
+  let d3 = lead_single_split(&mut m, 3, &mut log3, &mut stable3);
+  stores.0.insert(3, (log3, stable3));
+  match m.prepare_merge(&3, d3, &mut stores, &1) {
+    Some(Ok(_)) => {}
+    other => panic!("a merge into the follower target must admit after the install, got {other:?}"),
+  }
+  assert!(
+    !m.group(&1).unwrap().conf_change_in_flight(),
+    "the seat over the discarded tail is re-seated to the restart's value"
+  );
+}
+
+/// A FORMER LEADER's stale split reservation must not survive a destructive install:
+/// `split_reserves` feeds the public, role-independent `MultiRaft::split_reserved`, the
+/// coordinators' admission methods and the drivers' factory gates, so a follower whose deposed
+/// seat names a `Split` the restore discarded would reserve the child id on this host until it
+/// next led — a reservation a plain restart from the same durable state never has.
+#[test]
+fn a_former_leaders_stale_split_reservation_does_not_survive_a_destructive_install() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(1, 0, single_node_cfg(1), now, 42, SplitSm::default())
+    .unwrap();
+  let d = lead_single_split(&mut m, 1, &mut log, &mut stable);
+  for _ in 0..3 {
+    commit_one_split(&mut m, 1, d, &mut log, &mut stable);
+  }
+  // The leader's uncommitted tail: an ordinary entry, then a Split above it, neither drained.
+  let boundary = m
+    .propose(&1, d, &mut log, &stable, &Bytes::from_static(b"c"))
+    .unwrap()
+    .unwrap();
+  let split_idx = m
+    .propose_split(
+      &1,
+      d,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x02"),
+    )
+    .unwrap()
+    .unwrap();
+  assert_eq!(split_idx, boundary.next());
+  assert!(
+    m.split_reserved(&200),
+    "the propose window reserves the child id"
+  );
+  step_down(&mut m, 1, &mut log, &mut stable);
+  assert!(
+    m.group(&1).unwrap().commit_index() < boundary,
+    "the tail never committed"
+  );
+  assert!(
+    m.split_reserved(&200),
+    "the deposed proposer's seat still reserves it"
+  );
+
+  destructive_install_completes(&mut m, 1, d, &mut log, &mut stable, boundary);
+  assert!(
+    !m.split_reserved(&200),
+    "the reservation dies with the discarded tail: the seat is re-seated to the restart's value"
+  );
+  let tep = m.group(&1).unwrap();
+  assert!(!tep.split_in_flight());
+  assert!(
+    !tep.fork_obligations_standing(),
+    "no fork was staged: the split never applied"
+  );
 }
 
 /// A parked fork's standing capture fence no longer wedges a later merge into the same parent:
