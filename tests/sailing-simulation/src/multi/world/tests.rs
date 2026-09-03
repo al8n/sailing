@@ -210,6 +210,152 @@ fn the_held_fork_strike_names_edges_not_whole_ids() {
   );
 }
 
+/// THE #106 STRIKE DOMAIN IS THE CATALOG, NOT THE WEDGE SET. A merged-away source hosted NOWHERE is
+/// not a merge participant, so it never enters the wedge set — yet it is the very root a park on it
+/// enters the class through (`parked_on_quorumless` reads the source the park NAMES). When that park
+/// stands behind a tombstone-held fork, the held fork explains the root and the counterfactual must
+/// be able to strike it: a strike set drawn from the wedge set can never name the source, and the
+/// park stays un-credited — a run-end shape the storm band reaches.
+///
+/// The park is fabricated durably on a voter isolated from its leader — the committed
+/// `CommitMerge` naming the retired source appended to node 2's log, then a crash, whose restart
+/// re-parks deterministically — since no organic drive leaves a park standing over a source the
+/// world no longer hosts anywhere.
+#[test]
+fn the_under_hosted_strike_domain_reaches_a_merged_source_hosted_nowhere() {
+  use sailing_proto::{LogStore, StableStore};
+  const T: u64 = 100;
+  const S: u64 = 200;
+  const CHILD: u64 = 9_999;
+  let mut w = MultiWorld::new(7);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  let pair: BTreeSet<u64> = [0u64, 1].into_iter().collect();
+  w.create_group(T, &all);
+  w.create_group(S, &pair);
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(T).is_some() && w.leader_of(S).is_some()
+  }));
+
+  // S merged away and hosted nowhere: retire it, then register the merge the model would have.
+  assert!(w.remove_group(S), "S retires");
+  assert!(w.hosting_nodes(S).is_empty(), "hosted nowhere");
+  {
+    let source_led = MultiWorld::ledger_id(w.generation_of(S), S);
+    let target_led = MultiWorld::ledger_id(w.generation_of(T), T);
+    w.groups.get_mut(&S).expect("S is registered").merged = true;
+    w.merges.push(super::merge::MergeRecord {
+      source_led,
+      target_led,
+      target: T,
+      absorbed_keys: BTreeSet::new(),
+      resolved_record: Vec::new(),
+      boundary: sailing_proto::Index::new(1),
+    });
+  }
+
+  // Node 2's T replica parks on S: its durable log gains the committed `CommitMerge` naming S;
+  // isolated from its leader, a crash re-parks it deterministically.
+  w.isolate(2);
+  {
+    let log = w.logs.get_mut(&(2, T)).expect("node 2 hosts T");
+    let last = log.last_index();
+    let term = log.term(last).expect("a durable term");
+    let mut source_bytes = Vec::new();
+    sailing_proto::Data::encode(&S, &mut source_bytes);
+    let commit = sailing_proto::CommitMergePayload::new(
+      bytes::Bytes::from(source_bytes),
+      sailing_proto::Index::new(1),
+      sailing_proto::Term::new(1),
+      1,
+      1,
+    );
+    log.submit_append(
+      sailing_proto::OpId::new(1),
+      &[sailing_proto::Entry::new(
+        term,
+        last.next(),
+        sailing_proto::EntryKind::CommitMerge,
+        sailing_proto::fuzz_internals::shape_payload::commit_merge(&commit),
+      )],
+    );
+    log.flush();
+    let stable = w.stables.get_mut(&(2, T)).expect("node 2's stable");
+    let raised = stable.hard_state().with_commit(last.next());
+    stable.submit_write(sailing_proto::OpId::new(2), raised);
+    stable.flush();
+  }
+  w.crash(2);
+  assert!(
+    w.hosts[&2]
+      .group(&T)
+      .is_some_and(|ep| ep.pending_merge().is_some()),
+    "node 2's T re-parked on the committed CommitMerge"
+  );
+  assert_eq!(
+    w.parked_source_of(T),
+    Some(S),
+    "parked on the merged-away source"
+  );
+
+  // The held fork on node 2's T replica: a fence at-or-below its park, its child tombstoned there.
+  w.fork_conflicts
+    .entry((2, T))
+    .or_default()
+    .insert(sailing_proto::Index::new(1), CHILD);
+  w.host_tombstones.insert((2, CHILD));
+  assert!(
+    w.retired_hold_park(T),
+    "node 2's park is explained by its held fork"
+  );
+  assert!(
+    w.husk_dissolve_blocked_by_hold(S),
+    "and so is the merged-away source whose absorb that park is"
+  );
+
+  let underhosted = w.tracked_merge_wedge_set();
+  assert!(
+    underhosted.contains(&T) && !underhosted.contains(&S),
+    "T roots through the source it names; S is no participant and never enters the set: \
+     {underhosted:?}"
+  );
+  // THE GAP: a strike set drawn from the wedge set cannot name S, so the park is never credited.
+  let from_wedge: BTreeSet<u64> = underhosted
+    .iter()
+    .copied()
+    .filter(|&g| w.resurrected_husk(g) || w.husk_dissolve_blocked_by_hold(g))
+    .collect();
+  assert!(
+    !from_wedge.contains(&S),
+    "the wedge-set domain cannot name S"
+  );
+  assert!(
+    w.tracked_merge_wedge_set_excluding(&from_wedge)
+      .contains(&T),
+    "so the counterfactual leaves the park un-credited"
+  );
+  // THE DOMAIN: drawn from the catalog, the strike set names S and credits the park.
+  let hold_explained = w.hold_explained_husks();
+  assert!(
+    hold_explained.contains(&S),
+    "the strike domain reaches the merged-away source: {hold_explained:?}"
+  );
+  assert!(
+    !w.tracked_merge_wedge_set_excluding(&hold_explained)
+      .contains(&T),
+    "with the source struck, the park is credited to the held fork"
+  );
+  // THE COUPLING: the runner's report credits through this one function, so a strike domain that
+  // drifts back to the wedge set at the call site fails here, not only in a band.
+  assert_eq!(
+    crate::multi::vopr::under_hosted_hold_overlap(&w, &underhosted),
+    1,
+    "the runner's own attribution credits the park on this world"
+  );
+}
+
 /// OBSERVATION ROUTING, SUCCESSOR SIDE. Two incarnations are judged by two checkers, so the
 /// observations that feed them must be keyed by incarnation too. A gid-keyed queue is drained by
 /// whichever checker the loop reaches FIRST — BTree order, so the oldest — and clears it; every
@@ -3968,7 +4114,7 @@ fn a_rollback_restore_consumes_a_boot_epoch() {
 /// (no local U stores) nor observe U's lineage advance (U unhosted, floor 0, lineage 0) — the ghost
 /// obligation. Once U thaws, S's LEADER (an observer: it hosts U and sees `shape_gen(U) > expected`,
 /// a GLOBAL proof) appends a `ThawDischarged` witness on S's own log; every S replica's apply clears
-/// `abandoned[U]` — so node 2 reaches `!has_abandoned()` WITHOUT ever hosting U, the observer-led
+/// `abandoned[U]` — so node 2 reaches `!owes_live_thaw()` WITHOUT ever hosting U, the observer-led
 /// self-heal. (The drivability belt — dissolving S drops a dead-end obligation the absorb never
 /// needed — remains the fallback when no observer leads S; either mechanism keeps the co-hosted
 /// S→T absorb from wedging.)
@@ -4023,7 +4169,7 @@ fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
   assert!(w.run_until(4_000, |w| {
     [0u64, 1]
       .iter()
-      .all(|&n| w.hosts[&n].group(&S).is_some_and(|ep| ep.has_abandoned()))
+      .all(|&n| w.hosts[&n].group(&S).is_some_and(|ep| ep.owes_live_thaw()))
   }));
 
   // Node 2 JOINS S as a voter, catching up the abort entry and re-deriving abandoned[U] though it
@@ -4032,7 +4178,7 @@ fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
   propose_conf_change_until_accepted(&mut w, S, sailing_proto::ConfChangeType::AddNode, 2);
   assert!(
     w.run_until(6_000, |w| {
-      w.hosts_group(2, S) && w.hosts[&2].group(&S).is_some_and(|ep| ep.has_abandoned())
+      w.hosts_group(2, S) && w.hosts[&2].group(&S).is_some_and(|ep| ep.owes_live_thaw())
     }),
     "node 2 must join S and re-derive the abandoned[U] obligation"
   );
@@ -4047,7 +4193,11 @@ fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
       [0u64, 1]
         .iter()
         .all(|&n| w.hosts[&n].group(&U).is_some_and(|ep| !ep.is_frozen()))
-        && (0..3).all(|n| w.hosts[&n].group(&S).is_some_and(|ep| !ep.has_abandoned()))
+        && (0..3).all(|n| {
+          w.hosts[&n]
+            .group(&S)
+            .is_some_and(|ep| !ep.owes_live_thaw() && !ep.holds_witness_debt())
+        })
     }),
     "U must thaw and the witness must discharge the obligation on EVERY S replica"
   );
@@ -4059,7 +4209,7 @@ fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
     "node 2 never hosts U — the obligation was a local dead end there"
   );
   assert!(
-    !w.hosts[&2].group(&S).expect("S on 2").has_abandoned(),
+    !w.hosts[&2].group(&S).expect("S on 2").owes_live_thaw(),
     "node 2's ghost obligation cleared off the committed witness, not any local observation"
   );
   assert!(

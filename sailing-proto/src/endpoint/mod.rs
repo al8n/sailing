@@ -17,6 +17,7 @@ use std::{
 mod election;
 mod membership;
 mod merge;
+pub(crate) use merge::Cover;
 mod persistence;
 mod read_index;
 mod read_mode;
@@ -34,6 +35,18 @@ pub(crate) use merge::{AbsorbCaptureBlock, CaptureFence, MergeWindow};
 /// let an owned store materialize O(backlog) structs despite it; bounding the requested range WIDTH caps
 /// the count regardless of payload. The caller's loop re-reads the remainder.
 pub(crate) const MAX_READ_BATCH_ENTRIES: u64 = 8192;
+
+/// The crossing walk's per-CRANK budget, in chunks of [`MAX_READ_BATCH_ENTRIES`]: a parked replica's
+/// committed tail can be arbitrarily long (the leader runs on while it waits), and a warm store
+/// would otherwise let one `service_merge_applies` drain all of it synchronously. The budget bounds
+/// the crank, not the walk — the watermark advances chunk by chunk and the next crank resumes from
+/// it, so the walk still reaches the frontier, one budget at a time. THE CONVERGENCE PREMISE: each
+/// chunk is also capped at 1 MiB of payload, so the walk's per-crank progress is entry-size
+/// dependent, and its reaching the frontier at all assumes the walk out-runs the committed
+/// frontier's growth — the same premise the apply drain's one-chunk-per-crank budget already rests
+/// on, at four times that budget. A walk that trails a growing frontier withholds the cure hint for
+/// as long as it trails (the parked replica waits; see `note_abort_covered`'s residual list).
+pub(crate) const CROSSING_SCAN_CHUNKS_PER_CRANK: usize = 4;
 
 /// The per-crank apply budget: at most one read-batch's worth of committed entries is applied per
 /// `apply_committed` call. WHY: the drain is otherwise unbounded in PASSES — the per-pass FETCH is
@@ -3752,10 +3765,20 @@ where
               // The commit is DEAD even though its mint is fresh: parking it would stop the drain at
               // the aborted freeze generation, which the thaw pass then drives the source PAST — a
               // permanent wedge. Do NOT park and do NOT bump the lineage; emit `MergeAborted` like
-              // the aborted-park resolution. Uniform across replicas: the abort precedes this entry
-              // in the SAME log, so every replica's `abandoned` at this apply is identical (a pure
-              // function of the log prefix). The `commit_merge` gate refuses the common re-propose
-              // at propose; this belt covers the in-flight order the gate cannot see.
+              // the aborted-park resolution. Uniform across replicas that WALKED the log: the abort
+              // precedes this entry in the SAME log, so their `abandoned` at this apply is identical.
+              // The map is a near-pure function of the committed prefix, and the belt reads it
+              // TOTALLY (`abandoned_matches` sees covered and discharged records alike): a replica
+              // whose install crossed the abort keeps the record until a global fact disposes of
+              // it, a follower that observed the source past the generation keeps it discharged,
+              // and a global fact means the source's committed counter is past the generation —
+              // so a commit for the aborted generation cannot even be proposed while the map
+              // diverges. The record-less classes that could reach this entry differently are
+              // exactly two: an install-then-restart replica (its re-derivation lost the entry) and
+              // the never-derived straggler that never applied the abort before its destructive
+              // install (#133) — the residuals `note_abort_covered` records (#138). The
+              // `commit_merge` gate refuses the common re-propose at propose; this belt covers the
+              // in-flight order the gate cannot see.
               self
                 .outputs
                 .events
@@ -3875,8 +3898,9 @@ where
             // held at EXACTLY the witnessed generation: a STALE witness (the source re-froze at a
             // higher generation for a fresh merge, or this is a replayed duplicate) no-ops on the
             // gen-exact match, so the fresh obligation is untouched. Uniform on every replica — the
-            // leader that minted it clears HERE too, and a replica that can never LOCALLY observe the
-            // source (unhosted, floor 0/non-terminal, lineage unknown) clears here and NOWHERE else.
+            // leader that minted it clears HERE too (its own record was only marked discharged), and
+            // a replica that can never LOCALLY observe the source (unhosted, floor 0/non-terminal,
+            // lineage unknown) clears here and NOWHERE else — covered records included.
             let payload = match crate::wire::decode_thaw_discharged_payload(entry.data_bytes()) {
               Ok(p) => p,
               // A committed witness whose payload won't decode is corrupt — mirror the other merge

@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
   AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, PrepareMergePayload, Term,
-  VoteResponse,
+  VoteResponse, endpoint::Cover,
 };
 
 /// Encode a `PrepareMerge` payload naming target group bytes `t` with `source_gen_after`.
@@ -1155,9 +1155,9 @@ fn outstanding_abort_relay_captures_no_snapshot() {
   // The service discharges it (the source observed thawed past the abandoned freeze), modeled by
   // clearing it here. THE NEGATIVE PIN: with no outstanding obligation the fence does not
   // over-block — the very next crank captures.
-  assert!(ep.has_abandoned());
+  assert!(ep.owes_live_thaw());
   ep.clear_abandoned(&bytes::Bytes::from_static(b"\x2a"));
-  assert!(!ep.has_abandoned());
+  assert!(!ep.owes_live_thaw());
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
     stable.snapshot().is_some(),
@@ -1204,36 +1204,39 @@ fn restart_re_derives_the_abort_relay() {
   assert_eq!(ep.shape_gen(), 1, "replay re-bumped the abort's lineage");
   // The obligation is BACK: replaying the surviving abort entry re-derived it, so the service can
   // re-drive the source thaw — the source is never wedged frozen.
-  let (_source, source_gen_after, abort_index) = ep
+  let (_source, obligation) = ep
     .abandoned_obligations()
     .first()
     .cloned()
     .expect("replay re-derived the abandoned obligation from the surviving entry");
   assert_eq!(
-    source_gen_after, 4,
+    obligation.generation, 4,
     "the abandoned freeze generation survived the restart"
   );
   assert_eq!(
-    abort_index,
+    obligation.abort_index,
     Index::new(1),
     "the fence boundary re-derives to the replayed entry's index"
   );
+  assert!(
+    obligation.cover == Cover::None && !obligation.discharged,
+    "a replayed abort re-derives an UNCOVERED, LIVE obligation — its entry is in the log"
+  );
 }
 
-/// THE ABORT INSTALL CLEAR (the fence family, install edition): a snapshot install re-baselines a
+/// THE ABORT INSTALL MARK (the fence family, install edition): a snapshot install re-baselines a
 /// follower's log to a LEADER's boundary — a floor-advance NO local fenced capture produced —
-/// discarding an abort entry at-or-below it. That entry is the `abandoned` obligation's ONLY restart
-/// re-derivation, and with the source thawed and gone the service can never observe it advance to
-/// discharge it. So the install CLEARS an obligation its boundary covers: the boundary sits past the
-/// committed+applied abort, proving the source thawed past the abandoned freeze (the capturing
-/// leader's own service drove it). Without the clear the stranded obligation pins `abort_relay_fences`
-/// on a boundary the install already crossed — a permanent target-capture wedge with the abort entry
-/// gone.
-///
-/// Without the clear, after the install `abandoned` stays set with its entry compacted, so a
-/// LATER `maybe_snapshot` is fenced forever and never captures.
+/// discarding an abort entry at-or-below it. That entry is the `abandoned` obligation's only restart
+/// re-derivation, and the boundary proves only that the transferring leader's own fence had lifted
+/// there — which it does on a host-local escape as readily as on a thaw, with the source possibly
+/// still frozen beside this holder. So the install MARKS the obligation install-covered and KEEPS
+/// it, live: generation and abort index intact, still driven, still read by every live-obligation
+/// gate, and disposed of only on a global fact (`note_abort_covered` is the single authority; the
+/// container tests pin the disposal). What the mark does change is the FENCE: the entry the fence
+/// protected is gone, so an install-covered record fences nothing, and a LATER `maybe_snapshot`
+/// captures past the install with the record still standing.
 #[test]
-fn snapshot_install_retires_the_covered_abort_relay() {
+fn snapshot_install_marks_the_covered_abort_relay() {
   use crate::{InstallSnapshot, SnapshotMeta, conf::ConfState};
   use core::time::Duration;
   let cfg = Config::try_new(
@@ -1247,6 +1250,7 @@ fn snapshot_install_retires_the_covered_abort_relay() {
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
   let mut log = VecLog::default();
   let mut stable = AsyncStable::default();
+  let source = bytes::Bytes::from_static(b"\x2a");
   // The follower applies a TARGET-side abort at index 2 (mint 1 against base 0): it records exactly
   // one `abandoned` obligation (abort_index = 2) and bumps the lineage.
   ep.handle_message(
@@ -1283,10 +1287,14 @@ fn snapshot_install_retires_the_covered_abort_relay() {
     ep.abort_relay_fences(ep.applied_index()),
     "the outstanding abort obligation fences target compaction"
   );
+  assert_eq!(
+    ep.abandoned_record(&source).map(|m| m.cover),
+    Some(Cover::None),
+    "a freshly applied abort is uncovered — its entry is in the log"
+  );
 
-  // The target leader's post-abort snapshot lands (boundary 5 > commit 2 — a non-redundant install),
-  // the source ABSENT (this endpoint hosts none to thaw). The re-baseline discards the abort entry
-  // AND must clear the now-moot obligation.
+  // The target leader's post-abort snapshot lands (boundary 5 > commit 2 — a non-redundant install).
+  // The re-baseline discards the abort entry; the obligation it covered is marked and kept.
   let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(4),
@@ -1306,17 +1314,28 @@ fn snapshot_install_retires_the_covered_abort_relay() {
   );
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   assert_eq!(ep.applied_index(), Index::new(5), "the install landed");
-  // The boundary (5 >= abort_index 2) cleared the obligation — the fence lifts for every later
-  // boundary. Without the clear the obligation is stranded with its entry compacted, and the fence
-  // stays raised forever.
+  assert!(
+    ep.owes_live_thaw(),
+    "the covered obligation is RETAINED across the install — the boundary proves no thaw"
+  );
+  let record = ep.abandoned_record(&source).expect("retained");
+  assert_eq!(
+    (
+      record.generation,
+      record.abort_index,
+      record.cover,
+      record.discharged
+    ),
+    (3, Index::new(2), Cover::Install, false),
+    "MARKED install-covered, still live, generation and abort index intact"
+  );
   assert!(
     !ep.abort_relay_fences(Index::new(1_000)),
-    "the covering install cleared the obligation — the fence lifts"
+    "an install-covered record fences nothing — the entry the fence protected is gone"
   );
 
-  // END TO END: the fence really is gone — a LATER maybe_snapshot captures. Append and apply two
-  // entries ABOVE the boundary (threshold 1), then a storage crank captures. Were it still fenced,
-  // maybe_snapshot would refuse and no snapshot would ever be written.
+  // END TO END: the fence really is down. Append and apply two entries ABOVE the boundary
+  // (threshold 1); the storage crank captures at 7 with the record still standing.
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -1350,43 +1369,78 @@ fn snapshot_install_retires_the_covered_abort_relay() {
     Index::new(7),
     "the post-install tail applied"
   );
+  assert_eq!(
+    stable.snapshot().map(|(m, _)| m.last_index()),
+    Some(Index::new(7)),
+    "the later capture proceeds past the install — the retained record does not fence it"
+  );
   assert!(
-    stable.snapshot().is_some(),
-    "the cleared obligation no longer fences — the later capture proceeds"
+    ep.owes_live_thaw(),
+    "and the record still stands after the capture — disposal is the container's, on a global fact"
   );
 }
 
-/// SYMMETRY (the negative pin): a covering install CLEARS `abandoned` only when its boundary spans
-/// the abort entry. An obligation whose abort entry sits ABOVE the boundary is RETAINED — the install
-/// does not prove the source past THAT freeze, so its fence correctly still holds (the
-/// `abort_index <= boundary` test). The real install path never carries an above-boundary abort (a
-/// non-redundant install re-baselines strictly above `commit >= applied >= abort_index`); this pins
-/// the clear predicate directly so a refactor cannot silently clear an uncovered obligation.
+/// SYMMETRY (the negative pin): a covering install MARKS `abandoned` only where its boundary spans
+/// the abort entry, and it REMOVES nothing. An obligation whose abort entry sits ABOVE the boundary
+/// stays unmarked — the install proves nothing about THAT freeze, and its re-delivered entry
+/// re-applies to re-derive it (the `abort_index <= boundary` test) — so it keeps fencing, while the
+/// install-covered one, its entry gone, fences no more. The real install path never carries an
+/// above-boundary abort (a non-redundant install re-baselines strictly above
+/// `commit >= applied >= abort_index`); this pins the mark predicate directly so a refactor cannot
+/// silently mark an uncovered obligation — or drop a covered one.
 #[test]
-fn install_retires_only_the_covered_abort_relays() {
+fn install_marks_only_the_covered_abort_relays() {
   let (mut ep, _log, _stable) = make_merge_follower();
-  // COVERED: boundary 5 spans the abort entry at 3 → cleared, the fence lifts.
-  ep.note_abandoned(bytes::Bytes::from_static(b"\x2a"), 1, Index::new(3));
-  ep.note_abort_rebaselined(Index::new(5));
-  assert!(
-    !ep.has_abandoned(),
-    "the covered obligation (abort_index 3) cleared"
+  let covered = bytes::Bytes::from_static(b"\x2a");
+  let uncovered = bytes::Bytes::from_static(b"\x2b");
+  // COVERED: boundary 5 spans the abort entry at 3 → marked, retained, no longer fencing.
+  ep.note_abandoned(covered.clone(), 1, Index::new(3));
+  // UNCOVERED: boundary 5 does NOT span the abort entry at 8 → unmarked, retained, still fencing.
+  ep.note_abandoned(uncovered.clone(), 1, Index::new(8));
+  ep.note_abort_covered(Index::new(5), Cover::Install);
+  assert_eq!(
+    ep.abandoned_obligations().len(),
+    2,
+    "the mark removes nothing: both obligations are retained"
+  );
+  assert_eq!(
+    ep.abandoned_record(&covered).map(|m| m.cover),
+    Some(Cover::Install),
+    "the covered obligation (abort_index 3) is marked"
+  );
+  assert_eq!(
+    ep.abandoned_record(&uncovered).map(|m| m.cover),
+    Some(Cover::None),
+    "the uncovered obligation (abort_index 8) is not"
   );
   assert!(
     !ep.abort_relay_fences(Index::new(4)),
-    "nothing fences once the covered obligation cleared"
-  );
-  // UNCOVERED: boundary 5 does NOT span the abort entry at 8 → retained, the fence still holds.
-  ep.note_abandoned(bytes::Bytes::from_static(b"\x2b"), 1, Index::new(8));
-  ep.note_abort_rebaselined(Index::new(5));
-  assert_eq!(
-    ep.abandoned_obligations().first().map(|(_, _, at)| *at),
-    Some(Index::new(8)),
-    "the uncovered obligation (abort_index 8) is retained"
+    "the install-covered obligation no longer fences its own abort entry's boundary"
   );
   assert!(
     ep.abort_relay_fences(Index::new(8)),
     "the uncovered obligation still fences"
+  );
+  assert!(
+    ep.owes_live_thaw()
+      && ep
+        .abandoned_obligations()
+        .iter()
+        .all(|(_, m)| !m.discharged),
+    "both are still LIVE — a cover retires nothing"
+  );
+  // A later boundary marks what it now covers; re-marking is a no-op.
+  ep.note_abort_covered(Index::new(9), Cover::Install);
+  assert!(
+    ep.abandoned_obligations()
+      .iter()
+      .all(|(_, m)| m.cover == Cover::Install),
+    "a later boundary marks what it now covers and re-marking is a no-op"
+  );
+  assert_eq!(ep.abandoned_obligations().len(), 2, "still nothing removed");
+  assert!(
+    !ep.abort_relay_fences(Index::new(1_000)),
+    "neither fences now"
   );
 }
 
@@ -1419,12 +1473,12 @@ fn note_abandoned_is_per_source_and_replay_idempotent() {
   ep.note_abandoned(bytes::Bytes::from_static(b"\x2a"), 3, Index::new(9));
   let obligations = ep.abandoned_obligations();
   assert_eq!(obligations.len(), 2, "still one obligation per source");
-  let a = obligations
+  let (_, a) = obligations
     .iter()
-    .find(|(s, ..)| *s == bytes::Bytes::from_static(b"\x2a"))
+    .find(|(s, _)| *s == bytes::Bytes::from_static(b"\x2a"))
     .expect("source 2a still tracked");
   assert_eq!(
-    (a.1, a.2),
+    (a.generation, a.abort_index),
     (3, Index::new(9)),
     "the re-freeze's generation and abort index won last"
   );
@@ -1434,6 +1488,138 @@ fn note_abandoned_is_per_source_and_replay_idempotent() {
   assert!(
     ep.abort_relay_fences(Index::new(4)),
     "source 2b's obligation still fences its abort entry"
+  );
+}
+
+/// The LAST-WINS overwrite RESETS the cover and discharge marks, with no clear in between — the one
+/// path where a stale mark could reach a live obligation. A holder whose install covered `(S, g)`
+/// still carries that record while its log-behind local S reads gen `g`; S thaws and re-freezes
+/// elsewhere, and the abort for `(S, g')` applies here ABOVE the install boundary. That entry is in
+/// the log — a live replay source naming a freeze nothing has proven past — so the record it
+/// overwrites must be uncovered and live: were the install mark to survive, the new entry's fence
+/// would be missing; were a discharge mark to survive, every live-obligation gate would skip a
+/// freeze that is very much alive.
+#[test]
+fn a_fresh_abort_overwrites_a_covered_obligation_uncovered() {
+  let (mut ep, _log, _stable) = make_merge_follower();
+  let source = bytes::Bytes::from_static(b"\x2a");
+  ep.note_abandoned(source.clone(), 1, Index::new(3));
+  ep.note_abort_covered(Index::new(5), Cover::Install);
+  assert_eq!(
+    ep.abandoned_record(&source).map(|m| m.cover),
+    Some(Cover::Install),
+    "the install's boundary (5) covered the abort entry (3)"
+  );
+  // The fresh abort for the re-frozen incarnation applies above the boundary — no clear between.
+  ep.note_abandoned(source.clone(), 2, Index::new(9));
+  let m = ep
+    .abandoned_record(&source)
+    .expect("the source is still tracked");
+  assert_eq!(
+    m.cover,
+    Cover::None,
+    "the overwrite reset the mark: the new abort entry is a live replay source"
+  );
+  assert_eq!(
+    (m.generation, m.abort_index),
+    (2, Index::new(9)),
+    "the re-freeze's generation and abort index won"
+  );
+  assert!(
+    !ep.abort_relay_fences(Index::new(8)) && ep.abort_relay_fences(Index::new(9)),
+    "the fence now keys on the new entry alone"
+  );
+  // The same for a DISCHARGED record: a global proof retired (S, 2); S re-freezes at 3 and its
+  // abort applies at 12 — the overwrite is live again.
+  ep.note_discharged(&source);
+  assert!(
+    !ep.owes_live_thaw() && ep.abandoned_record(&source).is_some_and(|m| m.discharged),
+    "discharged: kept as the witness trigger, owed by no live gate"
+  );
+  ep.note_abandoned(source.clone(), 3, Index::new(12));
+  let m = ep.abandoned_record(&source).expect("still tracked");
+  assert!(
+    !m.discharged && ep.owes_live_thaw() && m.generation == 3,
+    "the overwrite reset the discharge mark: the new freeze is live"
+  );
+}
+
+/// THE FENCE BY COVER KIND: an ADOPT-covered record keeps fencing captures (the kept log still
+/// carries its abort entry — the record's only restart re-derivation), an INSTALL-covered one
+/// fences nothing (its entry is already gone), the cover is an ORDERED UPGRADE (an install past an
+/// adopt-covered record lifts the fence; an adopt after an install never brings it back), and a
+/// DISCHARGED record KEEPS fencing unless install-covered — until the witness applies it is the only
+/// future witness trigger, which compacting its entry and crashing would lose. The skip lives inside
+/// `abort_relay_fences` alone, so every capture site — and the absorb's three-way classification —
+/// agrees.
+#[test]
+fn an_install_cover_lifts_the_fence_and_an_adopt_cover_keeps_it() {
+  let source = bytes::Bytes::from_static(b"\x2a");
+  let fresh = |cover: Cover| {
+    let (mut ep, _log, _stable) = make_merge_follower();
+    ep.note_abandoned(source.clone(), 1, Index::new(3));
+    ep.note_abort_covered(Index::new(5), cover);
+    ep
+  };
+  // ADOPT keeps fencing.
+  let ep = fresh(Cover::Adopt);
+  assert_eq!(
+    ep.abandoned_record(&source).map(|m| m.cover),
+    Some(Cover::Adopt)
+  );
+  assert!(
+    ep.abort_relay_fences(Index::new(5)),
+    "an adopt-covered record still fences: its entry is in the kept log"
+  );
+  // INSTALL lifts.
+  let ep = fresh(Cover::Install);
+  assert!(
+    !ep.abort_relay_fences(Index::new(1_000)),
+    "an install-covered record fences nothing: its entry is gone"
+  );
+  assert!(
+    ep.owes_live_thaw(),
+    "and it is still live — lifting the fence is not disposal"
+  );
+  // The UPGRADE: adopt, then an install whose boundary covers it → Install, the fence lifts.
+  let mut ep = fresh(Cover::Adopt);
+  ep.note_abort_covered(Index::new(6), Cover::Install);
+  assert_eq!(
+    ep.abandoned_record(&source).map(|m| m.cover),
+    Some(Cover::Install),
+    "an install past an adopt-covered record upgrades the mark"
+  );
+  assert!(
+    !ep.abort_relay_fences(Index::new(1_000)),
+    "and lifts the fence"
+  );
+  // NO DOWNGRADE: install, then an adopt → still Install.
+  let mut ep = fresh(Cover::Install);
+  ep.note_abort_covered(Index::new(6), Cover::Adopt);
+  assert_eq!(
+    ep.abandoned_record(&source).map(|m| m.cover),
+    Some(Cover::Install),
+    "an adopt never downgrades an install cover — the discarded entry does not come back"
+  );
+  assert!(!ep.abort_relay_fences(Index::new(1_000)));
+  // DISCHARGED keeps fencing: until the witness applies, the record is the only future trigger.
+  let mut ep = fresh(Cover::Adopt);
+  ep.note_discharged(&source);
+  assert!(
+    ep.abort_relay_fences(Index::new(5)),
+    "a discharged record keeps fencing its entry: the only future witness trigger while a \
+     non-observer leads"
+  );
+  assert!(
+    !ep.owes_live_thaw() && ep.abandoned_matches(&source, 1),
+    "owed by no live gate, yet held — the belt and the witness apply read it"
+  );
+  // ... unless install-covered: the entry is already gone, so there is nothing left to fence.
+  let mut ep = fresh(Cover::Install);
+  ep.note_discharged(&source);
+  assert!(
+    !ep.abort_relay_fences(Index::new(1_000)),
+    "an install-covered discharged record fences nothing — its entry is already gone"
   );
 }
 
@@ -1838,7 +2024,7 @@ fn an_outstanding_thaw_obligation_does_not_fence_conf_changes() {
     )
     .unwrap();
   ack_through(&mut ep, &mut log, &mut stable, a);
-  assert!(ep.has_abandoned(), "the abort recorded an obligation");
+  assert!(ep.owes_live_thaw(), "the abort recorded an obligation");
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
   assert!(
@@ -1923,7 +2109,7 @@ fn outstanding_abort_relay_blocks_the_forced_absorb_capture() {
   // NEGATIVE PIN: discharge the obligation (the service clears it once the source is observed
   // thawed, modeled here). The fence lifts and the forced absorb capture proceeds and compacts
   // through the park — exactly as it does for a target with no outstanding abort (no over-block).
-  assert!(ep.has_abandoned());
+  assert!(ep.owes_live_thaw());
   ep.clear_abandoned(&bytes::Bytes::from_static(b"\x2b"));
   assert!(
     !ep.absorb_capture_blocked(),
@@ -2403,7 +2589,7 @@ fn abort_below_a_commit_kills_it_at_apply() {
     "the abort's own signal plus the killed commit's"
   );
   // Exactly one abandoned obligation — the applied abort's.
-  assert!(ep.has_abandoned());
+  assert!(ep.owes_live_thaw());
 }
 
 /// A TARGET-role abort with a STALE mint is a silent deterministic no-op: no lineage move, no
@@ -2423,7 +2609,7 @@ fn stale_abort_is_a_silent_no_op() {
   ack_through(&mut ep, &mut log, &mut stable, a);
   assert_eq!(ep.applied_index(), a, "applied as a no-op");
   assert_eq!(ep.shape_gen(), 0, "no lineage move");
-  assert!(!ep.has_abandoned(), "no abandoned obligation");
+  assert!(!ep.owes_live_thaw(), "no abandoned obligation");
   assert!(
     !core::iter::from_fn(|| ep.poll_event()).any(|ev| matches!(ev, Event::MergeAborted(_))),
     "no signal — the base's winner already spoke"
@@ -2818,8 +3004,8 @@ fn the_adopt_thaws_a_frozen_and_parked_target() {
   );
   assert_eq!(ep.applied_index(), Index::new(4));
   assert!(
-    !ep.has_abandoned(),
-    "boundary-covered obligations cleared, restart-agreed"
+    ep.abandoned_obligations().is_empty(),
+    "the adopt mints no obligation of its own: this log carries an unfreeze, never an abort"
   );
   assert!(
     log.first_index() <= Index::new(1),

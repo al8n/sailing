@@ -230,6 +230,181 @@ fn a_parked_merge_blocks_quiescence() {
   );
 }
 
+/// An adopter with a STANDING owed capture is never quiesce-eligible: the adopting install moved
+/// state to the cure's boundary without persisting the blob, and the per-crank merge service —
+/// which a quiesced group would never reach — is the only thing that stages that capture. Driven
+/// through the real container + engine (public API plus the shape-payload minting seam): a
+/// restored single-voter target parked over a source hosted nowhere is cured by the adopting
+/// install, then leads and settles commit == applied — and is NOT idle until the service stages
+/// the owed capture, after which it settles idle again.
+#[test]
+fn an_owed_adopt_capture_blocks_quiescence() {
+  use bytes::Bytes;
+  use sailing_proto::{
+    CommitMergePayload, Data, Entry, EntryKind, GroupEngine, HardState, Index, InstallSnapshot,
+    Instant, LogStore, Message, MultiRaft, OpId, SnapshotMeta, StableStore, StateMachine, Term,
+    conf::ConfState,
+  };
+
+  #[derive(Default)]
+  struct Sm(u64);
+  impl StateMachine for Sm {
+    type Command = Bytes;
+    type Response = u64;
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+    fn apply(&mut self, _: Index, _: Bytes) -> Result<u64, Self::Error> {
+      self.0 += 1;
+      Ok(self.0)
+    }
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.0)
+    }
+    fn restore(&mut self, s: u64) -> Result<(), Self::Error> {
+      self.0 = s;
+      Ok(())
+    }
+    fn absorb(&mut self, source: Self) -> bool {
+      self.0 += source.0;
+      true
+    }
+    fn supports_absorb(&self) -> bool {
+      true
+    }
+  }
+
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut multi: MultiRaft<u64, u64, Sm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  let gid = 1u64;
+  assert!(engine.add_group(gid));
+  // A durable log parked at 2 on a `CommitMerge` naming source 42 — hosted nowhere — with a
+  // committed entry above it: the boundary the cure will cover.
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let park = {
+    let mut sb = Vec::new();
+    42u64.encode(&mut sb);
+    sailing_proto::fuzz_internals::shape_payload::commit_merge(&CommitMergePayload::new(
+      Bytes::from(sb),
+      Index::new(5),
+      Term::new(1),
+      1,
+      1,
+    ))
+  };
+  {
+    let (log, stable) = engine.stores(&gid).unwrap();
+    log.submit_append(
+      OpId::ZERO,
+      &[
+        Entry::new(Term::new(1), Index::new(1), EntryKind::Normal, cmd.clone()),
+        Entry::new(Term::new(1), Index::new(2), EntryKind::CommitMerge, park),
+        Entry::new(Term::new(1), Index::new(3), EntryKind::Normal, cmd),
+      ],
+    );
+    stable.submit_write(
+      OpId::ZERO,
+      HardState::initial()
+        .with_term(Term::new(1))
+        .with_commit(Index::new(3))
+        .with_vote(Some(1u64)),
+    );
+  }
+  engine.flush();
+  {
+    let (log, stable) = engine.stores(&gid).unwrap();
+    multi
+      .restore_group_unchecked(
+        gid,
+        Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap(),
+        now,
+        7,
+        Sm::default(),
+        1,
+        log,
+        stable,
+      )
+      .unwrap();
+  }
+  assert!(
+    multi.group(&gid).unwrap().pending_merge().is_some(),
+    "parked over a source hosted nowhere"
+  );
+  // The service classifies the park as needing a cure and walks the interval; the cure adopts.
+  assert!(multi.service_merge_applies(now, &mut engine).is_empty());
+  let blob = {
+    let mut buf = Vec::new();
+    5u64.encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let meta = SnapshotMeta::new(
+    Index::new(3),
+    Term::new(1),
+    ConfState::from_voters(vec![1u64]),
+  )
+  .with_shape_gen(1);
+  {
+    let (log, stable) = engine.stores(&gid).unwrap();
+    multi
+      .handle_message(
+        &gid,
+        now,
+        log,
+        stable,
+        9u64,
+        Message::InstallSnapshot(InstallSnapshot::new(Term::new(1), 9u64, meta, blob)),
+      )
+      .unwrap();
+  }
+  assert!(
+    multi.group(&gid).unwrap().pending_merge().is_none(),
+    "the cure adopted the union"
+  );
+  assert!(
+    multi.group(&gid).unwrap().adopt_capture_owed(),
+    "and the adopt owes its forced capture"
+  );
+  // The adopter leads and settles — commit == applied, its own match at commit — the shape every
+  // other quiesce leg accepts.
+  let d = multi.group(&gid).unwrap().poll_timeout().unwrap();
+  {
+    let (log, stable) = engine.stores(&gid).unwrap();
+    multi.handle_timeout(&gid, d, log, stable).unwrap();
+  }
+  for _ in 0..4 {
+    engine.flush();
+    let (log, stable) = engine.stores(&gid).unwrap();
+    let _ = multi.handle_storage(&gid, d, log, stable).unwrap();
+  }
+  let ep = multi.group(&gid).unwrap();
+  assert!(ep.role().is_leader(), "leading");
+  assert_eq!(ep.commit_index(), ep.applied_index(), "settled");
+  assert!(
+    !super::group_idle(ep),
+    "an owed adopt capture is standing merge work — never quiesce-eligible"
+  );
+
+  // The service stages the owed capture; once it drains, the adopter is idle again.
+  assert!(multi.service_merge_applies(now, &mut engine).is_empty());
+  for _ in 0..4 {
+    engine.flush();
+    let (log, stable) = engine.stores(&gid).unwrap();
+    let _ = multi.handle_storage(&gid, d, log, stable).unwrap();
+  }
+  assert!(
+    !multi.group(&gid).unwrap().adopt_capture_owed(),
+    "the owed capture staged"
+  );
+  assert!(
+    super::group_idle(multi.group(&gid).unwrap()),
+    "the adopter settles idle once its owed capture is staged"
+  );
+}
+
 /// Quiesce-ineligibility of pending farewell work through the container, the CAUGHT-UP arm: a leader
 /// that removes a caught-up voter fires a commit-carrying heartbeat and — with the both-arms fix —
 /// still owes blind re-deliveries (the removed peer's ack is unobservable), so `group_idle` refuses

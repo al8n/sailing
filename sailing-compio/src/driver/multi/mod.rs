@@ -306,6 +306,11 @@ where
     // A standing merge-cure debt is a wedged peer the pump predicate cannot see (it is not
     // log-lagging); quiescing would silence the very cadence its cure rides.
     || ep.has_cure_debts()
+    // An adopt's owed capture is merge work only the per-crank service stages: the adopting
+    // install moved state to the cure's boundary without persisting the blob, so an adopter
+    // left asleep here holds nothing durable covering it — unable to cure the next parked
+    // voter — and its absorb membership fence never releases.
+    || ep.adopt_capture_owed()
   {
     return false;
   }

@@ -728,6 +728,16 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   run_multi_vopr_inner(seed, ticks, profile, !profile.phases.is_empty())
 }
 
+/// The #106 counterfactual's credit: how many of `underhosted`'s groups a tombstone-held fork
+/// EXPLAINS — the class re-derived with the hold-explained husks struck from its roots
+/// ([`MultiWorld::hold_explained_husks`], drawn from the whole catalog), and the difference counted.
+/// The ONE path both the runner's report and the harness's own unit test read, so the strike
+/// domain can never drift between them.
+pub(crate) fn under_hosted_hold_overlap(w: &MultiWorld, underhosted: &BTreeSet<u64>) -> u64 {
+  let counterfactual = w.tracked_merge_wedge_set_excluding(&w.hold_explained_husks());
+  underhosted.difference(&counterfactual).count() as u64
+}
+
 /// Like [`run_multi_vopr`], but forces the tracked #106/#110 wedge exemption ON for an UNPHASED
 /// profile. The predicate stays deliberately narrow (a genuine hosting shortfall only), so a
 /// non-merge livelock — or any wedge outside the tracked sets — still trips, and safety is never
@@ -1236,22 +1246,18 @@ fn quiesce(
   // coincidence: a group independently under-hosted that merely happens to sit in the held-fork
   // cascade would cancel a real regression. Each cured class is re-derived with ONLY the roots the
   // held-fork class actually EXPLAINS struck out, and the difference is what it is owed:
-  //   - #106's root is a missing host quorum, which a standing hold cannot cause and a RESURRECTED
-  //     HUSK can — the landed fork is why a torn-down id is hosted at all, on one member;
+  //   - #106's root is a missing host quorum, which a standing hold cannot cause but a RESURRECTED
+  //     HUSK can (the landed fork is why a torn-down id is hosted at all, on one member) and a
+  //     DISSOLVED SOURCE can (merged away and hosted nowhere, its absorbing target parked behind a
+  //     held fork — the park re-derives the root through the source it names, so the strike set
+  //     is drawn from the whole catalog, not the wedge set: such a source is never IN the set);
   //   - #110's root is a fork-fence-coupled park, which is exactly what a standing HOLD causes.
   // A root that survives its own class's strike-out stays counted, and still trips.
-  let resurrected: BTreeSet<u64> = underhosted
-    .iter()
-    .copied()
-    .filter(|&g| w.resurrected_husk(g) || w.husk_dissolve_blocked_by_hold(g))
-    .collect();
+  report.under_hosted_retired_hold_overlap += under_hosted_hold_overlap(w, &underhosted);
   // EDGE-level, not id-level: strike only the (node, gid) couplings a held fork explains, so a
   // group also coupled independently on another node keeps that root and still counts.
   let held_edges = w.held_fork_fence_edges(&forkfence);
-  let underhosted_cf = w.tracked_merge_wedge_set_excluding(&resurrected);
   let forkfence_cf = w.fork_fence_wedge_set_excluding(&held_edges);
-  report.under_hosted_retired_hold_overlap +=
-    underhosted.difference(&underhosted_cf).count() as u64;
   report.fork_fence_retired_hold_overlap += forkfence.difference(&forkfence_cf).count() as u64;
   if !converged {
     // Only a NON-exempt group that failed to converge is a wedge worth panicking on; if every

@@ -23,8 +23,13 @@ derive_more.workspace = true
 # Bench-only: criterion without plotters/rayon (lean dep tree; `cargo bench` + CI compile-check).
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # The Tier B coordinator scenarios drive the REAL multi stream coordinator; scoping the `tcp`
-# feature to dev-dependencies keeps the library target's dependency footprint std-only.
-sailing-proto = { workspace = true, features = ["std", "tcp"] }
+# feature to dev-dependencies keeps the library target's dependency footprint std-only. The
+# `fuzzing` feature rides here for the same reason the conformance crate carries it: a harness
+# unit test fabricates a committed `CommitMerge` entry on a replica's durable log (no organic drive
+# leaves a park standing over a source the world hosts nowhere), and the only encoder for that
+# payload is the off-by-default, doc(hidden) minting seam — reached by this crate's tests alone,
+# never by its library target.
+sailing-proto = { workspace = true, features = ["std", "tcp", "fuzzing"] }
 
 [[bench]]
 name = "endpoint"

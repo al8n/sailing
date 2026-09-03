@@ -773,8 +773,9 @@ pub enum MergeBlockedCause {
   /// the fork. That composition needs embedder action, which is why it is signalled rather than
   /// silently resolved.
   ForkFence,
-  /// The union is absorbed and serving; its durability capture waits on an undischarged abort
-  /// obligation. The named source's thaw is the exit.
+  /// The union is absorbed (or adopted) and serving; its durability capture waits on an
+  /// undischarged abort obligation held here. The named source is the one whose abort record
+  /// FENCES — never the source the union consumed — and its thaw's witness is the exit.
   AbortFence,
   /// A live merge freeze holds the capture: this group is itself a source pinned by a claiming
   /// target. The thaw — or this group's own dissolution into the claimant — is the exit.
@@ -1238,9 +1239,16 @@ where
   /// pending-`CommitMerge` windows need no leg of their own: the barrier holds the source `Frozen`
   /// and the park `MergeParked` throughout):
   ///
-  /// - [`OwesThaw`](RemoveError::OwesThaw) — the group owes an aborted upstream source its thaw
-  ///   ([`has_abandoned`](Endpoint::has_abandoned)); its own log is that obligation's only replay
-  ///   source. Discharged by the per-crank thaw pass (or a floor on the owed source).
+  /// - [`OwesThaw`](RemoveError::OwesThaw) — the group owes an aborted upstream source a LIVE thaw
+  ///   ([`owes_live_thaw`](Endpoint::owes_live_thaw)); its own log is that obligation's replay
+  ///   source, or — once a transfer has covered the abort entry — its endpoint's retained record is
+  ///   all that remains of it. Discharged by the per-crank thaw pass off a global proof (or a floor
+  ///   on the owed source). Steps aside when every live record is covered and names a source not
+  ///   hosted here: such a record drives nothing on this host, so the removal strands no thaw.
+  ///   ALSO refused while the group holds a DISCHARGED record whose `ThawDischarged` witness has
+  ///   not applied — a witness debt ([`holds_witness_debt`](Endpoint::holds_witness_debt)), with no
+  ///   step-aside, a poisoned holder included (its recovery is a non-destructive re-open, not a
+  ///   removal that would delete a proof no other replica may hold).
   /// - [`Frozen`](RemoveError::Frozen) — the group is a merge SOURCE mid-freeze
   ///   ([`merge_freeze_active`](Endpoint::merge_freeze_active)); its target parks against this exact
   ///   freeze, so tearing it down strands the park. Roll the merge back first (abort → thaw).
@@ -1280,10 +1288,37 @@ where
     S: StableStore<NodeId = I>,
   {
     // THE PARTICIPANT GATE, refused BEFORE any teardown so the group stays fully intact. Leg 1: a
-    // hosted holder of an undischarged target-role thaw obligation cannot leave — its log is the
-    // sole replay source that runs the outstanding thaw, so destroying it wedges the owed source
-    // frozen forever. Self-clearing off the per-crank thaw pass (or a floor on the owed source).
-    if self.groups.get(gid).is_some_and(Endpoint::has_abandoned) {
+    // hosted holder of a LIVE target-role thaw obligation cannot leave — its log (or, once a
+    // transfer covered the abort entry, its retained record alone) is what runs the outstanding
+    // thaw, so destroying it wedges the owed source frozen forever. Self-clearing off the per-crank
+    // thaw pass (or a floor on the owed source). THE STEP-ASIDE: when every live record the holder
+    // carries is COVERED and names a source NOT hosted here, none of them drives anything on this
+    // host (the drive needs the source's own stores, and an install-covered record does not even
+    // fence), so the removal strands no thaw and admits. The cost, stated plainly: the successor
+    // replica that later arrives here by snapshot is a RECORD-LESS one — the restart-after-install
+    // residual (`note_abort_covered`), deliberately accepted; the step-aside converts a wedge into
+    // that residual. A record whose source IS hosted here keeps refusing: it drives that source,
+    // and it is what keeps the source's own removal admissible through the owed-source escape.
+    // THE WITNESS DEBT: a DISCHARGED record whose witness has not applied refuses too, with NO
+    // step-aside — the observation that discharged it may be host-local knowledge (a persisted
+    // mirror, a terminal floor, a source hosted here) no other replica can reproduce, so while the
+    // leader cannot observe the source this record is the only future `ThawDischarged` trigger
+    // anywhere, and removing the holder destroys it while every other replica keeps its live
+    // obligation and abort-entry fence forever. The exits: the witness applies (this holder mints
+    // when it leads unparked; an observing leader mints without it), or the named source — hosted
+    // here, live past the generation and not itself a merge participant — is removed, and its purge
+    // clears the record. A POISONED holder's debt fences its removal too: it cannot mint and a
+    // peer's witness cannot apply on it, but admitting the removal would delete, together with the
+    // storage the drivers tear down, a proof no other replica may hold — the healthy unobserving
+    // peers would keep their live records, abort-replay fences and lifecycle gates raised
+    // indefinitely, while refusing wedges only a replica that serves nothing anyway. Its recovery
+    // is a NON-DESTRUCTIVE re-open from its preserved stores (the record re-derives live from the
+    // still-fenced abort entry, unless an install already discarded it — `note_abort_covered`,
+    // residual 1), a driver verb the built-in drivers do not offer yet (residual 13).
+    if let Some(ep) = self.groups.get(gid)
+      && ((ep.owes_live_thaw() && !self.owes_only_covered_dead_ends(gid))
+        || ep.holds_witness_debt())
+    {
       return Err(RemoveError::OwesThaw);
     }
     // An OWED source — one a hosted target still owes a thaw AT the generation this source is live
@@ -1398,7 +1433,7 @@ where
     // so what survives to the dissolve is a dead-end obligation this replica can neither drive nor
     // observe, which the belt DROPS by design (a co-hosting replica drives that thaw; dropping it
     // here strands nothing). The purge then clears whatever such residue the source still carries.
-    if removed.is_some() && self.groups.values().any(Endpoint::has_abandoned) {
+    if removed.is_some() && self.groups.values().any(Endpoint::holds_abandoned) {
       let mut source_key = Vec::new();
       gid.encode(&mut source_key);
       let source_key = Bytes::from(source_key);
@@ -1622,6 +1657,10 @@ where
   /// `Frozen` over the newly-frozen source. An unhosted `gid` has no live generation to escape and
   /// answers `false` (leg 2 is a no-op for it anyway). The purge in `remove_group_inner` stays
   /// id-wide by contrast: a departing incarnation voids ALL its obligations, stale ones included.
+  /// A COVERED obligation counts exactly like an uncovered one — that is what keeps this escape
+  /// open on a host whose install crossed the abort while the source stayed frozen here, the
+  /// stranded shape a covered source that nothing can drive would otherwise be. A DISCHARGED one
+  /// does not: its source is proven past the generation, so it names a spent incarnation.
   fn some_target_owes_thaw_to(&self, gid: &G) -> bool {
     let Some(live_gen) = self.groups.get(gid).map(Endpoint::shape_gen) else {
       return false;
@@ -1632,7 +1671,22 @@ where
     self
       .groups
       .iter()
-      .any(|(g, ep)| g != gid && ep.owes_thaw_for(&key) == Some(live_gen))
+      .any(|(g, ep)| g != gid && ep.owes_live_thaw_for(&key) == Some(live_gen))
+  }
+
+  /// Whether every LIVE record `gid` holds is covered and names a source not hosted here — the
+  /// `OwesThaw` teardown leg's step-aside read. A record whose source id will not decode counts as
+  /// held (the leg refuses): the drivability belt poisons on such an id, and the teardown gate must
+  /// never admit past a record it cannot classify.
+  fn owes_only_covered_dead_ends(&self, gid: &G) -> bool {
+    self.groups.get(gid).is_some_and(|ep| {
+      ep.live_obligations()
+        .into_iter()
+        .all(|(source_bytes, obligation)| {
+          obligation.is_covered()
+            && G::decode_exact(source_bytes).is_ok_and(|source| !self.groups.contains_key(&source))
+        })
+    })
   }
 
   /// Whether any OTHER hosted endpoint's parked `CommitMerge` names `gid` as its source — scanned
@@ -1653,31 +1707,31 @@ where
   }
 
   /// Whether any of `tgid`'s standing abort obligations names a source hosted-and-frozen on
-  /// this container — the cure-advertisement gate's abort leg: an adopt clears obligations at
-  /// the boundary, and clearing one whose live frozen counterparty sits RIGHT HERE would erase
-  /// the only drive for its thaw (a host-local proof of nothing — the source strands frozen).
-  /// Unhosted or hosted-but-unfrozen counterparties have no local strand to protect, and the
-  /// boundary-proof clear is exactly right for them.
+  /// this container — the cure-advertisement gate's abort leg. An adopt MARKS the obligations
+  /// its boundary covers and the container disposes of them afterwards; a live frozen
+  /// counterparty RIGHT HERE is exactly the source a boundary proves nothing about, so no
+  /// transfer is let stand between it and its drive at all — the retained record keeps that
+  /// drive on its own, and this gate is the second belt over the same shape. Unhosted or
+  /// hosted-but-unfrozen counterparties have no local strand to protect, and the mark is exactly
+  /// right for them. A discharged record withholds nothing: its source is past the generation.
   fn obligation_names_hosted_unadvanced(&self, tgid: &G) -> bool {
     let Some(tep) = self.groups.get(tgid) else {
       return false;
     };
-    tep
-      .abandoned_obligations()
-      .into_iter()
-      .any(|(sb, expected, _)| {
-        G::decode_exact(sb)
+    tep.live_obligations().into_iter().any(|(sb, obligation)| {
+      let expected = obligation.generation;
+      G::decode_exact(sb)
           .ok()
           .and_then(|source| self.groups.get(&source))
           // Withhold unless the hosted counterparty has provably advanced PAST the owed
           // generation. Freeze-active includes PENDING (the thaw path deliberately preserves
           // an obligation while its hosted source is still freeze-pending), and a hosted
           // source merely AT-OR-BELOW the owed generation is one delayed PrepareMerge away
-          // from freezing at it — an adopt's boundary clear would then erase the freeze's
-          // only local thaw driver in the same inbound batch. Only `shape_gen > expected` —
-          // the same past-proof the thaw pass discharges on — makes the clear safe.
+          // from freezing at it — an adopt in the same inbound batch would then cover a
+          // freeze this host is about to owe a drive for. Only `shape_gen > expected` — the
+          // same past-proof the thaw pass discharges on — lets the transfer through.
           .is_some_and(|sep| sep.merge_freeze_active() || sep.shape_gen() <= expected)
-      })
+    })
   }
 
   /// A gid was just admitted (create / restore / fork): any hosted target whose park names it
@@ -1697,13 +1751,11 @@ where
       // catch-up; a park whose CROSSING set names the admitted gid must stop advertising
       // before a same-iteration cure delivery adopts across a now-hosted crossing; and a park
       // whose ABANDONED obligations name it must re-gate against the restored counterparty's
-      // freeze state before an adopt's boundary clear could erase a live obligation.
+      // freeze state before an adopt could cover a live obligation against a source now hosted
+      // here (the retained record keeps its drive regardless; the re-gate is the second belt).
       if ep.pending_merge().is_some_and(|p| p.source_bytes() == key)
-        || ep.crossing_sources().contains(&key)
-        || ep
-          .abandoned_obligations()
-          .into_iter()
-          .any(|(sb, _, _)| sb == key)
+        || ep.crossing_sources().any(|b| *b == key)
+        || ep.live_obligations().into_iter().any(|(sb, _)| sb == key)
       {
         ep.note_merge_park_unresolvable(false);
       }
@@ -1734,7 +1786,19 @@ where
   /// obligation below its own freeze). An owed id whose committed bytes will NOT decode is
   /// committed-corrupt: POISON the source (the `MergeDecode` fail-stop every host reaches
   /// deterministically) and HOLD, never authorizing a teardown some other host would fail-stop on. The
-  /// poison makes this a side-effecting read (`&mut self`).
+  /// poison makes this a side-effecting read (`&mut self`). A COVERED obligation (a transfer crossed
+  /// its abort entry) holds exactly like an uncovered one — a former target whose own install
+  /// crossed its abort no longer slips this belt — and a live one holds exactly as long as it is
+  /// live: the thaw pass drives a hosted source to its thaw. A DISCHARGED record holds
+  /// UNCONDITIONALLY, drivable or not — it is a WITNESS DEBT ([`Endpoint::holds_witness_debt`]):
+  /// the observation that discharged it may be knowledge no other replica can reproduce, so the
+  /// record is the only future `ThawDischarged` trigger while the leader cannot observe the source,
+  /// and both teardowns this belt guards destroy the endpoint outright, while the holder's own
+  /// witness may not exist yet (a follower, a parked or poisoned holder, or one without stores mints
+  /// nothing; a freeze itself is no bar — the witness append has no freeze gate). The hold lifts
+  /// when the gen-exact witness applies (this holder's own, if it leads unparked, or any observing
+  /// leader's) or the purge clears the debt (the named source — hosted here, live past the
+  /// generation and not itself a merge participant — is removable).
   fn owes_a_drivable_thaw(&mut self, source: &G) -> bool {
     let obligations = self
       .groups
@@ -1742,7 +1806,11 @@ where
       .map(Endpoint::abandoned_obligations)
       .unwrap_or_default();
     let mut drivable = false;
-    for (owed, _, _) in obligations {
+    for (owed, obligation) in obligations {
+      if obligation.discharged {
+        drivable = true;
+        continue;
+      }
       match G::decode_exact(owed) {
         Ok(owed) if self.groups.contains_key(&owed) => drivable = true,
         // Decodable but not hosted here: a local dead-end — a co-hosting replica drives it.
@@ -1861,7 +1929,12 @@ where
   /// blocks the commit and to keep the reshape from racing the merge. Once `gid` ABORTS the merge
   /// (it holds `abandoned[source]`), the source thaws off that durable obligation regardless of
   /// `gid`'s voter set, so voter changes become safe and this returns false — the exemption the
-  /// dead-end-obligation world test turns on. Stores-free (in-memory `frozen_for`/`abandoned`), so
+  /// dead-end-obligation world test turns on. It holds for a COVERED obligation too: a transfer past
+  /// the abort marks the record and keeps it, so the source still thaws off it, and a voter change
+  /// on a holder whose install crossed the abort proceeds where a dropped record would have fenced
+  /// it. A DISCHARGED record does NOT exempt: its rationale — the source thaws off the record — is
+  /// false once the source is proven past the generation, so the fence answers as if no abort were
+  /// held (the claim is then spent or a husk). Stores-free (in-memory `frozen_for`/`abandoned`), so
   /// the conf-change delegates, holding only `gid`'s own log, consult it directly.
   fn some_source_claims_target_unresolved(&self, gid: &G) -> bool {
     let mut target_key = Vec::new();
@@ -1877,7 +1950,7 @@ where
       let source_key = Bytes::from(source_key);
       // Exempt a claim `gid` has already aborted: the source thaws off `abandoned[source]`, not off
       // `gid`'s voters, so moving them cannot strand it.
-      target.is_none_or(|t| t.owes_thaw_for(&source_key).is_none())
+      target.is_none_or(|t| t.owes_live_thaw_for(&source_key).is_none())
     })
   }
 
@@ -3834,7 +3907,7 @@ where
         .is_some_and(|ep| ep.pending_merge().is_some())
     {
       let hosted_crossing = self.groups.get(gid).is_some_and(|t| {
-        t.crossing_sources().iter().any(|b| {
+        t.crossing_sources().any(|b| {
           G::decode_exact(b.clone())
             .map(|g| self.groups.contains_key(&g))
             .unwrap_or(true)
@@ -3847,10 +3920,11 @@ where
         // Drop the WHOLE message, not just the hint — and key the gate on the PARK, not the
         // hint: the hint is edge-consumed at the first refusal, while the sibling condition
         // outlives it, and any later install's ordinary DESTRUCTIVE completion would supersede
-        // the park and clear covered obligations — exactly what the sibling state proved
-        // unsafe (a hosted crossing the blob would husk, or a live frozen counterparty whose
-        // thaw drive the clear would erase). Silent, like every receipt refusal: the paced
-        // resend re-drives once the sibling hold resolves through its own lifecycle.
+        // the park and cover its obligations — exactly the sibling state this gate refuses
+        // (a hosted crossing the blob would husk, or a live frozen counterparty a boundary
+        // proves nothing about; its retained record would keep the drive, but no transfer is
+        // let stand between such a source and it at all). Silent, like every receipt refusal:
+        // the paced resend re-drives once the sibling hold resolves through its own lifecycle.
         return Some(());
       }
     }
@@ -4303,9 +4377,16 @@ where
     // that removal against the obligation's discharge — a source torn down mid-thaw takes the
     // obligation with it and strands the upstream source frozen forever. Sits with `AlreadyPending`
     // among the target-role-residue gates (both refuse a source still entangled in a prior merge as
-    // a target). TRANSIENT like `SourceBarrierPending`: the thaw pass clears it within a few cranks,
-    // then the same freeze admits.
-    if sep.has_abandoned() {
+    // a target). TRANSIENT like `SourceBarrierPending`: the thaw pass retires it within a few cranks,
+    // then the same freeze admits. A DISCHARGED record refuses as well — a WITNESS DEBT: the absorb's
+    // dissolve would drop the record, the only future trigger while the leader cannot observe the
+    // source, and the holder's own witness may not exist yet (a freeze is no bar to minting — the
+    // witness append has no freeze gate — but a follower, a parked or poisoned holder, or one
+    // without stores mints nothing). It retires at the committed witness apply (this holder mints
+    // when it leads unparked; an observing leader mints without it) or through the purge when the
+    // named source — hosted here, live past the generation and not itself a merge participant — is
+    // removed.
+    if sep.owes_live_thaw() || sep.holds_witness_debt() {
       return Some(Err(MergeError::SourceOwesThaw));
     }
     let source_conf = sep.conf_state();
@@ -4494,13 +4575,16 @@ where
     // frozen-at-expected again (the apply-time belt catches the same hazard for an order the gate
     // cannot see). GENERATION-EXACT — a spent obligation the source already thawed past and re-froze
     // above names a dead incarnation and must not refuse a fresh legitimate merge; the discharge
-    // clears the record, so the re-freeze admits.
+    // retires the record, so the re-freeze admits. This gate is the belt's propose-time twin and the
+    // reason a covered record is never disposed of on a local fact: a holder that dropped it on
+    // "unhosted here" would pass this gate the moment the source came back frozen at the generation
+    // and mint the dead commit the belt no-ops everywhere else (`note_abort_covered`).
     let source_owed_key = {
       let mut b = Vec::new();
       source.encode(&mut b);
       Bytes::from(b)
     };
-    if tep.owes_thaw_for(&source_owed_key) == Some(source_gen_after) {
+    if tep.owes_live_thaw_for(&source_owed_key) == Some(source_gen_after) {
       return Some(Err(MergeError::TargetOwesThaw));
     }
     let target_conf = tep.conf_state();
@@ -5268,7 +5352,6 @@ where
       let hosted_crossing: Option<G> = if locally_unresolvable {
         self.groups.get(&tgid).and_then(|t| {
           t.crossing_sources()
-            .iter()
             .find_map(|b| match G::decode_exact(b.clone()) {
               Ok(g) if self.groups.contains_key(&g) => Some(g),
               // A committed source id that does not decode as G is committed-corrupt — the
@@ -5396,8 +5479,14 @@ where
           // while the source still owes a thaw THIS replica can drive, so the thaw pass discharges it
           // FIRST — dissolving would drop the obligation and strand the upstream source frozen. A
           // dead-end obligation (owed target not hosted here) does NOT hold: a co-hosting replica
-          // drives it, so absorbing here strands nothing. A parked target is never quiesce-eligible,
-          // so a genuinely-held park keeps being reached until it resolves.
+          // drives it, so absorbing here strands nothing. A WITNESS DEBT — a discharged record whose
+          // witness has not applied — holds unconditionally: the absorb would destroy the only future
+          // trigger while the leader cannot observe the source. Its exits are the gen-exact witness
+          // applying (a holder that leads unparked mints it, frozen or not; a follower waits for a
+          // peer's) or the purge (the named source — hosted here, live past the generation and not
+          // itself a merge participant — is removable). A
+          // parked target is never quiesce-eligible, so a genuinely-held park keeps being reached
+          // until it resolves.
           if self.owes_a_drivable_thaw(&source) {
             continue;
           }
@@ -5597,11 +5686,13 @@ where
     // a frozen source with a live leader but NO committed target-abort naming it is never reached
     // here (nothing sets its target's obligation), so it stays frozen and waits. Each obligation is
     // driven and discharged INDEPENDENTLY (per source key), so a target that aborted a fan-in of
-    // sources thaws every one of them — none is dropped.
+    // sources thaws every one of them — none is dropped. The worklist is TOTAL — discharged records
+    // included — because a discharged record is still the trigger a leading holder mints its
+    // witness from.
     let abandoned_targets: Vec<G> = self
       .groups
       .iter()
-      .filter(|(_, ep)| ep.has_abandoned())
+      .filter(|(_, ep)| ep.holds_abandoned())
       .map(|(gid, _)| gid.cheap_clone())
       .collect();
     for tgid in abandoned_targets {
@@ -5612,7 +5703,10 @@ where
         Some(tep) => tep.abandoned_obligations(),
         None => continue,
       };
-      for (source_bytes, expected, _abort_index) in obligations {
+      for (source_bytes, obligation) in obligations {
+        let expected = obligation.generation;
+        let covered = obligation.is_covered();
+        let discharged = obligation.discharged;
         let source_key = source_bytes.clone();
         let Ok(source) = G::decode_exact(source_bytes) else {
           // A committed source id that does not decode as G is committed-corrupt — the park
@@ -5625,89 +5719,169 @@ where
         };
         // DISCHARGE by OBSERVING the source, never by classifying the thaw's append outcome: the
         // abandoned freeze is gen `expected`, so a source advanced PAST it committed its unfreeze (or
-        // re-froze past it) — the obligation is delivered. The LOCAL clear takes the hosted live
-        // counter past `expected`, the PERSISTED engine lineage past it, or — for an UNHOSTED or a
-        // hosted-but-UNFROZEN source — a removal floor that no longer admits `expected` (both persisted
-        // legs OUTLIVE the source's teardown). Clearing lifts the target's compaction fence over the
-        // abort entry, so it releases only once the source is proven past `expected` — crash-durable
-        // via the abort entry's replay.
+        // re-froze past it) — the obligation is delivered. Two predicates from one lookup:
         //
-        // WHY the floor leg is FENCED OFF a FROZEN hosted source. A hosted incarnation at a LOWER gen
-        // than `expected` that is NOT frozen is a legal SQUATTER — the id was removed (floored past
-        // `expected`) and recreated below that non-terminal floor at a fresh gen — and its live counter
+        // GLOBAL PROOF — a fact every host agrees on, which retires the obligation on every holder
+        // alike and may back a COMMITTED witness: the hosted live counter past `expected` (committed
+        // ⇒ global); the persisted engine lineage past it — the driver's global mirror of the source's
+        // committed counter — read off an IDLE hosted source or an unhosted one; or the TERMINAL
+        // `MERGED_FLOOR` off an unpoisoned source (the source was absorbed away — global; a hosted
+        // frozen source at it is a husk the dissolve retires). THE MIRROR FENCE: the mirror is
+        // monotone-max and survives removal, so after a removal at a higher generation and a
+        // floor-less recreation re-frozen BELOW it, the mirror reads past a LIVE freeze; read off a
+        // source frozen at `expected` it is a replica-local drop dressed as a global proof (it would
+        // clear that live obligation here and, witnessed, cluster-wide), so the leg is fenced off any
+        // source whose freeze is ACTIVE — applied, or merely appended and not yet applied: an
+        // append-pending `PrepareMerge` is one apply away from freezing at `expected`, and a
+        // stale-high mirror read in that window would witness the live freeze the instant before it
+        // applies.
+        // IDLE means neither. The frozen source's own counter still discharges it via `seen_past`
+        // once it thaws. THE POISON FENCE on the terminal floor: the husk dissolve skips a poisoned
+        // husk and the drive answers `Poisoned`, so retiring the record off its floor would leave a
+        // poisoned frozen source nobody owes — unremovable (`Frozen`, no escape); with the record
+        // live, `remove_group(source)` admits through the owed-source escape and its purge clears
+        // the record. A witness minted ELSEWHERE still clears it (the poisoned-participant teardown
+        // spin-out, `note_abort_covered`'s residual list).
+        //
+        // LOCAL PROOF — what THIS host alone can act on, never witnessed: a non-terminal removal floor
+        // that no longer admits `expected`, for an UNHOSTED source or a hosted IDLE one. It is a
+        // HOST-LOCAL fact ("this host stopped hosting the incarnation at/below `expected`", set by the
+        // local removal ceiling), so it clears the record HERE only, and only an UNCOVERED one: its
+        // entry is still in the log and re-derives on restart — the documented escape family, and not
+        // unconditionally safe either: a floor-less squatter that climbs to `expected` and freezes
+        // there AFTER the clear hands this host the dead commit the others no-op at the belt
+        // (residual 3's family in `note_abort_covered`). For a COVERED record it is WITHDRAWN in BOTH
+        // arms: the record's whole value is the abort belt's uniformity and the owed-source escape,
+        // and neither survives a local drop. The hosted covered case is the floor-less squatter
+        // growing toward `expected` (a generation-reuse shape): the
+        // record is neither driven (nothing is frozen) nor disposed of, and the `OwesThaw` step-aside
+        // does not fire for a hosted source — a HOLD, recoverable rather than a divergence, because
+        // the squatter is hosted and unfrozen, so `remove_group(squatter)` admits and its purge
+        // clears the record and lifts the fence. And "unhosted here" is no proof at all — absence is
+        // transient (a boot-order restore, an operator restore from preserved stores, a floor-less
+        // restore), and a holder that dropped its record on absence would, once the source came back
+        // frozen at `expected`, pass `commit_merge`'s `TargetOwesThaw` gate and mint a fresh commit
+        // for the ABORTED generation, which the replicas still holding the record no-op at the
+        // same-merge abort belt while this one parks and absorbs — one committed target log, divergent
+        // lineage and state. Every retained disposal leg implies the source's COMMITTED counter is
+        // past `expected`, which is what makes that dead commit unproposable on every host
+        // (`note_abort_covered` is the single authority for the rule).
+        //
+        // WHY the floor leg is FENCED OFF a FREEZE-ACTIVE hosted source. A hosted incarnation at a
+        // LOWER gen than `expected` that is IDLE is a legal SQUATTER — the id was removed (floored
+        // past `expected`) and recreated below that non-terminal floor at a fresh gen — and its
+        // live counter
         // must NOT SHADOW the durable proof that the NAMED (dead) incarnation is discharged; the floor
         // advanced past `expected` at the removal and floors are MONOTONE, so `!floor_admits` fires. But
-        // a hosted source that is FROZEN is LIVE-and-owing whatever its generation: a recreated id can
-        // refreeze at a gen the OLD removal floor still sits above, and that fresh freeze is a REAL
-        // obligation only the source-side thaw DRIVE (below) may clear — the floor must never
+        // a hosted source whose freeze is active is LIVE-and-owing whatever its generation: a
+        // recreated id can refreeze at a gen the OLD removal floor still sits above, and that fresh
+        // freeze is a
+        // REAL obligation only the source-side thaw DRIVE (below) may clear — the floor must never
         // short-circuit it, or the source strands frozen forever (the merge-freeze wedge). A frozen
-        // source already PAST `expected` still discharges via `seen_past`.
-        //
-        // TWO predicates from one lookup. LOCAL discharge is what THIS replica can observe directly.
-        // The WITNESS mint predicate is STRICTLY STRONGER: a witness is a COMMITTED claim every replica
-        // applies, so it may rest ONLY on a GLOBALLY-valid proof — a hosted replica's applied lineage
-        // past `expected` (committed ⇒ global), the persisted engine lineage past it (the driver's
-        // global mirror of the source's committed counter), or the TERMINAL `MERGED_FLOOR` (the source
-        // was absorbed away — global). NEVER a non-terminal floor, and NEVER a lower-gen squatter's
-        // counter: both are HOST-LOCAL facts ("THIS host stopped hosting at/below `expected`", set by
-        // the local removal ceiling), so witnessing either would clear a LIVE obligation on a
-        // co-hosting holder whose source is still frozen — killing the thaw drive and stranding the
-        // source frozen forever.
-        let (local_discharged, global_proof) = match self.groups.get(&source) {
+        // source already PAST `expected` still discharges via `seen_past`. The terminal floor stays
+        // independent of idleness and cover: terminal means no later incarnation.
+        // `locally_retired` subsumes the global legs: everything that lets THIS host stop driving,
+        // proven globally or not. `global_proof` is the strict subset a witness may rest on.
+        let (locally_retired, global_proof) = match self.groups.get(&source) {
           Some(sep) => {
             let seen_past = sep.shape_gen() > expected;
-            let local = seen_past
-              || stores.lineage(&source) > expected
-              || (!sep.is_frozen() && !crate::floor_admits(stores.floor(&source), expected));
-            (local, seen_past)
+            let floor = stores.floor(&source);
+            let idle = !sep.merge_freeze_active();
+            let mirror_past = idle && stores.lineage(&source) > expected;
+            let terminal = floor == crate::MERGED_FLOOR && !sep.is_poisoned();
+            // Confined to NON-terminal floors on purpose: a poisoned hosted husk at the terminal
+            // floor would otherwise be cleared locally through `!floor_admits`, defeating the
+            // poison fence on `terminal` above.
+            let removed_below =
+              floor != crate::MERGED_FLOOR && !crate::floor_admits(floor, expected);
+            let local = seen_past || mirror_past || terminal || (idle && !covered && removed_below);
+            (local, seen_past || mirror_past || terminal)
           }
           None => {
+            // UNFENCED by construction: with no source here to read idleness from, a stale-high
+            // local mirror for a source re-frozen at `expected` on another host still counts —
+            // residual 5's floor-less family (`note_abort_covered`).
             let lineage_past = stores.lineage(&source) > expected;
             let floor = stores.floor(&source);
+            let terminal = floor == crate::MERGED_FLOOR;
             (
-              lineage_past || !crate::floor_admits(floor, expected),
-              lineage_past || floor == crate::MERGED_FLOOR,
+              lineage_past || terminal || (!covered && !crate::floor_admits(floor, expected)),
+              lineage_past || terminal,
             )
           }
         };
-        // THE OBSERVER LEADER DEFERS ITS CLEAR TO THE WITNESS APPLY. An UNPARKED holder that LEADS with
-        // a global proof appends the witness once (idempotent) and lets the committed apply clear the
-        // map — uniformly on every replica, this leader included — so a replica that can never LOCALLY
-        // observe the source (the dead-end class) clears off the same committed entry. Keeping the map
-        // entry alive is the re-append trigger under leader churn (a truncated witness is re-observed
-        // and re-appended by the next leader still holding it). A holder whose ONLY proof is a
-        // non-terminal floor mints nothing and takes the local clear below; a non-leader likewise.
+        // A GLOBAL PROOF RETIRES THE RECORD WITHOUT REMOVING IT — on EVERY holder alike, and BEFORE
+        // any witness is attempted. The record is marked DISCHARGED (`note_discharged`): the drive
+        // stops and every live-obligation gate skips it, but it stays as the WITNESS TRIGGER — for the
+        // lifecycle gates a WITNESS DEBT (`OwesThaw`, `SourceOwesThaw`): the holder is neither
+        // removable nor dissolvable as a merge source until the gen-exact witness applies or the named
+        // source's purge retires the record — and it keeps FENCING its abort entry until then (the
+        // only future trigger while a non-observer leads, which compacting the entry and crashing
+        // would lose). An UNPARKED holder that LEADS then appends the `ThawDischarged` witness once
+        // (idempotent) and lets the committed apply clear the map uniformly on every replica, this
+        // leader included, so a replica that can never LOCALLY observe the source (the dead-end
+        // class) clears off the same committed entry. Marking BEFORE the append is what makes the
+        // debt visible in the gap: a leader whose witness is appended but not yet committed — or
+        // whose stores were absent from the seam this crank, so nothing was appended at all — would
+        // otherwise hold a LIVE covered record for an unhosted source, which the teardown step-aside
+        // reads as a removable dead end; if this host held the sole reproducible proof, removing it
+        // would leave every other replica with a live record, a fence, and no future trigger. The
+        // discharged record IS the re-append trigger: under leader churn the next leader still
+        // holding it re-appends off the latched arm below (a truncated witness is re-observed the
+        // same way), and a leader that could not append this crank appends on the next. A follower
+        // that erased its record on the observation took the trigger with it, and a replica that
+        // could never observe the source kept the ghost until some other observer happened to lead
+        // (#137). A PARKED holder mints nothing while parked — a witness above the park could never
+        // apply there — and its still-fencing discharged record defers its own in-flight absorb's
+        // capture behind a debt exactly as an undischarged one does, so the park resolves on its own.
         //
-        // A PARKED holder is EXCLUDED from the defer: its apply drain is stopped at the absorb boundary,
-        // so a witness above the park could NEVER apply there, and a standing obligation whose abort
-        // entry sits at/below that boundary FENCES the holder's OWN in-flight absorb
-        // (`abort_relay_fences`) — deferring would deadlock the absorb on a witness the park blocks. It
-        // takes the local clear instead (the pre-witness behavior), which lifts that fence; a co-parked
-        // non-observing follower resolves on the absorb's forced-snapshot path (`note_abort_rebaselined`
-        // supersedes its park), not the witness. RESIDUAL: while a NON-observer leads an unparked holder,
-        // un-observing followers keep the ghost; it self-heals on the first observer-led term.
+        // THE LATCHED ARM IS GUARDED. `discharged` remembers a proof; a floor-less recreation of the
+        // source, re-frozen at `expected` HERE with its fresh abort appended but not yet applied,
+        // invalidates it — the abort's apply will re-arm the record live, and a witness minted off
+        // the stale flag would then clear that live obligation and strand the freeze. So the latched
+        // flag alone mints only while the source is not freeze-active at a generation at-or-below
+        // `expected` here; a LIVE global proof mints as ever. The same recreation frozen so on
+        // ANOTHER host is invisible to the guard (residual 10, `note_abort_covered`).
+        //
+        // RESIDUAL: while a NON-observer leads an unparked holder, un-observing followers keep the
+        // ghost, self-healing on the first observer-led term.
         let holder_defers = self
           .groups
           .get(&tgid)
           .is_some_and(|t| t.role().is_leader() && t.pending_merge().is_none());
-        if holder_defers && global_proof {
-          if let Some((tlog, _)) = stores.stores(&tgid) {
+        let latched_mintable = discharged
+          && self
+            .groups
+            .get(&source)
+            .is_none_or(|sep| !sep.merge_freeze_active() || sep.shape_gen() > expected);
+        if global_proof || latched_mintable {
+          if !discharged && let Some(tep) = self.groups.get_mut(&tgid) {
+            tep.note_discharged(&source_key);
+          }
+          if holder_defers && let Some((tlog, _)) = stores.stores(&tgid) {
             let _ = self.propose_thaw_witness(&tgid, &source_key, expected, now, tlog);
           }
           continue;
         }
-        if local_discharged {
+        // A stale latched flag beside a source re-frozen at-or-below `expected`: neither minted,
+        // driven, nor cleared — the fresh abort's apply re-arms the record live on its own.
+        if discharged {
+          continue;
+        }
+        // A LOCAL proof alone clears HERE and mints nothing (the pre-witness behavior) — an
+        // uncovered record whose entry re-derives on restart, its incarnation removed by this host.
+        if locally_retired {
           if let Some(tep) = self.groups.get_mut(&tgid) {
             tep.clear_abandoned(&source_key);
           }
           continue;
         }
-        // Not discharged: DRIVE the source-side thaw, best-effort and idempotent per crank. Only the
-        // source LEADER appends (others answer a transient refusal and later retire by OBSERVING the
-        // committed thaw); the incarnation gate binds the mint to `expected`, so a stale re-derivation
-        // cannot thaw a re-frozen pair, and the derived-from-abort gate re-verifies THIS obligation
-        // still backs it. The return is DISCARDED — discharge is decided by the direct observation
-        // above on a later crank, not by this append's outcome.
+        // Neither proven nor retired: DRIVE the source-side thaw, best-effort and idempotent per
+        // crank. Only the source LEADER appends (others answer a transient refusal and later retire
+        // by OBSERVING the committed thaw); the incarnation gate binds the mint to `expected`, so a
+        // stale re-derivation cannot thaw a re-frozen pair, and the derived-from-abort gate
+        // re-verifies THIS obligation still backs it. The return is DISCARDED — discharge is
+        // decided by the direct observation above on a later crank, not by this append's outcome.
         if let Some((slog, sstable)) = stores.stores(&source) {
           let _ = self.propose_merge_unfreeze(&source, now, slog, sstable, &tgid, expected);
         }
@@ -5752,8 +5926,11 @@ where
         continue;
       }
       // THE BELT (shared with the absorb Resolve arm): a husk that still owes a LOCALLY-DRIVABLE thaw
-      // must not dissolve — dropping the obligation strands the upstream source. A decode-corrupt owed
-      // id poisons the husk and holds.
+      // must not dissolve — dropping the obligation strands the upstream source — and neither may a
+      // husk carrying a WITNESS DEBT (a discharged record whose witness has not applied): the
+      // dissolve would destroy the only future trigger. It lifts when the witness applies (a husk that
+      // leads unparked mints its own — a freeze is no bar; a follower husk waits for a peer's) or the
+      // named source's purge clears the debt. A decode-corrupt owed id poisons the husk and holds.
       if self.owes_a_drivable_thaw(&gid) {
         continue;
       }
@@ -5957,12 +6134,28 @@ where
           // source's id stays un-reusable. Name the fence that is standing, or nothing at all
           // when only a transient is (it drains within cranks).
           if let Some(fence) = tep.capture_fence_at(capture_at) {
-            let cause = match fence {
-              crate::endpoint::CaptureFence::Frozen => MergeBlockedCause::Frozen,
-              crate::endpoint::CaptureFence::Fork => MergeBlockedCause::ForkFence,
-              crate::endpoint::CaptureFence::Abort => MergeBlockedCause::AbortFence,
+            // The freeze and fork legs name the absorbed source; the abort leg names the record
+            // that FENCES — the one whose thaw's witness is the exit — exactly as the adopt
+            // pass does. An undecodable fencing key is unreachable here: the thaw pass decodes
+            // every held key each crank and poisons the holder on failure, and the debtors
+            // filter above skips poisoned groups.
+            let (cause, named) = match fence {
+              crate::endpoint::CaptureFence::Frozen => {
+                (MergeBlockedCause::Frozen, Some(source.cheap_clone()))
+              }
+              crate::endpoint::CaptureFence::Fork => {
+                (MergeBlockedCause::ForkFence, Some(source.cheap_clone()))
+              }
+              crate::endpoint::CaptureFence::Abort => (
+                MergeBlockedCause::AbortFence,
+                tep
+                  .abort_fence_source_at(capture_at)
+                  .and_then(|key| G::decode_exact(key.clone()).ok()),
+              ),
             };
-            self.note_merge_blocked(&tgid, &source, boundary, cause);
+            if let Some(named) = named {
+              self.note_merge_blocked(&tgid, &named, boundary, cause);
+            }
           }
           continue;
         }
@@ -6063,7 +6256,42 @@ where
         }
         continue;
       }
+      // A standing fence DEFERS the owed capture; nothing is dropped. The adopt itself raises one:
+      // it adopt-covers the abort obligations at its boundary and keeps them (the kept log still
+      // carries their entries), and such a record fences the capture until a GLOBAL fact retires it
+      // — the thaw for a hosted frozen source, a witness for one this host does not host. The
+      // obligation outlives the wait, so the capture lands the moment the fence lifts; an
+      // install-covered record, by contrast, fences nothing (its entry is already gone).
       if blocked {
+        // The wait's own signal, the debt pass's contract exactly: post-adopt the group LOOKS
+        // healthy — unparked, serving the union — while its conf changes stay fenced and the
+        // absorbed source's id stays un-reusable. Name the fence that is standing (nothing when
+        // only a transient is — it drains within cranks): an abort fence by the record that
+        // fences, the freeze and fork legs by the adopt's own source. One observation per
+        // target per crank: a coexisting capture debt or a re-formed park already named this
+        // wedge above with the more actionable identity, and a second, differing observation
+        // would defeat the once-per-transition dedupe (two identities re-queued every crank).
+        if !self.merge_blocked_attempts.contains_key(&gid)
+          && let Some(ep) = self.groups.get(&gid)
+          && let Some((own, boundary)) = ep.adopt_capture_debt()
+          && let Some(fence) = ep.capture_fence_at(ep.applied_index())
+        {
+          let (cause, named) = match fence {
+            crate::endpoint::CaptureFence::Frozen => (MergeBlockedCause::Frozen, Some(own)),
+            crate::endpoint::CaptureFence::Fork => (MergeBlockedCause::ForkFence, Some(own)),
+            crate::endpoint::CaptureFence::Abort => (
+              MergeBlockedCause::AbortFence,
+              ep.abort_fence_source_at(ep.applied_index()),
+            ),
+          };
+          // An undecodable key is unreachable here — the thaw pass decodes every held key each
+          // crank and poisons the holder on failure, and the owers filter above skips poisoned
+          // groups — so the `None` arm is the deliberate shape of "nothing to name", not a
+          // silent drop.
+          if let Some(source) = named.and_then(|key| G::decode_exact(key.clone()).ok()) {
+            self.note_merge_blocked(&gid, &source, boundary, cause);
+          }
+        }
         continue;
       }
       let staged = match stores.stores(&gid) {

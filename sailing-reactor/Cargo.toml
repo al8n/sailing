@@ -49,6 +49,12 @@ futures-util = { workspace = true, features = ["std"] }
 socket2.workspace = true
 
 [dev-dependencies]
+# The quiesce predicate's adopt-debt leg is proven through a REAL adoption, and no organic drive
+# on one host leaves a park standing over a source it hosts nowhere: the test fabricates the
+# committed `CommitMerge` entry on the engine's log, and the only encoder for that payload is the
+# off-by-default, doc(hidden) minting seam — reached by this crate's tests alone, never by its
+# library target (the same reason the simulation and conformance crates carry it).
+sailing-proto = { workspace = true, features = ["fuzzing"] }
 rcgen.workspace = true
 rustls.workspace = true
 tokio = { version = "1", default-features = false, features = [

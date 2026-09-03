@@ -588,9 +588,10 @@ where
     // fence. The per-leg arguments live on `capture_blocked_at` — ONE predicate for every capture
     // producer (this threshold capture, the forced absorb capture, and any future site), so no
     // site can drift by carrying a partial set. A snapshot INSTALL is the one floor-advance that
-    // legitimately crosses these fences — it re-baselines to a LEADER's boundary and CLEARS what
-    // that boundary covers (`note_freeze_rebaselined`, `note_abort_rebaselined`) instead of
-    // leaning on them.
+    // legitimately crosses these fences — it re-baselines to a LEADER's boundary, clears the
+    // freeze that boundary covers (`note_freeze_rebaselined`) and install-covers the abort
+    // obligations it covers (`note_abort_covered`: kept for the container to dispose of on a global
+    // fact, but no longer fencing — their entries are gone) instead of leaning on them.
     if self.capture_blocked_at(self.applied) {
       return;
     }
@@ -1020,8 +1021,10 @@ where
         // naming a hosted source could hide). Bailing here is not a refusal: the raise branch
         // below advances commit off this very blob's evidence, the walk catches up next crank,
         // the hint re-gates, and the NEXT delivery adopts — the walk always ahead of the adopt.
+        // The same predicate gates the adopt's reads: `crossing_absorb_at` answers `None` for
+        // an unexamined boundary and the adopt bails before folding anything.
         && self.crossing_walk_covers(meta.last_index())
-        && !self.adopt_parked_union(log, meta, is.data().clone())
+        && !self.adopt_parked_union(meta, is.data().clone())
       {
         return;
       }
@@ -1367,50 +1370,34 @@ where
   /// site): the state moves wholesale to the blob's boundary while the LOG stays untouched —
   /// the exact inverse of the restore path's total discard, sound because Log Matching was
   /// already proven through the boundary and the blob is the deterministic fold of that prefix.
-  /// Returns false after poisoning (a decode/restore/log fault), exactly like the install body.
-  fn adopt_parked_union<L: LogStore>(
-    &mut self,
-    log: &L,
-    meta: &SnapshotMeta<I>,
-    data: Bytes,
-  ) -> bool
+  /// Returns false after poisoning (a decode/restore fault), exactly like the install body — or,
+  /// byte-unchanged and unpoisoned, for a boundary the crossing walk has not examined (unreachable
+  /// past the receipt gate).
+  fn adopt_parked_union(&mut self, meta: &SnapshotMeta<I>, data: Bytes) -> bool
   where
     F::Snapshot: Data,
   {
-    // EVERY fallible read runs FIRST, into locals, so a benign cold page (Pending / briefly
-    // empty — both legal under the LogStore contract) bails BYTE-UNCHANGED: the park stands,
-    // the hint keeps advertising, and the cure re-sends on its cooldown. Only a genuine store
-    // Err poisons. Nothing below the reads can fail benignly, so the mutation suite that
-    // follows is all-or-poison.
+    // EVERY fallible check runs FIRST, into locals, so the mutation suite that follows is
+    // all-or-poison. Nothing here can fail benignly: the adopt reads NO log — its one
+    // log-derived fact, the absorb point its membership fence engages at, comes from the
+    // crossing walk the admission gate proved covers the boundary (see
+    // `MergeState::crossing_absorbs`). A walk of the interval here would be neither resumable
+    // nor budgeted: a cold page inside a long interval, re-read from the park on every cure
+    // delivery, never completes under a small cache, while the walk crosses each page once.
     let Some(park_at) = self.merge.pending_apply.as_ref().map(PendingMergeApply::at) else {
       debug_assert!(false, "the adopt is keyed on a standing park");
       return false;
     };
     let boundary = meta.last_index();
-    let mut absorb_high = park_at;
-    let mut idx = park_at.next();
-    while idx <= boundary {
-      let read_end = boundary
-        .next()
-        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
-      let chunk = match log.entries(idx..read_end, 1 << 20) {
-        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
-        Ok(_) => return false,
-        Err(_) => {
-          self.poison(PoisonReason::LogRead);
-          return false;
-        }
-      };
-      for e in chunk.iter() {
-        if e.kind() == EntryKind::CommitMerge {
-          absorb_high = absorb_high.max(e.index());
-        }
-      }
-      idx = match chunk.last() {
-        Some(e) => e.index().next(),
-        None => return false,
-      };
+    // Admitted only behind the crossing walk — the receipt gate checks this same predicate —
+    // and enforced here as well: a boundary the walk has not examined has no absorb point and
+    // no plan to consume, so bail BYTE-UNCHANGED (the park stands, the cure re-sends) rather
+    // than fold a partial answer. Unreachable past the gate; not a fault, so no poison.
+    if !self.crossing_walk_covers(boundary) {
+      debug_assert!(false, "the adopt is admitted only behind the crossing walk");
+      return false;
     }
+    let absorb_high = self.crossing_absorb_at(boundary).unwrap_or(park_at);
     let snap = match <F::Snapshot as Data>::decode_exact(data) {
       Ok(s) => s,
       Err(_) => {
@@ -1431,19 +1418,23 @@ where
       return false;
     }
     // ── the mutation suite: nothing below fails benignly.
-    if self.merge.pending_apply.take().is_none() {
+    let Some(park) = self.merge.pending_apply.take() else {
       debug_assert!(false, "the park was checked above");
       return false;
-    }
+    };
     self.merge.park_unresolvable = false;
-    self.merge.crossing_sources.clear();
+    self.merge.crossings.clear();
     self.merge.crossing_scan_upto = Index::ZERO;
     self.merge.crossing_scan_current = false;
+    // The witness PLAN the crossing walk recorded for this park is taken here and folded below
+    // — only its part at-or-below the boundary, in log order; the adoption performs no witness
+    // walk of its own.
+    let witnesses = core::mem::take(&mut self.merge.crossing_witnesses);
     // The adopt persists no blob, so it OWES one forced capture — serviced by the container
     // independently of the snapshot threshold: without it, an idle adopter that later leads has
     // nothing durable covering the boundary (unable to cure the next parked voter) and its
     // absorb membership fence never releases.
-    self.merge.adopt_capture_owed = true;
+    self.merge.adopt_capture_owed = Some((park.source_bytes(), boundary));
     if self.fsm.restore(snap).is_err() {
       self.poison(PoisonReason::SnapshotRestore);
       return false;
@@ -1455,8 +1446,17 @@ where
     // the first such point. A skipped Split stages nothing here — restore-path parity: the
     // child reaches this host via ordinary transfer, and the token-redundant arm resolves any
     // later twin; a crossing that names a HOSTED source never reaches this arm at all (the
-    // advertisement gate withholds the hint). A skipped PrepareMerge/RollbackMerge pair is
-    // covered by the quartet clear + re-derivation below.
+    // advertisement gate withholds the hint). A skipped `PrepareMerge`/`RollbackMerge` pair on
+    // THIS group's own freeze is covered by the quartet clear + re-derivation below. A skipped
+    // TARGET-role abort (a RollbackMerge for a source that froze into this group after the
+    // park resolved on the leader) is NOT re-applied: obligations are never minted from
+    // anything but the abort's own apply, so this replica derives no record for it — the
+    // never-derived class (`note_abort_covered`, residual 2). Uniform all the same: the parked
+    // merge's OWN abort can never sit in the interval (committed at k+1 it resolves the park
+    // ABORTED before any cure is advertised), and the blob-carried lineage counter is what the
+    // `CommitMerge` lineage guard reads, so a stale-mint commit no-ops here as everywhere. The
+    // interval's `ThawDischarged` witnesses, by contrast, ARE applied below — off the plan the
+    // incremental crossing walk recorded, never a walk of the adoption's own.
     self.merge.absorb_index = Some(
       self
         .merge
@@ -1481,11 +1481,46 @@ where
     self.merge.frozen_for = None;
     self.merge.freeze_queue.retain(|i| *i > boundary);
     self.merge.claim_cache.retain(|i, _| *i > boundary);
-    // Obligations at-or-below the boundary clear on the same boundary-proof the restore path
-    // uses — and the restart agrees by construction (a crash before the commit persist lands
-    // re-parks and re-derives them; nothing was acked). The retain clause is vacuous here:
-    // every armed obligation sits below the park, hence below the boundary.
-    self.note_abort_rebaselined(boundary);
+    // THE INTERVAL'S WITNESSES APPLY FIRST, with the apply arm's own gen-exact clear: a
+    // committed `ThawDischarged` in `(park, boundary]` retires the record its abort set below
+    // the park — the global disposal this replica would otherwise never see, the record left
+    // adopt-covered forever, fencing the owed capture with no new witness ever mintable. The
+    // plan came from the incremental crossing walk (`MergeState::crossing_witnesses`), whose
+    // coverage of the boundary admitted this adoption. THE ORDER ARGUMENT: the adopt reproduces
+    // the drain's effect through the boundary and nothing beyond it. Through the boundary the
+    // fold is insensitive to order among the planned witnesses themselves — a parked target
+    // applies nothing, so no record changed generation while the park stood, a witness for a
+    // higher generation matches nothing, and a record retired meanwhile makes its planned
+    // witness a no-op here — and folding them in log order keeps the two readings identical
+    // regardless. Beyond the boundary NOTHING is folded: the walk's frontier may sit past the
+    // blob this cure ships, and a witness above the boundary stays in the kept log above
+    // `applied`, where the drain applies it at its own index — so a belt-dependent
+    // `CommitMerge` between the boundary and that witness still finds the record the same-merge
+    // abort belt needs; folded early, that commit would park and the witness would sit trapped
+    // behind the park, committed apply stalled. A witness whose abort ALSO sits inside the
+    // interval was never planned — that abort was never re-applied (above), so no record matched
+    // it — which is the same end state the drain reaches by re-arming and then clearing.
+    let planned: std::collections::BTreeMap<Index, (Bytes, u64)> = witnesses
+      .into_iter()
+      .filter(|(_, at)| *at <= boundary)
+      .map(|(pair, at)| (at, pair))
+      .collect();
+    for (_, (source, generation)) in planned {
+      if self.abandoned_matches(&source, generation) {
+        self.clear_abandoned(&source);
+      }
+    }
+    // What survives the witnesses is MARKED adopt-covered, never cleared: the boundary proves
+    // the transferring leader's fence lifted there, not that any source thawed (see
+    // `note_abort_covered`, the single authority), and only a GLOBAL fact disposes of each —
+    // the thaw for a hosted frozen source, a witness for one this host does not host. The
+    // mark's caller-specific half: the LOG is kept here, so every abort entry survives until
+    // the owed capture compacts it — a capture the adopt-covered record keeps FENCING until the
+    // disposal (a later install that discards the entry upgrades the mark and lifts the fence)
+    // — and a restart in that window re-derives the record UNCOVERED (it re-parks,
+    // re-advertises and is re-cured; nothing was acked). Every armed obligation sits below the
+    // park, hence below the boundary, so the mark is total here.
+    self.note_abort_covered(boundary, crate::endpoint::Cover::Adopt);
     // Meta adoption, exactly as the install path: mode, lineage, provenance.
     self.reads.active_read_mode = meta.read_only().unwrap_or(self.reads.active_read_mode);
     self.reads.read_mode_migrated = meta.read_only().is_some() || self.reads.read_mode_migrated;
@@ -1756,18 +1791,26 @@ where
     // A stale park kept here would wedge the drain forever below a boundary it cannot re-reach.
     self.merge.pending_apply = None;
     self.merge.park_unresolvable = false;
-    self.merge.crossing_sources.clear();
+    self.merge.crossings.clear();
     self.merge.crossing_scan_upto = Index::ZERO;
     self.merge.crossing_scan_current = false;
-    self.merge.adopt_capture_owed = false;
-    // The re-baseline discarded every abort entry at-or-below the boundary — the ONLY restart
-    // re-derivation of the `abandoned` obligation. The install sits past the committed+applied abort,
-    // proving the source thawed past the abandoned freeze (the capturing leader's own service drove
-    // it), so a covered obligation is MOOT; clear it here or `abort_relay_fences` would stay stuck on
-    // a boundary the install already crossed (the source thawed and gone, so the service could never
-    // observe it advance to discharge it) — a permanent capture wedge. An obligation above the
-    // boundary is retained (see the helper).
-    self.note_abort_rebaselined(meta.last_index());
+    self.merge.crossing_witnesses.clear();
+    self.merge.adopt_capture_owed = None;
+    // The re-baseline discarded every abort entry at-or-below the boundary — each covered
+    // obligation's only log re-derivation. The obligations themselves are MARKED install-covered
+    // and kept: the boundary proves the transferring leader's fence lifted there, not that any
+    // source thawed (see `note_abort_covered`, the single authority), and a co-hosted source may
+    // still be frozen and waiting on exactly this holder's drive. Only a GLOBAL fact disposes of
+    // each — the thaw for a hosted frozen source, a witness for one this host does not host —
+    // and meanwhile an install-covered record fences NOTHING: the entry it protected is gone, so
+    // a dead end costs this replica no capture. The mark's caller-specific half, two record-less
+    // shapes the mark cannot reach: a holder that restarts before the disposal re-derives
+    // nothing (the restart residual lives here alone, #132), and a straggler that never APPLIED
+    // the abort before this destructive install derives no record at all — the receipt-time gate
+    // does not cover it, its crossing walk starting above the park and no obligation existing
+    // yet to name a hosted counterparty (the install-over-a-park class, #133). An obligation
+    // above the boundary is untouched (see the helper).
+    self.note_abort_covered(meta.last_index(), crate::endpoint::Cover::Install);
     // The blob supersedes the capture-debt chain by the SAME rule: per-entry obligations below
     // the boundary are resolved GLOBALLY by the transferring leader's own discharge barrier —
     // the prior sources were terminally floored where their teardown was authorized, and that

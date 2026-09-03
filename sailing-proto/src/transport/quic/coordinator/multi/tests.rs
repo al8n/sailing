@@ -1765,7 +1765,7 @@ fn merge_verbs_ride_the_coordinator() {
     ));
   }
   assert!(
-    coord.group(&1).is_some_and(|ep| !ep.has_abandoned()),
+    coord.group(&1).is_some_and(|ep| !ep.owes_live_thaw()),
     "no abort applied — the target records no thaw obligation"
   );
 }
