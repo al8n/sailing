@@ -31,7 +31,7 @@ lochan = "0.1"
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"] }
 agnostic = { version = "0.10", default-features = false }
-agnostic-lite = { version = "0.6", default-features = false }
+agnostic-lite = { version = "0.7", default-features = false }
 socket2 = { version = "0.6", features = ["all"] }
 
 sailing-proto = { version = "0.0.0", path = "sailing-proto", default-features = false }
