@@ -430,7 +430,8 @@ where
   ///
   /// REFUSES every UNRESOLVED merge participant (inherited verbatim from the container's teardown
   /// gate: [`OwesThaw`](RemoveError::OwesThaw), [`Frozen`](RemoveError::Frozen),
-  /// [`MergeParked`](RemoveError::MergeParked), [`SpokenFor`](RemoveError::SpokenFor),
+  /// [`MergeParked`](RemoveError::MergeParked), [`OwesCapture`](RemoveError::OwesCapture),
+  /// [`OwesRecovery`](RemoveError::OwesRecovery), [`SpokenFor`](RemoveError::SpokenFor),
   /// [`Claimed`](RemoveError::Claimed)) — nothing is torn down and, crucially, the id is NOT
   /// tombstoned, so a refused removal is a clean no-op the caller retries once the choreography
   /// resolves. The gate runs FIRST, before any side-state is cleared, so the refusal leaves the
@@ -1217,12 +1218,14 @@ where
     resolutions
   }
 
-  /// Whether any hosted target's outstanding capture debt names `gid` as its absorbed source
-  /// (see [`MultiRaft::debt_names`]) — the drivers' factory and lifecycle gates consult this.
+  /// Whether any hosted target's outstanding capture debt — or a poisoned target's recovery pin,
+  /// after its absorb consumed the source and then failed to capture the union — names `gid` as
+  /// its absorbed source (see [`MultiRaft::debt_names`]) — the drivers' factory and lifecycle
+  /// gates consult this. A debt's naming releases at its discharge; a pin's only at a restart.
   ///
   /// The FACTORY needs no separate park leg: a solicited build goes through `create_group`, whose
-  /// `validate_new_group` already refuses a committed-consumed source on both legs — the debt this
-  /// predicate reports and the latched-CLOSED park beside it.
+  /// `validate_new_group` already refuses a committed-consumed source on both legs — the debt or
+  /// pin this predicate reports and the latched-CLOSED park beside it.
   pub fn debt_names(&self, gid: &G) -> bool {
     self.multi.debt_names(gid)
   }

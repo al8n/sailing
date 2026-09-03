@@ -6297,6 +6297,78 @@ where
   drain_storage(m, 1, Instant::ORIGIN, log, stable);
 }
 
+/// The refusals a RECOVERY PIN raises after `CaptureFailed { source, target }`: the consumed
+/// source's id is named (what the demux fence and the factory gate read), refuses removal
+/// (`SpokenFor` — no tombstone, no store teardown) and admission (`AbsorbPending` — no create, and
+/// no live restore off the very stores the restart needs), and the poisoned holder refuses its own
+/// removal (`OwesRecovery` — the teardown would shed the pin). The source's stores and floor are
+/// exactly as the resolution left them, and the pin is not a debt: further cranks emit nothing,
+/// mint nothing and floor nothing.
+fn assert_recovery_pinned<F>(
+  m: &mut MultiRaft<u64, u64, F>,
+  stores: &mut MapStores,
+  source: u64,
+  target: u64,
+  fsm: impl Fn() -> F,
+) where
+  F: crate::StateMachine<Command = Bytes, Snapshot = u64>,
+  F::Error: core::error::Error,
+{
+  let now = Instant::ORIGIN;
+  assert!(
+    m.debt_names(&source),
+    "the pin names the consumed source {source}"
+  );
+  assert!(
+    matches!(m.remove_group(&source, stores), Err(RemoveError::SpokenFor)),
+    "the pinned id {source} refuses removal: no tombstone, no store teardown"
+  );
+  assert!(
+    matches!(
+      m.create_group(source, 0, single_node_cfg(1), now, 99, fsm()),
+      Err(CreateGroupError::AbsorbPending)
+    ),
+    "the pinned id {source} refuses admission"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&source).unwrap();
+    assert!(
+      matches!(
+        m.restore_group_unchecked(source, single_node_cfg(1), now, 99, fsm(), 1, log, stable),
+        Err(CreateGroupError::AbsorbPending)
+      ),
+      "a live restore of {source} off the preserved stores refuses: beside a park-less poisoned \
+       target it would be a frozen husk claiming a dead target"
+    );
+  }
+  assert!(
+    matches!(
+      m.remove_group(&target, stores),
+      Err(RemoveError::OwesRecovery)
+    ),
+    "the poisoned holder {target} refuses its own removal: the teardown would shed the pin"
+  );
+  assert!(
+    stores.0.contains_key(&source),
+    "the source's stores are intact"
+  );
+  assert_eq!(stores.floor(&source), 0, "the source id was never floored");
+  for _ in 0..3 {
+    assert!(
+      m.service_merge_applies(now, stores).is_empty(),
+      "a pin is not a debt: no crank discharges it"
+    );
+  }
+  assert!(
+    m.group(&target).unwrap().capture_debt().is_none(),
+    "no debt was minted for the failed capture"
+  );
+  assert!(
+    stores.0.contains_key(&source) && stores.floor(&source) == 0,
+    "the cranks touched neither the stores nor the floor"
+  );
+}
+
 /// Arm 1 end-to-end inside one container: freeze → park → resolve. The source endpoint is
 /// extracted and absorbed, the target serves the union, the forced absorb capture is staged
 /// through the store seam, and the resolution surfaces for the driver's floor/teardown fold.
@@ -6928,6 +7000,10 @@ fn capture_failure_withholds_merged_and_keeps_the_source_recoverable() {
     merged_events, 0,
     "a failed absorb capture must surface no Event::Merged"
   );
+  // THE RECOVERY PIN: the union lives only in the poisoned target's volatile state machine, so
+  // the consumed source's preserved stores are its only restart derivation. Every naming surface
+  // refuses the id and the holder refuses its own removal, until the restart re-parks.
+  assert_recovery_pinned(&mut m, &mut stores, 2, 1, SnapFailSm::default);
 }
 
 /// The negative pin: with the forced capture SUCCEEDING, the resolve arm still emits exactly one
@@ -6956,6 +7032,247 @@ fn capture_success_still_emits_merged_once() {
     m.service_merge_applies(Instant::ORIGIN, &mut stores)
       .is_empty(),
     "the resolution fires exactly once"
+  );
+}
+
+/// The second shape at the poisoned-target exit: the target was poisoned BEFORE the resolving
+/// crank (the parked worklist has no poison filter), so its absorb SUCCEEDS — the parked entry
+/// applies and the union folds — into a fail-stopped state machine whose `Merged` the arm drops.
+/// The union then lives nowhere durable, exactly as at the refused fold: the consumed source's
+/// preserved stores are its only restart derivation, and the pin lands identically.
+#[test]
+fn a_target_poisoned_before_the_arm_pins_the_source_its_absorb_consumed() {
+  let (mut m, mut stores) = merge_host_with(SnapFailSm::default(), 2, SnapFailSm::default(), 3);
+  let k = freeze_and_park(&mut m, &mut stores);
+  seal_window(&mut m, &mut stores);
+  m.group_mut(&1)
+    .unwrap()
+    .poison(PoisonReason::ReservedShapeGen);
+  let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::CaptureFailed {
+      source: 2,
+      target: 1
+    }],
+    "a pre-poisoned target's absorb surfaces CaptureFailed, never a Merged teardown: {resolutions:?}"
+  );
+  let tep = m.group(&1).unwrap();
+  assert_eq!(
+    tep.applied_index(),
+    k,
+    "the absorb SUCCEEDED: the parked entry applied"
+  );
+  assert_eq!(
+    tep.state_machine().count,
+    2 + 3,
+    "the union folded into the fail-stopped state machine"
+  );
+  assert!(tep.pending_merge().is_none(), "the park was consumed");
+  assert!(!m.contains_group(&2), "the source endpoint was consumed");
+  let mut merged_events = 0;
+  while let Some((_, ev)) = m.poll_event() {
+    if matches!(ev, Event::Merged(_)) {
+      merged_events += 1;
+    }
+  }
+  assert_eq!(merged_events, 0, "the dropped Merged surfaces no event");
+  assert_recovery_pinned(&mut m, &mut stores, 2, 1, SnapFailSm::default);
+}
+
+/// The pin covers the WHOLE chain a consumed source carried. S0 (3) froze into S1 (2), whose
+/// absorb a standing abort fence DEFERRED — S1 holds the debt naming S0 — and S1 then froze into
+/// T (1), whose forced capture FAULTS. The consumption drained S1's chain; had it died there, S0's
+/// preserved stores — which S1's own restart replays its `CommitMerge` against, re-parking — would
+/// be removable and re-admittable beside a union no snapshot covers. T pins BOTH.
+#[test]
+fn a_failed_capture_pins_the_consumed_sources_whole_debt_chain() {
+  let now = Instant::ORIGIN;
+  let fail = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+  // T = 1 (its forced capture armed to fault later) and S1 = 2, both led and drained.
+  let (mut m, mut stores) = merge_host_with(
+    SnapFailSm::default(),
+    2,
+    SnapFailSm {
+      count: 0,
+      fail: fail.clone(),
+    },
+    3,
+  );
+  // S0 = 3, led.
+  stores
+    .0
+    .insert(3, (VecLog::default(), AsyncStable::default()));
+  m.create_group(3, 0, single_node_cfg(1), now, 7, SnapFailSm::default())
+    .unwrap();
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    let d = m.group(&3).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&3, d, l, s).unwrap();
+    drain_storage(&mut m, 3, d, l, s);
+    assert!(m.group(&3).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+
+  // S1's capture fence: an abort record for the unhosted 8, whose clearing rides 8's floor — the
+  // embedder's timescale — so S1's absorb of S0 defers into a debt. It is a local dead-end (8 is
+  // hosted nowhere), so it never holds S1's own later consumption.
+  {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    let abort = crate::RollbackMergePayload::abort(gid_key(8), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, l, crate::EntryKind::RollbackMerge, Bytes::from(buf))
+      .unwrap();
+    drain_storage(&mut m, 2, now, l, s);
+  }
+  assert!(
+    m.group(&2).unwrap().owes_live_thaw(),
+    "the abort fence stands on S1"
+  );
+  // S0 freezes for S1 at the endpoint seam (the container's propose gate refuses the fenced
+  // target; a foreign leader's gate ran unfenced).
+  let freeze0 = {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(gid_key(2), 1),
+      &mut fbuf,
+    );
+    m.group_mut(&3)
+      .unwrap()
+      .propose_merge_entry(now, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    let idx = l.last_index();
+    drain_storage(&mut m, 3, now, l, s);
+    idx
+  };
+  assert!(m.group(&3).unwrap().is_frozen(), "S0 froze for S1");
+  // S1 commits the absorb of S0 at its next lineage (the abort bumped S1 to 1) and parks; the
+  // sealed window resolves it DEFERRED behind the fence — S1 holds the debt naming S0.
+  {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(
+        now,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(3, freeze0, 1, 2),
+      )
+      .unwrap();
+    drain_storage(&mut m, 2, now, l, s);
+  }
+  assert!(m.group(&2).unwrap().pending_merge().is_some(), "S1 parked");
+  assert!(
+    m.service_merge_applies(now, &mut stores).is_empty(),
+    "the first pass only seals S1's window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, l, s);
+  }
+  assert_eq!(
+    m.service_merge_applies(now, &mut stores),
+    std::vec![MergeResolution::Absorbed {
+      source: 3,
+      target: 2
+    }],
+    "S1's absorb of S0 defers behind the abort fence"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, l, s);
+  }
+  assert_eq!(
+    m.group(&2).unwrap().capture_debt().map(|d| d.source()),
+    Some(gid_key(3)),
+    "S1 holds the debt naming S0"
+  );
+  assert!(!m.contains_group(&3) && stores.0.contains_key(&3));
+  while m.poll_merge_blocked().is_some() {}
+
+  // S1 freezes for T at the seam (a debtor refuses THIS host's propose gate; a foreign leader's
+  // ran debt-free), at its next lineage (the absorb bumped S1 to 2).
+  let freeze1 = {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(gid_key(1), 3),
+      &mut fbuf,
+    );
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    let idx = l.last_index();
+    drain_storage(&mut m, 2, now, l, s);
+    idx
+  };
+  assert!(m.group(&2).unwrap().is_frozen(), "S1 froze for T");
+  // T commits the absorb of S1 and parks; the window seals; then T's forced capture is armed to
+  // fault, so the resolving crank consumes S1 — its chain drained — folds the union, and fails.
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(
+        now,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(2, freeze1, 3, 1),
+      )
+      .unwrap();
+    drain_storage(&mut m, 1, now, l, s);
+  }
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "T parked");
+  assert!(
+    m.service_merge_applies(now, &mut stores).is_empty(),
+    "the first pass only seals T's window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, l, s);
+  }
+  fail.store(true, core::sync::atomic::Ordering::Relaxed);
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::CaptureFailed {
+      source: 2,
+      target: 1
+    }],
+    "the faulting capture surfaces CaptureFailed for the consumed debtor: {resolutions:?}"
+  );
+  assert_eq!(
+    m.group(&1).unwrap().poison_reason(),
+    Some(PoisonReason::SnapshotCapture)
+  );
+  assert!(!m.contains_group(&2), "S1 was consumed");
+
+  // BOTH links are pinned: the consumed debtor S1, and S0 through the chain S1 carried.
+  assert_recovery_pinned(&mut m, &mut stores, 2, 1, SnapFailSm::default);
+  assert!(
+    m.debt_names(&3),
+    "the pin reaches S0, named by the chain the consumption drained"
+  );
+  assert!(
+    matches!(m.remove_group(&3, &mut stores), Err(RemoveError::SpokenFor)),
+    "S0's id refuses removal: its stores are the restored S1's own re-park derivation"
+  );
+  assert!(
+    matches!(
+      m.create_group(3, 0, single_node_cfg(1), now, 99, SnapFailSm::default()),
+      Err(CreateGroupError::AbsorbPending)
+    ),
+    "S0's id refuses admission"
+  );
+  assert!(
+    stores.0.contains_key(&3) && stores.floor(&3) == 0,
+    "S0's stores and floor are untouched"
   );
 }
 
@@ -16154,6 +16471,11 @@ fn poisoned_absorb_surfaces_no_resolution() {
     !m.contains_group(&2),
     "the extracted source endpoint is consumed either way (its stores are not)"
   );
+  // THE RECOVERY PIN: nothing was absorbed, so the consumed source's preserved stores hold the
+  // only copy of its state. A debt would discharge into a `Merged` that floors and tears the
+  // source down; the pin never does — no capture covered the fold — and it holds every naming
+  // surface and the holder's own removal until the restart re-parks against the restored source.
+  assert_recovery_pinned(&mut m, &mut stores, 2, 1, NoAbsorbSm::default);
 }
 
 /// A backlogged group cannot starve its co-hosted neighbours. Each group's apply is INDEPENDENTLY

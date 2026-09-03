@@ -734,6 +734,18 @@ pub enum MergeResolution<G> {
   /// lifecycle signal so the embedder restarts. The driver mirrors the `Merged` latch discipline:
   /// draining the source routing's completion latch fail-stops the TARGET when it fired, because the
   /// target absorbed the source's FSM.
+  ///
+  /// The container PINS what the restart needs: the consumed source's preserved stores — and those
+  /// of every source in the debt chain it carried — are named by the poisoned target as recovery
+  /// pins, so until the restart [`debt_names`](crate::MultiRaft::debt_names) reports each id (the
+  /// demux drops its frames, the factory refuses to build it),
+  /// [`remove_group`](crate::MultiRaft::remove_group) refuses it
+  /// [`SpokenFor`](crate::RemoveError::SpokenFor), admission refuses it
+  /// [`AbsorbPending`](crate::CreateGroupError::AbsorbPending), and the poisoned target's own
+  /// removal refuses [`OwesRecovery`](crate::RemoveError::OwesRecovery). A pin is not a debt:
+  /// nothing discharges it in service, because no capture covered the fold — or, for a target
+  /// poisoned before the resolving crank whose absorb then succeeded, the union lives only in a
+  /// fail-stopped volatile state machine.
   CaptureFailed {
     /// The consumed source group, whose stores and floor the driver MUST keep for the restart.
     source: G,
@@ -990,11 +1002,13 @@ where
   // factory build (whose driver gate consults this same refusal transitively) — would revive a
   // husk beside the already-absorbed union. Self-releasing at the debt's discharge. The WHOLE
   // chain: an inherited debt names a source absorbed transitively, whose stores are pinned
-  // exactly the same way.
-  if groups.values().any(|ep| {
-    ep.capture_debt_chain()
-      .any(|m| m.source().as_ref() == encoded.as_slice())
-  }) {
+  // exactly the same way. And a poisoned target's RECOVERY PIN — its absorb consumed the source
+  // and then failed to capture the union — names the same way, releasing only at the restart: a
+  // live restore beside that park-less target would be a frozen husk claiming a dead target.
+  if groups
+    .values()
+    .any(|ep| ep.debt_names_source(encoded.as_slice()))
+  {
     return Err(CreateGroupError::AbsorbPending);
   }
   // THE SECOND LEG, and the earlier one in the merge's life: a hosted target PARKED on a
@@ -1022,6 +1036,18 @@ where
     return Err(CreateGroupError::AbsorbPending);
   }
   Ok(())
+}
+
+/// The keys a failed absorb capture pins on its poisoned target (see
+/// [`Endpoint::pin_failed_capture`]): the consumed source, then every source of the debt chain
+/// the source carried — each one's preserved stores is a restart derivation the union now depends
+/// on (the restored source replays its own `CommitMerge` and re-parks against the next).
+fn recovery_pin_keys<G: GroupId>(source: &G, inherited: &[crate::Merged]) -> Vec<Bytes> {
+  let mut key = Vec::new();
+  source.encode(&mut key);
+  core::iter::once(Bytes::from(key))
+    .chain(inherited.iter().map(crate::Merged::source))
+    .collect()
 }
 
 /// A container of single-group [`Endpoint`]s multiplexed by [`GroupId`].
@@ -1255,9 +1281,15 @@ where
   /// - [`MergeParked`](RemoveError::MergeParked) — the group is a TARGET parked on a `CommitMerge`
   ///   ([`pending_merge`](Endpoint::pending_merge)); removing the decider strands the frozen source.
   ///   Let the merge resolve (absorb or abort) first.
+  /// - [`OwesCapture`](RemoveError::OwesCapture) / [`OwesRecovery`](RemoveError::OwesRecovery) —
+  ///   the group is a TARGET whose absorb consumed a source without a covering capture: a fence
+  ///   DEFERRED the capture (a debt, discharged by the per-crank debt pass), or the capture FAILED
+  ///   (a recovery pin on the poisoned holder, released only by a restart). Removing the holder
+  ///   would strand the consumed source's preserved stores.
   /// - [`SpokenFor`](RemoveError::SpokenFor) — another hosted endpoint's park names this group as
   ///   its source (scanned as the thaw pass scans), covering the window before this group's own
-  ///   replica has observed its freeze.
+  ///   replica has observed its freeze — or its capture debt or recovery pin does, after the park
+  ///   was consumed.
   /// - [`Claimed`](RemoveError::Claimed) — another hosted SOURCE names this group as its TARGET
   ///   (applied `frozen_for`, or an append-pending `PrepareMerge` decoded from the source's log)
   ///   before this group has parked its `CommitMerge` — the mirror of `SpokenFor`, covering the
@@ -1358,6 +1390,18 @@ where
       .is_some_and(|ep| ep.capture_debt().is_some())
     {
       return Err(RemoveError::OwesCapture);
+    }
+    // Leg 3b's poisoned twin: a TARGET pinning a consumed source's preserved stores — its absorb
+    // consumed the source and then failed to capture the union. The pin is volatile and the
+    // ungated inner teardown drops it, so removing the holder in service would strand every
+    // pinned source un-floored, unhosted and admission-fenced beside a dead target. The only exit
+    // is the restart that re-parks against the restored source.
+    if self
+      .groups
+      .get(gid)
+      .is_some_and(Endpoint::holds_recovery_pins)
+    {
+      return Err(RemoveError::OwesRecovery);
     }
     // Leg 4: any OTHER hosted endpoint's park names gid as its source — the cross-endpoint leg,
     // covering the window where gid's own replica has not observed its own freeze yet.
@@ -1701,8 +1745,9 @@ where
           // The debt window: the park was consumed by a fence-deferred absorb, but the named
           // source's stores remain the union's only restart derivation until the discharge —
           // the naming outlives the park exactly that long. Inherited debts name sources whose
-          // stores are pinned the same way.
-          || ep.debt_names_source(&key))
+          // stores are pinned the same way, and so does a poisoned target's recovery pin (an
+          // absorb whose capture failed) — until the restart.
+          || ep.debt_names_source(key.as_ref()))
     })
   }
 
@@ -1762,17 +1807,23 @@ where
     }
   }
 
-  /// Whether any hosted target's outstanding capture debt names `gid` as its absorbed source —
-  /// the debt-window naming the lifecycle surfaces consult: the id's preserved stores are the
-  /// absorbed union's only restart derivation until the discharge, so nothing may re-host,
-  /// re-materialize, or tombstone it meanwhile. The wire demux treats a debt-named id like a
-  /// tombstone (frames drop silently, no unknown-group advisory is minted), and the factory's
-  /// pre-build gate refuses it.
+  /// Whether any hosted target's outstanding capture debt — or a poisoned target's RECOVERY PIN,
+  /// after its absorb consumed the source and then failed to capture the union — names `gid` as
+  /// its absorbed source: the naming the lifecycle surfaces consult, because the id's preserved
+  /// stores are the absorbed union's only restart derivation until the discharge (a debt) or the
+  /// restart (a pin), so nothing may re-host, re-materialize, or tombstone it meanwhile. The wire
+  /// demux treats a named id like a tombstone (frames drop silently, no unknown-group advisory is
+  /// minted), and the factory's pre-build gate refuses it. A debt's naming self-releases at its
+  /// discharge; a pin's does not release in service — the restart re-parks against the preserved
+  /// stores and re-derives the naming as a park.
   pub fn debt_names(&self, gid: &G) -> bool {
     let mut key = Vec::new();
     gid.encode(&mut key);
     let key = Bytes::from(key);
-    self.groups.values().any(|ep| ep.debt_names_source(&key))
+    self
+      .groups
+      .values()
+      .any(|ep| ep.debt_names_source(key.as_ref()))
   }
 
   /// Whether `source` owes a LOCALLY-DRIVABLE target-role thaw — the shared residual belt of the
@@ -5580,8 +5631,17 @@ where
           // tear its stores down, destroying the union's only copy behind a fail-stop. Emit
           // `CaptureFailed` instead — the source endpoint is already CONSUMED, so the driver
           // must fail its stranded routing (its callers would hang forever) while PRESERVING
-          // its stores and floor, and a restart re-parks against the restored source.
+          // its stores and floor, and a restart re-parks against the restored source. The
+          // second shape landing here is a target poisoned BEFORE this arm ran (the parked
+          // worklist has no poison filter) whose absorb SUCCEEDED: `applied` advanced and the
+          // `Merged` is dropped, the union living only in a fail-stopped volatile state
+          // machine. Either way the source's preserved stores — and those of every source in
+          // the debt chain it carried, which the restored source re-parks against in turn — are
+          // the union's only restart derivation, so PIN them on the poisoned holder before the
+          // resolution surfaces: the pin keeps the removal, admission, demux and factory gates
+          // refusing every named id, and this holder's own removal, until the restart.
           if tep.is_poisoned() {
+            tep.pin_failed_capture(recovery_pin_keys(&source, &inherited_debts));
             self.mark_dirty(&tgid);
             // Latch for `poll_poisoned` alongside the typed resolution, as at every other
             // in-service fail-stop.
@@ -5667,9 +5727,31 @@ where
             // teardown is safe. The source endpoint is already CONSUMED, so its parked routing is
             // stranded — emit `CaptureFailed` so the driver fails those callers typed while
             // PRESERVING the source's stores and floor, and a restart re-parks against the restored
-            // source rather than losing the union behind a floored, torn-down source. Inherited
-            // debt records die un-surfaced here, and soundly: the preserved source stores
-            // replay their own CommitMerge entries on restart and re-derive them.
+            // source rather than losing the union behind a floored, torn-down source. The
+            // inherited debt records are not surfaced — but every source they name is PINNED with
+            // the direct source: the restored source replays its own `CommitMerge` entries on
+            // restart and re-parks against each prior source's preserved stores in turn, so the
+            // whole chain is a restart derivation nothing in-service may tear down, tombstone or
+            // re-host. Every unstaged capture leaves the target poisoned (the capture's own
+            // fail-stops, or the vanished-stores poison above), so the pin lands on a
+            // fail-stopped holder — and withholding it would be the data-loss direction.
+            let pins = recovery_pin_keys(&source, &inherited_debts);
+            if let Some(tep) = self.groups.get_mut(&tgid) {
+              debug_assert!(
+                tep.is_poisoned(),
+                "an unstaged absorb capture leaves the target poisoned"
+              );
+              tep.pin_failed_capture(pins);
+            } else {
+              // Unreachable: `tgid` was iterated from `self.groups` and only `source` (a DISTINCT
+              // id) was removed above. The assert pins the post-removal invariant a future
+              // refactor could break — an exit that fails to pin strands the consumed source's
+              // stores unprotected behind the resolution.
+              debug_assert!(
+                false,
+                "the merge target vanished before its failed capture could pin"
+              );
+            }
             self.note_if_poisoned(&tgid);
             resolutions.push(MergeResolution::CaptureFailed {
               source,

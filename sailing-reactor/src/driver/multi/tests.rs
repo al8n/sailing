@@ -829,6 +829,167 @@ fn the_factory_gate_refuses_a_debt_named_source_and_releases_at_the_discharge() 
   );
 }
 
+/// THE DRIVER'S TEARDOWN AFTER A FAILED ABSORB CAPTURE. `CaptureFailed` leaves the consumed
+/// source's stores in the engine as the union's only restart derivation, and the driver's remove
+/// command runs the container's participant gate FIRST — before its floor write and its engine
+/// teardown — so the refusal here is the driver's refusal: the source's stores stay in the engine,
+/// its floor stays 0 (a removal floor admits above itself, and a factory build there would
+/// manufacture a blank source for the re-parked merge to trip on), and the factory gate's debt
+/// conjunct keeps refusing the id. The poisoned holder refuses its own removal too; the restart
+/// is the exit. The state machine advertises absorb support and refuses the fold — the
+/// deterministic fail-stop shape.
+#[test]
+fn a_failed_absorb_capture_keeps_the_sources_stores_in_the_engine() {
+  use sailing_proto::{
+    CreateGroupError, GroupEngine, Index, Instant, MergeResolution, MultiRaft, RemoveError,
+    StateMachine, StorageProgress,
+  };
+
+  #[derive(Default)]
+  struct Sm(u64);
+  impl StateMachine for Sm {
+    type Command = bytes::Bytes;
+    type Response = u64;
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+    fn apply(&mut self, _: Index, _: bytes::Bytes) -> Result<u64, Self::Error> {
+      self.0 += 1;
+      Ok(self.0)
+    }
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.0)
+    }
+    fn restore(&mut self, s: u64) -> Result<(), Self::Error> {
+      self.0 = s;
+      Ok(())
+    }
+    // Advertised so the propose gate admits the merge; `absorb` keeps its refusing default.
+    fn supports_absorb(&self) -> bool {
+      true
+    }
+  }
+
+  let cfg = || Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+  let now = Instant::ORIGIN;
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut multi: MultiRaft<u64, u64, Sm> = MultiRaft::new();
+
+  macro_rules! drain {
+    ($gid:expr, $at:expr) => {
+      for _ in 0..8 {
+        engine.flush();
+        let (log, stable) = engine.stores(&$gid).unwrap();
+        if !matches!(
+          multi.handle_storage(&$gid, $at, log, stable),
+          Some(StorageProgress::MorePending)
+        ) {
+          break;
+        }
+      }
+      engine.flush();
+      {
+        let (log, stable) = engine.stores(&$gid).unwrap();
+        let _ = multi.handle_storage(&$gid, $at, log, stable);
+      }
+    };
+  }
+  let boot = |multi: &mut MultiRaft<u64, u64, Sm>, engine: &mut GroupEngine<u64, u64>, gid| {
+    assert!(engine.add_group(gid));
+    multi
+      .create_group(gid, 0, cfg(), now, 7, Sm::default())
+      .unwrap();
+    let d = multi.group(&gid).unwrap().poll_timeout().unwrap();
+    {
+      let (log, stable) = engine.stores(&gid).unwrap();
+      multi.handle_timeout(&gid, d, log, stable).unwrap();
+    }
+    for _ in 0..4 {
+      engine.flush();
+      let (log, stable) = engine.stores(&gid).unwrap();
+      let _ = multi.handle_storage(&gid, d, log, stable).unwrap();
+    }
+    assert!(multi.group(&gid).unwrap().role().is_leader());
+    d
+  };
+
+  // Group 2 takes on state and freezes into group 1; group 1 commits the absorb and parks.
+  let d = boot(&mut multi, &mut engine, 1u64);
+  let ds = boot(&mut multi, &mut engine, 2u64);
+  {
+    let (log, stable) = engine.stores(&2).unwrap();
+    multi
+      .propose(&2, ds, log, stable, &bytes::Bytes::from_static(b"c"))
+      .unwrap()
+      .unwrap();
+  }
+  drain!(2u64, ds);
+  multi
+    .prepare_merge(&2, ds, &mut engine, &1)
+    .unwrap()
+    .unwrap();
+  drain!(2u64, ds);
+  assert!(multi.group(&2).unwrap().is_frozen());
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    multi.commit_merge(&1, d, log, stable, &2).unwrap().unwrap();
+  }
+  drain!(1u64, d);
+  assert!(multi.group(&1).unwrap().pending_merge().is_some(), "parked");
+  assert!(
+    multi.service_merge_applies(d, &mut engine).is_empty(),
+    "the first pass seals the window"
+  );
+  drain!(1u64, d);
+  assert_eq!(
+    multi.service_merge_applies(d, &mut engine),
+    vec![MergeResolution::CaptureFailed {
+      source: 2,
+      target: 1
+    }],
+    "the refused fold surfaces CaptureFailed"
+  );
+  assert!(multi.group(&1).unwrap().is_poisoned());
+  assert!(
+    !multi.contains_group(&2),
+    "the source endpoint was consumed"
+  );
+  assert!(
+    engine.contains_group(&2) && engine.stores(&2).is_some(),
+    "the source's stores survive the consumption"
+  );
+
+  // The driver's remove command for the source: the container gate refuses before any floor
+  // write or engine teardown, so the stores and the floor are exactly as CaptureFailed left them.
+  assert!(
+    matches!(
+      multi.remove_group(&2, &mut engine),
+      Err(RemoveError::SpokenFor)
+    ),
+    "the pinned source refuses removal"
+  );
+  assert!(engine.contains_group(&2), "nothing was torn down");
+  assert_eq!(engine.group_floor(&2), 0, "no removal floor was written");
+  assert!(
+    multi.debt_names(&2),
+    "the factory gate's debt conjunct refuses the pinned id"
+  );
+  assert!(
+    matches!(
+      multi.create_group(2, 0, cfg(), d, 7, Sm::default()),
+      Err(CreateGroupError::AbsorbPending)
+    ),
+    "the pinned id refuses admission"
+  );
+  assert!(
+    matches!(
+      multi.remove_group(&1, &mut engine),
+      Err(RemoveError::OwesRecovery)
+    ),
+    "the poisoned holder refuses its own removal: the teardown would shed the pin"
+  );
+  assert!(engine.contains_group(&1), "the holder's stores stay too");
+}
+
 /// A SPLIT READS TWO IDS, so its floor seam must be keyed by id. Both of the coordinator's split
 /// legs consult it — the parent's own incarnation and the caller's claim about the child — and a
 /// one-id snapshot answers whatever it was built from for BOTH of them. Built from the child, it

@@ -193,7 +193,11 @@ pub enum CreateGroupError {
   /// only restart derivation until the debt discharges. Admitting an incarnation now — a
   /// solicited factory build, an embedder create, a restore off those very stores — would
   /// revive a husk beside the already-absorbed union. Self-clearing: the debt's discharge (or a
-  /// crash, which re-parks the merge) releases the id to its ordinary floors.
+  /// crash, which re-parks the merge) releases the id to its ordinary floors. ALSO produced while
+  /// a poisoned target's RECOVERY PIN names the id — its absorb consumed the source and then
+  /// failed to capture the union ([`RemoveError::OwesRecovery`]): a live restore beside that
+  /// park-less target would be a frozen husk claiming a dead target. A pin does NOT self-clear in
+  /// service; the restart re-parks the merge against the preserved stores.
   #[error("the group id is the absorbed source of an outstanding capture debt")]
   AbsorbPending,
   /// The requested incarnation is below the id's persisted admission floor — a removal or merge
@@ -331,13 +335,27 @@ pub enum RemoveError {
   /// the SAME removal admits.
   #[error("the group owes its absorb capture and cannot be torn down")]
   OwesCapture,
+  /// The group is a POISONED merge TARGET whose absorb consumed a source and then failed to
+  /// capture the union — the state machine refused the fold, or the forced capture faulted — so
+  /// the consumed source's preserved stores, and those of every source it carried in its debt
+  /// chain, are pinned on this holder as the union's only restart derivation
+  /// ([`MergeResolution::CaptureFailed`](crate::MergeResolution::CaptureFailed)). The pin is
+  /// volatile and the teardown would shed it, stranding every pinned source un-floored and
+  /// admission-fenced beside a dead target. The ONLY variant with no in-service escape: fix the
+  /// fault (or the state machine) and restart the host — the restart re-parks the merge against
+  /// the restored source and re-derives the naming as a park. Whether a poisoned participant may
+  /// ever be torn down in service is an open question this variant deliberately leaves open.
+  #[error("the group's failed absorb capture pins its source's stores until a restart")]
+  OwesRecovery,
   /// Another hosted group's parked `CommitMerge` — or its outstanding capture debt, after a
-  /// fence-deferred absorb consumed the endpoint — names THIS group as its merge source. The
-  /// cross-endpoint leg: it fires even before this group's own replica has observed its freeze,
-  /// and it outlives the park through the debt window, where the named id's stores are the
-  /// absorbed union's only restart derivation. Removing (tombstoning) it strands the park or the
-  /// debt. Resolve or roll back the naming merge first — a debt discharges on its fence's own
-  /// resolution; recovery for a genuinely-dead participant is the embedder's catalog.
+  /// fence-deferred absorb consumed the endpoint, or its recovery pin, after the absorb's capture
+  /// failed — names THIS group as its merge source. The cross-endpoint leg: it fires even before
+  /// this group's own replica has observed its freeze, and it outlives the park through the debt
+  /// window, where the named id's stores are the absorbed union's only restart derivation.
+  /// Removing (tombstoning) it strands the park, the debt or the pin. Resolve or roll back the
+  /// naming merge first — a debt discharges on its fence's own resolution, a pin releases only at
+  /// the restart ([`OwesRecovery`](Self::OwesRecovery)); recovery for a genuinely-dead participant
+  /// is the embedder's catalog.
   #[error("an in-flight absorb names this group as its source and it cannot be torn down")]
   SpokenFor,
   /// Another hosted endpoint is a merge SOURCE that names THIS group as its TARGET — either
