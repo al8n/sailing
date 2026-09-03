@@ -282,12 +282,26 @@ pub enum CreateGroupError {
 pub enum RemoveError {
   /// The group still owes an aborted upstream merge its thaw: a merge it applied as a TARGET was
   /// aborted, recording a durable `abandoned` obligation its per-crank thaw pass has not yet
-  /// discharged. Tearing it down would destroy that obligation's ONLY replay source — the holder's
-  /// own log — leaving the upstream source frozen forever with no holder left to run the thaw. The
-  /// teardown-door sibling of [`MergeError::SourceOwesThaw`](crate::MergeError::SourceOwesThaw):
-  /// that gate guards the merge-absorb door (a source dissolving), this one guards the EXPLICIT
-  /// teardown door (a hosted group removed). TRANSIENT and self-clearing, exactly like it: the thaw pass
-  /// discharges each obligation within a few cranks, after which the SAME removal admits. The
+  /// discharged. Tearing it down would destroy the obligation — the holder's own log is its replay
+  /// source, and once a snapshot install has crossed the abort entry the endpoint's retained record
+  /// is all that remains of it — leaving the upstream source frozen forever with no holder left to
+  /// run the thaw. The teardown-door sibling of
+  /// [`MergeError::SourceOwesThaw`](crate::MergeError::SourceOwesThaw): that gate guards the
+  /// merge-absorb door (a source dissolving), this one guards the EXPLICIT teardown door (a hosted
+  /// group removed). TRANSIENT and self-clearing, exactly like it: the thaw pass discharges each
+  /// obligation within a few cranks, after which the SAME removal admits. Not produced for a holder
+  /// whose every live obligation is covered and names a source not hosted here — such a record
+  /// drives nothing on this host, so the removal strands no thaw. ALSO produced while the group
+  /// holds a DISCHARGED record whose `ThawDischarged` witness has not applied — a witness debt: the
+  /// observation that discharged it may be knowledge no other replica can reproduce, so the record
+  /// is the only future witness trigger while the leader cannot observe the source, and removing
+  /// the holder would destroy it. That debt retires at the committed witness apply (the holder
+  /// mints when it leads; an observing leader mints without it) or when the named source — hosted
+  /// here, live past the abandoned generation and not itself a merge participant — is removed and
+  /// its purge clears the record. A POISONED holder's debt fences its removal too: it cannot mint
+  /// and a peer's witness cannot apply on it, but admitting the removal would delete, with the
+  /// storage, a proof no other replica may hold — its recovery is a non-destructive re-open from
+  /// its preserved stores, which re-derives the record live from the still-fenced abort entry. The
   /// escape for a genuinely-dead holder is the catalog — flooring the OWED SOURCE discharges the
   /// obligation (the thaw pass's `!floor_admits` arm), after which removal admits.
   #[error("the group still owes an aborted merge its thaw and cannot be torn down")]
@@ -588,7 +602,13 @@ pub enum MergeError<I> {
   /// source endpoint, and every undischarged obligation would vanish with it, stranding the upstream
   /// source frozen forever. TRANSIENT, exactly like [`SourceBarrierPending`](Self::SourceBarrierPending):
   /// the thaw pass drives each abandoned source past its freeze within a few cranks, discharging the
-  /// obligation, after which the same freeze admits.
+  /// obligation, after which the same freeze admits. Also produced while the source holds a
+  /// DISCHARGED record whose `ThawDischarged` witness has not applied — a witness debt: the absorb's
+  /// dissolve would drop the record, the only future trigger while the leader cannot observe the
+  /// upstream source, and the holder's own witness may not exist yet (only an unparked, unpoisoned
+  /// leader with stores mints). It retires at the committed witness apply (the holder mints when it
+  /// leads; an observing leader mints without it) or when the named upstream source — hosted here,
+  /// live past the generation and not itself a merge participant — is removed.
   #[error("the source still owes an aborted merge its thaw")]
   SourceOwesThaw,
   /// The `prepare_merge` source is itself the CLAIMED TARGET of another in-flight merge: a

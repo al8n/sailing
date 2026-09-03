@@ -666,21 +666,21 @@ fn merge_band_smoke() {
 /// quiesce dump. Determinism holds because both replays share the flag.
 #[test]
 fn merge_profile_same_seed_same_report() {
-  let r = run_multi_vopr_certifying_tracked_wedges(40, 3_000, MultiProfile::merge_reshape());
+  let r = run_multi_vopr_certifying_tracked_wedges(42, 3_000, MultiProfile::merge_reshape());
   std::eprintln!(
-    "merge profile seed 40: merges_absorbed={}",
+    "merge profile seed 42: merges_absorbed={}",
     r.merges_absorbed
   );
-  assert_no_tracked_exemption("merge profile determinism", 40, &r);
+  assert_no_tracked_exemption("merge profile determinism", 42, &r);
   assert_eq!(
     r,
-    run_multi_vopr_certifying_tracked_wedges(40, 3_000, MultiProfile::merge_reshape()),
+    run_multi_vopr_certifying_tracked_wedges(42, 3_000, MultiProfile::merge_reshape()),
     "run_multi_vopr must be a pure function of (seed, ticks, profile)"
   );
   assert!(
     r.merges_absorbed > 0,
-    "seed 40 must exercise the fence-deferred absorb — a zero here means the defer path is inert \
-     exactly where it matters (see `merge_reshape_seed_40_converges` for why the pin is 40)"
+    "seed 42 must exercise the fence-deferred absorb — a zero here means the defer path is inert \
+     exactly where it matters (see `merge_reshape_seed_42_converges` for why the pin is 42)"
   );
 }
 
@@ -1003,21 +1003,57 @@ fn lifecycle_seeds_62_and_67_converge() {
   );
 }
 
-/// THE #106/#110 MERGE SEED, converging without an exemption. Seed 40 of the merge profile is a
+/// THE ATTRIBUTION SEEDS. Seed 40 of the merge profile is the schedule that exposed the gap: a
+/// target parked over a merged-away source hosted NOWHERE, behind a tombstone-held fork whose
+/// barrier withholds the cure — a #106 shape the counterfactual credits only when its strike domain
+/// is the whole catalog (the source is never a merge participant, so a strike set drawn from the
+/// wedge set cannot name it). Seed 42 carries the SCHEDULE pin — the fence-deferred absorb —
+/// because the retention of covered thaw obligations reclassified an install-covered record's
+/// absorb from `Defer` to `Clear` and rolled seed 40 out of that shape; seed 40 keeps the
+/// ATTRIBUTION pin here, deliberately without the `merges_absorbed` teeth, so the schedule that
+/// exposed the gap still runs end to end. Seeds 10, 17 and 38 reach the same held-fork shape on
+/// the current trajectories (every park credited on the catalog domain, one or more un-credited on
+/// the wedge-set domain), so they carry the teeth seed 40's trajectory no longer does.
+#[test]
+fn merge_reshape_credits_the_held_fork_parks() {
+  for seed in [40u64, 10, 17, 38] {
+    let r = run_multi_vopr_certifying_tracked_wedges(seed, 3_000, MultiProfile::merge_reshape());
+    std::eprintln!(
+      "#106 attribution seed {seed}: under-hosted={} credited={} fork-fence={} credited={}",
+      r.tracked_merge_wedges_exempted,
+      r.under_hosted_retired_hold_overlap,
+      r.fork_fence_couplings_exempted,
+      r.fork_fence_retired_hold_overlap,
+    );
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    assert_no_tracked_exemption("#106 attribution", seed, &r);
+  }
+}
+
+/// THE #106/#110 MERGE SEED, converging without an exemption. Seed 42 of the merge profile is a
 /// schedule that reaches the fence-deferred absorb and still quiesces with BOTH classifiers empty;
 /// its determinism twin ([`merge_profile_same_seed_same_report`]) pins the report's purity, and
 /// this pins the property that report carries — the defer is what got the run there.
 ///
 /// The pin moved off seed 43 when the relay began persisting the guard advance a REDUNDANT fold
 /// owes: a fork seed 43 used to leave staged (and whose fence produced its defer) is now consumed
-/// at the fold, so that seed no longer reaches the shape. The witness is a property of the
-/// schedule, not of the number — re-pinning to a seed that still exercises it keeps the teeth,
-/// where weakening the assertion would have removed them.
+/// at the fold, so that seed no longer reaches the shape. It moved again, off seed 40, when a
+/// covered thaw obligation stopped being dropped at a transfer: an install-covered record no
+/// longer fences its holder's absorb capture (the classification is `Clear`, not `Defer`), and a
+/// discharged record holds the absorb of a frozen holder as a witness debt — so seed 40's
+/// trajectory no longer contains a fence-deferred absorb at all, while seed 42's does
+/// (`merges_absorbed = 2`; seeds 45, 46, 47 and 49 also exercise it, and every seed from 41 to 52
+/// quiesces with both classifiers empty). The witness is a property of the schedule, not of the
+/// number — re-pinning to a seed that still exercises it keeps the teeth, where weakening the
+/// assertion would have removed them.
 #[test]
-fn merge_reshape_seed_40_converges() {
-  let r = run_multi_vopr_certifying_tracked_wedges(40, 3_000, MultiProfile::merge_reshape());
+fn merge_reshape_seed_42_converges() {
+  let r = run_multi_vopr_certifying_tracked_wedges(42, 3_000, MultiProfile::merge_reshape());
   std::eprintln!(
-    "#106/#110 merge seed 40: absorbed={} registered={} groups_created={} committed={}",
+    "#106/#110 merge seed 42: absorbed={} registered={} groups_created={} committed={}",
     r.merges_absorbed,
     r.merges_registered,
     r.groups_created,
@@ -1025,11 +1061,11 @@ fn merge_reshape_seed_40_converges() {
   );
   assert!(
     r.groups_created >= 2 && r.committed > 0,
-    "seed 40 vacuous: {r:?}"
+    "seed 42 vacuous: {r:?}"
   );
-  assert_no_tracked_exemption("#106/#110 merge", 40, &r);
+  assert_no_tracked_exemption("#106/#110 merge", 42, &r);
   assert!(
     r.merges_absorbed > 0,
-    "seed 40 never deferred a fenced absorb — the debt path is inert on this schedule: {r:?}"
+    "seed 42 never deferred a fenced absorb — the debt path is inert on this schedule: {r:?}"
   );
 }

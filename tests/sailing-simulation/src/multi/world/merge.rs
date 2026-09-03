@@ -1057,6 +1057,22 @@ impl MultiWorld {
     self.retired_hold_park(rec.target)
   }
 
+  /// The strike-set DOMAIN of the #106 counterfactual: every catalog id whose under-hosted shape a
+  /// tombstone-held fork explains — a resurrected husk, or a merged-away source whose absorbing
+  /// target is parked behind a held fork. Drawn from ALL catalog ids, never from the wedge set: a
+  /// #106 root can be a merged-away husk hosted NOWHERE, which is not a merge participant and so
+  /// never enters the wedge set itself — the park on it enters the class through the
+  /// `parked_on_quorumless` leg, which reads the source the park NAMES — and a strike set drawn
+  /// from the wedge set could never name it, leaving that park un-credited.
+  pub(crate) fn hold_explained_husks(&self) -> BTreeSet<u64> {
+    self
+      .groups
+      .keys()
+      .copied()
+      .filter(|&g| self.resurrected_husk(g) || self.husk_dissolve_blocked_by_hold(g))
+      .collect()
+  }
+
   pub(crate) fn resurrected_husk(&self, gid: u64) -> bool {
     let Some(meta) = self.groups.get(&gid) else {
       return false;
@@ -1251,14 +1267,23 @@ impl MultiWorld {
   }
 
   /// The choreography legs carried by `gid`'s OWN replicas — every replica when `generation` is
-  /// `None`, else only those bound to it.
+  /// `None`, else only those bound to it. The obligation leg reads the pair the product's teardown
+  /// gate reads — a LIVE record or a witness DEBT — because this predicate's contract is a superset
+  /// of that gate (a drawn removal must never trip a refusal): a live record outlives a snapshot
+  /// install that crossed the abort entry (the product keeps it, covered, until a global fact
+  /// retires it) and drives a hosted source to its thaw or waits on a witness, and a discharged
+  /// record is the witness debt the gate refuses on until its witness applies.
   fn own_replica_choreography(&self, gid: u64, generation: Option<u64>) -> bool {
     for node in &self.node_ids {
       if generation.is_some_and(|g| self.replica_gen_of(*node, gid) != g) {
         continue;
       }
       if let Some(ep) = self.hosts[node].group(&gid) {
-        if ep.merge_freeze_active() || ep.pending_merge().is_some() || ep.has_abandoned() {
+        if ep.merge_freeze_active()
+          || ep.pending_merge().is_some()
+          || ep.owes_live_thaw()
+          || ep.holds_witness_debt()
+        {
           return true;
         }
         if let Some(log) = self.logs.get(&(*node, gid))

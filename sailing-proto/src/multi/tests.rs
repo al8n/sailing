@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
   Config, Instant, PoisonReason,
+  endpoint::Cover,
   testkit::{AsyncStable, CountSm, VecLog},
 };
 use bytes::Bytes;
@@ -6394,7 +6395,7 @@ fn commit_merge_defers_a_target_reshaping_by_a_split() {
   // The source is untouched — still frozen_for the target, never stranded by a stale abort.
   assert!(m.group(&2).unwrap().is_frozen());
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "no obligation-less abort was recorded on the target"
   );
 
@@ -6516,7 +6517,7 @@ fn prepare_merge_defers_a_source_reshaping_by_a_split() {
 /// `RollbackInFlight`; once 1's abort applies the same commit admits and 3 absorbs. Admitting it
 /// under the in-flight abort strands 3: draining 2 applies the abort (bumping the counter and
 /// recording `abandoned[1]`) and stale-aborts 3's commit WITHOUT recording `abandoned[3]`, leaving 3
-/// frozen_for 2 forever while 1 thaws (`has_abandoned` clears 1 but never held 3).
+/// frozen_for 2 forever while 1 thaws (`owes_live_thaw` clears 1 but never held 3).
 /// (The abort of the SAME merge being committed is caught earlier by `AlreadyPending`.)
 #[test]
 fn commit_merge_defers_a_target_with_a_fanin_abort_in_flight() {
@@ -6700,7 +6701,7 @@ fn rollback_merge_defers_a_target_with_a_fanin_abort_in_flight() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "both obligations discharged on the observed advances"
   );
 }
@@ -6751,7 +6752,7 @@ fn rollback_merge_defers_a_target_reshaping_by_a_split() {
   }
   assert!(m.group(&2).unwrap().is_frozen(), "the source is untouched");
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "no obligation-less abort was recorded on the target"
   );
 
@@ -6777,7 +6778,7 @@ fn rollback_merge_defers_a_target_reshaping_by_a_split() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "the abort recorded its obligation post-split — the source is never stranded"
   );
 }
@@ -7001,7 +7002,10 @@ fn rollback_races_commit() {
   assert_eq!(tep.state_machine().count(), 3, "nothing absorbed");
   assert_eq!(tep.shape_gen(), 1, "the abort bumped the target's lineage");
   assert_eq!(
-    tep.abandoned_obligations().first().map(|(_, g, _)| *g),
+    tep
+      .abandoned_obligations()
+      .first()
+      .map(|(_, m)| m.generation),
     Some(1),
     "the target recorded exactly the abandoned freeze generation"
   );
@@ -7032,7 +7036,7 @@ fn rollback_races_commit() {
     drain_storage(&mut m, 1, Instant::ORIGIN, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the observed source advance discharged the obligation"
   );
 }
@@ -7060,7 +7064,7 @@ fn commit_merge_refuses_a_target_owing_this_source_a_thaw() {
     m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
-  assert!(m.group(&1).unwrap().has_abandoned(), "2 owes 1 a thaw");
+  assert!(m.group(&1).unwrap().owes_live_thaw(), "2 owes 1 a thaw");
   assert!(
     m.group(&2).unwrap().is_frozen(),
     "1 is still frozen at gen 1"
@@ -7089,7 +7093,7 @@ fn commit_merge_refuses_a_target_owing_this_source_a_thaw() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the obligation discharged"
   );
   // GEN-EXACTNESS: 1 re-freezes FRESH (a strictly higher generation) and the same target now ADMITS
@@ -7257,7 +7261,7 @@ fn both_fanned_in_aborts_thaw_neither_dropped() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "both obligations discharged on the observed advances"
   );
 }
@@ -7519,7 +7523,7 @@ fn a_source_owing_a_thaw_cannot_freeze_as_a_source() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
+    m.group(&2).unwrap().owes_live_thaw(),
     "2 recorded its target-role abort obligation for 1"
   );
 
@@ -7553,7 +7557,7 @@ fn a_source_owing_a_thaw_cannot_freeze_as_a_source() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    !m.group(&2).unwrap().has_abandoned(),
+    !m.group(&2).unwrap().owes_live_thaw(),
     "the observed advance discharged 2's obligation"
   );
 
@@ -7593,7 +7597,7 @@ fn teardown_refuses_a_group_that_still_owes_a_thaw() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "2 recorded its target-role abort obligation for 1"
   );
 
@@ -7612,7 +7616,7 @@ fn teardown_refuses_a_group_that_still_owes_a_thaw() {
   // and 1 is still frozen but still HAS a holder (2) to run the thaw.
   assert!(m.contains_group(&1), "the refused removal left 2 hosted");
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "2 still owes 1 the thaw"
   );
   assert!(
@@ -7634,7 +7638,7 @@ fn teardown_refuses_a_group_that_still_owes_a_thaw() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the observed advance discharged 2's obligation"
   );
 
@@ -7689,7 +7693,7 @@ fn teardown_refuses_a_frozen_source_and_a_parked_target() {
     "2 is still parked on its commit"
   );
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "no obligation was fabricated by the refusal"
   );
 
@@ -7726,7 +7730,7 @@ fn teardown_refuses_a_frozen_source_and_a_parked_target() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the observed advance discharged 2's obligation"
   );
 
@@ -7743,21 +7747,632 @@ fn teardown_refuses_a_frozen_source_and_a_parked_target() {
 
 /// The ONE deliberate teardown ESCAPE: an OWED source — a frozen source a hosted target already owes
 /// a thaw — is removable, because the removal PURGE binds every holder's obligation to the departing
-/// incarnation (and the driver floors the id — the catalog recovery for a genuinely-dead frozen
-/// participant). Group 1 freezes into 2 and 2 ABORTS, recording `abandoned[1]` while 1 stays frozen.
-/// `remove_group(&1)` ADMITS despite the active freeze — leg 2 steps aside for exactly this — and the
-/// purge clears 2's now-danging obligation so no stale record can ever back a recreate's thaw.
+/// incarnation and the driver FLOORS the id (the catalog recovery for a genuinely-dead frozen
+/// participant). Source 2 freezes into target 1 and 1 ABORTS, recording `abandoned[2]` while 2 stays
+/// frozen. `remove_group(&2)` ADMITS despite the active freeze — leg 2 steps aside for exactly this —
+/// and the purge clears 1's now-dangling obligation so no stale record can ever back a recreate's
+/// thaw.
+///
+/// THE FLOOR is the escape's other half, so it runs here on the engine the drivers actually read: an
+/// owed frozen source ALWAYS carries a nonzero removal ceiling, which is what forbids the drivers'
+/// `if floor > 0` guard from skipping an escaped removal and leaving the departed incarnation
+/// re-admittable at the very generation the purged obligation named. The ceiling stands on the LOG
+/// alone in the mirror-lost crash window: the applied `PrepareMerge` names the generation the freeze
+/// minted, and a frozen source can never capture, so nothing compacts that entry away.
 #[test]
 fn teardown_admits_an_owed_frozen_source_and_purges_the_obligation() {
-  let (mut m, mut stores) = merge_host_triple(3, 2, 4);
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
   let now = Instant::ORIGIN;
-  let k = freeze_and_park(&mut m, &mut stores);
-  // 2 aborts the merge and APPLIES it: 2 now owes 1 a thaw, and 1 is STILL a frozen source.
+  engine_group(&mut m, &mut engine, 1, 0, now);
+  engine_group(&mut m, &mut engine, 2, 0, now);
+
+  // 2 freezes into 1, and 1 parks the absorb at k.
+  m.prepare_merge(&2, now, &mut engine, &1).unwrap().unwrap();
+  engine_crank(&mut m, &mut engine, 2, now);
+  assert!(m.group(&2).unwrap().is_frozen());
+  let k = {
+    let (log, stable) = engine.stores(&1).unwrap();
+    m.commit_merge(&1, now, log, stable, &2).unwrap().unwrap()
+  };
+  engine_crank(&mut m, &mut engine, 1, now);
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+
+  // 1 aborts the merge and APPLIES it: 1 now owes 2 a thaw, and 2 is STILL a frozen source.
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    let a = m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    assert_eq!(a, k.next(), "the abort resolves the parked window");
+  }
+  engine_crank(&mut m, &mut engine, 1, now);
+  m.service_merge_applies(now, &mut engine);
+  engine_crank(&mut m, &mut engine, 1, now);
+  assert!(
+    m.group(&2).unwrap().is_frozen(),
+    "2 is still a frozen source"
+  );
+  assert!(m.group(&1).unwrap().owes_live_thaw(), "1 owes 2 the thaw");
+
+  // THE FLOOR, MIRROR-LOST: no lineage mirror landed for 2, so its ceiling rests entirely on the
+  // `PrepareMerge` still resident in its own log.
+  assert_eq!(
+    engine.group_gen(&2),
+    0,
+    "the source carries no lineage record — the crash window the stores leg exists for"
+  );
+  assert!(
+    engine.removal_floor(&2) > 0,
+    "an owed frozen source fences off its own log alone — the drivers' `if floor > 0` guard must \
+     never skip flooring an escaped removal"
+  );
+
+  // THE FLOOR, MIRRORED: the drivers' event fold lands the freeze's generation in the record, which
+  // joins the same ceiling rather than replacing it.
+  fold_lineage_events(&mut m, &mut engine);
+  assert!(engine.group_gen(&2) > 0, "the fold mirrored the freeze");
+  assert!(
+    engine.removal_floor(&2) > m.group(&2).unwrap().shape_gen(),
+    "the floor sits one past the incarnation's ceiling, so the generation the purged obligation \
+     named can never be re-admitted"
+  );
+
+  // THE FENCE, before the escape: the undischarged obligation fences the holder's own capture.
+  let applied = m.group(&1).unwrap().applied_index();
+  assert!(
+    m.group(&1).unwrap().capture_blocked_at(applied),
+    "the outstanding obligation fences the holder's capture at its applied index"
+  );
+
+  // THE ESCAPE: removing the OWED source ADMITS even though it is frozen (leg 2 suppressed).
+  assert!(
+    m.remove_group(&2, &mut engine).unwrap().is_some(),
+    "an owed frozen source is the designed catalog escape — the removal admits"
+  );
+  // THE PURGE ALONE LIFTS THE FENCE: nothing thawed anywhere, yet this leader may now capture past
+  // the abort — so a co-hosting replica that later installs that capture must read no thaw into
+  // its boundary (the covered obligation's whole rationale).
+  assert!(
+    !m.group(&1).unwrap().capture_blocked_at(applied),
+    "the escape's purge lifts the holder's capture fence with no thaw anywhere"
+  );
+  // The removal purge discharged the obligation the departed source can no longer thaw.
+  assert!(
+    !m.group(&1).unwrap().owes_live_thaw(),
+    "the purge cleared the holder's obligation for the departed incarnation"
+  );
+}
+
+/// A single host whose target 1 and source 2 both restart from durable logs mid-choreography — the
+/// shape a lagging co-hosting replica pair is in when the transferring leader's snapshot arrives:
+/// 1 holds a committed+applied TARGET-role abort of 2's freeze at generation 1 (its obligation
+/// re-derived by replay: `abandoned[2]`, abort entry at index 1) and 2 restarts FROZEN at exactly
+/// that generation with its claim on 1 (its `PrepareMerge` re-applied). Neither has fired a
+/// timeout, so both are followers — which is what lets 1 INSTALL.
+fn restored_holder_and_frozen_source() -> (MultiRaft<u64, u64, CountSm>, MapStores) {
+  restored_pair_with_holder_cfg(single_node_cfg(1))
+}
+
+/// [`restored_holder_and_frozen_source`] with the holder's config settable (a snapshot threshold
+/// for the capture pins).
+fn restored_pair_with_holder_cfg(
+  holder_cfg: Config<u64>,
+) -> (MultiRaft<u64, u64, CountSm>, MapStores) {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  // Target 1: the abort at index 1, committed and applied.
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(gid_key(2), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let mut tlog = VecLog::default();
+  let mut tstable = AsyncStable::default();
+  tlog.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::RollbackMerge,
+    abort,
+  )]);
+  tstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  m.restore_group_unchecked(
+    1,
+    holder_cfg,
+    now,
+    7,
+    CountSm::default(),
+    1,
+    &mut tlog,
+    &mut tstable,
+  )
+  .unwrap();
+  stores.0.insert(1, (tlog, tstable));
+  // Source 2: the freeze naming 1 at generation 1, committed and applied.
+  let mut slog = VecLog::default();
+  let mut sstable = AsyncStable::default();
+  slog.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::PrepareMerge,
+    prepare_merge_bytes(1, 1),
+  )]);
+  sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  m.restore_group_unchecked(
+    2,
+    single_node_cfg(1),
+    now,
+    8,
+    CountSm::default(),
+    1,
+    &mut slog,
+    &mut sstable,
+  )
+  .unwrap();
+  stores.0.insert(2, (slog, sstable));
+  while m.poll_event().is_some() {}
+  while m.poll_message().is_some() {}
+  let t = m.group(&1).unwrap();
+  assert!(t.role().is_follower(), "1 has not campaigned");
+  assert_eq!(
+    t.owes_live_thaw_for(&gid_key(2)),
+    Some(1),
+    "replay re-derived 1's obligation for 2's freeze at generation 1"
+  );
+  assert!(
+    t.abandoned_record(&gid_key(2))
+      .is_some_and(|r| r.cover == Cover::None && !r.discharged),
+    "re-derived from the entry: uncovered and live"
+  );
+  let sp = m.group(&2).unwrap();
+  assert!(
+    sp.role().is_follower() && sp.is_frozen(),
+    "2 restarted frozen"
+  );
+  assert_eq!(sp.shape_gen(), 1, "at exactly the abandoned generation");
+  assert_eq!(sp.frozen_for(), Some(&gid_key(1)), "claiming 1");
+  (m, stores)
+}
+
+/// Install the transferring leader's snapshot into restored target 1 — boundary 5, past the abort
+/// entry at 1: the destructive deferred install, drained to completion.
+fn install_past_the_abort(m: &mut MultiRaft<u64, u64, CountSm>, stores: &mut MapStores) {
+  let now = Instant::ORIGIN;
+  let meta = crate::SnapshotMeta::new(
+    Index::new(5),
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  let (log, stable) = stores.0.get_mut(&1).unwrap();
+  m.handle_message(
+    &1,
+    now,
+    log,
+    stable,
+    9u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(1),
+      9u64,
+      meta,
+      fork_blob(3),
+    )),
+  )
+  .unwrap();
+  drain_storage(m, 1, now, log, stable);
+  assert_eq!(
+    m.group(&1).unwrap().applied_index(),
+    Index::new(5),
+    "the install landed past the abort"
+  );
+}
+
+/// THE INSTALL RETAINS A LIVE OBLIGATION (#132). The transferring leader captured past the abort
+/// because ITS host removed the source through the owed-source escape — a host-local purge, no
+/// thaw anywhere — and this lagging holder installs that capture with the source still frozen
+/// RIGHT HERE. The boundary crossed the abort entry, so the obligation is marked install-covered
+/// and KEPT, live: it stands through a crank on which the frozen source cannot lead (no local
+/// discharge — a cover is not a proof for a hosted source), it drives the thaw the moment the
+/// source leads, and it retires only once the source is observed past the abandoned generation —
+/// DISCHARGED, not cleared: this follower keeps the record as the witness trigger. What the install
+/// does lift is the capture fence — the entry it protected is gone. A drop at the install erases
+/// the only drive of that thaw, holder by holder, and strands the source frozen for good.
+#[test]
+fn an_install_past_the_abort_retains_the_live_obligation_until_the_source_thaws() {
+  let (mut m, mut stores) = restored_holder_and_frozen_source();
+  let now = Instant::ORIGIN;
+  let source = gid_key(2);
+  install_past_the_abort(&mut m, &mut stores);
+  let t = m.group(&1).unwrap();
+  assert!(
+    t.owes_live_thaw(),
+    "RETAINED: the boundary proves the leader's fence lifted, not that 2 thawed — 2 is frozen here"
+  );
+  let record = t.abandoned_record(&source).expect("retained");
+  assert_eq!(
+    (record.cover, record.discharged),
+    (Cover::Install, false),
+    "marked install-covered, still live"
+  );
+  assert!(
+    !t.abort_relay_fences(t.applied_index()) && !t.capture_blocked_at(t.applied_index()),
+    "the install lifted the capture fence: the entry it protected is gone"
+  );
+  assert!(m.group(&2).unwrap().is_frozen(), "2 is still frozen");
+
+  // The pass while 2 is a FOLLOWER: hosted and frozen, so no local discharge — the record STANDS
+  // (a cover is no proof for a hosted source), and the drive answers a transient refusal.
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    m.group(&1).unwrap().owes_live_thaw(),
+    "a hosted frozen source is not discharged by a cover — the obligation stands until the thaw"
+  );
+  assert!(m.group(&2).unwrap().is_frozen(), "nothing thawed 2 yet");
+
+  // 2 elects itself (single voter); the pass now drives its thaw off the retained record.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+    assert!(m.group(&2).unwrap().role().is_leader(), "2 leads");
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    !m.group(&2).unwrap().is_frozen(),
+    "the retained obligation drove 2's thaw"
+  );
+  assert_eq!(
+    m.group(&2).unwrap().shape_gen(),
+    2,
+    "past the abandoned generation"
+  );
+
+  // The next pass OBSERVES 2 past `expected` — a global proof — and RETIRES the record: discharged,
+  // owed by no live gate, but kept as this follower's witness trigger.
+  m.service_merge_applies(now, &mut stores);
+  let t = m.group(&1).unwrap();
+  assert!(
+    !t.owes_live_thaw(),
+    "observed past the abandoned generation — no live obligation remains"
+  );
+  assert!(
+    t.abandoned_record(&source).is_some_and(|m| m.discharged),
+    "the record is KEPT, discharged — the trigger a later leader term mints the witness from"
+  );
+  assert!(
+    !t.capture_blocked_at(t.applied_index()),
+    "nothing fences the capture"
+  );
+  assert_eq!(
+    witness_count(&stores.0.get(&1).unwrap().0),
+    0,
+    "1 is a follower: it mints no witness"
+  );
+}
+
+/// THE ESCAPE STAYS OPEN (#132): after the install covered the obligation, the holder still OWES
+/// the frozen source at its live generation, so `remove_group(2)` ADMITS through the owed-source
+/// escape — the operator's door for a source nothing can drive — and the purge lifts the holder's
+/// fence. A drop at the install closes that door: with no holder owing it, the frozen source's
+/// removal refuses `Frozen`, and the pair is stuck for good.
+#[test]
+fn the_owed_source_escape_admits_after_a_covering_install() {
+  let (mut m, mut stores) = restored_holder_and_frozen_source();
+  install_past_the_abort(&mut m, &mut stores);
+  let applied = m.group(&1).unwrap().applied_index();
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "the retained record keeps 2 an OWED source — the escape admits despite the freeze"
+  );
+  assert!(
+    !m.group(&1).unwrap().owes_live_thaw(),
+    "the purge cleared the covered record"
+  );
+  assert!(
+    !m.group(&1).unwrap().capture_blocked_at(applied),
+    "and lifted the fence"
+  );
+}
+
+/// ABSENCE IS TRANSIENT — the restore-and-recommit hazard (#132, #138). A holder's record was
+/// install-covered while its source was absent from this container; nothing here can observe or
+/// drive that source, and the cranks must leave the record STANDING. The source then comes back —
+/// restored from preserved stores, still frozen at exactly the abandoned generation — and leads.
+/// `commit_merge(1, 2)` for that generation must refuse `TargetOwesThaw`: a holder that had disposed
+/// of its record on absence alone would pass the gate and mint a fresh commit for the ABORTED
+/// generation, which every replica still holding the record no-ops at the same-merge abort belt
+/// while this one parks and absorbs — one committed target log, divergent lineage and state.
+#[test]
+fn a_restored_source_frozen_at_the_covered_generation_cannot_be_recommitted() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores
+    .0
+    .insert(1, (VecLog::default(), AsyncStable::default()));
+  m.create_group(1, 0, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    let a = m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
-    assert_eq!(a, k.next());
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m, 1, d, log, stable);
+    assert!(m.group(&1).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  // The record as a transfer left it while 2 was absent: abort at 1, install-covered.
+  let source = gid_key(2);
+  {
+    let ep = m.group_mut(&1).unwrap();
+    ep.note_abandoned(source.clone(), 1, Index::new(1));
+    ep.note_abort_covered(Index::new(1), Cover::Install);
+  }
+  for _ in 0..3 {
+    m.service_merge_applies(now, &mut stores);
+  }
+  assert!(
+    m.group(&1).unwrap().owes_live_thaw()
+      && m
+        .group(&1)
+        .unwrap()
+        .abandoned_record(&source)
+        .is_some_and(|r| !r.discharged),
+    "absence disposes of nothing: the covered record stands, live, across cranks"
+  );
+  assert_eq!(
+    witness_count(&stores.0.get(&1).unwrap().0),
+    0,
+    "and a cover is no global proof — nothing was witnessed"
+  );
+
+  // 2 comes back from preserved stores, still frozen at the abandoned generation, claiming 1.
+  {
+    let mut slog = VecLog::default();
+    let mut sstable = AsyncStable::default();
+    slog.force_append(&[crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::PrepareMerge,
+      prepare_merge_bytes(1, 1),
+    )]);
+    sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+    m.restore_group_unchecked(
+      2,
+      single_node_cfg(1),
+      now,
+      8,
+      CountSm::default(),
+      1,
+      &mut slog,
+      &mut sstable,
+    )
+    .unwrap();
+    stores.0.insert(2, (slog, sstable));
+    // It leads (single voter), so the freeze barrier is met and the commit reaches the gate.
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+  }
+  let sp = m.group(&2).unwrap();
+  assert!(
+    sp.role().is_leader() && sp.is_frozen() && sp.shape_gen() == 1,
+    "2 leads, frozen at exactly the abandoned generation"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    assert!(
+      matches!(
+        m.commit_merge(&1, now, log, stable, &2),
+        Some(Err(MergeError::TargetOwesThaw))
+      ),
+      "the retained record refuses the dead commit for the aborted generation"
+    );
+  }
+}
+
+/// THE `OwesThaw` STEP-ASIDE (#132): the teardown leg refuses a holder of a LIVE obligation, but
+/// steps aside when every live record it holds is covered and names a source not hosted here — such
+/// a record drives nothing on this host (the drive needs the source's own stores), so the removal
+/// strands no thaw. It keeps refusing for an UNCOVERED dead end (its entry is the obligation's
+/// replay source, still fencing), for a covered record whose source IS hosted here (that record
+/// drives the source and keeps its own removal admissible through the owed-source escape), and for
+/// a DISCHARGED record — a witness debt: the observation that discharged it may be knowledge no
+/// other replica can reproduce, so the record is the only future witness trigger and no step-aside
+/// applies.
+#[test]
+fn the_owes_thaw_leg_steps_aside_for_covered_dead_ends_only() {
+  let now = Instant::ORIGIN;
+  let holder = |cover: Option<Cover>| {
+    let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+    let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+    stores
+      .0
+      .insert(1, (VecLog::default(), AsyncStable::default()));
+    m.create_group(1, 0, single_node_cfg(1), now, 7, CountSm::default())
+      .unwrap();
+    {
+      let (log, stable) = stores.0.get_mut(&1).unwrap();
+      let d = m.group(&1).unwrap().poll_timeout().unwrap();
+      m.handle_timeout(&1, d, log, stable).unwrap();
+      drain_storage(&mut m, 1, d, log, stable);
+    }
+    while m.poll_message().is_some() {}
+    while m.poll_event().is_some() {}
+    let ep = m.group_mut(&1).unwrap();
+    ep.note_abandoned(gid_key(2), 1, Index::new(1));
+    if let Some(cover) = cover {
+      ep.note_abort_covered(Index::new(1), cover);
+    }
+    (m, stores)
+  };
+  // Install-covered, source unhosted: the step-aside admits.
+  let (mut m, mut stores) = holder(Some(Cover::Install));
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "an install-covered dead end drives nothing here — the holder's removal admits"
+  );
+  // Uncovered, source unhosted: refused — the entry is the obligation's replay source.
+  let (mut m, mut stores) = holder(None);
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Err(RemoveError::OwesThaw),
+    "an uncovered obligation keeps refusing"
+  );
+  // Install-covered, source HOSTED (restored frozen at the generation): refused — it drives.
+  let (mut m, mut stores) = holder(Some(Cover::Install));
+  {
+    let mut slog = VecLog::default();
+    let mut sstable = AsyncStable::default();
+    slog.force_append(&[crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::PrepareMerge,
+      prepare_merge_bytes(1, 1),
+    )]);
+    sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+    m.restore_group_unchecked(
+      2,
+      single_node_cfg(1),
+      now,
+      8,
+      CountSm::default(),
+      1,
+      &mut slog,
+      &mut sstable,
+    )
+    .unwrap();
+    stores.0.insert(2, (slog, sstable));
+  }
+  assert!(m.group(&2).unwrap().is_frozen());
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Err(RemoveError::OwesThaw),
+    "a covered record whose source is hosted here drives it — the holder keeps refusing"
+  );
+  // A DISCHARGED record is a WITNESS DEBT: the holder keeps refusing until the witness applies.
+  let (mut m, mut stores) = holder(None);
+  m.group_mut(&1).unwrap().note_discharged(&gid_key(2));
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Err(RemoveError::OwesThaw),
+    "a discharged record is the only future witness trigger — no step-aside for it"
+  );
+}
+
+/// A FOLLOWER OBSERVER KEEPS ITS WITNESS TRIGGER (#137). Target 1, a follower, observes source 2
+/// thawed past the abandoned generation — a global proof — and RETIRES its record without erasing
+/// it: discharged, owed by no live gate, no witness (a follower mints none). When 1 later leads, the
+/// kept record is exactly what it mints the `ThawDischarged` witness from, and the committed apply
+/// clears the record. A follower that cleared its record on the observation took the trigger with
+/// it: on its first term it would have found nothing to witness, and every replica that could not
+/// observe 2 itself would have kept the ghost.
+#[test]
+fn a_follower_that_observed_the_thaw_keeps_its_witness_trigger() {
+  let (mut m, mut stores) = restored_holder_and_frozen_source();
+  let now = Instant::ORIGIN;
+  let source = gid_key(2);
+  // 2 leads; the pass drives its thaw off 1's live record; 2 applies it.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert_eq!(
+    m.group(&2).unwrap().shape_gen(),
+    2,
+    "2 thawed past the generation"
+  );
+  // 1, a FOLLOWER, observes the global proof: discharged, kept, unwitnessed.
+  m.service_merge_applies(now, &mut stores);
+  let t = m.group(&1).unwrap();
+  assert!(t.role().is_follower());
+  assert!(!t.owes_live_thaw(), "no live obligation remains");
+  assert!(
+    t.abandoned_record(&source).is_some_and(|r| r.discharged),
+    "the record is kept, discharged — the witness trigger"
+  );
+  assert_eq!(
+    witness_count(&stores.0.get(&1).unwrap().0),
+    0,
+    "a follower mints nothing"
+  );
+  // 1 leads: the kept record is the trigger — the witness is minted and its apply clears it.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m, 1, d, log, stable);
+    assert!(m.group(&1).unwrap().role().is_leader());
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    assert_eq!(
+      witness_count(log),
+      1,
+      "the leader minted the witness off the record it kept as a follower"
+    );
     drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply cleared the record"
+  );
+}
+
+/// THE WITNESS DEBT AT THE TEARDOWN DOOR (#137): target 1, a follower, observed source 2 thawed and
+/// holds its record discharged — the only future `ThawDischarged` trigger while the leader cannot
+/// observe 2. `remove_group(1)` refuses `OwesThaw` with no step-aside: the observation may be
+/// knowledge no other replica can reproduce, and removing the holder would destroy the trigger
+/// while every other replica keeps its live obligation and fence forever. Once 1 leads, mints, and
+/// the witness applies, the same removal admits.
+#[test]
+fn a_discharged_holders_removal_refuses_until_the_witness_applies() {
+  let (mut m, mut stores) = restored_holder_and_frozen_source();
+  let now = Instant::ORIGIN;
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  let t = m.group(&1).unwrap();
+  assert!(
+    t.role().is_follower() && !t.owes_live_thaw() && t.holds_witness_debt(),
+    "a follower observer: no live obligation, one witness debt"
+  );
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Err(RemoveError::OwesThaw),
+    "the witness debt refuses the holder's removal — its record is the only future trigger"
+  );
+  // 1 leads, mints, and the committed witness retires the debt; the removal admits.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m, 1, d, log, stable);
   }
   m.service_merge_applies(now, &mut stores);
   {
@@ -7765,20 +8380,597 @@ fn teardown_admits_an_owed_frozen_source_and_purges_the_obligation() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    m.group(&2).unwrap().is_frozen(),
-    "1 is still a frozen source"
+    !m.group(&1).unwrap().holds_witness_debt(),
+    "the committed witness apply retired the debt"
   );
-  assert!(m.group(&1).unwrap().has_abandoned(), "2 owes 1 the thaw");
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "with the witness applied, the same removal admits"
+  );
+}
 
-  // THE ESCAPE: removing the OWED source ADMITS even though it is frozen (leg 2 suppressed).
+/// A POISONED HOLDER'S DEBT FENCES ITS REMOVAL (#138, residual 13): it cannot mint and a peer's
+/// witness cannot apply on it, but admitting the removal would delete, with the storage the drivers
+/// tear down, a proof no other replica may hold — the healthy unobserving peers would keep live
+/// records and raised fences with no witness producer. Refusing wedges only a replica that serves
+/// nothing. THE PURGE EXIT still works on it: once the named source is co-hosted and live past the
+/// generation, removing the source admits, and its purge reaches every hosted endpoint — the
+/// poisoned holder included — so the debt clears and the holder's own removal then admits.
+#[test]
+fn a_poisoned_holders_witness_debt_fences_its_removal() {
+  let (mut m, mut stores, source_key) = target_only_owing(1);
+  let now = Instant::ORIGIN;
+  m.group_mut(&2).unwrap().note_discharged(&source_key);
+  m.group_mut(&2)
+    .unwrap()
+    .poison(PoisonReason::ReservedShapeGen);
   assert!(
-    m.remove_group(&2, &mut stores).unwrap().is_some(),
-    "an owed frozen source is the designed catalog escape — the removal admits"
+    m.group(&2).unwrap().is_poisoned() && m.group(&2).unwrap().holds_witness_debt(),
+    "poisoned, holding a debt it can never pay itself"
   );
-  // The removal purge discharged the obligation the departed source can no longer thaw.
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Err(RemoveError::OwesThaw),
+    "the debt fences a poisoned holder's removal too — the proof would go with the storage"
+  );
+  // THE EXIT: the named source comes to be hosted here, live past the generation (founded at 2).
+  stores
+    .0
+    .insert(1, (VecLog::default(), AsyncStable::default()));
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.create_group_founded_at(
+      1,
+      2,
+      single_node_cfg(1),
+      now,
+      9,
+      CountSm::default(),
+      1,
+      &*log,
+      stable,
+    )
+    .unwrap();
+  }
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "a source live past the generation is removable — nothing gates it"
+  );
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
-    "the R2 purge cleared 2's obligation for the departed incarnation"
+    !m.group(&2).unwrap().holds_witness_debt()
+      && m.group(&2).unwrap().abandoned_obligations().is_empty(),
+    "the purge reached the poisoned holder and cleared its debt"
+  );
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "with the debt purged, the poisoned holder's removal admits"
+  );
+}
+
+/// THE WITNESS DEBT AT THE MERGE-SOURCE DOOR (#137): a discharged holder cannot dissolve as a
+/// fresh merge's SOURCE — `prepare_merge` refuses `SourceOwesThaw`: a frozen holder cannot propose
+/// the witness (proposes are refused while frozen), and the absorb's dissolve would drop the
+/// record, the only future trigger. Once the witness applies, the same freeze admits.
+#[test]
+fn a_discharged_holder_cannot_freeze_as_a_source_until_the_witness_applies() {
+  let (mut m, mut stores) = restored_holder_and_frozen_source();
+  let now = Instant::ORIGIN;
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    m.group(&1).unwrap().holds_witness_debt(),
+    "a follower observer: one witness debt"
+  );
+  // 1 leads (a freeze proposes on the source leader) but has not cranked: the debt stands. The
+  // fresh merge's target is group 0 — a merge points down the id order.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m, 1, d, log, stable);
+    assert!(m.group(&1).unwrap().role().is_leader());
+  }
+  stores
+    .0
+    .insert(0, (VecLog::default(), AsyncStable::default()));
+  m.create_group(0, 0, single_node_cfg(1), now, 9, CountSm::default())
+    .unwrap();
+  {
+    let (log, stable) = stores.0.get_mut(&0).unwrap();
+    let d = m.group(&0).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&0, d, log, stable).unwrap();
+    drain_storage(&mut m, 0, d, log, stable);
+  }
+  let verdict = m.prepare_merge(&1, now, &mut stores, &0);
+  assert!(
+    matches!(verdict, Some(Err(MergeError::SourceOwesThaw))),
+    "the witness debt refuses 1 as a merge source — frozen, it could never mint: {verdict:?}"
+  );
+  // The crank mints; the committed witness retires the debt; the same freeze admits.
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(!m.group(&1).unwrap().holds_witness_debt());
+  let verdict = m.prepare_merge(&1, now, &mut stores, &0);
+  assert!(
+    matches!(verdict, Some(Ok(_))),
+    "with the witness applied, the same freeze admits: {verdict:?}"
+  );
+}
+
+/// THE PURGE EXIT FOR A WITNESS DEBT (#137): source 2 is hosted here and live past the abandoned
+/// generation, so `remove_group(2)` admits, and its purge clears every holder's record for 2 —
+/// the discharged one included. The holder's own removal then admits.
+#[test]
+fn a_discharged_record_retires_when_its_source_leaves_the_host() {
+  let (mut m, mut stores) = restored_holder_and_frozen_source();
+  let now = Instant::ORIGIN;
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    m.group(&1).unwrap().holds_witness_debt(),
+    "one witness debt"
+  );
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Err(RemoveError::OwesThaw),
+    "refused while the debt stands"
+  );
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "the thawed source is removable — it is live past the generation, nothing gates it"
+  );
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the purge cleared the discharged record with the departing source"
+  );
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "and the holder's removal admits"
+  );
+}
+
+/// A store seam that WITHHOLDS the stores of chosen groups — `stores()` answers `None` for them
+/// while floors and lineages stay readable — the crank on which the service cannot reach a
+/// holder's stores. Resolution and records delegate to an inner [`LineageStores`].
+struct WithheldStores {
+  inner: LineageStores,
+  withheld: std::collections::BTreeSet<u64>,
+}
+
+impl crate::GroupStores<u64, VecLog, AsyncStable> for WithheldStores {
+  fn stores(&mut self, group: &u64) -> Option<(&mut VecLog, &mut AsyncStable)> {
+    if self.withheld.contains(group) {
+      return None;
+    }
+    crate::GroupStores::stores(&mut self.inner, group)
+  }
+}
+
+impl crate::FloorStore<u64> for WithheldStores {
+  fn floor(&self, gid: &u64) -> u64 {
+    self.inner.floor(gid)
+  }
+
+  fn lineage(&self, gid: &u64) -> u64 {
+    self.inner.lineage(gid)
+  }
+}
+
+/// THE LEADER'S WITNESS DEBT (#137): a covered-dead-end holder — target 2 leads, source 1 is
+/// unhosted, the record install-covered — observes a GLOBAL proof (the persisted lineage mirror
+/// past the generation; the terminal floor alike) and marks the record DISCHARGED before it
+/// appends the witness. So while the witness is appended but not yet committed the record reads as
+/// a WITNESS DEBT and `remove_group(2)` refuses `OwesThaw`. A record left LIVE there reads as a
+/// removable covered dead end instead, and if this host held the sole reproducible proof, removing
+/// it would leave every other replica with a live record, a fence, and no future trigger. Once the
+/// witness applies, the removal admits.
+#[test]
+fn a_leading_holders_observation_is_a_witness_debt_until_its_witness_applies() {
+  let now = Instant::ORIGIN;
+  // The persisted lineage mirror as the proof.
+  let (mut m, inner, _) = target_only_owing(1);
+  m.group_mut(&2)
+    .unwrap()
+    .note_abort_covered(Index::new(1), Cover::Install);
+  let mut stores = LineageStores {
+    inner,
+    floors: std::collections::BTreeMap::new(),
+    lineages: std::collections::BTreeMap::from([(1u64, 2u64)]),
+  };
+  m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    witness_count(&stores.inner.0.get(&2).unwrap().0),
+    1,
+    "the leader appended the witness"
+  );
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Err(RemoveError::OwesThaw),
+    "the appended-but-uncommitted witness is a debt — no step-aside for it"
+  );
+  let t = m.group(&2).unwrap();
+  assert!(
+    !t.owes_live_thaw() && t.holds_witness_debt(),
+    "the leader marked the debt BEFORE appending the witness"
+  );
+  {
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply retired the debt"
+  );
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "and the removal admits"
+  );
+  // The terminal floor as the proof: the same debt.
+  let (mut m, mut stores, _) = target_only_owing(1);
+  m.group_mut(&2)
+    .unwrap()
+    .note_abort_covered(Index::new(1), Cover::Install);
+  stores.1.insert(1);
+  m.service_merge_applies(now, &mut stores);
+  assert_eq!(witness_count(&stores.0.get(&2).unwrap().0), 1);
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Err(RemoveError::OwesThaw),
+    "the terminal-floor proof is a debt until its witness applies"
+  );
+}
+
+/// THE LEADER'S WITNESS DEBT WITH ITS STORES WITHHELD (#137): the same holder observes the proof on
+/// a crank where the service cannot reach its stores — nothing can be appended — and the record is
+/// marked DISCHARGED all the same: a debt, the removal refused, with nothing in the log. The next
+/// crank with the stores back appends the witness exactly once, off the latched arm, and its apply
+/// retires the debt.
+#[test]
+fn a_leading_holder_without_stores_still_takes_the_witness_debt() {
+  let now = Instant::ORIGIN;
+  let (mut m, inner, _) = target_only_owing(1);
+  m.group_mut(&2)
+    .unwrap()
+    .note_abort_covered(Index::new(1), Cover::Install);
+  let mut stores = WithheldStores {
+    inner: LineageStores {
+      inner,
+      floors: std::collections::BTreeMap::new(),
+      lineages: std::collections::BTreeMap::from([(1u64, 2u64)]),
+    },
+    withheld: std::collections::BTreeSet::from([2u64]),
+  };
+  m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    witness_count(&stores.inner.inner.0.get(&2).unwrap().0),
+    0,
+    "nothing could be appended without the stores"
+  );
+  let t = m.group(&2).unwrap();
+  assert!(
+    !t.owes_live_thaw() && t.holds_witness_debt(),
+    "yet the observation is recorded as a debt"
+  );
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Err(RemoveError::OwesThaw),
+    "the unappended witness is a debt — the removal refuses"
+  );
+  // The stores return: exactly one witness is appended, off the latched arm.
+  stores.withheld.clear();
+  m.service_merge_applies(now, &mut stores);
+  m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    witness_count(&stores.inner.inner.0.get(&2).unwrap().0),
+    1,
+    "the next crank with stores appended the witness, once"
+  );
+  {
+    let (log, stable) = stores.inner.inner.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply retired the debt"
+  );
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "and the removal admits"
+  );
+}
+
+/// A DISCHARGED FOLLOWER KEEPS FENCING ITS ENTRY UNTIL THE WITNESS APPLIES (#137). Target 1, a
+/// follower, observes source 2 thawed and retires its record as discharged — and the record still
+/// FENCES the abort entry it re-derives from: while a non-observer leads, this record is the only
+/// future witness trigger, and a threshold capture past the entry followed by a crash would lose
+/// it for good, leaving every replica that never observed 2 holding its live obligation forever.
+/// So the capture at `applied` is refused; the witness applies; the fence lifts and the capture
+/// proceeds.
+#[test]
+fn a_discharged_follower_keeps_fencing_its_entry_until_the_witness_applies() {
+  let (mut m, mut stores) =
+    restored_pair_with_holder_cfg(single_node_cfg(1).with_snapshot_threshold(1));
+  let now = Instant::ORIGIN;
+  let source = gid_key(2);
+  // 2 leads and thaws off 1's record; 1 (a follower) observes and retires the record, discharged.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  let t = m.group(&1).unwrap();
+  assert!(
+    t.role().is_follower() && t.abandoned_record(&source).is_some_and(|r| r.discharged),
+    "a follower observer: discharged, kept"
+  );
+  assert!(
+    t.abort_relay_fences(t.applied_index()),
+    "and still fencing its abort entry — the only future witness trigger"
+  );
+  // The leader replicates a command above the abort: applied(2) - first_index(1) reaches the
+  // threshold, and the capture is REFUSED by the discharged record's fence.
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        Term::new(1),
+        9u64,
+        Index::new(1),
+        Term::new(1),
+        std::vec![crate::Entry::new(
+          Term::new(1),
+          Index::new(2),
+          crate::EntryKind::Normal,
+          cmd.clone(),
+        )],
+        Index::new(2),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+    drain_storage(&mut m, 1, now, log, stable);
+    assert_eq!(m.group(&1).unwrap().applied_index(), Index::new(2));
+    assert!(
+      stable.snapshot().is_none(),
+      "the threshold capture is refused: compacting the entry would risk the trigger"
+    );
+  }
+  // The witness arrives by replication; its apply clears the record, and the capture proceeds.
+  let witness = {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(source.clone(), 1),
+      &mut buf,
+    );
+    Bytes::from(buf)
+  };
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        Term::new(1),
+        9u64,
+        Index::new(2),
+        Term::new(1),
+        std::vec![crate::Entry::new(
+          Term::new(1),
+          Index::new(3),
+          crate::EntryKind::ThawDischarged,
+          witness,
+        )],
+        Index::new(3),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+    drain_storage(&mut m, 1, now, log, stable);
+    assert!(
+      m.group(&1).unwrap().abandoned_obligations().is_empty(),
+      "the committed witness apply cleared the record"
+    );
+    assert_eq!(
+      stable.snapshot().map(|(meta, _)| meta.last_index()),
+      Some(Index::new(3)),
+      "the fence lifted with the record — the capture landed"
+    );
+  }
+}
+
+/// THE CRASH VARIANT (#137): a follower observer retires its record as discharged, then restarts
+/// before any witness exists. Its abort entry is still in the log — the fence kept it there — so
+/// the restart re-derives an UNDISCHARGED record; the restarted holder observes the thawed source
+/// again, retires it again, and when it leads it mints the witness that clears every replica's
+/// record. Had the entry been compacted, the restart would derive nothing and this holder could
+/// never mint.
+#[test]
+fn a_restarted_discharged_follower_re_derives_its_record_and_mints_when_leading() {
+  let (mut m, mut stores) = restored_holder_and_frozen_source();
+  let now = Instant::ORIGIN;
+  let source = gid_key(2);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    m.group(&1)
+      .unwrap()
+      .abandoned_record(&source)
+      .is_some_and(|r| r.discharged),
+    "the follower observed and retired the record, discharged"
+  );
+  // THE RESTART: both groups come back from their preserved stores.
+  drop(m);
+  let mut m2: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m2.restore_group_unchecked(
+      1,
+      single_node_cfg(1),
+      now,
+      7,
+      CountSm::default(),
+      2,
+      log,
+      stable,
+    )
+    .unwrap();
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m2.restore_group_unchecked(
+      2,
+      single_node_cfg(1),
+      now,
+      8,
+      CountSm::default(),
+      2,
+      log,
+      stable,
+    )
+    .unwrap();
+  }
+  let t = m2.group(&1).unwrap();
+  assert!(
+    t.owes_live_thaw() && t.abandoned_record(&source).is_some_and(|r| !r.discharged),
+    "the kept entry re-derived an UNDISCHARGED record — the volatile mark is gone, the trigger is not"
+  );
+  assert_eq!(
+    m2.group(&2).unwrap().shape_gen(),
+    2,
+    "2 restarted thawed, past the generation"
+  );
+  // It observes again (a follower: discharged again), then leads and mints.
+  m2.service_merge_applies(now, &mut stores);
+  assert!(
+    m2.group(&1)
+      .unwrap()
+      .abandoned_record(&source)
+      .is_some_and(|r| r.discharged),
+    "re-observed: discharged again, still held"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let d = m2.group(&1).unwrap().poll_timeout().unwrap();
+    m2.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m2, 1, d, log, stable);
+    assert!(m2.group(&1).unwrap().role().is_leader());
+  }
+  m2.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    assert_eq!(
+      witness_count(log),
+      1,
+      "leading, it minted the witness off the re-derived record"
+    );
+    drain_storage(&mut m2, 1, now, log, stable);
+  }
+  assert!(
+    m2.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply cleared the record"
+  );
+}
+
+/// A POISONED HUSK KEEPS ITS HOLDER'S RECORD AND THE ESCAPE OPEN (#138, residual 7): source 2 is
+/// hosted, frozen at the abandoned generation, at the terminal `MERGED_FLOOR` — and poisoned. The
+/// husk dissolve skips a poisoned husk and the drive answers `Poisoned`, so retiring the record off
+/// the terminal floor would leave a poisoned frozen source nobody owes: unremovable, with no
+/// escape. Fenced off poison, the terminal floor retires nothing here, the record stays live, and
+/// `remove_group(2)` admits through the owed-source escape, whose purge clears the record.
+#[test]
+fn a_poisoned_husk_keeps_its_holders_record_and_the_escape_open() {
+  let (mut m, mut stores) = leading_holder_with(admit_frozen_source);
+  let now = Instant::ORIGIN;
+  m.group_mut(&2)
+    .unwrap()
+    .poison(PoisonReason::ReservedShapeGen);
+  stores.1.insert(2);
+  for _ in 0..2 {
+    m.service_merge_applies(now, &mut stores);
+  }
+  assert!(m.contains_group(&2), "the dissolve skips a poisoned husk");
+  assert!(
+    m.group(&1).unwrap().owes_live_thaw()
+      && m
+        .group(&1)
+        .unwrap()
+        .abandoned_record(&gid_key(2))
+        .is_some_and(|r| !r.discharged),
+    "the terminal floor is no proof off a poisoned source — the record stays live"
+  );
+  assert_eq!(
+    witness_count(&stores.0.get(&1).unwrap().0),
+    0,
+    "and nothing is witnessed off it"
+  );
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "the live record keeps 2 an OWED source — its removal admits despite the freeze"
+  );
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the escape's purge cleared the record"
   );
 }
 
@@ -7811,7 +9003,7 @@ fn a_stale_obligation_does_not_bypass_the_frozen_gate() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
+    m.group(&2).unwrap().owes_live_thaw(),
     "2 owes 1 the gen-1 thaw"
   );
 
@@ -7829,7 +9021,7 @@ fn a_stale_obligation_does_not_bypass_the_frozen_gate() {
     "1 advanced past the spent freeze generation"
   );
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
+    m.group(&2).unwrap().owes_live_thaw(),
     "the discharge pass has NOT run — 2 still carries the spent gen-1 obligation"
   );
 
@@ -7863,7 +9055,7 @@ fn a_stale_obligation_does_not_bypass_the_frozen_gate() {
   );
   // And 2's spent obligation is untouched — the gate is a pure read, fabricating and clearing nothing.
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
+    m.group(&2).unwrap().owes_live_thaw(),
     "the refusal left 2's lingering obligation exactly as it was"
   );
 }
@@ -7923,7 +9115,7 @@ fn conf_change_on_a_claimed_merge_target_is_refused() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "2's obligation discharged"
   );
   // With the claim gone and no obligation, the same conf change now ADMITS.
@@ -7943,6 +9135,51 @@ fn conf_change_on_a_claimed_merge_target_is_refused() {
       "the released target admits the voter change"
     );
   }
+}
+
+/// The claimed-target fence's exemption holds for a COVERED obligation (#132). Target 1 aborted 2's
+/// merge and its install then crossed the abort entry; the record is kept (covered) while 2 is
+/// still frozen here with its claim on 1 — so a voter change on 1 is exactly as safe as before the
+/// install: 2 thaws off the retained obligation, not off 1's voters. A record dropped at the
+/// install re-fences the change (the claim reads unresolved again) with nothing left on 1 to
+/// resolve it.
+#[test]
+fn a_covered_obligation_keeps_the_claimed_target_conf_change_exempt() {
+  let (mut m, mut stores) = restored_holder_and_frozen_source();
+  let now = Instant::ORIGIN;
+  install_past_the_abort(&mut m, &mut stores);
+  // 1 elects itself (single voter) so it can propose; 2 still claims it, frozen.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m, 1, d, log, stable);
+    assert!(m.group(&1).unwrap().role().is_leader());
+  }
+  assert!(m.group(&2).unwrap().is_frozen(), "2 still claims 1");
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    assert!(
+      matches!(
+        m.propose_conf_change_v2(
+          &1,
+          now,
+          log,
+          stable,
+          crate::ConfChange::new(crate::ConfChangeType::AddNode, 9u64, Bytes::new()).into_v2(),
+        ),
+        Some(Ok(_))
+      ),
+      "the retained obligation exempts the claim: 2 thaws off it, not off 1's voters"
+    );
+  }
+  assert!(
+    m.group(&1)
+      .unwrap()
+      .abandoned_record(&gid_key(2))
+      .is_some_and(|r| r.is_covered() && !r.discharged),
+    "the exemption rode the covered, live record, which the election and the change left standing"
+  );
 }
 
 /// Leg 4 in isolation: a source is refused `SpokenFor` PURELY because another hosted endpoint's park
@@ -8047,7 +9284,7 @@ fn teardown_refuses_a_claimed_target_before_the_park() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the observed thaw discharged 2's obligation"
   );
   // SELF-CLEARING PIN: with the claiming merge rolled back, the SAME removal now admits.
@@ -8158,7 +9395,7 @@ fn a_claimed_merge_target_cannot_freeze_as_a_source() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    !m.group(&2).unwrap().has_abandoned(),
+    !m.group(&2).unwrap().owes_live_thaw(),
     "the observed thaw discharged 2's obligation"
   );
 
@@ -8319,14 +9556,14 @@ fn a_late_obligation_holds_the_absorb_until_the_thaw_discharges() {
   }
   assert!(m.group(&3).unwrap().is_frozen());
   // 2 aborts the 1 -> 2 merge but the abort is NOT drained — appended+committed below where 2's own
-  // freeze will land. `has_abandoned` reads APPLIED state, so it is still false here: the prepare
+  // freeze will land. `owes_live_thaw` reads APPLIED state, so it is still false here: the prepare
   // gate below cannot see the obligation.
   {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
     m.rollback_merge(&2, now, log, stable, &3).unwrap().unwrap();
   }
   assert!(
-    !m.group(&2).unwrap().has_abandoned(),
+    !m.group(&2).unwrap().owes_live_thaw(),
     "the abort has not applied — no obligation yet"
   );
   // The freeze DOOR now refuses this colocated shape outright: 1's applied claim on 2 is locally
@@ -8358,7 +9595,7 @@ fn a_late_obligation_holds_the_absorb_until_the_thaw_discharges() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
+    m.group(&2).unwrap().owes_live_thaw(),
     "the abort applied — 2 now owes 1 a thaw"
   );
   assert!(m.group(&2).unwrap().is_frozen(), "and 2 is frozen for 3");
@@ -8402,7 +9639,7 @@ fn a_late_obligation_holds_the_absorb_until_the_thaw_discharges() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    !m.group(&2).unwrap().has_abandoned(),
+    !m.group(&2).unwrap().owes_live_thaw(),
     "2's obligation discharged on the observed advance"
   );
   let done = m.service_merge_applies(now, &mut stores);
@@ -8662,7 +9899,7 @@ fn the_belt_holds_a_husk_owing_a_locally_drivable_thaw() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    m.group(&1).unwrap().has_abandoned() && m.group(&1).unwrap().is_frozen(),
+    m.group(&1).unwrap().owes_live_thaw() && m.group(&1).unwrap().is_frozen(),
     "2 owes 1 a drivable thaw AND is frozen for 3"
   );
   // The catalog (adversarially) floors 2 terminally; the belt must hold the dissolve while 2 owes a
@@ -8680,7 +9917,7 @@ fn the_belt_holds_a_husk_owing_a_locally_drivable_thaw() {
     "2 is untouched while its drivable obligation stands"
   );
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "the obligation is intact — the dissolve did not drop it"
   );
 }
@@ -8692,7 +9929,7 @@ fn the_belt_holds_a_husk_owing_a_locally_drivable_thaw() {
 fn a_source_without_an_obligation_absorbs_at_once() {
   let (mut m, mut stores) = merge_host_triple(2, 4, 3);
   let now = Instant::ORIGIN;
-  assert!(!m.group(&3).unwrap().has_abandoned(), "2 owes nothing");
+  assert!(!m.group(&3).unwrap().owes_live_thaw(), "2 owes nothing");
   {
     m.prepare_merge(&3, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&3).unwrap();
@@ -8751,7 +9988,7 @@ fn a_corrupt_owed_id_holds_the_park_and_poisons_the_source() {
   }
   assert!(m.group(&3).unwrap().is_frozen(), "2 is frozen for 3");
   assert!(
-    m.group(&3).unwrap().has_abandoned(),
+    m.group(&3).unwrap().owes_live_thaw(),
     "2 carries the corrupt obligation"
   );
   // 3 commits the absorb of 2 and parks; seal 3's window.
@@ -8811,7 +10048,7 @@ fn a_decodable_unhosted_owed_id_lets_the_absorb_proceed() {
     drain_storage(&mut m, 3, now, log, stable);
   }
   assert!(
-    m.group(&3).unwrap().has_abandoned(),
+    m.group(&3).unwrap().owes_live_thaw(),
     "2 owes a dead-end thaw"
   );
   {
@@ -8843,6 +10080,324 @@ fn a_decodable_unhosted_owed_id_lets_the_absorb_proceed() {
   );
 }
 
+/// Group 3 (a former target) commits a TARGET-role abort for unhosted source 999, freezes into
+/// group 2, and 2 parks its commit — the frozen holder shape of the drivability belt — with 3's
+/// record then DISCHARGED (the proof observed after the freeze). Returns the container and seam
+/// after the park's seal crank, one crank short of the absorb.
+fn frozen_holder_with_a_witness_debt() -> (MultiRaft<u64, u64, CountSm>, MapStores, Bytes) {
+  let (mut m, mut stores) = merge_host_triple(2, 4, 3);
+  let now = Instant::ORIGIN;
+  let unhosted = gid_key(999);
+  {
+    let (log, _stable) = stores.0.get_mut(&3).unwrap();
+    let abort = crate::RollbackMergePayload::abort(unhosted.clone(), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
+    m.group_mut(&3)
+      .unwrap()
+      .propose_merge_entry(now, log, crate::EntryKind::RollbackMerge, Bytes::from(buf))
+      .unwrap();
+  }
+  {
+    m.prepare_merge(&3, now, &mut stores, &2).unwrap().unwrap();
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  assert!(m.group(&3).unwrap().is_frozen() && m.group(&3).unwrap().owes_live_thaw());
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().pending_merge().is_some(), "parked");
+  // The proof, observed after the freeze: the record retires as a witness debt.
+  m.group_mut(&3).unwrap().note_discharged(&unhosted);
+  assert!(m.group(&3).unwrap().holds_witness_debt());
+  (m, stores, unhosted)
+}
+
+/// THE WITNESS DEBT HOLDS THE ABSORB — THE LEADING HOLDER (#137): frozen holder 3 leads, so the
+/// seal crank appends its witness, but the witness is not yet applied when the resolving crank
+/// reaches 2's park. The Resolve arm HOLDS: absorbing would destroy the only future trigger while
+/// the witness is in flight. Once the witness applies, the absorb proceeds.
+#[test]
+fn the_absorb_holds_on_a_witness_debt_until_the_appended_witness_applies() {
+  let (mut m, mut stores, _) = frozen_holder_with_a_witness_debt();
+  let now = Instant::ORIGIN;
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    witness_count(&stores.0.get(&3).unwrap().0),
+    1,
+    "the leading holder appended its witness on the seal crank"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.service_merge_applies(now, &mut stores).is_empty(),
+    "the absorb HOLDS on the witness debt — the witness is appended but not applied"
+  );
+  assert!(
+    m.contains_group(&3) && m.group(&2).unwrap().pending_merge().is_some(),
+    "the holder stands and the park waits"
+  );
+  // The witness applies on the holder's own drain; the debt retires; the absorb proceeds.
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  assert!(
+    !m.group(&3).unwrap().holds_witness_debt(),
+    "the committed witness apply retired the debt"
+  );
+  assert_eq!(
+    m.service_merge_applies(now, &mut stores),
+    std::vec![MergeResolution::Merged {
+      source: 3,
+      target: 2
+    }],
+    "with the debt retired, the absorb proceeds"
+  );
+  assert!(!m.contains_group(&3));
+}
+
+/// THE WITNESS DEBT HOLDS THE ABSORB — THE FOLLOWER HOLDER (#137): frozen holder 3 has stepped
+/// down, so no witness exists anywhere; the Resolve arm HOLDS all the same. A peer's witness,
+/// delivered by replication, retires the debt, and the absorb proceeds.
+#[test]
+fn the_absorb_holds_on_a_witness_debt_until_a_peers_witness_applies() {
+  let (mut m, mut stores, unhosted) = frozen_holder_with_a_witness_debt();
+  let now = Instant::ORIGIN;
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    step_down(&mut m, 3, log, stable);
+  }
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert_eq!(
+    witness_count(&stores.0.get(&3).unwrap().0),
+    0,
+    "a follower holder minted nothing"
+  );
+  assert!(
+    m.service_merge_applies(now, &mut stores).is_empty(),
+    "the absorb HOLDS on the witness debt — no witness exists yet"
+  );
+  assert!(m.contains_group(&3) && m.group(&2).unwrap().pending_merge().is_some());
+  // A peer's witness arrives by replication from the leader the holder now follows.
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    let last = log.last_index();
+    let last_term = log.term(last).unwrap();
+    let term = m.group(&3).unwrap().term();
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(&ThawDischargedPayload::new(unhosted, 1), &mut buf);
+    m.handle_message(
+      &3,
+      now,
+      log,
+      stable,
+      2u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        term,
+        2u64,
+        last,
+        last_term,
+        std::vec![crate::Entry::new(
+          term,
+          last.next(),
+          crate::EntryKind::ThawDischarged,
+          Bytes::from(buf),
+        )],
+        last.next(),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  assert!(
+    !m.group(&3).unwrap().holds_witness_debt(),
+    "the peer's witness retired the debt"
+  );
+  assert_eq!(
+    m.service_merge_applies(now, &mut stores),
+    std::vec![MergeResolution::Merged {
+      source: 3,
+      target: 2
+    }],
+    "with the debt retired, the absorb proceeds"
+  );
+}
+
+/// THE WITNESS DEBT HOLDS THE HUSK DISSOLVE (#137): source 2 is a hosted frozen husk at the
+/// terminal floor (absorbed away elsewhere), a follower, carrying a discharged record for an
+/// unhosted source. The dissolve would destroy the only future trigger, so it HOLDS until a peer's
+/// witness applies; then it retires the husk.
+#[test]
+fn the_husk_dissolve_holds_on_a_witness_debt_until_a_peers_witness_applies() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores
+    .0
+    .insert(1, (VecLog::default(), AsyncStable::default()));
+  m.create_group(1, 0, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  admit_frozen_source(&mut m, &mut stores);
+  let unhosted = gid_key(999);
+  {
+    let ep = m.group_mut(&2).unwrap();
+    ep.note_abandoned(unhosted.clone(), 1, Index::new(1));
+    ep.note_discharged(&unhosted);
+  }
+  stores.1.insert(2);
+  for _ in 0..2 {
+    assert!(
+      !m.service_merge_applies(now, &mut stores)
+        .contains(&MergeResolution::Retired { source: 2 }),
+      "the dissolve HOLDS on the witness debt"
+    );
+  }
+  assert!(
+    m.contains_group(&2) && m.group(&2).unwrap().is_frozen(),
+    "the husk stands"
+  );
+  // A peer's witness arrives by replication; its apply retires the debt; the dissolve proceeds.
+  {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(&ThawDischargedPayload::new(unhosted, 1), &mut buf);
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.handle_message(
+      &2,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        Term::new(1),
+        9u64,
+        Index::new(1),
+        Term::new(1),
+        std::vec![crate::Entry::new(
+          Term::new(1),
+          Index::new(2),
+          crate::EntryKind::ThawDischarged,
+          Bytes::from(buf),
+        )],
+        Index::new(2),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    !m.group(&2).unwrap().holds_witness_debt(),
+    "the peer's witness retired the debt"
+  );
+  assert!(
+    m.service_merge_applies(now, &mut stores)
+      .contains(&MergeResolution::Retired { source: 2 }),
+    "with the debt retired, the husk dissolves"
+  );
+  assert!(!m.contains_group(&2));
+}
+
+/// THE PURGE EXIT FOR A FROZEN HOLDER'S DEBT (#137): frozen holder 3 (a follower) observed source
+/// 4 — hosted here, live past the abandoned generation — and holds the debt with no witness. Its
+/// absorb HOLDS; removing 4 admits (nothing gates a thawed, unowed source), the purge clears 3's
+/// record with it, and the absorb proceeds on the next crank.
+#[test]
+fn a_frozen_holders_debt_retires_through_the_purge_and_the_absorb_proceeds() {
+  let (mut m, mut stores) = merge_host_triple(2, 4, 3);
+  let now = Instant::ORIGIN;
+  // Source 4, hosted and live past the generation 3's abort abandoned (founded at 2).
+  stores
+    .0
+    .insert(4, (VecLog::default(), AsyncStable::default()));
+  {
+    let (log, stable) = stores.0.get_mut(&4).unwrap();
+    m.create_group_founded_at(
+      4,
+      2,
+      single_node_cfg(1),
+      now,
+      9,
+      CountSm::default(),
+      1,
+      &*log,
+      stable,
+    )
+    .unwrap();
+  }
+  assert_eq!(
+    m.group(&4).unwrap().shape_gen(),
+    2,
+    "live past the generation"
+  );
+  {
+    let (log, _stable) = stores.0.get_mut(&3).unwrap();
+    let abort = crate::RollbackMergePayload::abort(gid_key(4), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
+    m.group_mut(&3)
+      .unwrap()
+      .propose_merge_entry(now, log, crate::EntryKind::RollbackMerge, Bytes::from(buf))
+      .unwrap();
+  }
+  {
+    m.prepare_merge(&3, now, &mut stores, &2).unwrap().unwrap();
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().pending_merge().is_some(), "parked");
+  // The holder steps down (the barrier was certified on its leader's tracker at the commit), so
+  // it will mint nothing. The seal crank: 3 observes 4 past the generation — discharged, unwitnessed.
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    step_down(&mut m, 3, log, stable);
+  }
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert!(
+    m.group(&3).unwrap().holds_witness_debt() && witness_count(&stores.0.get(&3).unwrap().0) == 0,
+    "the follower holder retired the record as a debt, unwitnessed"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.service_merge_applies(now, &mut stores).is_empty(),
+    "the absorb HOLDS on the debt"
+  );
+  // THE EXIT: the thawed source is removable, and its purge clears the debt with it.
+  assert_eq!(
+    m.remove_group(&4, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "a source live past the generation is removable — nothing gates it"
+  );
+  assert!(
+    m.group(&3).unwrap().abandoned_obligations().is_empty(),
+    "the purge cleared the debt"
+  );
+  assert_eq!(
+    m.service_merge_applies(now, &mut stores),
+    std::vec![MergeResolution::Merged {
+      source: 3,
+      target: 2
+    }],
+    "with the debt purged, the absorb proceeds"
+  );
+}
+
 /// SAFETY, structural: a source thaw is REFUSED with NO append unless the claimed
 /// target hosts a matching committed abort obligation. A frozen source claimed by target 2 — but with
 /// NO abort ever applied on 2 — must not thaw: appending it would move the source's counter out from
@@ -8863,7 +10418,7 @@ fn thaw_without_a_committed_target_abort_is_refused() {
   }
   assert!(m.group(&2).unwrap().is_frozen() && m.group(&2).unwrap().shape_gen() == 1);
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "target 2 holds no abort obligation — nothing authorizes a thaw"
   );
   let last_before = stores.0.get(&2).unwrap().0.last_index();
@@ -8932,7 +10487,7 @@ fn removed_source_obligation_cannot_back_a_recreates_thaw() {
       .unwrap()
       .abandoned_obligations()
       .first()
-      .map(|(_, g, _)| *g),
+      .map(|(_, m)| m.generation),
     Some(1),
     "target 2 owes source 1 a thaw for freeze gen 1"
   );
@@ -8942,7 +10497,7 @@ fn removed_source_obligation_cannot_back_a_recreates_thaw() {
   assert!(m.remove_group(&2, &mut stores).unwrap().is_some());
   stores.0.remove(&2);
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the removal purged the target's obligation for the departed source"
   );
 
@@ -9027,7 +10582,9 @@ fn a_floored_sources_rederived_obligation_discharges() {
     m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
-  let abort_index = m.group(&1).unwrap().abandoned_obligations()[0].2;
+  let abort_index = m.group(&1).unwrap().abandoned_obligations()[0]
+    .1
+    .abort_index;
 
   // Tear the source down (non-terminal) and drop its store. The removal purges the obligation (the
   // race-free leg), so re-INSERT it to model the restart replay that re-derives it from the surviving
@@ -9040,7 +10597,7 @@ fn a_floored_sources_rederived_obligation_discharges() {
     .unwrap()
     .note_abandoned(Bytes::from(key), 1, abort_index);
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "the obligation is re-derived, as a restart replay would"
   );
 
@@ -9054,7 +10611,7 @@ fn a_floored_sources_rederived_obligation_discharges() {
   };
   m.service_merge_applies(now, &mut stores);
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the persisted floor past the freeze gen discharged the re-derived obligation"
   );
 }
@@ -9097,7 +10654,9 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
     m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
-  let abort_index = m.group(&1).unwrap().abandoned_obligations()[0].2;
+  let abort_index = m.group(&1).unwrap().abandoned_obligations()[0]
+    .1
+    .abort_index;
 
   // THE REMOVAL-FLOOR DISCIPLINE, played as a driver's `remove_group` wiring does: one past the
   // source's OWN lineage — the freeze rode the unified counter, so no target scan is needed.
@@ -9119,7 +10678,7 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
     .unwrap()
     .note_abandoned(Bytes::from(key), 1, abort_index);
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "replay re-derived the obligation from the surviving abort entry"
   );
 
@@ -9128,7 +10687,7 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
   // removal the fence never lifts.
   m.service_merge_applies(now, &mut stores);
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the removal-persisted floor discharged the re-derived obligation across the restart"
   );
 
@@ -9225,7 +10784,9 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
     m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
-  let abort_index = m.group(&1).unwrap().abandoned_obligations()[0].2;
+  let abort_index = m.group(&1).unwrap().abandoned_obligations()[0]
+    .1
+    .abort_index;
 
   // The removal-floor discipline off the UNIFIED counter: the frozen source's OWN lineage (1)
   // already covers the obligation's generation — the floor needs no target scan. Persist it,
@@ -9295,7 +10856,7 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the seeded counter discharged the re-derived obligation on the hosted arm"
   );
 
@@ -9370,7 +10931,7 @@ fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor
     m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
-  assert!(m.group(&1).unwrap().has_abandoned());
+  assert!(m.group(&1).unwrap().owes_live_thaw());
 
   // Remove the SOURCE with the unified-counter discipline: its OWN lineage covers the freeze — the
   // removal floor is derived with NO knowledge of any target. Removing the source also PURGES the
@@ -9382,7 +10943,7 @@ fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor
   assert!(m.remove_group(&2, &mut stores).unwrap().is_some());
   stores.inner.0.remove(&2);
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "removing the source purged the target's live obligation for it"
   );
 
@@ -9405,7 +10966,7 @@ fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor
     .unwrap();
   }
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "the restored target re-derived the obligation from its durable abort entry"
   );
 
@@ -9413,7 +10974,7 @@ fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor
   // exists to observe: `!floor_admits(2, 1)` proves the frozen-at-1 incarnation is gone forever.
   m.service_merge_applies(now, &mut stores);
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the re-derived obligation discharged off the source's removal floor"
   );
 
@@ -9619,7 +11180,7 @@ fn hosted_lineage_equals_the_engine_record_after_every_fold() {
   m.service_merge_applies(now, &mut engine);
   // The observing leader deferred its clear to the witness — apply it on the holder (no lineage move).
   engine_crank(&mut m, &mut engine, 1, now);
-  assert!(!m.group(&1).unwrap().has_abandoned());
+  assert!(!m.group(&1).unwrap().owes_live_thaw());
 
   // RE-FREEZE and ABSORB: park, seal, resolve — the Merged fold mirrors the target's bump.
   m.prepare_merge(&2, now, &mut engine, &1).unwrap().unwrap();
@@ -11321,7 +12882,7 @@ fn abort_relay_survives_a_leaderless_source() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    m.group(&2).unwrap().is_frozen() && m.group(&1).unwrap().has_abandoned(),
+    m.group(&2).unwrap().is_frozen() && m.group(&1).unwrap().owes_live_thaw(),
     "the source is frozen and the obligation is recorded"
   );
 
@@ -11333,7 +12894,7 @@ fn abort_relay_survives_a_leaderless_source() {
   }
   m.service_merge_applies(now, &mut stores);
   assert!(
-    m.group(&2).unwrap().is_frozen() && m.group(&1).unwrap().has_abandoned(),
+    m.group(&2).unwrap().is_frozen() && m.group(&1).unwrap().owes_live_thaw(),
     "a leaderless source keeps the obligation — nothing thawed, nothing dropped"
   );
 
@@ -11359,7 +12920,7 @@ fn abort_relay_survives_a_leaderless_source() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the observed source advance discharged the obligation"
   );
 }
@@ -11383,14 +12944,14 @@ fn accepted_thaw_retires_on_the_observed_advance() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "the abort recorded the obligation"
   );
   // The service DRIVES the thaw: it APPENDS the source-side RollbackMerge on the source leader's
   // log. The append alone does NOT discharge — the obligation is still set right after.
   m.service_merge_applies(now, &mut stores);
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "the append is only a leg of delivery — the obligation is not yet discharged"
   );
   {
@@ -11410,7 +12971,7 @@ fn accepted_thaw_retires_on_the_observed_advance() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the observed advance discharged the obligation — no infinite requeue"
   );
 }
@@ -11451,7 +13012,7 @@ fn stale_abort_relay_does_not_thaw_a_refrozen_source() {
       .unwrap()
       .abandoned_obligations()
       .first()
-      .map(|(_, g, _)| *g),
+      .map(|(_, m)| m.generation),
     Some(1),
     "the obligation is recorded at gen 1"
   );
@@ -11482,7 +13043,7 @@ fn stale_abort_relay_does_not_thaw_a_refrozen_source() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
-    !m.group(&1).unwrap().has_abandoned(),
+    !m.group(&1).unwrap().owes_live_thaw(),
     "the observed advance discharged the obligation, freeing the target to absorb again"
   );
 
@@ -12088,7 +13649,7 @@ fn target_only_owing(generation: u64) -> (MultiRaft<u64, u64, CountSm>, MapStore
   m.group_mut(&2)
     .unwrap()
     .note_abandoned(source_key.clone(), generation, Index::new(1));
-  assert!(m.group(&2).unwrap().has_abandoned());
+  assert!(m.group(&2).unwrap().owes_live_thaw());
   (m, stores, source_key)
 }
 
@@ -12107,7 +13668,7 @@ fn a_witness_apply_clears_an_unobservable_dead_end_obligation() {
     m.service_merge_applies(now, &mut stores);
   }
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
+    m.group(&2).unwrap().owes_live_thaw(),
     "no proof anywhere — the obligation wedges"
   );
   assert_eq!(
@@ -12130,8 +13691,559 @@ fn a_witness_apply_clears_an_unobservable_dead_end_obligation() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    !m.group(&2).unwrap().has_abandoned(),
+    !m.group(&2).unwrap().owes_live_thaw(),
     "the committed witness apply cleared the dead-end obligation"
+  );
+}
+
+/// A COVERED DEAD END STANDS UNTIL A WITNESS, AND ITS INSTALL-COVER LIFTS THE CAPTURE FENCE (#132,
+/// #138). Target 2 owes UNHOSTED source 1 (floor 0, lineage 0: nothing this host could ever observe
+/// or drive) and an install's boundary crossed the abort entry. Absence is no proof, so the record
+/// STANDS across cranks — live, unwitnessed (a cover is no global proof) — and the capture wedge the
+/// dead end would otherwise be is cured by the FENCE, not by disposal: the install discarded the
+/// entry the fence protected, so the threshold capture proceeds with the record standing. The
+/// record's exit is a witness some observer mints elsewhere: its committed apply clears it.
+#[test]
+fn a_covered_dead_end_stands_until_a_witness_and_its_install_cover_lifts_the_fence() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores
+    .0
+    .insert(2, (VecLog::default(), AsyncStable::default()));
+  m.create_group(
+    2,
+    0,
+    single_node_cfg(1).with_snapshot_threshold(1),
+    now,
+    7,
+    CountSm::default(),
+  )
+  .unwrap();
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+    assert!(m.group(&2).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  let source_key = gid_key(1);
+  // The obligation as an install left it: abort entry at 1, install-covered.
+  {
+    let ep = m.group_mut(&2).unwrap();
+    ep.note_abandoned(source_key.clone(), 5, Index::new(1));
+    ep.note_abort_covered(Index::new(1), Cover::Install);
+  }
+  // A command past the threshold: the capture fires — the install-covered record fences nothing.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.propose(&2, now, log, stable, &Bytes::from_static(b"x"))
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+    assert_eq!(m.group(&2).unwrap().applied_index(), Index::new(2));
+    assert_eq!(
+      stable.snapshot().map(|(meta, _)| meta.last_index()),
+      Some(Index::new(2)),
+      "the threshold capture landed: an install-covered record does not fence it"
+    );
+  }
+  // Cranks: the record STANDS — absence is no proof — and nothing is minted off a cover.
+  for _ in 0..4 {
+    m.service_merge_applies(now, &mut stores);
+  }
+  assert!(
+    m.group(&2).unwrap().owes_live_thaw()
+      && m
+        .group(&2)
+        .unwrap()
+        .abandoned_record(&source_key)
+        .is_some_and(|r| !r.discharged),
+    "a covered dead end stands, live, until a global fact — absence is not one"
+  );
+  assert_eq!(
+    witness_count(&stores.0.get(&2).unwrap().0),
+    0,
+    "a cover is no global proof — nothing minted"
+  );
+  // A witness ARRIVES (append it as replication delivers it, then commit + apply): the exit.
+  {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(source_key.clone(), 5),
+      &mut buf,
+    );
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, log, EntryKind::ThawDischarged, Bytes::from(buf))
+      .unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply cleared the covered dead end"
+  );
+}
+
+/// The witness route disposes of a COVERED record too (#132): a co-hosting holder with a GLOBAL
+/// proof mints `ThawDischarged`, and its committed apply clears every replica's record at the
+/// witnessed generation — the mark neither blocks that clear nor is needed for it. Here the witness
+/// arrives by replication on a holder whose transfer covered its record before any crank ran.
+#[test]
+fn a_witness_apply_clears_a_covered_obligation() {
+  let (mut m, mut stores, source_key) = target_only_owing(5);
+  let now = Instant::ORIGIN;
+  m.group_mut(&2)
+    .unwrap()
+    .note_abort_covered(Index::new(1), Cover::Install);
+  assert_eq!(
+    m.group(&2)
+      .unwrap()
+      .abandoned_record(&source_key)
+      .map(|r| r.cover),
+    Some(Cover::Install),
+    "the transfer's boundary covered the abort entry (1)"
+  );
+  assert!(
+    m.group(&2).unwrap().owes_live_thaw(),
+    "the covered record stands"
+  );
+  // A witness ARRIVES (append it as replication delivers it, then commit + apply).
+  {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(source_key.clone(), 5),
+      &mut buf,
+    );
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, log, EntryKind::ThawDischarged, Bytes::from(buf))
+      .unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply cleared the covered record"
+  );
+}
+
+/// A hosted target and a hosted source 2 for the witness-mint pins: target 1 leads and holds a
+/// LIVE record for 2's freeze at generation 1; 2 is admitted by the caller's `admit`. Returns the
+/// container and its plain store seam (floor 0, lineage 0 unless the pin says otherwise).
+fn leading_holder_with(
+  admit: impl FnOnce(&mut MultiRaft<u64, u64, CountSm>, &mut MapStores),
+) -> (MultiRaft<u64, u64, CountSm>, MapStores) {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores
+    .0
+    .insert(1, (VecLog::default(), AsyncStable::default()));
+  m.create_group(1, 0, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m, 1, d, log, stable);
+    assert!(m.group(&1).unwrap().role().is_leader());
+  }
+  admit(&mut m, &mut stores);
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  m.group_mut(&1)
+    .unwrap()
+    .note_abandoned(gid_key(2), 1, Index::new(1));
+  (m, stores)
+}
+
+/// Restore group 2 FROZEN at generation 1 claiming target 1 into `m`, from a log holding only its
+/// applied `PrepareMerge`.
+fn admit_frozen_source(m: &mut MultiRaft<u64, u64, CountSm>, stores: &mut MapStores) {
+  let mut slog = VecLog::default();
+  let mut sstable = AsyncStable::default();
+  slog.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::PrepareMerge,
+    prepare_merge_bytes(1, 1),
+  )]);
+  sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  m.restore_group_unchecked(
+    2,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    8,
+    CountSm::default(),
+    1,
+    &mut slog,
+    &mut sstable,
+  )
+  .unwrap();
+  stores.0.insert(2, (slog, sstable));
+  assert!(m.group(&2).unwrap().is_frozen() && m.group(&2).unwrap().shape_gen() == 1);
+}
+
+/// THE MIRROR LEG WITNESSES A HOSTED, UNFROZEN, LAGGING SOURCE (#137): source 2 is hosted at
+/// generation 0 — a restore that trails its own history — while the engine's lineage mirror, the
+/// driver's global record of 2's committed counter, reads past the abandoned generation. Read off
+/// an UNFROZEN source the mirror is a global proof, so the leading holder MINTS the witness and
+/// defers its clear to the committed apply. Under the hosted arm's old predicate only the live
+/// counter could witness, and this shape cleared locally and silently instead.
+#[test]
+fn the_mirror_leg_witnesses_a_hosted_unfrozen_lagging_source() {
+  let (mut m, inner) = leading_holder_with(|m, stores| {
+    stores
+      .0
+      .insert(2, (VecLog::default(), AsyncStable::default()));
+    m.create_group(
+      2,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      8,
+      CountSm::default(),
+    )
+    .unwrap();
+  });
+  let now = Instant::ORIGIN;
+  assert!(!m.group(&2).unwrap().is_frozen() && m.group(&2).unwrap().shape_gen() == 0);
+  let mut stores = LineageStores {
+    inner,
+    floors: std::collections::BTreeMap::new(),
+    lineages: std::collections::BTreeMap::from([(2u64, 2u64)]),
+  };
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    assert_eq!(
+      witness_count(log),
+      1,
+      "the mirror past the generation, read off an unfrozen source, is a global proof — witnessed"
+    );
+    assert!(
+      !m.group(&1).unwrap().owes_live_thaw() && m.group(&1).unwrap().holds_witness_debt(),
+      "the leader marked the debt before appending — the discharged record is the re-append trigger"
+    );
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply cleared the record"
+  );
+}
+
+/// THE MIRROR LEG IS FENCED OFF A SOURCE FROZEN AT THE ABANDONED GENERATION. The mirror is
+/// monotone-max and survives removal: after a removal at a higher generation and a floor-less
+/// recreation re-frozen at the abandoned one, it reads past a LIVE freeze. Read off that frozen
+/// source it would retire a live obligation here and — witnessed — cluster-wide: a replica-local
+/// drop dressed as a global proof. So a hosted source frozen at the generation is neither
+/// discharged nor witnessed off the mirror; its own counter discharges it once it thaws.
+#[test]
+fn the_mirror_leg_is_fenced_off_a_source_frozen_at_the_abandoned_generation() {
+  let (mut m, inner) = leading_holder_with(admit_frozen_source);
+  let now = Instant::ORIGIN;
+  let mut stores = LineageStores {
+    inner,
+    floors: std::collections::BTreeMap::new(),
+    lineages: std::collections::BTreeMap::from([(2u64, 5u64)]),
+  };
+  for _ in 0..3 {
+    m.service_merge_applies(now, &mut stores);
+  }
+  let t = m.group(&1).unwrap();
+  assert!(
+    t.owes_live_thaw()
+      && t
+        .abandoned_record(&gid_key(2))
+        .is_some_and(|r| !r.discharged),
+    "a stale mirror proves nothing about a source frozen at the generation — the record stays live"
+  );
+  assert_eq!(
+    witness_count(&stores.inner.0.get(&1).unwrap().0),
+    0,
+    "and nothing is witnessed off it"
+  );
+  assert!(
+    m.group(&2).unwrap().is_frozen(),
+    "the live freeze is untouched"
+  );
+}
+
+/// A COVERED DEAD END IS NOT CLEARED OFF A NON-TERMINAL FLOOR (#138): target 2 owes UNHOSTED
+/// source 1, whose persisted removal floor sits past the abandoned generation — a host-local fact
+/// ("this host stopped hosting the incarnation"). For an UNCOVERED record that floor clears
+/// locally, as it always has: the entry is still in the log and re-derives on restart. For a
+/// COVERED record the leg is withdrawn — the record's whole value is the abort belt's uniformity
+/// and the owed-source escape, and neither survives a local drop — so it stands, live, and nothing
+/// is minted off a local fact.
+#[test]
+fn a_covered_dead_end_is_not_cleared_off_a_non_terminal_floor() {
+  let now = Instant::ORIGIN;
+  // COVERED: stands.
+  let (mut m, inner, source_key) = target_only_owing(1);
+  m.group_mut(&2)
+    .unwrap()
+    .note_abort_covered(Index::new(1), Cover::Install);
+  let mut stores = LineageStores {
+    inner,
+    floors: std::collections::BTreeMap::from([(1u64, 2u64)]),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  for _ in 0..3 {
+    m.service_merge_applies(now, &mut stores);
+  }
+  assert!(
+    m.group(&2).unwrap().owes_live_thaw()
+      && m
+        .group(&2)
+        .unwrap()
+        .abandoned_record(&source_key)
+        .is_some_and(|r| !r.discharged),
+    "a non-terminal floor is a local fact — it disposes of no covered record"
+  );
+  assert_eq!(
+    witness_count(&stores.inner.0.get(&2).unwrap().0),
+    0,
+    "and mints nothing"
+  );
+  // UNCOVERED twin: clears locally, as before.
+  let (mut m, inner, _) = target_only_owing(1);
+  let mut stores = LineageStores {
+    inner,
+    floors: std::collections::BTreeMap::from([(1u64, 2u64)]),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    m.group(&2).unwrap().abandoned_obligations().is_empty(),
+    "an uncovered record's entry re-derives on restart — the local floor still clears it"
+  );
+  assert_eq!(
+    witness_count(&stores.inner.0.get(&2).unwrap().0),
+    0,
+    "a local proof mints nothing"
+  );
+}
+
+/// A COVERED HOSTED SQUATTER IS NOT CLEARED OFF A NON-TERMINAL FLOOR (#138, residual 6): source 2
+/// is hosted, idle, at generation 0 — recreated below the removal floor that sits past the
+/// abandoned generation, growing toward it — and the holder's record is install-covered. The floor
+/// is a local fact, so the hosted arm withholds its clear exactly as the unhosted arm does; the
+/// record stands, live, unwitnessed — a HOLD that is recoverable rather than a divergence: the
+/// squatter is hosted and unfrozen, so its removal admits and the purge clears the record.
+#[test]
+fn a_covered_hosted_squatter_is_not_cleared_off_a_non_terminal_floor() {
+  let (mut m, inner) = leading_holder_with(|m, stores| {
+    stores
+      .0
+      .insert(2, (VecLog::default(), AsyncStable::default()));
+    m.create_group(
+      2,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      8,
+      CountSm::default(),
+    )
+    .unwrap();
+  });
+  let now = Instant::ORIGIN;
+  let source_key = gid_key(2);
+  m.group_mut(&1)
+    .unwrap()
+    .note_abort_covered(Index::new(1), Cover::Install);
+  let mut stores = LineageStores {
+    inner,
+    floors: std::collections::BTreeMap::from([(2u64, 2u64)]),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  for _ in 0..3 {
+    m.service_merge_applies(now, &mut stores);
+  }
+  assert!(
+    m.group(&1).unwrap().owes_live_thaw()
+      && m
+        .group(&1)
+        .unwrap()
+        .abandoned_record(&source_key)
+        .is_some_and(|r| !r.discharged),
+    "the hosted squatter's local floor disposes of no covered record"
+  );
+  assert_eq!(
+    witness_count(&stores.inner.0.get(&1).unwrap().0),
+    0,
+    "and mints nothing"
+  );
+  // THE EXIT: the squatter is hosted and unfrozen, so its removal admits; the purge clears.
+  assert_eq!(
+    m.remove_group(&2, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "an idle squatter is removable — no freeze gate, no owed-source question"
+  );
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the purge cleared the holder's record"
+  );
+}
+
+/// AN APPEND-PENDING FREEZE IS NOT IDLE (#138, residual 5): source 2's `PrepareMerge` toward 1 is
+/// appended and observed but not yet applied — one apply away from freezing at the abandoned
+/// generation — while a stale-high lineage mirror and a removal floor past the generation both
+/// sit in the engine. Neither may retire the record: read now, the mirror would witness the live
+/// freeze cluster-wide the instant before it applies, and the floor would clear it locally. Once
+/// the freeze applies, the record drives the thaw as usual and the source's own counter retires it.
+#[test]
+fn an_append_pending_freeze_at_the_generation_is_neither_cleared_nor_witnessed() {
+  let (mut m, mut inner) = merge_host(0, 0);
+  let now = Instant::ORIGIN;
+  // 2 appends its freeze toward 1 — observed at append, NOT applied (no drain).
+  m.prepare_merge(&2, now, &mut inner, &1).unwrap().unwrap();
+  let sp = m.group(&2).unwrap();
+  assert!(
+    sp.merge_freeze_active() && !sp.is_frozen() && sp.shape_gen() == 0,
+    "freeze-pending: appended, unapplied"
+  );
+  let source_key = gid_key(2);
+  m.group_mut(&1)
+    .unwrap()
+    .note_abandoned(source_key.clone(), 1, Index::new(1));
+  let mut stores = LineageStores {
+    inner,
+    floors: std::collections::BTreeMap::from([(2u64, 3u64)]),
+    lineages: std::collections::BTreeMap::from([(2u64, 5u64)]),
+  };
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    m.group(&1).unwrap().owes_live_thaw()
+      && m
+        .group(&1)
+        .unwrap()
+        .abandoned_record(&source_key)
+        .is_some_and(|r| !r.discharged),
+    "a freeze-pending source is not idle: neither the mirror nor the floor retires the record"
+  );
+  assert_eq!(
+    witness_count(&stores.inner.0.get(&1).unwrap().0),
+    0,
+    "and nothing is witnessed off the stale mirror"
+  );
+  // The freeze applies; the record drives the thaw; the source's own counter retires it.
+  {
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().is_frozen() && m.group(&2).unwrap().shape_gen() == 1);
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert_eq!(
+    m.group(&2).unwrap().shape_gen(),
+    2,
+    "the retained record drove the thaw"
+  );
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    assert_eq!(
+      witness_count(log),
+      1,
+      "observed past the generation — the leader witnessed it"
+    );
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply cleared the record"
+  );
+}
+
+/// THE TERMINAL FLOOR WITNESSES A HOSTED HUSK (#137): source 2 is hosted, frozen at the abandoned
+/// generation, and its floor is the terminal `MERGED_FLOOR` — it was absorbed away, globally, and
+/// what is hosted here is a husk. The terminal floor needs no freeze fence (terminal means no later
+/// incarnation), so the leading holder mints the witness off it in the thaw pass; the husk dissolve
+/// behind it in the same crank then retires the husk, and its purge takes the holder's record with
+/// it. The witness is what every OTHER replica's record clears on; here it applies to nothing.
+#[test]
+fn the_terminal_floor_witnesses_a_hosted_husk() {
+  let (mut m, mut stores) = leading_holder_with(admit_frozen_source);
+  let now = Instant::ORIGIN;
+  stores.1.insert(2);
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    witness_count(&stores.0.get(&1).unwrap().0),
+    1,
+    "the terminal floor is a global proof for a hosted frozen husk — the leading holder witnessed it"
+  );
+  assert!(
+    resolutions.contains(&MergeResolution::Retired { source: 2 }) && !m.contains_group(&2),
+    "the husk dissolve retired the source in the same crank, behind the mint"
+  );
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the dissolve's purge cleared the holder's record"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty() && !m.group(&1).unwrap().is_poisoned(),
+    "the committed witness applies to nothing here — its work is on the other replicas"
+  );
+}
+
+/// THE LATCHED MINT ARM IS GUARDED (#138, residual 10): `discharged` remembers a proof that a
+/// floor-less recreation of source 2, re-frozen at the abandoned generation here, invalidates —
+/// its fresh abort applies later and re-arms the record live, and a witness minted off the stale
+/// flag would then clear that live obligation and strand the freeze. So the leading holder mints
+/// nothing off the latched flag while 2 is freeze-active at a generation at-or-below the abandoned
+/// one; once the source is idle, the latched flag mints as intended.
+#[test]
+fn a_stale_discharge_mark_is_not_witnessed_beside_a_source_refrozen_at_the_generation() {
+  let now = Instant::ORIGIN;
+  // Re-frozen at the generation here: NOT witnessed off the latched flag.
+  let (mut m, mut stores) = leading_holder_with(admit_frozen_source);
+  m.group_mut(&1).unwrap().note_discharged(&gid_key(2));
+  for _ in 0..3 {
+    m.service_merge_applies(now, &mut stores);
+  }
+  assert_eq!(
+    witness_count(&stores.0.get(&1).unwrap().0),
+    0,
+    "a source freeze-active at the generation invalidates the latched proof — no witness"
+  );
+  assert!(
+    m.group(&1).unwrap().holds_witness_debt() && m.group(&2).unwrap().is_frozen(),
+    "the record waits, discharged; the freeze is untouched"
+  );
+  // Idle (a squatter at generation 0, nothing frozen): the latched flag mints.
+  let (mut m, mut stores) = leading_holder_with(|m, stores| {
+    stores
+      .0
+      .insert(2, (VecLog::default(), AsyncStable::default()));
+    m.create_group(
+      2,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      8,
+      CountSm::default(),
+    )
+    .unwrap();
+  });
+  m.group_mut(&1).unwrap().note_discharged(&gid_key(2));
+  m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    witness_count(&stores.0.get(&1).unwrap().0),
+    1,
+    "beside an idle source the latched flag is the trigger it was kept to be"
   );
 }
 
@@ -12181,7 +14293,7 @@ fn a1_a_non_terminal_floor_clears_locally_and_mints_no_witness() {
   };
   m.service_merge_applies(now, &mut stores);
   assert!(
-    !m.group(&2).unwrap().has_abandoned(),
+    !m.group(&2).unwrap().owes_live_thaw(),
     "a non-terminal floor discharges the obligation LOCALLY"
   );
   assert_eq!(
@@ -12245,7 +14357,7 @@ fn a_lower_gen_squatter_does_not_shadow_the_floor_discharge() {
   };
   m.service_merge_applies(now, &mut stores);
   assert!(
-    !m.group(&2).unwrap().has_abandoned(),
+    !m.group(&2).unwrap().owes_live_thaw(),
     "the persisted floor discharged the obligation off the durable proof, not the squatter's counter"
   );
   // A lower-gen hosted counter is HOST-LOCAL, never a global proof: no witness is minted (the A1
@@ -12287,7 +14399,7 @@ fn a_live_frozen_source_at_expected_is_not_prematurely_discharged() {
     "source 2 is the live obligation, frozen at the abandoned generation"
   );
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "the target owes 2 a thaw"
   );
   // The floor at the source's OWN admission value (a gen-1 incarnation admits iff `floor <= 1`):
@@ -12295,7 +14407,7 @@ fn a_live_frozen_source_at_expected_is_not_prematurely_discharged() {
   stores.floors.insert(2, 1);
   m.service_merge_applies(now, &mut stores);
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "a live frozen source AT the abandoned gen is not prematurely discharged by the hosted floor leg"
   );
 }
@@ -12327,7 +14439,7 @@ fn a_frozen_source_below_a_stale_floor_is_not_floor_discharged() {
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&2).unwrap().is_frozen() && m.group(&2).unwrap().shape_gen() == 1);
-  assert!(m.group(&1).unwrap().has_abandoned());
+  assert!(m.group(&1).unwrap().owes_live_thaw());
   // A STALE removal floor ABOVE the freeze gen (the id's PRIOR incarnation was floored to 3): it does
   // NOT admit gen 1, so the bare floor leg WOULD fire — but the source is FROZEN, so the fence holds.
   stores.floors.insert(2, 3);
@@ -12337,7 +14449,7 @@ fn a_frozen_source_below_a_stale_floor_is_not_floor_discharged() {
   );
   m.service_merge_applies(now, &mut stores);
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "a FROZEN source below a stale floor is a live obligation — the floor leg must not discharge it"
   );
 }
@@ -12363,7 +14475,7 @@ fn a_stale_witness_no_ops_against_a_fresh_obligation() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
+    m.group(&2).unwrap().owes_live_thaw(),
     "the gen-mismatched witness no-op'd — the fresh obligation is untouched"
   );
   assert_eq!(
@@ -12371,7 +14483,7 @@ fn a_stale_witness_no_ops_against_a_fresh_obligation() {
       .unwrap()
       .abandoned_obligations()
       .first()
-      .map(|(_, g, _)| *g),
+      .map(|(_, m)| m.generation),
     Some(9),
     "the live generation stands"
   );
@@ -12394,8 +14506,8 @@ fn two_cranks_with_a_global_proof_append_one_witness() {
     "the in-flight witness is not re-appended crank after crank"
   );
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
-    "the leader deferred its clear to the witness apply — the obligation is still the re-append trigger"
+    !m.group(&2).unwrap().owes_live_thaw() && m.group(&2).unwrap().holds_witness_debt(),
+    "the leader marked the debt before appending — the discharged record is the re-append trigger"
   );
   // The committed apply clears it, leader included.
   {
@@ -12403,7 +14515,7 @@ fn two_cranks_with_a_global_proof_append_one_witness() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    !m.group(&2).unwrap().has_abandoned(),
+    !m.group(&2).unwrap().owes_live_thaw(),
     "the committed witness discharged the obligation"
   );
 }
@@ -12426,7 +14538,7 @@ fn a_truncated_witness_is_re_appended_by_the_next_observing_leader() {
   };
   assert_eq!(witness_count(&stores.0.get(&2).unwrap().0), 1);
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
+    m.group(&2).unwrap().owes_live_thaw(),
     "obligation held — the witness has not committed"
   );
 
@@ -12465,7 +14577,7 @@ fn a_truncated_witness_is_re_appended_by_the_next_observing_leader() {
     "the witness was truncated"
   );
   assert!(
-    m.group(&2).unwrap().has_abandoned(),
+    m.group(&2).unwrap().owes_live_thaw(),
     "the obligation survived the truncation"
   );
 
@@ -12482,7 +14594,7 @@ fn a_truncated_witness_is_re_appended_by_the_next_observing_leader() {
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
-    !m.group(&2).unwrap().has_abandoned(),
+    !m.group(&2).unwrap().owes_live_thaw(),
     "the re-driven witness committed and discharged the obligation — not wedged"
   );
 }
@@ -12519,7 +14631,7 @@ fn late_abort_no_ops_after_the_merge_resolved() {
   assert_eq!(tep.state_machine().count(), 5, "the union stands");
   assert_eq!(tep.shape_gen(), 1, "the stale abort moved nothing");
   assert!(
-    !tep.has_abandoned(),
+    !tep.owes_live_thaw(),
     "a stale abort records no thaw obligation"
   );
 }
@@ -13571,7 +15683,7 @@ fn rollback_refuses_a_pending_freeze_then_lands() {
       .unwrap()
       .abandoned_obligations()
       .first()
-      .map(|(_, g, _)| *g),
+      .map(|(_, m)| m.generation),
     Some(1),
     "the abort recorded the thaw obligation at the freeze generation"
   );
@@ -15030,7 +17142,7 @@ fn a_deferred_absorb_chains_the_consumed_debtors_debts() {
     drain_storage(&mut m, 3, d3, l, s);
   }
   assert!(
-    m.group(&3).unwrap().has_abandoned(),
+    m.group(&3).unwrap().owes_live_thaw(),
     "the abort fence stands"
   );
 
@@ -15143,7 +17255,7 @@ fn a_deferred_absorb_chains_the_consumed_debtors_debts() {
     drain_storage(&mut m, 3, d3, l, s);
   }
   assert!(
-    !m.group(&3).unwrap().has_abandoned(),
+    !m.group(&3).unwrap().owes_live_thaw(),
     "the applied witness cleared the obligation"
   );
   let resolutions = m.service_merge_applies(d3, &mut stores);
@@ -15166,6 +17278,129 @@ fn a_deferred_absorb_chains_the_consumed_debtors_debts() {
   // The discharge self-releases the admission fence.
   m.create_group(2, 0, single_node_cfg(1), d3, 99, SplitSm::default())
     .unwrap();
+}
+
+/// THE FENCED CAPTURE DEBT IS NAMED BY ITS FENCE (#132): target 1 holds an abort record for
+/// source 8 — hosted nowhere — and absorbs frozen source 2 deferred behind that record's fence,
+/// minting a capture debt. The debt pass reports the wait as `AbortFence` naming 8, the record
+/// that fences (whose thaw's witness is the exit) — never 2, the source the union consumed —
+/// exactly as the adopt pass names its own fenced capture.
+#[test]
+fn a_fenced_capture_debt_is_reported_by_its_fencing_source() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  // Target 1 leads and commits the abort for 8.
+  let (mut log1, mut stable1) = (VecLog::default(), AsyncStable::default());
+  m.create_group(1, 0, single_node_cfg(1), now, 45, SplitSm::default())
+    .unwrap();
+  let d = lead_single_split(&mut m, 1, &mut log1, &mut stable1);
+  stores.0.insert(1, (log1, stable1));
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    let abort = crate::RollbackMergePayload::abort(gid_key(8), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(d, l, crate::EntryKind::RollbackMerge, Bytes::from(buf))
+      .unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+  }
+  assert!(
+    m.group(&1).unwrap().owes_live_thaw(),
+    "the abort fence stands"
+  );
+  // Source 2 leads and freezes for 1.
+  let (mut log2, mut stable2) = (VecLog::default(), AsyncStable::default());
+  m.create_group(2, 0, single_node_cfg(1), d, 46, SplitSm::default())
+    .unwrap();
+  let d2 = lead_single_split(&mut m, 2, &mut log2, &mut stable2);
+  stores.0.insert(2, (log2, stable2));
+  let freeze_idx = {
+    let (l, s) = stores.0.get_mut(&2).unwrap();
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(gid_key(1), 1),
+      &mut fbuf,
+    );
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(d2, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    let idx = l.last_index();
+    drain_storage(&mut m, 2, d2, l, s);
+    idx
+  };
+  assert!(m.group(&2).unwrap().is_frozen());
+  // The committed absorb parks 1; the resolver absorbs it DEFERRED — the abort fence stands at
+  // the boundary — minting the debt.
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(
+        d,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(2, freeze_idx, 1, 2),
+      )
+      .unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+  }
+  let park = m.group(&1).unwrap().pending_merge().expect("parked").at();
+  assert!(
+    m.service_merge_applies(d, &mut stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+  }
+  while m.poll_merge_blocked().is_some() {}
+  assert_eq!(
+    m.service_merge_applies(d, &mut stores),
+    std::vec![MergeResolution::Absorbed {
+      source: 2,
+      target: 1
+    }],
+    "the deferred absorb proceeds behind the fence"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+  }
+  assert_eq!(
+    m.group(&1)
+      .unwrap()
+      .capture_debt()
+      .map(|debt| debt.source()),
+    Some(gid_key(2)),
+    "the debt names the source it consumed"
+  );
+
+  // The debt pass: the capture is refused behind the abort record, and the wait is reported by
+  // the record that fences — once, however many cranks re-derive it.
+  assert!(m.service_merge_applies(d, &mut stores).is_empty());
+  assert_eq!(
+    m.poll_merge_blocked(),
+    Some(crate::MergeBlocked {
+      target: 1,
+      source: 8,
+      boundary: park,
+      cause: MergeBlockedCause::AbortFence,
+    }),
+    "named by the fencing record — its thaw's witness is the exit — not by the consumed source"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "one signal for the standing wait"
+  );
+  assert!(
+    m.group(&1).unwrap().capture_debt().is_some(),
+    "the debt stands behind the fence"
+  );
 }
 
 /// A crash replays the chain: the inner `CommitMerge` re-parks while the LATER committed
@@ -15704,6 +17939,15 @@ fn commit_merge_bytes(
   )
 }
 
+/// A raw `PrepareMerge` entry payload naming a typed target id at `source_gen_after` — the
+/// force-append form a restore fixture uses to restart a source FROZEN.
+fn prepare_merge_bytes(target: u64, source_gen_after: u64) -> Bytes {
+  let p = crate::PrepareMergePayload::new(gid_key(target), source_gen_after);
+  let mut buf = Vec::new();
+  crate::wire::encode_prepare_merge_payload(&p, &mut buf);
+  Bytes::from(buf)
+}
+
 /// [`commit_merge_bytes`] with the freeze's TERM settable — for a source whose freeze was appended
 /// under a later term than its first (an install deposed it before the freeze).
 fn commit_merge_bytes_at(
@@ -15963,6 +18207,1587 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
     restored.state_machine().units,
     5,
     "adopt-equivalent: the same union, no re-cure"
+  );
+}
+
+/// A restored target 1 parked at index 2 on a `CommitMerge` naming UNHOSTED source 42 — the cure
+/// shape, before any crank.
+fn parked_target_over_an_unhosted_source() -> (MultiRaft<u64, u64, SplitSm>, MapStores) {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 1),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m.restore_group_unchecked(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+  (m, stores)
+}
+
+/// The cure blob covering `boundary` at lineage `shape_gen`, as the target leader (node 9) ships
+/// it.
+fn cure_blob_at_gen(boundary: Index, shape_gen: u64) -> Message<u64> {
+  let meta = crate::SnapshotMeta::new(
+    boundary,
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(shape_gen);
+  Message::InstallSnapshot(crate::InstallSnapshot::new(
+    Term::new(1),
+    9u64,
+    meta,
+    fork_blob(5),
+  ))
+}
+
+/// The cure blob covering `boundary`, as the target leader (node 9) ships it.
+fn cure_blob_to(boundary: Index) -> Message<u64> {
+  let meta = crate::SnapshotMeta::new(
+    boundary,
+    Term::new(1),
+    crate::conf::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  Message::InstallSnapshot(crate::InstallSnapshot::new(
+    Term::new(1),
+    9u64,
+    meta,
+    fork_blob(5),
+  ))
+}
+
+/// THE ADOPTION RETAINS AND MARKS (#132): the parked-union adoption is the second transfer that
+/// crosses abort entries — state moves to the blob's boundary while the LOG is kept — and it marks
+/// the obligations it covers adopt-covered, removing none. Unlike an install-cover, an adopt-cover
+/// KEEPS FENCING: the kept log still carries the entry, the record's only restart re-derivation.
+/// The covered record is a dead end here (its source is unhosted) and absence is no proof, so it
+/// stands across cranks, and the adopt's owed capture is DEFERRED behind its fence — not dropped —
+/// until a witness clears the record; the next crank then stages the capture.
+#[test]
+fn the_adopt_marks_a_covered_obligation_and_its_owed_capture_waits_for_the_disposal() {
+  let (mut m, mut stores) = parked_target_over_an_unhosted_source();
+  let now = Instant::ORIGIN;
+  // An EARLIER abort's obligation, below the park, naming a source no one hosts.
+  let source_key = gid_key(7);
+  m.group_mut(&1)
+    .unwrap()
+    .note_abandoned(source_key.clone(), 1, Index::new(1));
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    Some(Index::new(2)),
+    "an unhosted counterparty withholds nothing — the park advertises"
+  );
+  assert!(
+    m.group(&1)
+      .unwrap()
+      .abandoned_record(&source_key)
+      .is_some_and(|r| r.cover == Cover::None),
+    "a parked holder disposes of nothing over an unproven dead end — the record stands, uncovered"
+  );
+  // The cure blob adopts.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(&1, now, log, stable, 9u64, cure_blob_to(Index::new(3)))
+      .unwrap();
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(tep.pending_merge().is_none(), "the adopt cleared the park");
+  assert_eq!(tep.applied_index(), Index::new(3), "state at the boundary");
+  assert!(tep.owes_live_thaw(), "RETAINED across the adopt");
+  assert_eq!(
+    tep
+      .abandoned_record(&source_key)
+      .map(|r| (r.cover, r.discharged)),
+    Some((Cover::Adopt, false)),
+    "and MARKED adopt-covered: the boundary (3) crossed the abort entry (1), the log kept"
+  );
+  assert!(
+    tep.adopt_capture_owed(),
+    "the adopt owes its forced capture"
+  );
+  assert!(
+    tep.capture_blocked_at(tep.applied_index()),
+    "which the adopt-covered record fences — its entry is in the kept log"
+  );
+  // The gated ack drains; cranks pass; the record stands (absence is no proof) and the owed
+  // capture waits behind it, deferred, not dropped.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  for _ in 0..3 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  }
+  assert!(
+    m.group(&1).unwrap().adopt_capture_owed() && m.group(&1).unwrap().owes_live_thaw(),
+    "the owed capture waits, deferred, while the covered dead end stands"
+  );
+  assert!(
+    m.group(&1)
+      .unwrap()
+      .abandoned_record(&source_key)
+      .is_some_and(|r| !r.discharged),
+    "nothing retired it — a cover is no proof"
+  );
+  // A witness ARRIVES by replication from the leader that cured this park, above the boundary;
+  // its committed apply clears the record and lifts the fence.
+  {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(source_key.clone(), 1),
+      &mut buf,
+    );
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        Term::new(1),
+        9u64,
+        Index::new(3),
+        Term::new(1),
+        std::vec![crate::Entry::new(
+          Term::new(1),
+          Index::new(4),
+          crate::EntryKind::ThawDischarged,
+          Bytes::from(buf),
+        )],
+        Index::new(4),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply cleared the covered dead end"
+  );
+  // The next crank finds the fence lifted and stages the owed capture.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert!(
+    !m.group(&1).unwrap().adopt_capture_owed(),
+    "the owed capture staged the moment the fence lifted"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+    assert!(
+      sailing_proto_durable_covers(stable, Index::new(4)),
+      "the owed capture is durable at-or-past the boundary"
+    );
+    assert!(
+      log.first_index() > Index::new(2),
+      "its compaction released the absorb membership fence"
+    );
+  }
+}
+
+/// THE FENCED ADOPT DEBT IS NAMED (#132): an adopt-covered record whose source no one hosts fences
+/// the owed capture, and the container reports that wait exactly as it reports a fenced capture
+/// debt — one `MergeBlocked { AbortFence }` naming the FENCING source at the adopt's boundary,
+/// visible across every crank it stands, deduped against the per-crank repeats, and gone the
+/// crank the witness applies, the fence lifts, and the capture stages.
+#[test]
+fn a_fenced_adopt_capture_is_reported_as_an_abort_fence_until_the_witness_lifts_it() {
+  let (mut m, mut stores) = parked_target_over_an_unhosted_source();
+  let now = Instant::ORIGIN;
+  // An EARLIER abort's obligation, below the park, naming a source no one hosts.
+  let source_key = gid_key(7);
+  m.group_mut(&1)
+    .unwrap()
+    .note_abandoned(source_key.clone(), 1, Index::new(1));
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.poll_merge_blocked().map(|b| (b.source, b.cause)),
+    Some((42, MergeBlockedCause::SourceUnhosted)),
+    "the park's own hold is the resolver's signal, not the debt's"
+  );
+  // The cure adopts; the record is adopt-covered and fences the owed capture.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(&1, now, log, stable, 9u64, cure_blob_to(Index::new(3)))
+      .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.pending_merge().is_none() && tep.adopt_capture_owed(),
+    "adopted, the forced capture owed"
+  );
+  assert!(
+    tep.capture_blocked_at(tep.applied_index()),
+    "and fenced by the adopt-covered record"
+  );
+  let observation = crate::MergeBlocked {
+    target: 1,
+    source: 7,
+    boundary: Index::new(3),
+    cause: MergeBlockedCause::AbortFence,
+  };
+  // The first crank names the wait; it stays visible, un-consumed, across the cranks it stands.
+  for crank in 0..4 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+    assert_eq!(
+      m.peek_merge_blocked().as_ref(),
+      Some(&observation),
+      "crank {crank}: the fenced adopt debt is reported by its fencing source at its boundary"
+    );
+  }
+  assert_eq!(m.poll_merge_blocked(), Some(observation.clone()));
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "one signal for the standing wait — the per-crank repeats deduped"
+  );
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.peek_merge_blocked(),
+    None,
+    "a consumed signal is not re-armed while its cause stands unchanged"
+  );
+  assert!(
+    m.group(&1).unwrap().adopt_capture_owed(),
+    "the owed capture still waits"
+  );
+  // The witness ARRIVES by replication from the leader that cured this park; its committed apply
+  // clears the record and lifts the fence.
+  {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(source_key.clone(), 1),
+      &mut buf,
+    );
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        Term::new(1),
+        9u64,
+        Index::new(3),
+        Term::new(1),
+        std::vec![crate::Entry::new(
+          Term::new(1),
+          Index::new(4),
+          crate::EntryKind::ThawDischarged,
+          Bytes::from(buf),
+        )],
+        Index::new(4),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().abandoned_obligations().is_empty(),
+    "the committed witness apply cleared the covered dead end"
+  );
+  // The next crank stages the owed capture and reports nothing — then and after.
+  for crank in 0..2 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+    assert!(
+      !m.group(&1).unwrap().adopt_capture_owed(),
+      "crank {crank}: the owed capture staged the moment the fence lifted"
+    );
+    assert_eq!(
+      m.peek_merge_blocked(),
+      None,
+      "crank {crank}: nothing stands, nothing is reported"
+    );
+  }
+}
+
+/// THE LIVE CO-HOSTED SHAPE NEVER ADOPTS (#132): a parked target whose obligation names a source
+/// hosted-and-frozen RIGHT HERE is doubly protected — the resolver withholds the cure
+/// advertisement, and the receipt-time gate drops a cure blob that rides a stale hint anyway — so
+/// no transfer ever stands between that source and its drive: the park and the uncovered record
+/// stand, the source untouched.
+#[test]
+fn a_cure_blob_never_adopts_over_a_hosted_frozen_counterparty() {
+  let (mut m, mut stores) = parked_target_over_an_unhosted_source();
+  let now = Instant::ORIGIN;
+  // Source 2 restarts FROZEN at generation 1 with its claim on 1, which owes it the thaw (an
+  // earlier abort at index 1, below the park).
+  {
+    let mut slog = VecLog::default();
+    let mut sstable = AsyncStable::default();
+    slog.force_append(&[crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::PrepareMerge,
+      prepare_merge_bytes(1, 1),
+    )]);
+    sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+    m.restore_group_unchecked(
+      2,
+      single_node_cfg(1),
+      now,
+      8,
+      SplitSm::default(),
+      1,
+      &mut slog,
+      &mut sstable,
+    )
+    .unwrap();
+    stores.0.insert(2, (slog, sstable));
+  }
+  assert!(m.group(&2).unwrap().is_frozen(), "2 restarted frozen");
+  let source_key = gid_key(2);
+  m.group_mut(&1)
+    .unwrap()
+    .note_abandoned(source_key.clone(), 1, Index::new(1));
+  // The resolver withholds the advertisement: the counterparty is hosted and unadvanced.
+  let _ = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    None,
+    "no cure is advertised over a hosted frozen counterparty"
+  );
+  // The stale-hint window: a hint derived before the counterparty was observed here, the blob
+  // already in flight. The receipt gate keys on the PARK and drops the whole message.
+  m.group_mut(&1).unwrap().note_merge_park_unresolvable(true);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(&1, now, log, stable, 9u64, cure_blob_to(Index::new(3)))
+      .unwrap();
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.pending_merge().is_some(),
+    "the park stands — nothing adopted"
+  );
+  assert_eq!(tep.applied_index(), Index::new(1), "state untouched");
+  assert_eq!(
+    tep.merge_park_unresolvable(),
+    None,
+    "the gate consumed the stale hint"
+  );
+  assert!(
+    tep
+      .abandoned_record(&source_key)
+      .is_some_and(|r| r.cover == Cover::None && !r.discharged),
+    "the record stands, uncovered and live"
+  );
+  assert!(
+    m.group(&2).unwrap().is_frozen(),
+    "the source is untouched, its drive intact"
+  );
+}
+
+/// A restored target 1 parked at index 2 whose log carries a TARGET-role abort for unhosted source 7
+/// BELOW the park (index 1, so the record is live at the park) and, ABOVE it inside the interval a
+/// cure would adopt across, the committed `ThawDischarged` witness for that very record — or, with
+/// `witness` supplied, an arbitrary payload in its place. Not yet cranked.
+fn parked_target_with_a_witness_above_the_park(
+  witness: Bytes,
+) -> (MultiRaft<u64, u64, CountSm>, MapStores) {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(gid_key(7), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::RollbackMerge,
+      abort,
+    ),
+    // The parked commit mints against the abort's bump: target generation 2 after 1.
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 2),
+    ),
+    // Committed content above the park closes the abort window; here it is the witness itself.
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(3),
+      crate::EntryKind::ThawDischarged,
+      witness,
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  m.restore_group_unchecked(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let t = m.group(&1).unwrap();
+  assert!(t.pending_merge().is_some(), "parked");
+  assert!(
+    t.abandoned_record(&gid_key(7))
+      .is_some_and(|r| !r.discharged && r.cover == Cover::None),
+    "the abort below the park re-derived a live record"
+  );
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+  (m, stores)
+}
+
+/// THE ADOPTED INTERVAL'S WITNESS IS APPLIED (#137): target 1 applied an abort for unhosted source 7
+/// below its park, and the committed `ThawDischarged` that retires it sits inside the interval the
+/// cure blob adopts across. The crossing walk PLANS that witness (it names a held record), and the
+/// adoption folds the plan with the gen-exact clear, so the record is CLEARED, nothing fences the
+/// owed adopt capture, and the capture stages and compacts — the absorb membership fence releases.
+/// Skipping the witness would leave the record adopt-covered forever: the global witness already
+/// exists, in the kept log, so no new one is ever minted, and the mandatory capture stays fenced.
+#[test]
+fn a_witness_inside_the_adopted_interval_clears_the_record() {
+  let now = Instant::ORIGIN;
+  let witness = {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(gid_key(7), 1),
+      &mut buf,
+    );
+    Bytes::from(buf)
+  };
+  let (mut m, mut stores) = parked_target_with_a_witness_above_the_park(witness);
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let tep = m.group(&1).unwrap();
+  assert_eq!(
+    tep.merge_park_unresolvable(),
+    Some(Index::new(2)),
+    "the park advertises"
+  );
+  assert_eq!(
+    tep.planned_witnesses().keys().cloned().collect::<Vec<_>>(),
+    std::vec![(gid_key(7), 1u64)],
+    "the walk planned the one witness that names a held record"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(&1, now, log, stable, 9u64, cure_blob_to(Index::new(3)))
+      .unwrap();
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.pending_merge().is_none() && tep.applied_index() == Index::new(3),
+    "adopted"
+  );
+  assert!(
+    tep.abandoned_obligations().is_empty() && tep.planned_witnesses().is_empty(),
+    "the planned witness cleared the record at the adopt, and the plan went with the park"
+  );
+  assert!(
+    tep.adopt_capture_owed() && !tep.capture_blocked_at(tep.applied_index()),
+    "the owed capture is unfenced"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert!(
+    !m.group(&1).unwrap().adopt_capture_owed(),
+    "the owed capture staged"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+    assert!(
+      sailing_proto_durable_covers(stable, Index::new(3)),
+      "the owed capture is durable at the boundary"
+    );
+    assert!(
+      log.first_index() > Index::new(2),
+      "its compaction released the absorb membership fence"
+    );
+  }
+}
+
+/// A committed witness above the park that will not decode is committed-corrupt: the crossing
+/// WALK fail-stops `MergeDecode` the crank it reads it — before any cure is advertised, so no adopt
+/// is ever admitted across it — exactly as it does for a malformed crossing, and as the apply arm
+/// would have.
+#[test]
+fn a_malformed_witness_inside_the_adopted_interval_poisons() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) =
+    parked_target_with_a_witness_above_the_park(Bytes::from_static(b"\xff\xff\xff"));
+  let _ = m.service_merge_applies(now, &mut stores);
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.is_poisoned(),
+    "a committed-corrupt witness above the park fail-stops the crossing walk"
+  );
+  assert_eq!(
+    tep.merge_park_unresolvable(),
+    None,
+    "and no cure was advertised off the partial walk"
+  );
+  assert!(
+    tep.pending_merge().is_some() && tep.applied_index() == Index::new(1),
+    "nothing moved: the park stands"
+  );
+}
+
+/// A log seam that COUNTS every `entries` read (its requested range), can answer exactly one
+/// designated read with a cold page (`EntriesRead::Pending`), and can model a ONE-PAGE cache —
+/// the crossing walk's per-read bound, its watermark resumption, and the adopt's read-free
+/// consumption of what the walk carried, observed.
+struct CountingLog {
+  inner: VecLog,
+  reads: core::cell::RefCell<Vec<(Index, Index)>>,
+  cold_on_read: core::cell::Cell<Option<usize>>,
+  /// The one-page cache policy: a multi-entry read is served only when it asks for the page
+  /// loaded last; any other page misses (`Pending`), LOADS — so its retry is served — and evicts
+  /// the page before it, so a re-read of an earlier page is always cold. Single-entry reads (the
+  /// resolver's abort-window probe) bypass it: the seam models the interval's pages, not the probe.
+  one_page: bool,
+  cached_page: core::cell::Cell<Option<Index>>,
+  served: core::cell::RefCell<Vec<(Index, Index)>>,
+}
+
+impl CountingLog {
+  fn new(inner: VecLog) -> Self {
+    Self {
+      inner,
+      reads: core::cell::RefCell::new(Vec::new()),
+      cold_on_read: core::cell::Cell::new(None),
+      one_page: false,
+      cached_page: core::cell::Cell::new(None),
+      served: core::cell::RefCell::new(Vec::new()),
+    }
+  }
+
+  fn cold_on_read(self, nth: Option<usize>) -> Self {
+    self.cold_on_read.set(nth);
+    self
+  }
+
+  fn one_page_cache(mut self) -> Self {
+    self.one_page = true;
+    self
+  }
+
+  fn read_ranges(&self) -> Vec<(Index, Index)> {
+    self.reads.borrow().clone()
+  }
+
+  /// The multi-entry reads the one-page cache SERVED (its misses are in `read_ranges` only).
+  fn served_pages(&self) -> Vec<(Index, Index)> {
+    self.served.borrow().clone()
+  }
+}
+
+impl crate::LogStore for CountingLog {
+  type Error = core::convert::Infallible;
+
+  fn first_index(&self) -> Index {
+    self.inner.first_index()
+  }
+
+  fn last_index(&self) -> Index {
+    self.inner.last_index()
+  }
+
+  fn term(&self, index: Index) -> Result<Term, Self::Error> {
+    self.inner.term(index)
+  }
+
+  fn entries(
+    &self,
+    range: core::ops::Range<Index>,
+    max_bytes: u64,
+  ) -> Result<crate::EntriesRead<'_>, Self::Error> {
+    let nth = self.reads.borrow().len();
+    self.reads.borrow_mut().push((range.start, range.end));
+    if self.cold_on_read.get() == Some(nth) {
+      return Ok(crate::EntriesRead::Pending);
+    }
+    if self.one_page && range.end.get() - range.start.get() > 1 {
+      if self.cached_page.get() != Some(range.start) {
+        self.cached_page.set(Some(range.start));
+        return Ok(crate::EntriesRead::Pending);
+      }
+      self.served.borrow_mut().push((range.start, range.end));
+    }
+    self.inner.entries(range, max_bytes)
+  }
+
+  fn submit_append(&mut self, id: crate::OpId, entries: &[crate::Entry]) {
+    self.inner.submit_append(id, entries)
+  }
+
+  fn compact(&mut self, up_to: Index) {
+    self.inner.compact(up_to)
+  }
+
+  fn restore(&mut self, last_index: Index, last_term: Term) {
+    self.inner.restore(last_index, last_term)
+  }
+
+  fn poll(&mut self) -> Option<Result<crate::LogDone, Self::Error>> {
+    self.inner.poll()
+  }
+
+  fn has_pending(&self) -> bool {
+    self.inner.has_pending()
+  }
+}
+
+struct CountingStores(std::collections::BTreeMap<u64, (CountingLog, AsyncStable)>);
+
+impl crate::GroupStores<u64, CountingLog, AsyncStable> for CountingStores {
+  fn stores(&mut self, group: &u64) -> Option<(&mut CountingLog, &mut AsyncStable)> {
+    self.0.get_mut(group).map(|(l, s)| (l, s))
+  }
+}
+
+impl crate::FloorStore<u64> for CountingStores {
+  fn floor(&self, _gid: &u64) -> u64 {
+    0
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
+/// THE WITNESS PLAN IS BOUNDED AND INCREMENTAL (#137): target 1 is parked at index 2 over a
+/// LONG tail of committed witnesses for sources it does not hold, with the one witness that names
+/// its held record last. The crossing walk reads the tail in bounded chunks, plans exactly ONE
+/// witness (the tail is skipped, not retained), resumes from its watermark after a cold page
+/// rather than re-reading the interval, and the adoption — which walks nothing of its own for
+/// witnesses — folds the plan and clears the record, so the owed capture stages and compacts.
+#[test]
+fn the_witness_plan_is_bounded_by_the_map_and_the_walk_resumes_from_its_watermark() {
+  use crate::endpoint::MAX_READ_BATCH_ENTRIES;
+  let now = Instant::ORIGIN;
+  let tail: u64 = MAX_READ_BATCH_ENTRIES + 1_800;
+  let last = Index::new(2 + tail + 1);
+  let encode_witness = |source: u64, generation: u64| {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(gid_key(source), generation),
+      &mut buf,
+    );
+    Bytes::from(buf)
+  };
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(gid_key(7), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let mut entries = std::vec![
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::RollbackMerge,
+      abort
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 2),
+    ),
+  ];
+  // The tail: witnesses for sources this target never held — nothing to plan.
+  for i in 0..tail {
+    entries.push(crate::Entry::new(
+      Term::new(1),
+      Index::new(3 + i),
+      crate::EntryKind::ThawDischarged,
+      encode_witness(1_000 + i, 1),
+    ));
+  }
+  // The one that matters, last.
+  entries.push(crate::Entry::new(
+    Term::new(1),
+    last,
+    crate::EntryKind::ThawDischarged,
+    encode_witness(7, 1),
+  ));
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&entries);
+  stable.force_state(Term::new(1), Some(1u64), last);
+  m.restore_group_unchecked(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
+  let mut stores = CountingStores(std::collections::BTreeMap::new());
+  stores.0.insert(
+    1,
+    (
+      // The resolver reads the abort-window coordinate first (one entry), then the walk's
+      // first bounded chunk lands; the walk's SECOND chunk answers cold.
+      CountingLog::new(log).cold_on_read(Some(2)),
+      stable,
+    ),
+  );
+
+  // Crank 1: the resolver reads the abort-window coordinate (one entry), the walk's first
+  // bounded chunk lands, and its second read answers cold — the walk stops at its watermark and
+  // withholds the hint (fail-closed).
+  let window = (Index::new(3), Index::new(4));
+  let chunk_end = Index::new(3 + MAX_READ_BATCH_ENTRIES);
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let reads = stores.0.get(&1).unwrap().0.read_ranges();
+  assert_eq!(
+    reads,
+    std::vec![window, (Index::new(3), chunk_end), (chunk_end, last.next())],
+    "the window read, one bounded chunk, then the cold page"
+  );
+  assert!(
+    reads
+      .iter()
+      .all(|(s, e)| e.get() - s.get() <= MAX_READ_BATCH_ENTRIES),
+    "every read of the walk is bounded: {reads:?}"
+  );
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    None,
+    "no hint off a partial walk"
+  );
+  assert!(
+    m.group(&1).unwrap().planned_witnesses().is_empty(),
+    "the plan is empty so far: the first chunk held only witnesses for unheld sources"
+  );
+
+  // Crank 2: the walk RESUMES from its watermark — the retry reads only what the cold page hid.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let reads = stores.0.get(&1).unwrap().0.read_ranges();
+  assert_eq!(
+    &reads[3..],
+    &[window, (chunk_end, last.next())],
+    "the retry re-reads the window coordinate and resumes the walk exactly where the first \
+     chunk ended — never at the park: {reads:?}"
+  );
+  let tep = m.group(&1).unwrap();
+  assert_eq!(
+    tep.merge_park_unresolvable(),
+    Some(Index::new(2)),
+    "the walk is current — the park advertises"
+  );
+  assert_eq!(
+    tep.planned_witnesses().keys().cloned().collect::<Vec<_>>(),
+    std::vec![(gid_key(7), 1u64)],
+    "the plan holds exactly the one witness naming a held record — the tail was skipped"
+  );
+
+  // The adopt folds the plan; the record clears; the owed capture stages and compacts — and the
+  // adopt itself reads NOTHING: the walk carried its absorb point along with the plan.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(&1, now, log, stable, 9u64, cure_blob_to(last))
+      .unwrap();
+  }
+  assert_eq!(
+    stores.0.get(&1).unwrap().0.read_ranges().len(),
+    reads.len(),
+    "the adopt performed no log read of its own over the warm interval"
+  );
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.pending_merge().is_none() && tep.applied_index() == last,
+    "adopted"
+  );
+  assert!(
+    tep.abandoned_obligations().is_empty() && tep.planned_witnesses().is_empty(),
+    "the planned witness cleared the record; the plan went with the park"
+  );
+  assert!(
+    !tep.capture_blocked_at(last),
+    "nothing fences the owed capture"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert!(
+    !m.group(&1).unwrap().adopt_capture_owed(),
+    "the owed capture staged"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+    assert!(
+      log.first_index() > Index::new(2),
+      "its compaction released the absorb membership fence"
+    );
+  }
+}
+
+/// THE WALK IS BUDGETED PER CRANK (#137): a warm committed tail longer than
+/// `CROSSING_SCAN_CHUNKS_PER_CRANK` chunks is walked across cranks — exactly the budgeted reads per
+/// crank, the watermark advancing after each chunk, the hint withheld until the walk reaches the
+/// frontier — and only then is the adopt admitted. The budget bounds the crank, not the walk.
+#[test]
+fn the_crossing_walk_spends_its_chunk_budget_per_crank_and_resumes() {
+  use crate::endpoint::{CROSSING_SCAN_CHUNKS_PER_CRANK, MAX_READ_BATCH_ENTRIES};
+  let now = Instant::ORIGIN;
+  let budget = CROSSING_SCAN_CHUNKS_PER_CRANK as u64;
+  let tail: u64 = budget * MAX_READ_BATCH_ENTRIES + 1_800;
+  let last = Index::new(2 + tail + 1);
+  let encode_witness = |source: u64, generation: u64| {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(gid_key(source), generation),
+      &mut buf,
+    );
+    Bytes::from(buf)
+  };
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(gid_key(7), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let mut entries = std::vec![
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::RollbackMerge,
+      abort
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 2),
+    ),
+  ];
+  for i in 0..tail {
+    entries.push(crate::Entry::new(
+      Term::new(1),
+      Index::new(3 + i),
+      crate::EntryKind::ThawDischarged,
+      encode_witness(1_000 + i, 1),
+    ));
+  }
+  entries.push(crate::Entry::new(
+    Term::new(1),
+    last,
+    crate::EntryKind::ThawDischarged,
+    encode_witness(7, 1),
+  ));
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&entries);
+  stable.force_state(Term::new(1), Some(1u64), last);
+  m.restore_group_unchecked(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let mut stores = CountingStores(std::collections::BTreeMap::new());
+  stores.0.insert(1, (CountingLog::new(log), stable));
+  let window = (Index::new(3), Index::new(4));
+  let chunk = |i: u64| {
+    (
+      Index::new(3 + i * MAX_READ_BATCH_ENTRIES),
+      Index::new(3 + (i + 1) * MAX_READ_BATCH_ENTRIES),
+    )
+  };
+
+  // Crank 1: the window read, then exactly the budgeted chunks — the frontier still ahead, the
+  // hint withheld, nothing planned yet (every chunk so far named only unheld sources).
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let reads = stores.0.get(&1).unwrap().0.read_ranges();
+  let mut expected = std::vec![window];
+  expected.extend((0..budget).map(chunk));
+  assert_eq!(
+    reads, expected,
+    "crank 1 spent exactly its chunk budget and stopped short of the frontier"
+  );
+  assert_eq!(
+    m.group(&1).unwrap().merge_park_unresolvable(),
+    None,
+    "no hint off a budget-bounded partial walk"
+  );
+  assert!(m.group(&1).unwrap().planned_witnesses().is_empty());
+
+  // Crank 2: the window read, then the walk resumes from its watermark and reaches the frontier
+  // in one remaining chunk — the hint and the plan follow.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let reads = stores.0.get(&1).unwrap().0.read_ranges();
+  assert_eq!(
+    &reads[expected.len()..],
+    &[window, (chunk(budget - 1).1, last.next())],
+    "crank 2 resumed at the watermark and read only the remainder: {reads:?}"
+  );
+  let tep = m.group(&1).unwrap();
+  assert_eq!(
+    tep.merge_park_unresolvable(),
+    Some(Index::new(2)),
+    "the walk reached the frontier — the park advertises"
+  );
+  assert_eq!(
+    tep.planned_witnesses().keys().cloned().collect::<Vec<_>>(),
+    std::vec![(gid_key(7), 1u64)],
+    "the plan holds the one witness naming a held record"
+  );
+  // The adopt is admitted only now, and folds the plan.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(&1, now, log, stable, 9u64, cure_blob_to(last))
+      .unwrap();
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.pending_merge().is_none() && tep.abandoned_obligations().is_empty(),
+    "adopted past the walked tail, the record cleared off the plan"
+  );
+}
+
+/// THE ADOPT WALKS NOTHING (#137): the resumable, budgeted crossing walk carries the absorb point
+/// an adoption engages its membership fence at, so the adopt performs no log read of its own.
+/// Under a ONE-PAGE cache — a multi-entry read is served only for the page loaded last; any other
+/// page misses, loads, and evicts — the walk crosses a three-page interval once (each page cold,
+/// then served, never revisited), the cure is admitted behind it, and the adoption completes on
+/// its first delivery with zero reads. An adopt-time re-walk from the park could never land: its
+/// first page misses (the walk's last page evicted it), the retry's second page misses, and the
+/// retry after that misses the first page again — the cure re-sent forever.
+#[test]
+fn the_adopt_reads_no_page_the_walk_already_crossed() {
+  use crate::endpoint::MAX_READ_BATCH_ENTRIES;
+  let now = Instant::ORIGIN;
+  let tail: u64 = 2 * MAX_READ_BATCH_ENTRIES + 1_800;
+  let last = Index::new(2 + tail + 1);
+  let encode_witness = |source: u64, generation: u64| {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(gid_key(source), generation),
+      &mut buf,
+    );
+    Bytes::from(buf)
+  };
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(gid_key(7), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let mut entries = std::vec![
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::RollbackMerge,
+      abort
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 2),
+    ),
+  ];
+  for i in 0..tail {
+    entries.push(crate::Entry::new(
+      Term::new(1),
+      Index::new(3 + i),
+      crate::EntryKind::ThawDischarged,
+      encode_witness(1_000 + i, 1),
+    ));
+  }
+  entries.push(crate::Entry::new(
+    Term::new(1),
+    last,
+    crate::EntryKind::ThawDischarged,
+    encode_witness(7, 1),
+  ));
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&entries);
+  stable.force_state(Term::new(1), Some(1u64), last);
+  m.restore_group_unchecked(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let mut stores = CountingStores(std::collections::BTreeMap::new());
+  stores
+    .0
+    .insert(1, (CountingLog::new(log).one_page_cache(), stable));
+  let window = (Index::new(3), Index::new(4));
+  let page = |i: u64| {
+    (
+      Index::new(3 + i * MAX_READ_BATCH_ENTRIES),
+      last
+        .next()
+        .min(Index::new(3 + (i + 1) * MAX_READ_BATCH_ENTRIES)),
+    )
+  };
+
+  // Four cranks: every crank probes the window (a single entry, outside the cache's model),
+  // then the walk resumes at its watermark — the page it missed last crank is served, the next
+  // one misses — until the third page is served and the walk reaches the frontier. No page is
+  // ever requested again once served.
+  let mut expected = Vec::new();
+  for crank in 0..4u64 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+    expected.push(window);
+    if crank > 0 {
+      expected.push(page(crank - 1));
+    }
+    if crank < 3 {
+      expected.push(page(crank));
+    }
+    assert_eq!(
+      stores.0.get(&1).unwrap().0.read_ranges(),
+      expected,
+      "crank {crank}: the walk resumed at its watermark and re-requested only the page it missed"
+    );
+    assert_eq!(
+      m.group(&1).unwrap().merge_park_unresolvable(),
+      (crank == 3).then_some(Index::new(2)),
+      "crank {crank}: the hint waits for the frontier"
+    );
+  }
+  assert_eq!(
+    stores.0.get(&1).unwrap().0.served_pages(),
+    std::vec![page(0), page(1), page(2)],
+    "each page served exactly once, in order — the walk crossed the interval once"
+  );
+  assert_eq!(
+    m.group(&1)
+      .unwrap()
+      .planned_witnesses()
+      .keys()
+      .cloned()
+      .collect::<Vec<_>>(),
+    std::vec![(gid_key(7), 1u64)],
+    "the plan holds the one witness naming a held record"
+  );
+
+  // The cure's FIRST delivery adopts, and the adopt requests no page at all.
+  let before = stores.0.get(&1).unwrap().0.read_ranges();
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(&1, now, log, stable, 9u64, cure_blob_to(last))
+      .unwrap();
+  }
+  assert_eq!(
+    stores.0.get(&1).unwrap().0.read_ranges(),
+    before,
+    "the adopt performed no log read: the walk carried its absorb point"
+  );
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.pending_merge().is_none() && tep.applied_index() == last,
+    "adopted on the first delivery"
+  );
+  assert!(
+    tep.abandoned_obligations().is_empty() && tep.planned_witnesses().is_empty(),
+    "the planned witness cleared the record; the plan went with the park"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert!(
+    !m.group(&1).unwrap().adopt_capture_owed(),
+    "the owed capture staged"
+  );
+}
+
+/// THE PLAN IS BOUNDARY-SCOPED (#137): the walk's frontier W sits above the boundary B a cure
+/// ships; a witness for a held record lies at W' with B < W' <= W, and a belt-dependent
+/// `CommitMerge` for that record's source at D with B < D < W'. The adoption folds nothing above
+/// B: the record STANDS adopt-covered, the drain then applies D through the same-merge abort belt
+/// as a no-op (`MergeAborted`, no park, the lineage untouched) and applies W' at its own index,
+/// clearing the record. Folding W' at the adopt would have cleared the record early, parked D
+/// over a source no one hosts, and trapped W' behind that park — committed apply stalled.
+#[test]
+fn the_adopt_folds_no_witness_above_its_boundary() {
+  let now = Instant::ORIGIN;
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(gid_key(7), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let witness = {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(gid_key(7), 1),
+      &mut buf,
+    );
+    Bytes::from(buf)
+  };
+  let (boundary, d, w, last) = (Index::new(6), Index::new(8), Index::new(10), Index::new(11));
+  let mut entries = std::vec![
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::RollbackMerge,
+      abort
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 2),
+    ),
+  ];
+  for i in 3..=last.get() {
+    let at = Index::new(i);
+    let (kind, data) = if at == d {
+      // A FRESH mint for the aborted freeze generation: only the belt keeps it from parking.
+      (
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(7, Index::new(9), 1, 3),
+      )
+    } else if at == w {
+      (crate::EntryKind::ThawDischarged, witness.clone())
+    } else {
+      (crate::EntryKind::Normal, cmd.clone())
+    };
+    entries.push(crate::Entry::new(Term::new(1), at, kind, data));
+  }
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&entries);
+  stable.force_state(Term::new(1), Some(1u64), last);
+  m.restore_group_unchecked(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_some(),
+    "parked at 2 over a source hosted nowhere"
+  );
+
+  // The walk reaches the frontier W: the crossing at D recorded, the witness at W' planned.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let tep = m.group(&1).unwrap();
+  assert_eq!(
+    tep.merge_park_unresolvable(),
+    Some(Index::new(2)),
+    "the walk reached the frontier — the park advertises"
+  );
+  assert_eq!(
+    tep.planned_witnesses().get(&(gid_key(7), 1u64)),
+    Some(&w),
+    "the witness above the boundary is planned at its index"
+  );
+
+  // The cure covers only B < D < W': the adopt folds nothing above B — the record stands.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(&1, now, log, stable, 9u64, cure_blob_at_gen(boundary, 2))
+      .unwrap();
+  }
+  let tep = m.group(&1).unwrap();
+  assert!(
+    tep.pending_merge().is_none() && tep.applied_index() == boundary,
+    "adopted to the boundary"
+  );
+  assert_eq!(
+    tep
+      .abandoned_record(&gid_key(7))
+      .map(|r| (r.cover, r.discharged)),
+    Some((Cover::Adopt, false)),
+    "the record STANDS: the witness at W' > B was not folded"
+  );
+  assert!(
+    tep.planned_witnesses().is_empty(),
+    "the plan went with the park"
+  );
+  assert_eq!(tep.shape_gen(), 2, "the lineage folded from the blob");
+
+  // The drain resumes above the boundary: D applies through the belt as a no-op — no park, the
+  // lineage untouched — and W' clears the record at its own index.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  let mut aborted_at = None;
+  while let Some((gid, ev)) = m.poll_event() {
+    if gid == 1
+      && let Event::MergeAborted(e) = ev
+    {
+      aborted_at = Some(e.index());
+    }
+  }
+  assert_eq!(
+    aborted_at,
+    Some(d),
+    "D no-oped through the same-merge abort belt"
+  );
+  let tep = m.group(&1).unwrap();
+  assert!(tep.pending_merge().is_none(), "D did not park");
+  assert_eq!(
+    tep.applied_index(),
+    last,
+    "the drain ran through W' to the frontier"
+  );
+  assert!(
+    tep.abandoned_obligations().is_empty(),
+    "W' cleared the record at its own index"
+  );
+  assert_eq!(tep.shape_gen(), 2, "the belt bumps nothing");
+}
+
+/// THE PLAN IS BOUNDED BY THE HELD RECORDS (#137): two committed witnesses for the same
+/// `(source, generation)` inside the interval yield ONE plan entry, at the lower index — the first
+/// clears the record, the duplicate no-ops — so the plan grows with the records this target
+/// holds, never with the witnesses the range repeats.
+#[test]
+fn duplicate_witnesses_plan_once_at_the_lower_index() {
+  let now = Instant::ORIGIN;
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(gid_key(7), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let witness = {
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(
+      &ThawDischargedPayload::new(gid_key(7), 1),
+      &mut buf,
+    );
+    Bytes::from(buf)
+  };
+  let last = Index::new(4);
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::RollbackMerge,
+      abort,
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 2),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(3),
+      crate::EntryKind::ThawDischarged,
+      witness.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      last,
+      crate::EntryKind::ThawDischarged,
+      witness,
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), last);
+  m.restore_group_unchecked(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (log, stable));
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.group(&1)
+      .unwrap()
+      .planned_witnesses()
+      .iter()
+      .map(|(pair, at)| (pair.clone(), *at))
+      .collect::<Vec<_>>(),
+    std::vec![((gid_key(7), 1u64), Index::new(3))],
+    "one entry for the pair, at the lower index"
+  );
+}
+
+/// THE ABSORB POINT IS PER-BOUNDARY (#137): a park at k with crossings at k+3, k+7 and k+11 —
+/// driven through the crossing walk itself — answers each boundary with the highest crossing
+/// at-or-below it, never one above it, and answers nothing at all for a boundary the walk has
+/// not examined.
+#[test]
+fn the_crossing_absorb_point_is_the_highest_crossing_at_or_below_the_boundary() {
+  let now = Instant::ORIGIN;
+  let k = 2u64;
+  let last = Index::new(k + 12);
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let mut entries = std::vec![
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone()
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(k),
+      crate::EntryKind::CommitMerge,
+      commit_merge_bytes(42, Index::new(5), 1, 1),
+    ),
+  ];
+  for i in (k + 1)..=last.get() {
+    let (kind, data) = match i - k {
+      3 | 7 | 11 => (
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(40 + i, Index::new(1), 1, 2),
+      ),
+      _ => (crate::EntryKind::Normal, cmd.clone()),
+    };
+    entries.push(crate::Entry::new(Term::new(1), Index::new(i), kind, data));
+  }
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&entries);
+  stable.force_state(Term::new(1), Some(1u64), last);
+  m.restore_group_unchecked(
+    1,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(
+    m.group(&1).unwrap().pending_merge().map(|p| p.at()),
+    Some(Index::new(k)),
+    "parked at k"
+  );
+  let ep = m.group_mut(&1).unwrap();
+  ep.advance_crossing_scan(&log);
+  assert!(
+    ep.crossing_walk_covers(last),
+    "one warm crank walks the whole tail"
+  );
+  let at = |i: u64| Index::new(k + i);
+  assert_eq!(
+    ep.crossing_absorb_at(at(2)),
+    None,
+    "k+2: no crossing at-or-below"
+  );
+  assert_eq!(
+    ep.crossing_absorb_at(at(3)),
+    Some(at(3)),
+    "k+3: the crossing itself"
+  );
+  assert_eq!(
+    ep.crossing_absorb_at(at(7)),
+    Some(at(7)),
+    "k+7: the crossing itself"
+  );
+  assert_eq!(
+    ep.crossing_absorb_at(at(10)),
+    Some(at(7)),
+    "in [k+7, k+11): the highest at-or-below, never the one above"
+  );
+  assert_eq!(
+    ep.crossing_absorb_at(at(12)),
+    Some(at(11)),
+    "the frontier: the highest crossing at-or-below"
+  );
+  assert_eq!(
+    ep.crossing_absorb_at(at(13)),
+    None,
+    "above the walk's frontier: unexamined, no answer"
+  );
+}
+
+/// THE DESTRUCTIVE-INSTALL RESIDUAL, PINNED (#138, residual 12): target 1 applied an abort for
+/// source 2, then installed the leader's snapshot past it — a leader that had applied the witness
+/// and captured beyond it, so no witness will ever reach this replica. The install-covered record
+/// stays LIVE here with nothing to retire it short of a new global proof: it fences no capture (the
+/// entry is gone), its holder is removable through the step-aside while the source is unhosted, and
+/// `SourceOwesThaw` holds the holder as a merge source. This is the recorded outcome, not a fix; the
+/// retention itself is pinned by the install tests (`an_install_past_the_abort_retains…`,
+/// `snapshot_install_marks_the_covered_abort_relay`) whose red is the old drop.
+#[test]
+fn an_install_covered_dead_end_is_the_recorded_residual() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  let abort = {
+    let p = crate::RollbackMergePayload::abort(gid_key(2), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+    Bytes::from(buf)
+  };
+  let mut tlog = VecLog::default();
+  let mut tstable = AsyncStable::default();
+  tlog.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::RollbackMerge,
+    abort,
+  )]);
+  tstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  m.restore_group_unchecked(
+    1,
+    single_node_cfg(1).with_snapshot_threshold(1),
+    now,
+    7,
+    CountSm::default(),
+    1,
+    &mut tlog,
+    &mut tstable,
+  )
+  .unwrap();
+  stores.0.insert(1, (tlog, tstable));
+  install_past_the_abort(&mut m, &mut stores);
+  let t = m.group(&1).unwrap();
+  assert!(
+    t.owes_live_thaw()
+      && t
+        .abandoned_record(&gid_key(2))
+        .is_some_and(|r| r.cover == Cover::Install && !r.discharged),
+    "the install-covered record stands, live — the witness that would retire it never arrives"
+  );
+  assert!(
+    !t.capture_blocked_at(t.applied_index()),
+    "it fences no capture: the entry it protected is gone"
+  );
+  // The holder leads and refuses to freeze as a merge source; its captures proceed freely.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m, 1, d, log, stable);
+    assert!(m.group(&1).unwrap().role().is_leader());
+  }
+  stores
+    .0
+    .insert(0, (VecLog::default(), AsyncStable::default()));
+  m.create_group(0, 0, single_node_cfg(1), now, 9, CountSm::default())
+    .unwrap();
+  let verdict = m.prepare_merge(&1, now, &mut stores, &0);
+  assert!(
+    matches!(verdict, Some(Err(MergeError::SourceOwesThaw))),
+    "the live record holds the holder as a merge source: {verdict:?}"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose(&1, now, log, stable, &Bytes::from_static(b"x"))
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+    assert!(
+      stable
+        .snapshot()
+        .is_some_and(|(meta, _)| meta.last_index() > Index::new(5)),
+      "the threshold capture landed past the install with the record standing"
+    );
+  }
+  assert_eq!(
+    m.remove_group(&1, &mut stores).map(|r| r.is_some()),
+    Ok(true),
+    "and the holder is removable through the step-aside: its source is unhosted"
   );
 }
 
@@ -17148,7 +20973,7 @@ fn a_hosted_unadvanced_counterparty_withholds_the_cure() {
   .unwrap();
   assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "the abort armed the obligation"
   );
   let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
@@ -17282,7 +21107,7 @@ fn a_hosted_unadvanced_counterparty_withholds_the_cure() {
     "no destructive completion can supersede the park the sibling state protects"
   );
   assert!(
-    m.group(&1).unwrap().has_abandoned(),
+    m.group(&1).unwrap().owes_live_thaw(),
     "the live thaw obligation is intact"
   );
 }

@@ -2703,6 +2703,136 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
   );
 }
 
+/// A LOCALLY TOMBSTONED CHILD ID HOLDS THE FORK — it never abandons it. The staged blob is the
+/// child partition's ONLY local copy, and a tombstone is a WINDOW (`clear_tombstone` lifts it), not
+/// a verdict about the fork, so the materialization loop the drivers run must leave the fork staged
+/// with its blob, its fence and its reservation intact and come round again. Dropping it here is
+/// silent partial data loss: the parent's half survives, the child's half is gone, and nothing in
+/// the pair ever reports a missing partition.
+///
+/// The tombstone is taken AFTER the split commits because that is the only window in which one can
+/// meet a staged fork at all — `propose_split` refuses a retired child outright
+/// ([`SplitError::ChildRetired`]), so the entry is never appended in the other order.
+#[test]
+fn a_tombstoned_child_holds_the_fork_rather_than_abandoning_it() {
+  let now = Instant::ORIGIN;
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut c = SplitCoord::new();
+
+  // Genesis: parent 100 leads (single voter) and commits 3 units of load.
+  engine.add_group(100);
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    SplitSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  let d = c.group(&100).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c.handle_timeout(&100, d, l, s).unwrap();
+  }
+  settle_engine(&mut c, &mut engine, &[100], d);
+  assert!(c.group(&100).unwrap().role().is_leader());
+  for _ in 0..3 {
+    let (l, s) = engine.stores(&100).unwrap();
+    c.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"), &NoFloors)
+      .unwrap()
+      .unwrap();
+    settle_engine(&mut c, &mut engine, &[100], d);
+  }
+  assert_eq!(c.group(&100).unwrap().state_machine().units, 3);
+
+  // The split commits and STAGES the fork: child 300 takes 2 of the parent's 3 units.
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c.propose_split(
+      &100,
+      d,
+      l,
+      s,
+      &300,
+      0,
+      Bytes::from_static(b"\x02"),
+      &NoFloors,
+    )
+    .expect("the parent is hosted")
+    .expect("the leader appends the split");
+  }
+  settle_engine(&mut c, &mut engine, &[100], d);
+  assert!(
+    c.group(&100).unwrap().peek_pending_fork().is_some(),
+    "the applied split staged the fork"
+  );
+
+  // The embedder tombstones the child id — never hosted here, so the removal tears nothing down and
+  // leaves only the volatile consent gate behind.
+  assert!(
+    c.remove_group(&300, &mut empty_stores()).unwrap().is_none(),
+    "the id is not hosted — the removal only tombstones"
+  );
+  assert!(c.is_retired(&300));
+
+  // THE HOLD, at both edges of the drivers' materialization loop.
+  assert!(
+    c.peek_yieldable_fork(&NoHold).is_none(),
+    "the tombstone rides in as occupancy, so the drain holds instead of yielding"
+  );
+  assert_eq!(
+    c.install_yieldable_fork(&100, &300, &mut engine, now, 1),
+    InstallOutcome::Held,
+    "the install edge answers HOLD for a tombstoned id — abandoning would destroy the partition's \
+     only local copy for a gate the embedder can lift"
+  );
+  assert!(
+    c.group(&100).unwrap().peek_pending_fork().is_some(),
+    "held means STAGED: the blob, the fence and the child reservation all survive"
+  );
+  assert!(
+    !engine.contains_group(&300),
+    "the hold wrote nothing for the child — not even empty storage"
+  );
+  assert_eq!(
+    c.peek_split_conflict(),
+    Some((100, 300)),
+    "the hold is announced to the placement brain, never silent"
+  );
+
+  // CLEARED: the same staged fork materializes, with the child's half conserved across the hold.
+  assert!(c.clear_tombstone(&300));
+  {
+    let fork = c
+      .peek_yieldable_fork(&NoHold)
+      .expect("the lifted tombstone releases the held fork");
+    assert_eq!(((*fork.child()), fork.parent_gen_after()), (300, 1));
+  }
+  let InstallOutcome::Installed { child_gen, .. } =
+    c.install_yieldable_fork(&100, &300, &mut engine, now, 1)
+  else {
+    panic!("a cleared id materializes the fork it held")
+  };
+  assert_eq!(child_gen, 0, "the fork's own child generation");
+  assert_eq!(
+    c.group(&300).unwrap().applied_index(),
+    crate::FORK_BASE_INDEX,
+    "the child booted at the manufactured baseline"
+  );
+  assert_eq!(
+    c.group(&300).unwrap().state_machine().units + c.group(&100).unwrap().state_machine().units,
+    3,
+    "conservation across the hold: the held blob still carries the child's 2 units"
+  );
+  assert_eq!(
+    c.group(&300).unwrap().state_machine().units,
+    2,
+    "the child's half is exactly what the split named"
+  );
+}
+
 /// THE PUBLIC FORK DOOR IS FENCED, AND TOKEN-LESS. `create_group_from_fork` is callable by anyone
 /// holding a coordinator, so it is fenced two ways. It no longer ACCEPTS provenance at all — the
 /// parameter is gone, so a caller cannot stamp its own content with an identity, which matters
@@ -3095,7 +3225,7 @@ fn merge_verbs_ride_the_coordinator() {
     ));
   }
   assert!(
-    coord.group(&1).is_some_and(|ep| !ep.has_abandoned()),
+    coord.group(&1).is_some_and(|ep| !ep.owes_live_thaw()),
     "no abort applied — the target records no thaw obligation"
   );
 }
@@ -4059,7 +4189,7 @@ fn abort_and_apply(
     }
   }
   let after = stores.map.get(&1).unwrap().0.last_index();
-  let owed = coord.group(&1).is_some_and(|ep| ep.has_abandoned());
+  let owed = coord.group(&1).is_some_and(|ep| ep.owes_live_thaw());
   (verdict, after != before, owed)
 }
 
