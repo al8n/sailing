@@ -1811,14 +1811,23 @@ where
     // yet to name a hosted counterparty (the install-over-a-park class, #133). An obligation
     // above the boundary is untouched (see the helper).
     self.note_abort_covered(meta.last_index(), crate::endpoint::Cover::Install);
-    // The blob supersedes the capture-debt chain by the SAME rule: per-entry obligations below
-    // the boundary are resolved GLOBALLY by the transferring leader's own discharge barrier —
-    // the prior sources were terminally floored where their teardown was authorized, and that
-    // floor reaches this host by propagation. Locally their preserved stores and engine
-    // records stand exactly as a husk's do (never re-admittable, torn down off the propagated
-    // floor), so the chain clears here WITHOUT surfacing `Merged` — this host authorizes no
-    // teardown it did not run.
-    self.note_debts_rebaselined();
+    // The capture-debt chain SURVIVES the re-baseline. The blob at-or-past the absorb boundary
+    // is the union's durable form on THIS host — reaching this body implies
+    // `boundary > commit >= applied >= absorb index` (redundancy classified at-or-below commit,
+    // a cross-lineage blob was refused at receipt) — so the held `Merged`s are dischargeable
+    // here, and ONLY here: the terminal floor is this host's own write, nothing propagates it.
+    // The per-crank capture-debt pass discharges them on this install's durable evidence in the
+    // same crank, one `Merged` per source, exactly once — `durable_snapshot_covers` plus a
+    // released `merge_conf_fence` (the park is cleared above and the restored log's
+    // `first_index` is past the absorb point), with the group's stores in hand from the pass's
+    // caller. A poisoned completion discharges nothing: the pass skips poisoned debtors, so the
+    // chain and its naming stand. THE KNOWN DIVERGENCE from the install/restart-agreement
+    // doctrine: this install is a second way the boundary's `CommitMerge` vanishes under a live
+    // debt, so a crash after the blob's fsync and before the pass's discharge (and the driver's
+    // floor write) restarts with the chain gone — the sources' stores then stand redundant
+    // under non-terminal floors (their union is durable in the blob) and un-named, the residual
+    // the durable-engine program closes (#134). Strictly narrower than clearing the chain here,
+    // which orphaned the sources on every path.
     // The fourth per-host reshape obligation the install supersedes: a QUEUED fork's durability
     // barrier at-or-below the boundary. The justification is the restore itself, not any claim
     // about the sender: `log.restore` above already discarded the split entry — the replay
