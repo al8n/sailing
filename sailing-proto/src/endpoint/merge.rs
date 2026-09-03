@@ -325,7 +325,11 @@ pub(crate) struct MergeState {
   /// Log index of the most recently appended (not-yet-applied) `CommitMerge` on THIS leader —
   /// the in-flight leg of the target's membership fence (`> applied` ⇒ a commit-merge is in
   /// flight), mirroring `pending_split_index` exactly: derived state, re-seated conservatively
-  /// at `become_leader`, never a sticky flag.
+  /// at `become_leader`, never a sticky flag. A destructive snapshot install re-seats it to ZERO
+  /// with the other in-flight fences — the restart's value: a follower's seat above the boundary
+  /// is a former leader's over the tail the restore discarded, and left standing it would hold
+  /// `merge_conf_fence` against the install's own evidence indefinitely (it names an index this
+  /// replica's log may never reach again).
   pub(crate) pending_commit_index: Index,
   /// Log index of the most recently appended (not-yet-applied) `RollbackMerge` on THIS leader
   /// (`> applied` ⇒ a rollback is in flight) — `commit_merge`'s LINEAGE fence, the exact analogue
@@ -338,7 +342,9 @@ pub(crate) struct MergeState {
   /// Set for EVERY `RollbackMerge` append (the source-role thaw included — harmlessly, since a
   /// thawing source is `frozen` and `commit_merge` refuses it `AlreadyFrozen` first). Derived,
   /// self-releasing via `> applied`, re-seated conservatively to `last` at `become_leader` like the
-  /// other fences (a truncated-then-re-elected abort must not wedge the merge verbs).
+  /// other fences (a truncated-then-re-elected abort must not wedge the merge verbs), and to ZERO
+  /// by a destructive snapshot install with the rest of them (restart parity: the seat's entry was
+  /// in the discarded tail).
   pub(crate) pending_rollback_index: Index,
   /// Log index of the SOURCE-role `RollbackMerge` (thaw) this leader last appended and not yet
   /// applied (`> applied` ⇒ a thaw is in flight) — the abort-relay's IDEMPOTENT-APPEND guard:

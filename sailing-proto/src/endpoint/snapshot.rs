@@ -1784,6 +1784,30 @@ where
     self.merge.freeze_index = None;
     self.merge.freeze_term = None;
     self.merge.frozen_for = None;
+    // Re-seat every leader-side in-flight fence to the restart's value. Only a FOLLOWER installs,
+    // and a follower has no proposals of its own in flight, so a seat above the boundary is a
+    // former leader's over the tail `log.restore` just discarded: the entry it names no longer
+    // exists here (one above the boundary that did commit arrives by AppendEntries and takes
+    // its ordinary path — a `CommitMerge` parks), while a seat at-or-below the boundary reads
+    // `> applied` false either way. The re-seat therefore changes behaviour in exactly the
+    // wedge cases and nowhere else, and a plain restart from the same durable state zeroes all
+    // five. Left standing, `pending_commit_index` holds `merge_conf_fence` indefinitely — it
+    // names an index this replica's log may never reach again — and refuses the debt pass
+    // this install's own durable evidence (the capture-debt discharge below — with a capture
+    // fence standing, its only same-crank route); `pending_conf_index` holds
+    // `conf_change_in_flight`, which `prepare_merge` reads on the TARGET with no leader gate;
+    // and `pending_split_index` with its child holds the public, role-independent
+    // `split_reserved`. `pending_rollback_index` and `pending_read_mode_index` are read on the
+    // leader path only, which `become_leader` re-seats first — restart parity. The cross-source
+    // abort fence reads `pending_commit_source` only from a leader, behind that same re-seat.
+    // The thaw and witness guards are not fences of this class — `become_leader` already
+    // re-seats them to ZERO, the opposite bias — and stay as they are.
+    self.merge.pending_commit_index = Index::ZERO;
+    self.merge.pending_rollback_index = Index::ZERO;
+    self.split.pending_split_index = Index::ZERO;
+    self.split.pending_split_child = Bytes::new();
+    self.pending_conf_index = Index::ZERO;
+    self.reads.pending_read_mode_index = Index::ZERO;
     // A parked CommitMerge is SUPERSEDED by the install: at-or-below the boundary, the blob IS
     // the union (the target leader's forced absorb capture sits past every resolution, so a
     // log-behind straggler is caught up wholesale without ever touching its local source);
@@ -1818,16 +1842,16 @@ where
     // here, and ONLY here: the terminal floor is this host's own write, nothing propagates it.
     // The per-crank capture-debt pass discharges them on this install's durable evidence in the
     // same crank, one `Merged` per source, exactly once — `durable_snapshot_covers` plus a
-    // released `merge_conf_fence` (the park is cleared above and the restored log's
-    // `first_index` is past the absorb point), with the group's stores in hand from the pass's
-    // caller. A poisoned completion discharges nothing: the pass skips poisoned debtors, so the
-    // chain and its naming stand. THE KNOWN DIVERGENCE from the install/restart-agreement
-    // doctrine: this install is a second way the boundary's `CommitMerge` vanishes under a live
-    // debt, so a crash after the blob's fsync and before the pass's discharge (and the driver's
-    // floor write) restarts with the chain gone — the sources' stores then stand redundant
-    // under non-terminal floors (their union is durable in the blob) and un-named, the residual
-    // the durable-engine program closes (#134). Strictly narrower than clearing the chain here,
-    // which orphaned the sources on every path.
+    // released `merge_conf_fence` (the park is cleared and the in-flight leg re-seated above,
+    // and the restored log's `first_index` is past the absorb point), with the group's stores
+    // in hand from the pass's caller. A poisoned completion discharges nothing: the pass skips
+    // poisoned debtors, so the chain and its naming stand. THE KNOWN DIVERGENCE from the
+    // install/restart-agreement doctrine: this install is a second way the boundary's
+    // `CommitMerge` vanishes under a live debt, so a crash after the blob's fsync and before the
+    // pass's discharge (and the driver's floor write) restarts with the chain gone — the
+    // sources' stores then stand redundant under non-terminal floors (their union is durable in
+    // the blob) and un-named, the residual the durable-engine program closes (#134). Strictly
+    // narrower than clearing the chain here, which orphaned the sources on every path.
     // The fourth per-host reshape obligation the install supersedes: a QUEUED fork's durability
     // barrier at-or-below the boundary. The justification is the restore itself, not any claim
     // about the sender: `log.restore` above already discarded the split entry — the replay
