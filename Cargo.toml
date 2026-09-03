@@ -30,7 +30,7 @@ flume = { version = "0.12", default-features = false, features = ["async"] }
 lochan = "0.1"
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"] }
-agnostic = { version = "0.10", default-features = false }
+agnostic = { version = "0.11", default-features = false }
 agnostic-lite = { version = "0.6", default-features = false }
 socket2 = { version = "0.6", features = ["all"] }
 
