@@ -216,6 +216,30 @@ pub trait GroupStores<G, L, S> {
 /// resolution folds: dropping the stores while the floor is only STAGED (not durable) and crashing
 /// would re-admit the id below its generation.
 ///
+/// THE HOST-LOCALITY FENCE: the terminal floor is written by the host that FOLDS the resolution,
+/// and nothing in-tree carries one host's floor to another — no snapshot meta, entry payload or
+/// message field admits a floor; every consumer below reads the LOCAL [`FloorStore`]. A host that
+/// never folded reads the floor at FOUR sites:
+///
+/// 1. the husk dissolve — a hosted FROZEN source at this floor is retired (`Retired`);
+/// 2. the dead-target thaw — a hosted frozen source whose UNHOSTED target reads this floor mints
+///    its own COMMITTED thaw;
+/// 3. the park resolver's ABSENT-SOURCE arm — a park whose source is unhosted resolves `Abort`
+///    (a replayed duplicate) under this floor, and otherwise WAITS for the post-merge snapshot;
+/// 4. the thaw pass's two TERMINAL arms (the hosted-source and the unhosted-source leg of its
+///    global proof), which retire an abort obligation on every holder and back the COMMITTED
+///    `ThawDischarged` witness — the unhosted leg is the one a floor for an unhosted id reaches.
+///
+/// Sites 3 and 4 turn a floor for an UNHOSTED id under a standing park into a skipped union or a
+/// witness this host holds no proof for. So a floor the EMBEDDER'S CATALOG writes here (cross-host
+/// knowledge, never this host's fold) is legitimate ONLY for an id its catalog registered ABSORBED
+/// that this host hosts as a FROZEN HUSK, and only once this node's replica of the target is gone
+/// or past the absorb boundary with NO park naming the source — the precondition the repo's model
+/// embedder enforces (`embedder_husk_floors` in the simulation world), because feeding the floor
+/// anywhere else manufactures the absent/duplicate abort arm and skips the union on this replica
+/// alone: committed divergence against every host that absorbed. A source frozen for a target
+/// that is unhosted here and unfloored is the embedder's to observe and re-host, never to floor.
+///
 /// CONSENSUS-GRADE WARNING: a false terminal floor no longer costs merely ONE local replica. The
 /// per-crank service reads this floor on a source's DEAD (unhosted) TARGET to authorize the source
 /// minting its OWN thaw — a COMMITTED entry every replica applies (see the dead-target derivation in
@@ -712,11 +736,15 @@ pub enum MergeResolution<G> {
   },
   /// A hosted FROZEN source at the TERMINAL [`MERGED_FLOOR`] — the husk of a lineage that was
   /// absorbed away ELSEWHERE (its target caught up via a snapshot install and never parked here) —
-  /// was DISSOLVED locally. There is no absorb and so no capture: the driver folds the SAME source
-  /// half as `Merged` MINUS the capture — re-persist `floor(source) = `[`MERGED_FLOOR`] (a monotone
-  /// no-op when already durable, but MANDATORY co-barriered with the teardown: a `FloorStore` may
-  /// serve a STAGED floor, and dropping the stores off it then crashing before the flush would
-  /// re-admit the id below its gen) and drop the source's stores.
+  /// was DISSOLVED locally. The floor is the EMBEDDER'S CATALOG's assertion that the resolving
+  /// host's own fold retired the lineage, not anything this host derived: no terminal floor
+  /// travels between hosts (the host-locality fence on [`MERGED_FLOOR`]), so without that
+  /// assertion the husk would stand forever. There is no absorb and so no capture: the driver
+  /// folds the SAME source half as `Merged` MINUS the capture — re-persist
+  /// `floor(source) = `[`MERGED_FLOOR`] (a monotone no-op when already durable, but MANDATORY
+  /// co-barriered with the teardown: a `FloorStore` may serve a STAGED floor, and dropping the
+  /// stores off it then crashing before the flush would re-admit the id below its gen) and drop
+  /// the source's stores.
   Retired {
     /// The dissolved husk's source group.
     source: G,
@@ -776,7 +804,10 @@ pub enum MergeBlockedCause {
   /// source hosted on this host: an adopting install would cross that entry without resolving
   /// it, leaving the hosted replica a live-voting husk of an absorbed-away (or stale-no-op)
   /// lineage — so the cure advertisement is withheld, outcome-blind and fail-closed, and the
-  /// park waits on the hosted replica's own lifecycle or the propagated terminal floor.
+  /// park waits on the hosted replica's own lifecycle: its absorb or abort resolving here, its
+  /// removal, or — for the husk of a lineage the embedder's catalog registered absorbed — the
+  /// catalog's terminal floor, which the dissolve consumes. No floor arrives from the host that
+  /// folded the crossing's absorb.
   CrossedHostedSource,
   /// A staged fork holds the merge. Two shapes, one exit — the fork conflict's resolution:
   /// the union is absorbed and serving while its durability capture waits on the TARGET's own fork
@@ -5399,8 +5430,11 @@ where
       // hosted here would leave that replica a live-voting husk of a lineage the blob absorbed
       // — or a stale no-op only the full apply machinery's lineage guard can classify, a
       // re-derivation no scan can soundly make — so ANY hosted crossing withholds the hint and
-      // the park waits (its exit is the hosted replica's own lifecycle, or the propagated
-      // terminal floor). A decode failure withholds too: fail-closed.
+      // the park waits. Its exit is the hosted replica's own lifecycle — the crossing's absorb or
+      // abort resolving here, or its removal — or the embedder's catalog flooring that replica as
+      // the husk of a lineage it registered absorbed, which the dissolve consumes; no terminal
+      // floor arrives from the host that folded the absorb. A decode failure withholds too:
+      // fail-closed.
       let mut crossing_decode_corrupt = false;
       let hosted_crossing: Option<G> = if locally_unresolvable {
         self.groups.get(&tgid).and_then(|t| {
@@ -5976,11 +6010,14 @@ where
     // THE FLOOR-AUTHORITATIVE HUSK DISSOLVE, ordered AFTER the resolver loop AND the thaw pass so a
     // witness has already cleared any of a husk's UNDRIVABLE obligations before the belt reads them.
     // A hosted FROZEN source at the TERMINAL `MERGED_FLOOR` is the husk of a lineage absorbed away
-    // ELSEWHERE (its target caught up via a snapshot install and never parked here): tombstones refuse
-    // recreation, so no later same-id incarnation can ever exist and the floor is AUTHORITATIVE that
-    // this frozen replica is dead. Otherwise it is unremovable (`Frozen`), blocks its claimed target's
-    // removal (`Claimed`), and is capture-fenced forever. Dissolve it LOCALLY; a poisoned husk is left
-    // for its own fail-stop.
+    // ELSEWHERE (its target caught up via a snapshot install and never parked here). The floor is
+    // not this host's derivation: the resolving host's fold wrote its own, and nothing carries it
+    // here — what this arm keys on is the EMBEDDER'S CATALOG asserting that the lineage was
+    // retired by that fold (the host-locality fence on `MERGED_FLOOR`). Taken as asserted it is
+    // AUTHORITATIVE: tombstones refuse recreation, so no later same-id incarnation can ever exist
+    // and this frozen replica is dead. Otherwise it is unremovable (`Frozen`), blocks its claimed
+    // target's removal (`Claimed`), and is capture-fenced forever. Dissolve it LOCALLY; a poisoned
+    // husk is left for its own fail-stop.
     // The source ids NAMED by any co-hosted target's still-standing park, collected in ONE pass
     // here (exact because the resolver + thaw passes above already ran) rather than re-scanning
     // every group per husk — the husk×park product was O(N²) under merge-heavy reshaping. A frozen
@@ -6038,9 +6075,10 @@ where
       // foreign-led freeze can husk a debtor here while the replicas that captured cleanly never
       // owed. Retiring would drop the held `Merged` — the earlier absorbed source's only
       // terminal-floor permission — so it discharges into the SAME evidence this dissolve keys
-      // on: the propagated `MERGED_FLOOR` was co-barriered with the claimant's durable capture
-      // of this husk's state machine, which has carried the prior union since that absorb
-      // applied. (A claimant that itself deferred writes no terminal floor until its own debt
+      // on: the catalog's `MERGED_FLOOR` asserts that the claimant's own fold retired this
+      // lineage, and that fold's durable capture covered this husk's state machine, which has
+      // carried the prior union since that absorb applied. (A claimant that itself deferred folds
+      // no `Merged` — nothing for a catalog to register and floor — until its own debt
       // discharges, so the floor gate serializes the chain by construction.) A committed-corrupt
       // debt source id fail-stops the husk instead of retiring it.
       let mut inherited_sources: std::vec::Vec<G> = std::vec::Vec::new();
@@ -6097,12 +6135,21 @@ where
     // locally unresolvable, whose defining condition is that NO S replica is hosted there at all. So
     // no skip, of either shape, ever adds a surviving S husk (a vote) to the success world's S
     // electorate; the hosts whose S replicas survive un-consumed are exactly those where the
-    // absorb is still locally pending or locally impossible-by-hosting, and their husks retire
-    // off the propagated terminal floor once it arrives. S's voter set
-    // is FROZEN-TIME-FIXED (a frozen source refuses conf changes), dissolved T replicas are
-    // tombstoned NON-voters, and this mint is LEADER-only. Therefore in the success world an S
-    // leader can never even APPEND this thaw (the surviving-husk electorate cannot elect), let
-    // alone commit it — the divergence is unconstructible. In the
+    // absorb is still locally pending or locally impossible-by-hosting. Those replicas are LIVE
+    // and ELECTABLE — elections run unchanged under a freeze — and no floor retires them on its
+    // own: the resolving host's terminal floor never travels here, and the embedder's catalog MAY
+    // floor them as husks (the dissolve then retires them), an action that may never occur. What
+    // keeps such a leader from minting is this loop's own legs: a pending host HOSTS T, so leg (i)
+    // skips it; a host that never hosted T reads a HOST-LOCAL floor for T that is non-terminal —
+    // T's lineage is alive, so no catalog may floor it (the fence on `MERGED_FLOOR`) — and leg
+    // (ii) skips it. S's voter set is FROZEN-TIME-FIXED (a frozen source refuses conf changes),
+    // dissolved T replicas are tombstoned NON-voters, and this mint is LEADER-only, so no S leader
+    // in the success world reaches the mint — the divergence is unconstructible. The minority
+    // claim above is TIME-LOCAL (#133): across successive installs at successive boundaries the
+    // surviving husks ACCUMULATE, one per superseded park whose source was hosted, and nothing
+    // in-tree retires them; the legs hold for each of them, but their reclamation is the
+    // structural cure's (#135/#133) — an install recording each crossed absorb's hosted source as
+    // an observation, or the target generation riding the freeze payload. In the
     // commit-ABORTED world the source's drivable-thaw belt (the absorb Resolve arm / husk belt) thaws
     // S off the target's `abandoned` obligation before T could ever dissolve. In the
     // commit-NEVER-EXISTED world (the genuine chain strand) this thaw is exactly correct: no commit is

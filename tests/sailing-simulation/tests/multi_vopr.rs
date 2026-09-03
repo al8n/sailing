@@ -532,8 +532,9 @@ fn soak_reshape_profile() {
 /// the band explores, and the wider space contains a #106-family case the cures do not cover: an
 /// absorb TARGET parked on a source that has been merged away and torn down on EVERY host, its own
 /// replicas apply-stalled at the park boundary with log-current state. Nothing can serve those
-/// replicas — the husk-teardown-off-propagated-floor design leaves no host holding the source's
-/// state once completion propagates — so no embedder action releases it: removing the fork-child
+/// replicas — every host that absorbed folded its own terminal floor and tore the source down,
+/// and the world's catalog floored the surviving husks, so no host holds the source's state once
+/// the completion is registered — so no embedder action releases it: removing the fork-child
 /// squatter clears only the coincident fence, the source cannot be recreated (merged away, terminal
 /// floor), and the parked target blocks its own teardown.
 ///

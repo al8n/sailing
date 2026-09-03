@@ -1759,12 +1759,13 @@ where
     // (None/Compact/Restore), NEVER the OrphanedLog poison.
     // A superseded park means this install crosses CommitMerge entries the replay will never
     // run — including the parked one itself, whose source may be hosted HERE (the ordinary
-    // log-behind resolvable-park shape). Record every crossed absorb's source off the still-
-    // intact log BEFORE the restore discards it: the container retires hosted gen-eligible
-    // husks on this install's own evidence, keeping the absorbed-lineage electorate empty (the
-    // husk-minority argument's obligation, now that installs reach quorum-many parked hosts).
-    // A read fault only forfeits the eager retire — the propagated terminal floor remains the
-    // fallback exit — so it is not poisoned here.
+    // log-behind resolvable-park shape). Nothing retires that source on this install's evidence:
+    // the scan-side re-derivation of the apply's lineage guard was retired as unsound in 3d45079
+    // (a crossed CommitMerge can be a stale no-op only the full apply machinery can classify),
+    // and no terminal floor propagates from the host that folded the absorb. The hosted source
+    // therefore stays a frozen husk — electable, unremovable (`Frozen`), capture-fenced — until
+    // the embedder's catalog floors it as the husk of a lineage it registered absorbed (the
+    // dissolve retires it) or the structural cure lands (#133).
     log.restore(meta.last_index(), meta.last_term());
     // The re-baseline discarded every entry above the boundary — a pending merge freeze among
     // them no longer exists in this log, so the append-observed kill releases (re-armed at

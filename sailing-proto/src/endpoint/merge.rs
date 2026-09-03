@@ -261,12 +261,14 @@ pub(crate) struct MergeState {
   /// the blob absorbed (or a lineage whose stale no-op only the full apply machinery can
   /// classify), and no scan-side re-derivation of the apply's lineage guard is sound — so the
   /// refusal is deliberately outcome-blind and conservative. Patience costs liveness only for
-  /// the composed shape, whose exit stays the hosted replica's own lifecycle (or the propagated
-  /// terminal floor). THE INDEX: the absorb point. The adopting install engages its membership
-  /// fence at the highest absorb point AT-OR-BELOW ITS BOUNDARY and reads it here instead of
-  /// walking the interval itself: this walk is resumable and budgeted, an adopt-time walk would
-  /// be neither — a cold page inside a long interval, re-read from the park on every cure
-  /// delivery, never completes under a small cache, while this walk crosses each page once.
+  /// the composed shape, whose exit is the hosted replica's own lifecycle — its absorb or abort
+  /// resolving here, or its removal — or the embedder's catalog flooring it as the frozen husk
+  /// of a lineage it registered absorbed; no terminal floor arrives from the host that folded
+  /// the crossing's absorb (#133). THE INDEX: the absorb point. The adopting install engages
+  /// its membership fence at the highest absorb point AT-OR-BELOW ITS BOUNDARY and reads it here
+  /// instead of walking the interval itself: this walk is resumable and budgeted, an adopt-time
+  /// walk would be neither — a cold page inside a long interval, re-read from the park on every
+  /// cure delivery, never completes under a small cache, while this walk crosses each page once.
   /// PER-BOUNDARY, not a frontier maximum: the walk may run past the blob a cure ships (commit
   /// moves between cranks), and a crossing ABOVE the adopted boundary still applies locally
   /// later, engaging the fence at its own apply — pinning it early would fence conf changes off

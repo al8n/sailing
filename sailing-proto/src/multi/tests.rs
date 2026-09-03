@@ -16922,10 +16922,11 @@ fn a_foreign_led_absorb_of_a_debtor_discharges_the_inherited_debt() {
   assert!(stores.0.contains_key(&1) && stores.0.contains_key(&2));
 }
 
-/// The husk twin: a foreign-led freeze husks the debtor (target unhosted), the terminal floor
-/// propagates, and the retirement must surface the inherited debt alongside `Retired` — the
-/// propagated `MERGED_FLOOR` was co-barriered with the claimant's durable capture of this
-/// husk's state machine, which has carried the prior union since that absorb applied.
+/// The husk twin: a foreign-led freeze husks the debtor (target unhosted) and the embedder's
+/// catalog floors it terminally — the claimant's own fold retired the lineage elsewhere, and no
+/// floor travels between hosts — so the retirement must surface the inherited debt alongside
+/// `Retired`: the catalog's `MERGED_FLOOR` asserts the claimant's durable capture of this husk's
+/// state machine, which has carried the prior union since that absorb applied.
 #[test]
 fn a_husked_debtor_retires_with_its_inherited_debt_discharged() {
   let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
@@ -16969,7 +16970,7 @@ fn a_husked_debtor_retires_with_its_inherited_debt_discharged() {
       },
       MergeResolution::Retired { source: 1 },
     ],
-    "the retirement surfaces the inherited debt on the propagated-floor evidence"
+    "the retirement surfaces the inherited debt on the catalog's terminal-floor evidence"
   );
   assert!(!m.contains_group(&1), "the husk dissolved");
   assert!(stores.0.contains_key(&1) && stores.0.contains_key(&2));
@@ -17070,10 +17071,11 @@ fn a_sources_standing_fork_barrier_holds_its_consumption() {
   assert!(!m.contains_group(&1), "the source was consumed");
 }
 
-/// The husk twin of the same host-local barrier: the absorb resolved ELSEWHERE and only the
-/// terminal floor propagated here, so no local park ever names this frozen source. Retiring it
-/// while the barrier stands would destroy the staged child's only local recovery derivation, so
-/// the dissolve holds — and releases on the very next crank once the child's baseline is durable.
+/// The husk twin of the same host-local barrier: the absorb resolved ELSEWHERE and the embedder's
+/// catalog floored the husk here (no floor travels between hosts), so no local park ever names
+/// this frozen source. Retiring it while the barrier stands would destroy the staged child's only
+/// local recovery derivation, so the dissolve holds — and releases on the very next crank once
+/// the child's baseline is durable.
 #[test]
 fn a_husks_standing_fork_barrier_holds_its_retirement() {
   let (mut m, mut stores, split_idx, d) = fork_fenced_source_fixture(1, 200);
@@ -21005,7 +21007,8 @@ fn a_same_crank_park_resolution_purges_the_queued_signal() {
     "the hold signalled and nobody drained it"
   );
 
-  // The propagated terminal floor resolves the park INSIDE the next service call.
+  // A terminal floor on the source — the absent arm's replayed-duplicate reading — resolves the
+  // park INSIDE the next service call.
   stores.1.insert(42);
   let resolutions = m.service_merge_applies(now, &mut stores);
   assert!(
