@@ -83,7 +83,7 @@ clap = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
 [build-dependencies]
-buffa-build = "0.8"
+buffa-build = "0.9"
 
 [dev-dependencies]
 rcgen.workspace = true
