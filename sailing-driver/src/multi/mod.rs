@@ -462,25 +462,32 @@ pub enum LifecycleEvent<G, I> {
     target: G,
   },
   /// A committed merge is STANDING STILL on this host for a structural reason — see
-  /// [`MergeBlockedCause`] for the causes and their exits. Fired ONCE PER TRANSITION of a
-  /// target's cause, not once per crank.
+  /// [`MergeBlockedCause`] for the causes and their exits. Fired ONCE PER TRANSITION of an
+  /// observation — a `(target, source)` pair's cause and coordinate — not once per crank; two
+  /// holds on one target that name different sources are two observations.
   ///
   /// A pure observation: nothing is torn down, no action is required, and the container keeps
   /// re-deriving the hold every crank whether or not this is consumed (so a full tail costs a
   /// notification and nothing else). It exists because the held shapes are otherwise invisible
-  /// from outside — a parked target is not log-lagging and its apply stall is purely local, and a
+  /// from outside — a parked target is not log-lagging and its apply stall is purely local, a
   /// target owing a deferred capture looks entirely healthy while its conf changes are fenced and
-  /// the consumed source's id stays un-reusable. Two causes are the placement brain's to act on
+  /// the consumed source's id stays un-reusable, and a source stranded by a dead target is merely
+  /// frozen. Three causes are the placement brain's to act on
   /// ([`SourceUnhosted`](MergeBlockedCause::SourceUnhosted) — place the source, or let the
   /// leader's cure blob arrive; [`ForkFence`](MergeBlockedCause::ForkFence) — resolve the split
-  /// conflict that stands behind it); the rest lift on their own protocol timescale.
+  /// conflict that stands behind it; [`StrandedSource`](MergeBlockedCause::StrandedSource) —
+  /// re-host the dead target, never floor it); the rest lift on their own protocol timescale.
   MergeBlocked {
-    /// The absorbing target — the group whose apply drain or capture is held.
+    /// The absorbing target — the group whose apply drain or capture is held; for
+    /// [`StrandedSource`](MergeBlockedCause::StrandedSource), the UNHOSTED target the named
+    /// source is frozen for.
     target: G,
     /// The named source group.
     source: G,
-    /// The held coordinate: the parked `CommitMerge`'s index while the park stands, the absorb
-    /// boundary the capture owes once the park has been deferred into a debt.
+    /// The held coordinate, on a cause-dependent scale: a target-log coordinate for the park and
+    /// debt causes (the parked `CommitMerge`'s index while the park stands, the absorb boundary
+    /// the capture owes once the park has been deferred into a debt), the SOURCE'S freeze index
+    /// for [`StrandedSource`](MergeBlockedCause::StrandedSource).
     boundary: Index,
     /// What is holding it.
     cause: MergeBlockedCause,

@@ -10079,30 +10079,19 @@ fn dead_target_thaw_belt_refuses_while_a_park_names_the_source() {
   );
 }
 
-/// THE TERMINAL-FLOOR-ONLY TRIGGER: a source frozen for an UNHOSTED target self-thaws ONLY when the
-/// target reads the terminal `MERGED_FLOOR` — a NON-terminal floor is a host-local fact and must mint
-/// NOTHING (the witness-mint discipline, second edition). A crafted frozen source (2) claims target 1,
-/// which is never hosted; under a non-terminal floor the source stays frozen forever, and only the
-/// terminal floor derives its thaw.
-#[test]
-fn dead_target_thaw_needs_the_terminal_floor_not_a_non_terminal_one() {
+/// A host whose only group is source 2, crafted FROZEN for the never-hosted target 1 (a restored
+/// durable log holding the `PrepareMerge` at index 1) and elected, with the stores reading
+/// `target_floor` for 1: the chain strand, where no local verb can ever release the freeze.
+fn source_frozen_for_unhosted_target(
+  target_floor: u64,
+) -> (MultiRaft<u64, u64, CountSm>, LineageStores) {
   let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
-  // Craft group 2 FROZEN for the (never-hosted) target 1 via a restored durable log.
-  let mut prep = Vec::new();
-  {
-    let mut tb = Vec::new();
-    Data::encode(&1u64, &mut tb);
-    crate::wire::encode_prepare_merge_payload(
-      &crate::PrepareMergePayload::new(Bytes::from(tb), 1),
-      &mut prep,
-    );
-  }
   let mut slog = VecLog::default();
   slog.force_append(&[crate::Entry::new(
     Term::new(1),
     Index::new(1),
     crate::EntryKind::PrepareMerge,
-    Bytes::from(prep),
+    prepare_merge_bytes(1, 1),
   )]);
   let mut sstable = AsyncStable::default();
   sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
@@ -10122,7 +10111,6 @@ fn dead_target_thaw_needs_the_terminal_floor_not_a_non_terminal_one() {
     "the crafted freeze applied"
   );
   // Elect group 2 (leader-only mint); a frozen group still campaigns.
-  let now = Instant::ORIGIN;
   let d = m.group(&2).unwrap().poll_timeout().unwrap();
   m.handle_timeout(&2, d, &mut slog, &mut sstable).unwrap();
   drain_storage(&mut m, 2, d, &mut slog, &mut sstable);
@@ -10135,12 +10123,28 @@ fn dead_target_thaw_needs_the_terminal_floor_not_a_non_terminal_one() {
     std::collections::BTreeSet::new(),
   );
   inner.0.insert(2, (slog, sstable));
-  // Target 1 is UNHOSTED with a NON-terminal floor (5): the trigger must NOT mint.
-  let mut stores = LineageStores {
+  let stores = LineageStores {
     inner,
-    floors: std::collections::BTreeMap::from([(1u64, 5u64)]),
+    floors: std::collections::BTreeMap::from([(1u64, target_floor)]),
     lineages: std::collections::BTreeMap::new(),
   };
+  (m, stores)
+}
+
+/// THE TERMINAL-FLOOR-ONLY TRIGGER: a source frozen for an UNHOSTED target self-thaws ONLY when the
+/// target reads the terminal `MERGED_FLOOR` — a NON-terminal floor is a host-local fact and must mint
+/// NOTHING (the witness-mint discipline, second edition). A crafted frozen source (2) claims target 1,
+/// which is never hosted; under a non-terminal floor the source stays frozen forever, and only the
+/// terminal floor derives its thaw. What the non-terminal floor DOES yield is the strand's
+/// observation: one `StrandedSource` naming the dead target, the source and the source's freeze
+/// index, deduped across the cranks that re-derive it, with the source left exactly as it was —
+/// hosted, and refusing removal as any frozen source does — and retired the crank the terminal
+/// floor hands the source to the dead-target thaw.
+#[test]
+fn dead_target_thaw_needs_the_terminal_floor_not_a_non_terminal_one() {
+  let now = Instant::ORIGIN;
+  // Target 1 is UNHOSTED with a NON-terminal floor (5): the trigger must NOT mint.
+  let (mut m, mut stores) = source_frozen_for_unhosted_target(5);
   for _ in 0..4 {
     m.service_merge_applies(now, &mut stores);
     let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
@@ -10150,8 +10154,28 @@ fn dead_target_thaw_needs_the_terminal_floor_not_a_non_terminal_one() {
     m.group(&2).unwrap().is_frozen(),
     "a non-terminal floor is host-local — it mints NO dead-target thaw"
   );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    Some(MergeBlocked {
+      target: 1,
+      source: 2,
+      boundary: Index::new(1),
+      cause: MergeBlockedCause::StrandedSource,
+    }),
+    "a source frozen for an unhosted, unfloored target is reported stranded, at its freeze index"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "one signal for the standing strand, however many cranks re-derive it"
+  );
+  assert!(
+    matches!(m.remove_group(&2, &mut stores), Err(RemoveError::Frozen)),
+    "the stranded source is a live frozen replica, not a husk: it stays hosted and unremovable"
+  );
 
-  // Flip the target's floor to the TERMINAL sentinel: now the source derives its own thaw.
+  // Flip the target's floor to the TERMINAL sentinel: now the source derives its own thaw, and
+  // the observation retires with the strand — nothing further is signalled.
   stores.floors.insert(1, crate::MERGED_FLOOR);
   for _ in 0..4 {
     m.service_merge_applies(now, &mut stores);
@@ -10161,6 +10185,564 @@ fn dead_target_thaw_needs_the_terminal_floor_not_a_non_terminal_one() {
   assert!(
     !m.group(&2).unwrap().is_frozen(),
     "the terminal floor on the dead target derived the source's own thaw"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the observation retired with the strand"
+  );
+  assert!(
+    m.merge_blocked_seen.is_empty(),
+    "and its edge retired with it"
+  );
+}
+
+/// Re-hosting the dead target — the observation's own remedy — RETIRES the strand: the next crank
+/// finds the target hosted, the edge and any undelivered signal go with it, and a later strand of
+/// the same pair (the target gone again) signals afresh instead of being deduped against the
+/// retired edge.
+#[test]
+fn a_re_hosted_target_retires_the_strand_and_a_re_strand_signals_afresh() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = source_frozen_for_unhosted_target(0);
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.poll_merge_blocked()
+      .map(|b| (b.target, b.source, b.cause)),
+    Some((1, 2, MergeBlockedCause::StrandedSource))
+  );
+
+  // The embedder re-hosts the target: a fresh incarnation admits (no floor below it, no pin).
+  m.create_group(1, 0, single_node_cfg(1), now, 9, CountSm::default())
+    .unwrap();
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "a hosted target is no strand: the observation retired"
+  );
+  assert!(m.merge_blocked_seen.is_empty(), "and its edge with it");
+  assert!(
+    m.group(&2).unwrap().is_frozen(),
+    "the source now waits on the re-hosted target's own resolution"
+  );
+
+  // The target dies again through the ungated inner teardown (the public door refuses a target
+  // a hosted source claims, `Claimed`): the same pair strands afresh, and signals afresh.
+  assert!(m.remove_group_inner(&1).is_some());
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.poll_merge_blocked(),
+    Some(MergeBlocked {
+      target: 1,
+      source: 2,
+      boundary: Index::new(1),
+      cause: MergeBlockedCause::StrandedSource,
+    }),
+    "a legitimate re-strand is a fresh transition"
+  );
+}
+
+/// A POISONED frozen source is left to its own fail-stop, as every pass leaves it: the strand is
+/// not observed on it.
+#[test]
+fn a_poisoned_stranded_source_is_not_observed() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = source_frozen_for_unhosted_target(0);
+  m.group_mut(&2).unwrap().poison(PoisonReason::MergeDecode);
+  for _ in 0..3 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  }
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "a poisoned source's strand is its poison signal's business"
+  );
+}
+
+/// An ORDINARY in-flight merge is not a strand: the freeze applied, the target is hosted and has
+/// simply not parked its `CommitMerge` yet — an arbitrarily long window on a follower host — and
+/// naming a live source to an embedder would invite exactly the floor write the cause forbids.
+#[test]
+fn an_ordinary_merge_freeze_with_a_hosted_target_is_not_a_strand() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = merge_host(1, 1);
+  m.prepare_merge(&2, now, &mut stores, &1).unwrap().unwrap();
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().is_frozen());
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_none(),
+    "the target has not parked"
+  );
+  for _ in 0..3 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  }
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "a hosted target owns the merge: nothing is signalled"
+  );
+}
+
+/// Add a led single-voter [`CountSm`] group `gid` to a [`merge_host`].
+fn add_led_count_group(m: &mut MultiRaft<u64, u64, CountSm>, stores: &mut MapStores, gid: u64) {
+  stores
+    .0
+    .insert(gid, (VecLog::default(), AsyncStable::default()));
+  m.create_group(
+    gid,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+  )
+  .unwrap();
+  let (l, s) = stores.0.get_mut(&gid).unwrap();
+  let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&gid, d, l, s).unwrap();
+  drain_storage(m, gid, d, l, s);
+  assert!(m.group(&gid).unwrap().role().is_leader());
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+}
+
+/// Freeze the led single-voter `source` for `target` at the ENDPOINT seam — a freeze committed
+/// by a leader whose door ran on another host's view — at the source's next lineage.
+fn freeze_at_seam<F>(
+  m: &mut MultiRaft<u64, u64, F>,
+  stores: &mut MapStores,
+  source: u64,
+  target: u64,
+) where
+  F: crate::StateMachine<Command = Bytes, Snapshot = u64>,
+  F::Error: core::error::Error,
+{
+  let next_gen = m.group(&source).unwrap().shape_gen() + 1;
+  let (l, s) = stores.0.get_mut(&source).unwrap();
+  m.group_mut(&source)
+    .unwrap()
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      l,
+      crate::EntryKind::PrepareMerge,
+      prepare_merge_bytes(target, next_gen),
+    )
+    .unwrap();
+  drain_storage(m, source, Instant::ORIGIN, l, s);
+}
+
+/// A standing park NAMING the source is that park's own observation, not a strand: while a
+/// hosted target's `CommitMerge` names the source nothing is signalled for it, and only once the
+/// park is gone — aborted deterministically at the closed window here, the freeze being a claim
+/// by a different target — does the strand surface, keyed on the dead target.
+#[test]
+fn a_park_naming_the_stranded_source_holds_the_observation_until_it_resolves() {
+  let now = Instant::ORIGIN;
+  // X = 1, T = 2, S = 3: S freezes for T through the door, then T dies unresolved.
+  let (mut m, mut stores) = merge_host(1, 1);
+  add_led_count_group(&mut m, &mut stores, 3);
+  m.prepare_merge(&3, now, &mut stores, &2).unwrap().unwrap();
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, l, s);
+  }
+  let (freeze_idx, expected) = {
+    let sep = m.group(&3).unwrap();
+    assert!(sep.is_frozen(), "S froze for T");
+    (sep.freeze_index().unwrap(), sep.shape_gen())
+  };
+  assert!(
+    m.remove_group_inner(&2).is_some(),
+    "T dies through the ungated teardown"
+  );
+  // A foreign-led `CommitMerge(3→1)` parks X naming S (the seam: the door's gates ran elsewhere).
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(
+        now,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(3, freeze_idx, expected, 1),
+      )
+      .unwrap();
+    drain_storage(&mut m, 1, now, l, s);
+  }
+  assert!(
+    m.group(&1).unwrap().pending_merge().is_some(),
+    "X parked naming S"
+  );
+  assert!(
+    m.service_merge_applies(now, &mut stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the park names the source: the hold is the park's to report, not a strand"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, l, s);
+  }
+  assert_eq!(
+    m.service_merge_applies(now, &mut stores),
+    std::vec![MergeResolution::Aborted {
+      source: 3,
+      target: 1
+    }],
+    "a park under a foreign claim aborts deterministically"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    Some(MergeBlocked {
+      target: 2,
+      source: 3,
+      boundary: freeze_idx,
+      cause: MergeBlockedCause::StrandedSource,
+    }),
+    "with the park gone the strand surfaces, keyed on the dead target"
+  );
+  assert!(
+    m.group(&3).unwrap().is_frozen(),
+    "X's aborted park released nothing on S: its claim is T's"
+  );
+}
+
+/// The `Clear` arm's window: the legal co-hosted chain S→T→U. U's absorb consumes T through the
+/// ungated teardown, leaving S frozen for a target that is unhosted and — for the rest of this
+/// crank — unfloored: the driver writes T's terminal floor only after the call returns. A target
+/// named as the SOURCE of a resolution pushed this crank is therefore no strand, and the next
+/// crank's terminal floor hands S to the dead-target thaw.
+#[test]
+fn a_target_consumed_this_crank_is_not_a_stranded_sources_target() {
+  let now = Instant::ORIGIN;
+  // U = 1, T = 2, S = 3, all led; S freezes for T, then T for U.
+  let (mut m, mut stores) = merge_host(1, 1);
+  add_led_count_group(&mut m, &mut stores, 3);
+  m.prepare_merge(&3, now, &mut stores, &2).unwrap().unwrap();
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, l, s);
+  }
+  assert!(m.group(&3).unwrap().is_frozen(), "S froze for T");
+  // T's own freeze for U arrives committed from a leader that never observed S's claim (the
+  // door here refuses it `SourceClaimedAsTarget`): the seam.
+  freeze_at_seam(&mut m, &mut stores, 2, 1);
+  assert!(m.group(&2).unwrap().is_frozen(), "T froze for U");
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.commit_merge(&1, now, l, s, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, l, s);
+  }
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "U parked");
+  seal_window(&mut m, &mut stores);
+  assert_eq!(
+    m.service_merge_applies(now, &mut stores),
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }],
+    "U absorbed T"
+  );
+  assert!(
+    !m.contains_group(&2) && m.group(&3).unwrap().is_frozen(),
+    "S is frozen for a target consumed this crank"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the consumed target's floor is the driver's next write, not a strand"
+  );
+  // The driver folds the `Merged`: T's terminal floor. The dead-target thaw takes over.
+  stores.1.insert(2);
+  for _ in 0..4 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, l, s);
+  }
+  assert!(
+    !m.group(&3).unwrap().is_frozen(),
+    "the terminal floor on the dead target derived S's own thaw"
+  );
+  assert_eq!(m.poll_merge_blocked(), None, "nothing was ever a strand");
+}
+
+/// The `Absorbed` window: U's absorb of T DEFERS behind a fence, and T's floor is DELIBERATELY
+/// left unwritten until the debt discharges — T's stores are the union's only restart derivation.
+/// A source frozen for that T is no strand while the debt names T, nor in the crank the discharge
+/// surfaces `Merged`; the driver's floor then hands it to the dead-target thaw.
+#[test]
+fn a_target_in_the_absorbed_debt_window_is_not_a_stranded_sources_target() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  // S = 3 freezes for T = 2 at the seam (T is already frozen for U, which the door refuses).
+  let (mut log3, mut stable3) = (VecLog::default(), AsyncStable::default());
+  m.create_group(3, 0, single_node_cfg(1), d, 45, SplitSm::default())
+    .unwrap();
+  let d3 = lead_single_split(&mut m, 3, &mut log3, &mut stable3);
+  stores.0.insert(3, (log3, stable3));
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    m.group_mut(&3)
+      .unwrap()
+      .propose_merge_entry(
+        d3,
+        l,
+        crate::EntryKind::PrepareMerge,
+        prepare_merge_bytes(2, 1),
+      )
+      .unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  assert!(m.group(&3).unwrap().is_frozen(), "S froze for T");
+  defer_to_absorbed(&mut m, &mut stores, d);
+  assert!(
+    !m.contains_group(&2) && m.debt_names(&2),
+    "T is consumed and named by U's debt"
+  );
+  let mut observed = std::vec::Vec::new();
+  for _ in 0..3 {
+    assert!(m.service_merge_applies(d, &mut stores).is_empty());
+    while let Some(b) = m.poll_merge_blocked() {
+      observed.push(b);
+    }
+  }
+  assert!(
+    observed
+      .iter()
+      .all(|b| b.cause != MergeBlockedCause::StrandedSource),
+    "the debt window is no strand: {observed:?}"
+  );
+  assert!(
+    observed
+      .iter()
+      .any(|b| b.cause == MergeBlockedCause::ForkFence),
+    "the debt's own fence is what is reported: {observed:?}"
+  );
+  // The fence lifts; the discharge surfaces `Merged` — the same crank names T as its source.
+  m.remove_group(&200, &mut empty_stores()).unwrap();
+  let split = install_head_fork(&mut m, 1, 200, d);
+  m.lift_fork_barrier(&1, split);
+  assert_eq!(
+    m.service_merge_applies(d, &mut stores),
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 1
+    }],
+    "the debt discharged"
+  );
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the discharge crank is no strand either: the floor is the driver's next write"
+  );
+  stores.1.insert(2);
+  for _ in 0..4 {
+    assert!(m.service_merge_applies(d, &mut stores).is_empty());
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, d3, l, s);
+  }
+  assert!(
+    !m.group(&3).unwrap().is_frozen(),
+    "the terminal floor on the dead target derived S's own thaw"
+  );
+  assert_eq!(m.poll_merge_blocked(), None, "nothing was ever a strand");
+}
+
+/// The `CaptureFailed` pin: U's absorb consumed T but its capture FAULTED, so T's stores and floor
+/// are pinned untouched until the restart that re-parks against them. A source frozen for the
+/// pinned T is no strand — the pin names T — across every crank until that restart.
+#[test]
+fn a_target_pinned_by_a_failed_capture_is_not_a_stranded_sources_target() {
+  let now = Instant::ORIGIN;
+  let fail = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+  // U = 1 (its forced capture armed to fault later), T = 2, S = 3.
+  let (mut m, mut stores) = merge_host_with(
+    SnapFailSm::default(),
+    2,
+    SnapFailSm {
+      count: 0,
+      fail: fail.clone(),
+    },
+    3,
+  );
+  stores
+    .0
+    .insert(3, (VecLog::default(), AsyncStable::default()));
+  m.create_group(3, 0, single_node_cfg(1), now, 7, SnapFailSm::default())
+    .unwrap();
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    let d = m.group(&3).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&3, d, l, s).unwrap();
+    drain_storage(&mut m, 3, d, l, s);
+    assert!(m.group(&3).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  m.prepare_merge(&3, now, &mut stores, &2).unwrap().unwrap();
+  {
+    let (l, s) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, l, s);
+  }
+  assert!(m.group(&3).unwrap().is_frozen(), "S froze for T");
+  // T's own freeze for U arrives committed from a leader that never observed S's claim (the
+  // door here refuses it `SourceClaimedAsTarget`): the seam. U then commits and parks.
+  freeze_at_seam(&mut m, &mut stores, 2, 1);
+  assert!(m.group(&2).unwrap().is_frozen(), "T froze for U");
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.commit_merge(&1, now, l, s, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, l, s);
+  }
+  assert!(m.group(&1).unwrap().pending_merge().is_some(), "U parked");
+  seal_window(&mut m, &mut stores);
+  fail.store(true, core::sync::atomic::Ordering::Relaxed);
+  assert_eq!(
+    m.service_merge_applies(now, &mut stores),
+    std::vec![MergeResolution::CaptureFailed {
+      source: 2,
+      target: 1
+    }],
+    "U consumed T and its capture faulted"
+  );
+  assert!(
+    !m.contains_group(&2) && m.debt_names(&2),
+    "T is consumed and pinned"
+  );
+  for _ in 0..3 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  }
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "a pinned target is no strand: the restart re-parks against it"
+  );
+  assert!(m.group(&3).unwrap().is_frozen(), "S waits on that restart");
+}
+
+/// Distinct pairs coexist in one crank: a park's own observation (its unhosted source) and a
+/// stranded source's, each keyed by its `(target, source)` pair and each retained.
+#[test]
+fn a_park_observation_and_a_strand_observation_coexist() {
+  let now = Instant::ORIGIN;
+  let (mut m, mut stores) = under_hosted_park_host();
+  // S = 3, crafted frozen for the never-hosted T = 2.
+  let mut slog = VecLog::default();
+  slog.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::PrepareMerge,
+    prepare_merge_bytes(2, 1),
+  )]);
+  let mut sstable = AsyncStable::default();
+  sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  m.restore_group_unchecked(
+    3,
+    single_node_cfg(1),
+    now,
+    7,
+    SplitSm::default(),
+    1,
+    &mut slog,
+    &mut sstable,
+  )
+  .unwrap();
+  assert!(m.group(&3).unwrap().is_frozen());
+  stores.0.insert(3, (slog, sstable));
+  for _ in 0..2 {
+    assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  }
+  let mut observed = std::vec::Vec::new();
+  while let Some(b) = m.poll_merge_blocked() {
+    observed.push(b);
+  }
+  observed.sort_by_key(|b| b.target);
+  assert_eq!(
+    observed,
+    std::vec![
+      MergeBlocked {
+        target: 1,
+        source: 42,
+        boundary: Index::new(2),
+        cause: MergeBlockedCause::SourceUnhosted,
+      },
+      MergeBlocked {
+        target: 2,
+        source: 3,
+        boundary: Index::new(1),
+        cause: MergeBlockedCause::StrandedSource,
+      },
+    ],
+    "two pairs, two observations, once each"
+  );
+}
+
+/// Observations are keyed by their `(target, source)` PAIR, not by the target alone: a follower
+/// target that is PARKED (a foreign-led second absorb — `AlreadyPending` is host-local) while it
+/// holds a DEBT reports both holds — the park's unhosted source and the debt's fence — where a
+/// target-keyed edge let the debt pass overwrite the park's signal every crank.
+#[test]
+fn a_parked_target_holding_a_debt_reports_both_holds() {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  let debt_at = defer_to_absorbed(&mut m, &mut stores, d);
+  // A debt-free foreign leader committed a second absorb into this target, of the unhosted 3.
+  {
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    m.group_mut(&1)
+      .unwrap()
+      .propose_merge_entry(
+        d,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(3, Index::new(9), 1, 3),
+      )
+      .unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+  }
+  let park = m
+    .group(&1)
+    .unwrap()
+    .pending_merge()
+    .expect("the second absorb parked")
+    .at();
+  for _ in 0..3 {
+    assert!(
+      !m.service_merge_applies(d, &mut stores)
+        .iter()
+        .any(|r| matches!(r, MergeResolution::Absorbed { .. })),
+      "the standing debt holds the second park"
+    );
+    let (l, s) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, d, l, s);
+  }
+  let mut observed = std::vec::Vec::new();
+  while let Some(b) = m.poll_merge_blocked() {
+    observed.push(b);
+  }
+  observed.sort_by_key(|b| b.source);
+  assert_eq!(
+    observed,
+    std::vec![
+      MergeBlocked {
+        target: 1,
+        source: 2,
+        boundary: debt_at,
+        cause: MergeBlockedCause::ForkFence,
+      },
+      MergeBlocked {
+        target: 1,
+        source: 3,
+        boundary: park,
+        cause: MergeBlockedCause::SourceUnhosted,
+      },
+    ],
+    "both holds on the one target are reported, once each"
   );
 }
 
@@ -18022,6 +18604,116 @@ fn a_covering_install_discharges_the_debt_chain() {
   assert!(stores.0.contains_key(&2));
 }
 
+/// Consume `holder` — a live debtor — into a NEW led target `target` through a fence-DEFERRED
+/// absorb, chaining the holder's whole debt chain onto the target: the target is created and led,
+/// fenced by an undischarged abort obligation for the unhosted `dead_source`, then a foreign-led
+/// freeze on the holder and the target's committed absorb resolve `Absorbed`. `instants` carries
+/// each leader's instant (the holder's is read, the target's recorded). The fixture's debtor (1)
+/// carries the fork barrier that holds its consumption; it is released here, at its consumption.
+fn defer_holder_into_fenced_target(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  stores: &mut MapStores,
+  instants: &mut std::collections::BTreeMap<u64, Instant>,
+  holder: u64,
+  target: u64,
+  dead_source: u64,
+) {
+  // Every target is created at the fixture's own instant, the debtor's.
+  let d = instants[&1];
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(target, 0, single_node_cfg(1), d, 45, SplitSm::default())
+    .unwrap();
+  let dt = lead_single_split(m, target, &mut log, &mut stable);
+  instants.insert(target, dt);
+  stores.0.insert(target, (log, stable));
+  {
+    let (l, s) = stores.0.get_mut(&target).unwrap();
+    let abort = crate::RollbackMergePayload::abort(gid_key(dead_source), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
+    m.group_mut(&target)
+      .unwrap()
+      .propose_merge_entry(dt, l, crate::EntryKind::RollbackMerge, Bytes::from(buf))
+      .unwrap();
+    drain_storage(m, target, dt, l, s);
+  }
+  assert!(
+    m.group(&target).unwrap().owes_live_thaw(),
+    "the abort fence stands on {target}"
+  );
+
+  // The foreign-led freeze on the holder, then its committed absorb into the target.
+  let dh = instants[&holder];
+  let freeze_gen = m.group(&holder).unwrap().shape_gen() + 1;
+  let freeze_idx = {
+    let (l, s) = stores.0.get_mut(&holder).unwrap();
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(gid_key(target), freeze_gen),
+      &mut fbuf,
+    );
+    m.group_mut(&holder)
+      .unwrap()
+      .propose_merge_entry(dh, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
+    let idx = l.last_index();
+    drain_storage(m, holder, dh, l, s);
+    idx
+  };
+  assert!(m.group(&holder).unwrap().is_frozen());
+  {
+    let target_gen = m.group(&target).unwrap().shape_gen() + 1;
+    let (l, s) = stores.0.get_mut(&target).unwrap();
+    m.group_mut(&target)
+      .unwrap()
+      .propose_merge_entry(
+        dt,
+        l,
+        crate::EntryKind::CommitMerge,
+        commit_merge_bytes(holder, freeze_idx, freeze_gen, target_gen),
+      )
+      .unwrap();
+    drain_storage(m, target, dt, l, s);
+  }
+  assert!(
+    m.group(&target).unwrap().pending_merge().is_some(),
+    "parked on {target}"
+  );
+  assert!(
+    m.service_merge_applies(dt, stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&target).unwrap();
+    drain_storage(m, target, dt, l, s);
+  }
+  if holder == 1 {
+    // The fixture's debtor carries the fork barrier that holds its consumption; release it
+    // only now, so the resolver (which runs ahead of the debt pass) consumes the debtor with
+    // its debt still live.
+    m.remove_group(&200, &mut empty_stores()).unwrap();
+    let split = install_head_fork(m, 1, 200, dt);
+    m.lift_fork_barrier(&1, split);
+  }
+  assert!(
+    m.group(&holder).unwrap().capture_debt().is_some(),
+    "the holder's debt is live at its consumption"
+  );
+  assert_eq!(
+    m.service_merge_applies(dt, stores),
+    std::vec![MergeResolution::Absorbed {
+      source: holder,
+      target
+    }],
+    "the abort fence defers the capture, chaining the holder's debts onto {target}"
+  );
+  {
+    let (l, s) = stores.0.get_mut(&target).unwrap();
+    drain_storage(m, target, dt, l, s);
+  }
+  assert!(!m.contains_group(&holder), "the holder was consumed");
+}
+
 /// Two levels up a chain: the debtor is consumed by a fence-deferred absorb (its debt is
 /// inherited), then that holder by another (both are inherited), so the final holder owns one
 /// debt and carries two. One covering install discharges every level on the same evidence —
@@ -18036,98 +18728,14 @@ fn a_covering_install_discharges_every_level_of_an_inherited_chain() {
   // unhosted source, so its absorb DEFERS and inherits the consumed holder's chain (the
   // abort-fenced twin of the fork-fenced shape the fixture starts from).
   for (holder, target, dead_source) in [(1u64, 3u64, 8u64), (3, 4, 9)] {
-    let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
-    m.create_group(target, 0, single_node_cfg(1), d, 45, SplitSm::default())
-      .unwrap();
-    let dt = lead_single_split(&mut m, target, &mut log, &mut stable);
-    instants.insert(target, dt);
-    stores.0.insert(target, (log, stable));
-    {
-      let (l, s) = stores.0.get_mut(&target).unwrap();
-      let abort = crate::RollbackMergePayload::abort(gid_key(dead_source), 1, 1);
-      let mut buf = Vec::new();
-      crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
-      m.group_mut(&target)
-        .unwrap()
-        .propose_merge_entry(dt, l, crate::EntryKind::RollbackMerge, Bytes::from(buf))
-        .unwrap();
-      drain_storage(&mut m, target, dt, l, s);
-    }
-    assert!(
-      m.group(&target).unwrap().owes_live_thaw(),
-      "the abort fence stands on {target}"
+    defer_holder_into_fenced_target(
+      &mut m,
+      &mut stores,
+      &mut instants,
+      holder,
+      target,
+      dead_source,
     );
-
-    // The foreign-led freeze on the holder, then its committed absorb into the target.
-    let dh = instants[&holder];
-    let freeze_gen = m.group(&holder).unwrap().shape_gen() + 1;
-    let freeze_idx = {
-      let (l, s) = stores.0.get_mut(&holder).unwrap();
-      let mut fbuf = Vec::new();
-      crate::wire::encode_prepare_merge_payload(
-        &crate::PrepareMergePayload::new(gid_key(target), freeze_gen),
-        &mut fbuf,
-      );
-      m.group_mut(&holder)
-        .unwrap()
-        .propose_merge_entry(dh, l, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
-        .unwrap();
-      let idx = l.last_index();
-      drain_storage(&mut m, holder, dh, l, s);
-      idx
-    };
-    assert!(m.group(&holder).unwrap().is_frozen());
-    {
-      let target_gen = m.group(&target).unwrap().shape_gen() + 1;
-      let (l, s) = stores.0.get_mut(&target).unwrap();
-      m.group_mut(&target)
-        .unwrap()
-        .propose_merge_entry(
-          dt,
-          l,
-          crate::EntryKind::CommitMerge,
-          commit_merge_bytes(holder, freeze_idx, freeze_gen, target_gen),
-        )
-        .unwrap();
-      drain_storage(&mut m, target, dt, l, s);
-    }
-    assert!(
-      m.group(&target).unwrap().pending_merge().is_some(),
-      "parked on {target}"
-    );
-    assert!(
-      m.service_merge_applies(dt, &mut stores).is_empty(),
-      "the first pass only seals the window"
-    );
-    {
-      let (l, s) = stores.0.get_mut(&target).unwrap();
-      drain_storage(&mut m, target, dt, l, s);
-    }
-    if holder == 1 {
-      // The fixture's debtor carries the fork barrier that holds its consumption; release it
-      // only now, so the resolver (which runs ahead of the debt pass) consumes the debtor with
-      // its debt still live.
-      m.remove_group(&200, &mut empty_stores()).unwrap();
-      let split = install_head_fork(&mut m, 1, 200, dt);
-      m.lift_fork_barrier(&1, split);
-    }
-    assert!(
-      m.group(&holder).unwrap().capture_debt().is_some(),
-      "the holder's debt is live at its consumption"
-    );
-    assert_eq!(
-      m.service_merge_applies(dt, &mut stores),
-      std::vec![MergeResolution::Absorbed {
-        source: holder,
-        target
-      }],
-      "the abort fence defers the capture, chaining the holder's debts onto {target}"
-    );
-    {
-      let (l, s) = stores.0.get_mut(&target).unwrap();
-      drain_storage(&mut m, target, dt, l, s);
-    }
-    assert!(!m.contains_group(&holder), "the holder was consumed");
   }
   let d4 = instants[&4];
   let tep = m.group(&4).unwrap();
@@ -18186,6 +18794,208 @@ fn a_covering_install_discharges_every_level_of_an_inherited_chain() {
     m.service_merge_applies(d4, &mut stores).is_empty(),
     "nothing surfaces twice"
   );
+}
+
+/// A host whose debt holder carries a THREE-level inherited chain: the fixture's debtor 1 (owing
+/// 2's capture) is consumed by 3, 3 by 4 and 4 by 5, every absorb fence-deferred, so 5 owns the
+/// debt for 4 and carries 3's, 1's and 2's — four consumed, unhosted sources whose floors stay
+/// deliberately unwritten until the discharge. Returns the container, its stores and each leader's
+/// instant, with the chain standing (5's abort fence holds it).
+fn three_level_debt_chain_host() -> (
+  MultiRaft<u64, u64, SplitSm>,
+  MapStores,
+  std::collections::BTreeMap<u64, Instant>,
+) {
+  let (mut m, mut stores, _k, _split_idx, d, _ds) = fork_fenced_park_fixture();
+  defer_to_absorbed(&mut m, &mut stores, d);
+  let mut instants = std::collections::BTreeMap::from([(1u64, d)]);
+  for (holder, target, dead_source) in [(1u64, 3u64, 8u64), (3, 4, 9), (4, 5, 10)] {
+    defer_holder_into_fenced_target(
+      &mut m,
+      &mut stores,
+      &mut instants,
+      holder,
+      target,
+      dead_source,
+    );
+  }
+  let tep = m.group(&5).unwrap();
+  assert_eq!(
+    tep.capture_debt().expect("the own debt").source(),
+    gid_key(4),
+    "the own debt names the consumed holder"
+  );
+  for named in [1u64, 2, 3, 4] {
+    assert!(m.debt_names(&named), "the chain names {named}");
+  }
+  assert!(
+    m.service_merge_applies(instants[&5], &mut stores)
+      .is_empty(),
+    "the chain waits: the abort fence still stands"
+  );
+  (m, stores, instants)
+}
+
+/// Craft `source` hosted and FROZEN for `target` — a restored durable log holding the
+/// `PrepareMerge` at index 1 — without hosting `target`: the strand's shape at the endpoint seam.
+fn restore_frozen_split_source(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  stores: &mut MapStores,
+  source: u64,
+  target: u64,
+) {
+  let mut slog = VecLog::default();
+  slog.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::PrepareMerge,
+    prepare_merge_bytes(target, 1),
+  )]);
+  let mut sstable = AsyncStable::default();
+  sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  m.restore_group_unchecked(
+    source,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    SplitSm::default(),
+    1,
+    &mut slog,
+    &mut sstable,
+  )
+  .unwrap();
+  assert!(
+    m.group(&source).unwrap().is_frozen(),
+    "the crafted freeze applied"
+  );
+  stores.0.insert(source, (slog, sstable));
+}
+
+/// The strand's target-side naming check reaches the holder's INHERITED chain, not only its own
+/// debt: with 5 owning the debt for 4 and carrying 3's, 1's and 2's, a source frozen for the
+/// deepest inherited level (2 — consumed, unhosted, its floor deliberately unwritten until the
+/// discharge) is no strand for as long as the chain stands. The host's only observation is the
+/// chain's own fence hold.
+#[test]
+fn a_target_named_deep_in_an_inherited_chain_is_not_a_stranded_sources_target() {
+  let (mut m, mut stores, instants) = three_level_debt_chain_host();
+  let d = instants[&5];
+  // S = 60, crafted frozen for T = 2, the chain's deepest inherited source.
+  restore_frozen_split_source(&mut m, &mut stores, 60, 2);
+  let mut observed = std::vec::Vec::new();
+  for _ in 0..3 {
+    assert!(m.service_merge_applies(d, &mut stores).is_empty());
+    while let Some(b) = m.poll_merge_blocked() {
+      observed.push(b);
+    }
+  }
+  assert!(
+    observed
+      .iter()
+      .all(|b| b.cause != MergeBlockedCause::StrandedSource),
+    "an inherited debt's window is no strand: {observed:?}"
+  );
+  assert!(
+    observed.iter().any(|b| b.target == 5),
+    "the chain's own hold is what is reported: {observed:?}"
+  );
+  assert!(
+    m.group(&60).unwrap().is_frozen(),
+    "the source waits on the discharge, then the floor"
+  );
+}
+
+/// The naming check is exact, not a blanket suppression while a chain stands: beside the same
+/// three-level chain, a source frozen for an id the chain does NOT name (50, never hosted, never
+/// consumed) IS a strand, reported beside the chain's own hold.
+#[test]
+fn a_target_the_chain_does_not_name_is_a_strand_beside_the_chain() {
+  let (mut m, mut stores, instants) = three_level_debt_chain_host();
+  let d = instants[&5];
+  // S = 60, crafted frozen for T = 50, which nothing on this host names.
+  restore_frozen_split_source(&mut m, &mut stores, 60, 50);
+  let mut observed = std::vec::Vec::new();
+  for _ in 0..3 {
+    assert!(m.service_merge_applies(d, &mut stores).is_empty());
+    while let Some(b) = m.poll_merge_blocked() {
+      observed.push(b);
+    }
+  }
+  assert_eq!(
+    observed
+      .iter()
+      .filter(|b| b.cause == MergeBlockedCause::StrandedSource)
+      .cloned()
+      .collect::<std::vec::Vec<_>>(),
+    std::vec![MergeBlocked {
+      target: 50,
+      source: 60,
+      boundary: Index::new(1),
+      cause: MergeBlockedCause::StrandedSource,
+    }],
+    "an unnamed dead target is a strand, once: {observed:?}"
+  );
+  assert!(
+    observed.iter().any(|b| b.target == 5),
+    "reported beside the chain's own hold: {observed:?}"
+  );
+}
+
+/// The strand derivation at scale: the same three-level chain (5 the one naming holder), TWO
+/// crafted strands — 60 frozen for 2, which the holder's inherited chain names, and 61 frozen for
+/// 50, which nothing names — beside 24 idle single-voter groups that hold no park and no naming.
+/// Exactly one `StrandedSource` stands, for the unnamed target; none for the named one, whose
+/// naming the walk over the holders alone must still reach through the inherited chain; and none
+/// keyed on any of the idle groups, which the once-per-crank pass visits without ever admitting
+/// them into the holder list.
+#[test]
+fn many_idle_groups_beside_two_strands_yield_exactly_the_unnamed_strand() {
+  let (mut m, mut stores, instants) = three_level_debt_chain_host();
+  let d = instants[&5];
+  let idle: std::vec::Vec<u64> = (100u64..124).collect();
+  for gid in &idle {
+    m.create_group(*gid, 0, single_node_cfg(1), d, 9, SplitSm::default())
+      .unwrap();
+  }
+  restore_frozen_split_source(&mut m, &mut stores, 60, 2);
+  restore_frozen_split_source(&mut m, &mut stores, 61, 50);
+  let mut observed = std::vec::Vec::new();
+  for _ in 0..3 {
+    assert!(m.service_merge_applies(d, &mut stores).is_empty());
+    while let Some(b) = m.poll_merge_blocked() {
+      observed.push(b);
+    }
+  }
+  assert_eq!(
+    observed
+      .iter()
+      .filter(|b| b.cause == MergeBlockedCause::StrandedSource)
+      .cloned()
+      .collect::<std::vec::Vec<_>>(),
+    std::vec![MergeBlocked {
+      target: 50,
+      source: 61,
+      boundary: Index::new(1),
+      cause: MergeBlockedCause::StrandedSource,
+    }],
+    "one strand, the unnamed target's, once: {observed:?}"
+  );
+  assert!(
+    observed
+      .iter()
+      .all(|b| !idle.contains(&b.target) && !idle.contains(&b.source)),
+    "an idle group is neither a strand's target nor its source: {observed:?}"
+  );
+  assert!(
+    observed.iter().any(|b| b.target == 5),
+    "reported beside the chain's own hold: {observed:?}"
+  );
+  for source in [60u64, 61] {
+    assert!(
+      m.group(&source).unwrap().is_frozen(),
+      "{source} stays frozen: the named one waits on the discharge, the strand on its remedy"
+    );
+  }
 }
 
 /// A poisoning completion — the state machine refuses the blob, `SnapshotRestore` — discharges
@@ -19165,8 +19975,21 @@ fn an_under_hosted_park_advertises_and_adopts_the_cure() {
 /// A restored target 1 parked at index 2 on a `CommitMerge` naming UNHOSTED source 42 — the cure
 /// shape, before any crank.
 fn parked_target_over_an_unhosted_source() -> (MultiRaft<u64, u64, SplitSm>, MapStores) {
-  let now = Instant::ORIGIN;
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  park_target_over_an_unhosted_source(&mut m, &mut stores, 1);
+  (m, stores)
+}
+
+/// [`parked_target_over_an_unhosted_source`] for a chosen `target` id, restored into a container
+/// beside whatever it already hosts — the shape's building block when a test needs several such
+/// targets in one host.
+fn park_target_over_an_unhosted_source(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  stores: &mut MapStores,
+  target: u64,
+) {
+  let now = Instant::ORIGIN;
   let cmd = {
     let mut buf = Vec::new();
     Bytes::from_static(b"c").encode(&mut buf);
@@ -19191,7 +20014,7 @@ fn parked_target_over_an_unhosted_source() -> (MultiRaft<u64, u64, SplitSm>, Map
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(3));
   m.restore_group_unchecked(
-    1,
+    target,
     single_node_cfg(1),
     now,
     7,
@@ -19201,10 +20024,11 @@ fn parked_target_over_an_unhosted_source() -> (MultiRaft<u64, u64, SplitSm>, Map
     &mut stable,
   )
   .unwrap();
-  assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
-  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
-  stores.0.insert(1, (log, stable));
-  (m, stores)
+  assert!(
+    m.group(&target).unwrap().pending_merge().is_some(),
+    "parked"
+  );
+  stores.0.insert(target, (log, stable));
 }
 
 /// The cure blob covering `boundary` at lineage `shape_gen`, as the target leader (node 9) ships
@@ -19486,6 +20310,132 @@ fn a_fenced_adopt_capture_is_reported_as_an_abort_fence_until_the_witness_lifts_
       "crank {crank}: nothing stands, nothing is reported"
     );
   }
+}
+
+/// ONE OBSERVATION PER TARGET PER CRANK, held across MANY fenced adopt owners at once (#135): the
+/// adopt-capture pass withholds its own fence signal exactly for a target an earlier pass of the
+/// same crank already named — a re-formed park here, the more actionable identity — and emits it
+/// for every other owner, however many the crank services; and the crank's attempt evidence, the
+/// target set the suppression reads included, is gone once the crank retires it, so the next crank
+/// derives every hold afresh.
+#[test]
+fn many_fenced_adopt_owners_keep_one_observation_per_target_per_crank() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  let targets = [1u64, 2, 3, 4, 5];
+  // Every target: parked over unhosted 42, holding an EARLIER abort's obligation below the park
+  // that names a source no one hosts (70 + the target's id, distinct per target).
+  for &t in &targets {
+    park_target_over_an_unhosted_source(&mut m, &mut stores, t);
+    m.group_mut(&t)
+      .unwrap()
+      .note_abandoned(gid_key(70 + t), 1, Index::new(1));
+  }
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  while m.poll_merge_blocked().is_some() {}
+  // The cure adopts each; every record is adopt-covered and fences its owner's owed capture.
+  for &t in &targets {
+    let (log, stable) = stores.0.get_mut(&t).unwrap();
+    m.handle_message(&t, now, log, stable, 9u64, cure_blob_to(Index::new(3)))
+      .unwrap();
+    drain_storage(&mut m, t, now, log, stable);
+    let tep = m.group(&t).unwrap();
+    assert!(
+      tep.pending_merge().is_none()
+        && tep.adopt_capture_owed()
+        && tep.capture_blocked_at(tep.applied_index()),
+      "target {t}: adopted, the forced capture owed and fenced"
+    );
+  }
+  // A foreign-led second absorb, of the unhosted 43, RE-PARKS the middle owner above the adopt
+  // boundary — with its `k + 1` committed, so the abort window is decided and the park pass
+  // names that wait first in every crank from here on.
+  {
+    let cmd = {
+      let mut buf = Vec::new();
+      Bytes::from_static(b"c").encode(&mut buf);
+      Bytes::from(buf)
+    };
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    m.handle_message(
+      &3,
+      now,
+      log,
+      stable,
+      9u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        Term::new(1),
+        9u64,
+        Index::new(3),
+        Term::new(1),
+        std::vec![
+          crate::Entry::new(
+            Term::new(1),
+            Index::new(4),
+            crate::EntryKind::CommitMerge,
+            commit_merge_bytes(43, Index::new(5), 1, 2),
+          ),
+          crate::Entry::new(Term::new(1), Index::new(5), crate::EntryKind::Normal, cmd),
+        ],
+        Index::new(5),
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  let tep = m.group(&3).unwrap();
+  assert_eq!(
+    tep.pending_merge().map(|p| p.at()),
+    Some(Index::new(4)),
+    "re-parked above the adopt"
+  );
+  assert!(
+    tep.adopt_capture_owed() && tep.capture_blocked_at(tep.applied_index()),
+    "still owing its fenced capture"
+  );
+  // ONE crank services all five owners.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  let mut observed = std::vec::Vec::new();
+  while let Some(b) = m.poll_merge_blocked() {
+    observed.push(b);
+  }
+  observed.sort_by_key(|b| (b.target, b.source));
+  let fenced = |t: u64| MergeBlocked {
+    target: t,
+    source: 70 + t,
+    boundary: Index::new(3),
+    cause: MergeBlockedCause::AbortFence,
+  };
+  assert_eq!(
+    observed,
+    std::vec![
+      fenced(1),
+      fenced(2),
+      MergeBlocked {
+        target: 3,
+        source: 43,
+        boundary: Index::new(4),
+        cause: MergeBlockedCause::SourceUnhosted,
+      },
+      fenced(4),
+      fenced(5),
+    ],
+    "each unnamed owner reports its own fence; the re-parked one reports its park alone"
+  );
+  assert!(
+    m.merge_blocked_attempts.is_empty() && m.merge_blocked_targets.is_empty(),
+    "the crank's attempt evidence retired with the crank"
+  );
+  // The next crank starts clean and re-derives the same five holds — deduped against the edge,
+  // nothing new is queued, and the evidence retires again.
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  assert_eq!(
+    m.poll_merge_blocked(),
+    None,
+    "the standing holds, unchanged, signal once"
+  );
+  assert!(m.merge_blocked_targets.is_empty());
 }
 
 /// THE LIVE CO-HOSTED SHAPE NEVER ADOPTS (#132): a parked target whose obligation names a source

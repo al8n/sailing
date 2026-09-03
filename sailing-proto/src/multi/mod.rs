@@ -238,7 +238,8 @@ pub trait GroupStores<G, L, S> {
 /// embedder enforces (`embedder_husk_floors` in the simulation world), because feeding the floor
 /// anywhere else manufactures the absent/duplicate abort arm and skips the union on this replica
 /// alone: committed divergence against every host that absorbed. A source frozen for a target
-/// that is unhosted here and unfloored is the embedder's to observe and re-host, never to floor.
+/// that is unhosted here and unfloored is reported as [`MergeBlockedCause::StrandedSource`] — the
+/// embedder's to re-host, never to floor.
 ///
 /// CONSENSUS-GRADE WARNING: a false terminal floor no longer costs merely ONE local replica. The
 /// per-crank service reads this floor on a source's DEAD (unhosted) TARGET to authorize the source
@@ -825,6 +826,19 @@ pub enum MergeBlockedCause {
   /// A live merge freeze holds the capture: this group is itself a source pinned by a claiming
   /// target. The thaw — or this group's own dissolution into the claimant — is the exit.
   Frozen,
+  /// This SOURCE is hosted here and frozen for a target that is not hosted here and carries
+  /// no terminal floor. Both of the source's release verbs — `commit_merge` and `rollback_merge` —
+  /// ride the dead target's log, the dead-target thaw fires only on the TERMINAL floor, and
+  /// nothing in-tree carries the resolving host's floor to this one, so the source stays frozen
+  /// with no local exit: electable, unremovable (`Frozen`), capture-fenced. The embedder's
+  /// remedies are re-hosting the target — its local absorb or abort then resolves the freeze —
+  /// and the structural cure (#135). A floor write is NOT one of them: flooring the unhosted
+  /// target is unsafe (with a co-hosted X parked on a committed `CommitMerge(T→X)`, a terminal
+  /// floor on T turns that park's absent-source arm into an abort that SKIPS the union on this
+  /// replica alone, and that park can form AFTER this observation), and the SOURCE must never be
+  /// floored for this cause — on this host it is a live frozen replica, not a husk. An
+  /// observation, never a command; its `boundary` is the source's freeze index.
+  StrandedSource,
 }
 
 /// A merge held on this host by a STRUCTURAL cause, surfaced once per transition — see
@@ -832,17 +846,24 @@ pub enum MergeBlockedCause {
 ///
 /// An OBSERVATION, never a command: nothing is torn down, nothing waits on consumption, and the
 /// container re-derives the same verdict every crank whether or not anyone reads this. It exists
-/// because both held shapes are otherwise INVISIBLE from outside — a parked target is not
-/// log-lagging and its apply stall is purely local, and a debt-holding target looks entirely
-/// healthy while its conf changes are fenced and the consumed source's id stays un-reusable.
+/// because the held shapes are otherwise INVISIBLE from outside — a parked target is not
+/// log-lagging and its apply stall is purely local, a debt-holding target looks entirely healthy
+/// while its conf changes are fenced and the consumed source's id stays un-reusable, and a source
+/// stranded by a dead target is merely frozen, exactly like the source of a merge about to
+/// resolve. One observation per `(target, source)` pair: two holds on one target that name
+/// different sources are reported side by side.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeBlocked<G> {
-  /// The absorbing target — the group whose apply drain (or capture) is held.
+  /// The absorbing target — the group whose apply drain (or capture) is held; for
+  /// [`StrandedSource`](MergeBlockedCause::StrandedSource) the UNHOSTED target the named source
+  /// is frozen for.
   pub target: G,
   /// The named source group.
   pub source: G,
-  /// The held coordinate: the parked `CommitMerge`'s index while the park stands, the absorb
-  /// boundary the capture owes once the park has been deferred into a debt.
+  /// The held coordinate, on a cause-dependent scale: a TARGET-log coordinate for the park and
+  /// debt causes — the parked `CommitMerge`'s index while the park stands, the absorb boundary
+  /// the capture owes once the park has been deferred into a debt — and the SOURCE'S freeze index
+  /// for [`StrandedSource`](MergeBlockedCause::StrandedSource).
   pub boundary: Index,
   /// What is holding it.
   pub cause: MergeBlockedCause,
@@ -1135,16 +1156,24 @@ where
   /// removal killed. Every other advance already rides a durable write the caller makes anyway
   /// (a relayed fork's child registration), so this queue exists for that one arm.
   guard_advances: VecDeque<(G, u64)>,
-  /// The last [`MergeBlockedCause`] signalled per target — the EDGE that makes
+  /// The last observation signalled per `(target, named source)` pair — the EDGE that makes
   /// [`poll_merge_blocked`](Self::poll_merge_blocked) fire once per transition instead of once per
-  /// crank. An entry lives exactly as long as the target's park or capture debt does (dropped at
-  /// the top of the next [`service_merge_applies`](Self::service_merge_applies) once neither
-  /// stands, and at removal), so a target that gets held again later signals afresh.
-  merge_blocked_seen: BTreeMap<G, (MergeBlockedCause, G, Index)>,
-  /// Every `note_merge_blocked` ATTEMPT of the CURRENT service crank (the edge dedupe absorbs
-  /// repeats downstream) — the end-of-crank retirement's evidence that a cause was still
-  /// derived this crank. Drained there; meaningful only within one `service_merge_applies`.
-  merge_blocked_attempts: BTreeMap<G, (MergeBlockedCause, G, Index)>,
+  /// crank. An entry lives exactly as long as the crank still derives its hold (dropped at the
+  /// end of every [`service_merge_applies`](Self::service_merge_applies) that did not re-attempt
+  /// it, and at either group's removal), so a pair that gets held again later signals afresh.
+  merge_blocked_seen: BTreeMap<(G, G), (MergeBlockedCause, Index)>,
+  /// Every `note_merge_blocked` ATTEMPT of the CURRENT service crank, by the same key (the edge
+  /// dedupe absorbs repeats downstream) — the end-of-crank retirement's evidence that a hold was
+  /// still derived this crank. Drained there; meaningful only within one `service_merge_applies`.
+  merge_blocked_attempts: BTreeMap<(G, G), (MergeBlockedCause, Index)>,
+  /// The TARGETS named by [`merge_blocked_attempts`](Self::merge_blocked_attempts) — a target is
+  /// in this set iff an attempt of the current crank names it. The adopt-capture pass's
+  /// one-observation-per-target suppression reads it in `O(log N)`, where a scan of the
+  /// pair-keyed attempts would cost every blocked owner a walk over the attempts the owners
+  /// before it added (`Θ(N²)` per crank, and a capture fence stands across cranks). Lives
+  /// exactly as long as the attempts do: filled beside them, dropped with them at the
+  /// end-of-crank retirement.
+  merge_blocked_targets: BTreeSet<G>,
   /// Pending structural-hold observations, drained by
   /// [`poll_merge_blocked`](Self::poll_merge_blocked). Best-effort like the poison tail: the
   /// container's own re-derivation, not this queue, is what keeps the hold resolving, so a
@@ -1226,6 +1255,7 @@ where
       guard_advances: VecDeque::new(),
       merge_blocked_seen: BTreeMap::new(),
       merge_blocked_attempts: BTreeMap::new(),
+      merge_blocked_targets: BTreeSet::new(),
       merge_blocked: VecDeque::new(),
       poisoned_seen: BTreeSet::new(),
       poisoned_pending: VecDeque::new(),
@@ -1484,15 +1514,21 @@ where
     self.poisoned_seen.remove(gid);
     self.poisoned_pending.retain(|g| g != gid);
     // Same rule for the structural-hold observation, on both roles: a target that is gone holds
-    // nothing, and a source that is gone is not the hold anyone can act on. Clearing the edge lets
-    // a re-admitted id that gets held again signal afresh.
-    self.merge_blocked_seen.remove(gid);
-    // A remembered observation NAMING the removed gid clears too, so the successor cause (the
-    // next hosted crossing, the underlying unhosted source) can signal afresh.
-    self.merge_blocked_seen.retain(|_, (_, src, _)| src != gid);
+    // nothing, and a source that is gone is not the hold anyone can act on. Clearing every edge
+    // keyed on the removed gid, as target or as named source, lets a re-admitted id that gets
+    // held again signal afresh, and lets the successor cause (the next hosted crossing, the
+    // underlying unhosted source, a source stranded again by this very removal) signal afresh.
+    self
+      .merge_blocked_seen
+      .retain(|(target, source), _| target != gid && source != gid);
     self
       .merge_blocked
       .retain(|b| &b.target != gid && &b.source != gid);
+    // The crank's attempt evidence (`merge_blocked_attempts` and its target set) is left as it
+    // is: both are empty between cranks, and a removal INSIDE a crank (an absorbed source, a
+    // dissolved husk) must keep them in step — an attempt that named the removed gid this crank
+    // still names it, so the target stays in the set; the end-of-crank retirement drops both,
+    // and the retained edge and queue above no longer hold anything for it to match.
     let removed = self.groups.remove(gid);
     // PURGE-ON-REMOVAL: a source leaving the container takes every target's outstanding thaw
     // obligation for it along with it, binding the obligation to the incarnation SYNCHRONOUSLY —
@@ -2913,15 +2949,17 @@ where
     self.poisoned_pending.pop_front()
   }
 
-  /// The next merge held by a STRUCTURAL cause on this host, reported ONCE PER TRANSITION of a
-  /// target's cause rather than once per crank — see [`MergeBlocked`].
+  /// The next merge held by a STRUCTURAL cause on this host, reported ONCE PER TRANSITION of an
+  /// observation — a `(target, named source)` pair's cause and coordinate — rather than once per
+  /// crank — see [`MergeBlocked`].
   ///
   /// An OBSERVATION on a best-effort tail: the hold's resolution is driven by
   /// [`service_merge_applies`](Self::service_merge_applies) re-deriving it every crank, never by
   /// this queue, so a dropped signal costs a notification and nothing else. What the embedder does
   /// with it is cause-specific and always OUT of the consensus path: give an unhosted source a
-  /// host, resolve a split conflict, remove a group whose thaw will never come. Doing nothing is
-  /// also a valid answer for the causes that lift on their own.
+  /// host, resolve a split conflict, remove a group whose thaw will never come, re-host the dead
+  /// target a frozen source is stranded by. Doing nothing is also a valid answer for the causes
+  /// that lift on their own.
   pub fn poll_merge_blocked(&mut self) -> Option<MergeBlocked<G>> {
     self.merge_blocked.pop_front()
   }
@@ -2935,10 +2973,10 @@ where
     self.merge_blocked.front().cloned()
   }
 
-  /// Queue one [`MergeBlocked`] iff `cause` DIFFERS from the last one signalled for `target`. The
-  /// container re-derives every hold on every crank, so without this edge the queue would grow by
-  /// one entry per crank for as long as the hold stands; with it, a stable hold costs exactly one
-  /// signal and a hold that changes shape costs one more.
+  /// Queue one [`MergeBlocked`] iff the observation DIFFERS from the last one signalled for the
+  /// `(target, source)` pair. The container re-derives every hold on every crank, so without this
+  /// edge the queue would grow by one entry per crank for as long as the hold stands; with it, a
+  /// stable hold costs exactly one signal and a hold that changes shape costs one more.
   fn note_merge_blocked(
     &mut self,
     target: &G,
@@ -2946,24 +2984,27 @@ where
     boundary: Index,
     cause: MergeBlockedCause,
   ) {
-    // The FULL observation identity dedups — cause, named source, and boundary — never the
+    // The FULL observation identity dedups — the pair, the cause and the boundary — never the
     // cause alone: with hosted crossings A then B, removing A must let B's observation through,
-    // or the placement layer holds a wedge with no actionable identity for it.
-    let observation = (cause, source.cheap_clone(), boundary);
-    self.merge_blocked_attempts.insert(
-      target.cheap_clone(),
-      (cause, source.cheap_clone(), boundary),
-    );
-    if self.merge_blocked_seen.get(target) == Some(&observation) {
+    // or the placement layer holds a wedge with no actionable identity for it. The PAIR is the
+    // key, so two holds on one target that name different sources are two observations, both
+    // retained: a parked target that also holds a debt (a foreign-led second absorb parked
+    // mid-window — `AlreadyPending` is host-local) reports the park's wait and the debt's fence
+    // side by side, where a target-keyed edge had the debt pass overwrite the park's signal.
+    let key = (target.cheap_clone(), source.cheap_clone());
+    let observation = (cause, boundary);
+    self.merge_blocked_attempts.insert(key.clone(), observation);
+    self.merge_blocked_targets.insert(target.cheap_clone());
+    if self.merge_blocked_seen.get(&key) == Some(&observation) {
       return;
     }
-    self
-      .merge_blocked_seen
-      .insert(target.cheap_clone(), observation);
+    self.merge_blocked_seen.insert(key, observation);
     // A superseded observation still QUEUED (a full lifecycle tail held it undelivered) is
     // replaced, not delivered first: the embedder would act on the stale identity — the old
-    // crossing, the old cause — before ever seeing the current one.
-    self.merge_blocked.retain(|b| &b.target != target);
+    // cause, the old coordinate — before ever seeing the current one.
+    self
+      .merge_blocked
+      .retain(|b| &b.target != target || &b.source != source);
     self.merge_blocked.push_back(MergeBlocked {
       target: target.cheap_clone(),
       source: source.cheap_clone(),
@@ -6401,10 +6442,11 @@ where
         // absorbed source's id stays un-reusable. Name the fence that is standing (nothing when
         // only a transient is — it drains within cranks): an abort fence by the record that
         // fences, the freeze and fork legs by the adopt's own source. One observation per
-        // target per crank: a coexisting capture debt or a re-formed park already named this
-        // wedge above with the more actionable identity, and a second, differing observation
-        // would defeat the once-per-transition dedupe (two identities re-queued every crank).
-        if !self.merge_blocked_attempts.contains_key(&gid)
+        // target per crank from this pass: a coexisting capture debt or a re-formed park already
+        // named this wedge above with the more actionable identity, and the adopt's own fence is
+        // the same wedge seen from a less actionable angle — a second observation beside it
+        // would be noise, not a second hold.
+        if !self.merge_blocked_targets.contains(&gid)
           && let Some(ep) = self.groups.get(&gid)
           && let Some((own, boundary)) = ep.adopt_capture_debt()
           && let Some(fence) = ep.capture_fence_at(ep.applied_index())
@@ -6452,21 +6494,141 @@ where
       }
       self.mark_dirty(&gid);
     }
+    // THE STRANDED-SOURCE OBSERVATION, derived after every pass that could resolve the shape and
+    // immediately before the retirement, so it is retired like every other hold. A hosted FROZEN
+    // source whose claimed target is (i) NOT hosted here AND (ii) reads a NON-terminal floor is
+    // the chain strand the dead-target derivation above cannot serve: both of the source's
+    // release verbs ride the dead target's log, the mint above fires only on the terminal floor,
+    // and nothing in-tree carries the resolving host's floor to this one. It is NAMED to the
+    // embedder — whose exits are re-hosting the target and the structural cure (#135), never a
+    // floor write (see `MergeBlockedCause::StrandedSource`) — keyed like every other observation
+    // by `(target, source)`, at the SOURCE'S freeze index. Every guard below is a shape another
+    // pass owns, or a floor that is deliberately absent:
+    // - a claim that does not decode is the committed-corrupt class the dead-target loop above
+    //   already poisoned this crank, and the poison filter here skips it;
+    // - a hosted target (any state) is the resolver's, the thaw pass's, or an ordinary merge's;
+    // - a standing park naming the source is that park's own observation (a debt never names a
+    //   HOSTED source — see the naming argument below);
+    // - a source owing a LOCALLY-DRIVABLE thaw is the thaw pass's (its poison side effect on a
+    //   corrupt owed id is the thaw pass's own fail-stop, reached earlier this crank);
+    // - a target a debt names (the `Absorbed` window, a `CaptureFailed` pin) is unhosted with
+    //   its floor DELIBERATELY unwritten until the discharge or the restart;
+    // - a target named as the SOURCE of a resolution pushed THIS crank (the `Clear` arm's local
+    //   absorb, the debt pass's discharge, the husk dissolve) has its terminal floor written by
+    //   the driver only after this call returns — the next crank reads it, and the dead-target
+    //   thaw takes over.
+    let stranded: Vec<(G, G, Bytes, Index)> = self
+      .groups
+      .iter()
+      .filter(|(_, ep)| ep.is_frozen() && !ep.is_poisoned())
+      .filter_map(|(sgid, sep)| {
+        let boundary = sep.freeze_index()?;
+        let target = G::decode_exact(sep.frozen_for()?.clone()).ok()?;
+        if self.groups.contains_key(&target) {
+          return None;
+        }
+        let mut source_key = Vec::new();
+        sgid.encode(&mut source_key);
+        Some((
+          target,
+          sgid.cheap_clone(),
+          Bytes::from(source_key),
+          boundary,
+        ))
+      })
+      .collect();
+    // ONE linear pass over the hosted groups per crank, taken only while a strand stands — the
+    // cost model every per-crank pass in this container accepts (the husk dissolve's
+    // `park_named_sources`, the debt pass, the thaw pass) — collecting the two things the
+    // per-candidate guards below consult, so no candidate re-scans every group (that
+    // strand×group product would otherwise stand every crank for as long as a strand does, and
+    // the drivers' cue-retry wake re-cranks it while a lifecycle tail is full):
+    // - the source ids NAMED by any hosted endpoint's standing park. A frozen source holds no
+    //   park of its own, so the SOURCE key's membership here is exactly the park half of the
+    //   other-endpoint scan `park_names_source` performs for it. The scan's DEBT half is not
+    //   asked for the source at all: a debt or a recovery pin names a source whose endpoint was
+    //   CONSUMED (the `Defer` arm mints its debt after `remove_group_inner(&source)`, an
+    //   inherited entry is a consumed holder's own debt carried on, a pin is minted for the
+    //   sources the failed capture consumed), and a named id refuses re-admission
+    //   (`AbsorbPending`) for as long as the naming stands — so a HOSTED frozen candidate is
+    //   never debt- or pin-named, and that check would be dead;
+    // - the ids of the endpoints that hold naming (`holds_naming` — an own debt, an inherited
+    //   chain, a recovery pin), the only endpoints whose chain or pins can name a TARGET.
+    // Both collections stay exact across the loop: it mutates no park, debt or pin
+    // (`owes_a_drivable_thaw`'s poison, its one side effect, removes nothing).
+    let mut park_named: BTreeSet<Bytes> = BTreeSet::new();
+    let mut naming_holders: Vec<G> = Vec::new();
+    if !stranded.is_empty() {
+      for (gid, ep) in &self.groups {
+        if let Some(park) = ep.pending_merge() {
+          park_named.insert(park.source_bytes());
+        }
+        if ep.holds_naming() {
+          naming_holders.push(gid.cheap_clone());
+        }
+      }
+    }
+    for (target, source, source_key, boundary) in stranded {
+      let resolved_this_crank = resolutions.iter().any(|r| match r {
+        MergeResolution::Merged { source: s, .. }
+        | MergeResolution::Absorbed { source: s, .. }
+        | MergeResolution::Aborted { source: s, .. }
+        | MergeResolution::Retired { source: s }
+        | MergeResolution::CaptureFailed { source: s, .. } => *s == target,
+      });
+      let mut target_key = Vec::new();
+      target.encode(&mut target_key);
+      // Cheapest first — the set lookup, then the floor reads — then the TARGET-side naming
+      // walk, and the drivability read, the one side-effecting guard, LAST.
+      //
+      // The target-side check is `debt_names` asked of the naming holders alone, walked from
+      // the list the pass above collected with an O(log N) lookup each: every holder is asked
+      // whether its chain or pins name the target, and no aggregate set is built. Per candidate
+      // the work is a walk over the holders (each a deferred or failed capture the ledger
+      // tracks, which leaves the chain at its discharge or at the restart), the comparisons
+      // proportional to the LIVE obligations this host holds — not to history — and the
+      // allocations are the encoded target key here and the source key carried from the
+      // collection. A cross-crank index would have to be invalidated at every mint,
+      // inheritance, discharge, pin and removal site for no asymptotic gain while strands are
+      // few.
+      if resolved_this_crank
+        || park_named.contains(&source_key)
+        || stores.floor(&source) == crate::MERGED_FLOOR
+        || stores.floor(&target) == crate::MERGED_FLOOR
+        || naming_holders.iter().any(|h| {
+          self
+            .groups
+            .get(h)
+            .is_some_and(|ep| ep.debt_names_source(target_key.as_slice()))
+        })
+        || self.owes_a_drivable_thaw(&source)
+      {
+        continue;
+      }
+      self.note_merge_blocked(
+        &target,
+        &source,
+        boundary,
+        MergeBlockedCause::StrandedSource,
+      );
+    }
     // THE OBSERVATION RETIREMENT, at the END of the crank so a hold resolved by ANY pass above
     // never outlives it: the seen edge and the QUEUE both retain only what THIS crank still
-    // derived. Every pass re-attempts a standing cause each crank (the edge dedupe absorbs the
-    // repeats), so absence here IS resolution or cause drift — and a queued undelivered signal
-    // for either would prompt embedder action against a hold that no longer exists (re-hosting
-    // an absorbed source beside the cured union, chasing a crossing that moved on). The drivers
-    // drain immediately after this returns, so nothing later re-checks.
+    // derived, pair by pair. Every pass re-attempts a standing cause each crank (the edge dedupe
+    // absorbs the repeats), so absence here IS resolution or cause drift — and a queued
+    // undelivered signal for either would prompt embedder action against a hold that no longer
+    // exists (re-hosting an absorbed source beside the cured union, chasing a crossing that moved
+    // on, re-hosting a target already back). The drivers drain immediately after this returns,
+    // so nothing later re-checks.
     let attempts = core::mem::take(&mut self.merge_blocked_attempts);
+    self.merge_blocked_targets.clear();
     self
       .merge_blocked_seen
-      .retain(|g, obs| attempts.get(g) == Some(obs));
+      .retain(|key, obs| attempts.get(key) == Some(obs));
     self.merge_blocked.retain(|b| {
       attempts
-        .get(&b.target)
-        .is_some_and(|(c, s, i)| *c == b.cause && *s == b.source && *i == b.boundary)
+        .get(&(b.target.cheap_clone(), b.source.cheap_clone()))
+        .is_some_and(|(c, i)| *c == b.cause && *i == b.boundary)
     });
     resolutions
   }

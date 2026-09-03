@@ -1487,6 +1487,16 @@ where
       || self.merge.recovery_pins.iter().any(|p| p.as_ref() == key)
   }
 
+  /// Whether this endpoint holds ANY naming — an own debt, an inherited chain, or a recovery
+  /// pin — i.e. whether [`debt_names_source`](Self::debt_names_source) can answer `true` for
+  /// some id. It gates membership in the container's once-per-crank list of naming holders,
+  /// which its per-strand target-side check walks instead of every hosted group.
+  pub(crate) fn holds_naming(&self) -> bool {
+    self.merge.capture_debt.is_some()
+      || !self.merge.inherited_debts.is_empty()
+      || !self.merge.recovery_pins.is_empty()
+  }
+
   /// Pin the preserved stores of every listed source on this POISONED holder (see
   /// [`MergeState::recovery_pins`]): the absorb consumed them without a covering capture, so until
   /// a restart re-parks against them nothing may tear them down, tombstone, re-host or
