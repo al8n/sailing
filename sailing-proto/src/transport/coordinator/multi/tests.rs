@@ -3733,6 +3733,91 @@ fn debt_window_coord() -> (SplitCoord, Stores, Instant) {
   (c, st, d)
 }
 
+/// A `CaptureFailed` at the coordinator: the consumed source is NOT tombstoned (a terminal refusal
+/// would fence exactly the incarnation the restart must restore), and the RECOVERY PIN the
+/// container placed reaches `debt_names` — the demux fence and the drivers' factory gate read a pin
+/// exactly as they read a debt — while the coordinator's lifecycle verbs refuse the pinned id and
+/// the poisoned holder. The target is poisoned BEFORE the resolving crank: the exit whose absorb
+/// succeeds into a fail-stopped state machine, so the union lives nowhere durable.
+#[test]
+fn a_failed_capture_pins_its_source_through_the_coordinator() {
+  let now = Instant::ORIGIN;
+  let mut c = SplitCoord::new();
+  let mut st = Stores {
+    map: BTreeMap::new(),
+    floors: BTreeMap::new(),
+  };
+  for g in [1u64, 2] {
+    st.map
+      .insert(g, (VecLog::default(), AsyncStable::default()));
+    c.create_group(g, single_voter(2), now, 7, SplitSm::default(), 0, &NoFloors)
+      .unwrap();
+  }
+  let d = lead_split_group(&mut c, 1, &mut st, now);
+  commit_one_on(&mut c, 1, &mut st, d);
+  let ds = lead_split_group(&mut c, 2, &mut st, now);
+  commit_one_on(&mut c, 2, &mut st, ds);
+  c.prepare_merge(&2, ds, &mut st, &1, &NoFloors)
+    .unwrap()
+    .unwrap();
+  settle_group(&mut c, 2, &mut st, ds);
+  assert!(c.group(&2).unwrap().is_frozen());
+  {
+    let (l, s) = st.stores(&1).unwrap();
+    c.commit_merge(&1, d, l, s, &2, &NoFloors).unwrap().unwrap();
+  }
+  settle_group(&mut c, 1, &mut st, d);
+  assert!(c.group(&1).unwrap().pending_merge().is_some(), "parked");
+  assert!(
+    c.service_merge_applies(d, &mut st).is_empty(),
+    "the first pass seals the window"
+  );
+  settle_group(&mut c, 1, &mut st, d);
+  c.multi
+    .group_mut(&1)
+    .unwrap()
+    .poison(crate::PoisonReason::ReservedShapeGen);
+  assert_eq!(
+    c.service_merge_applies(d, &mut st),
+    std::vec![crate::MergeResolution::CaptureFailed {
+      source: 2,
+      target: 1
+    }],
+    "the poisoned target's absorb surfaces CaptureFailed"
+  );
+  assert!(
+    !c.is_retired(&2),
+    "a CaptureFailed source is NOT tombstoned: the restart must restore it"
+  );
+  assert!(
+    c.debt_names(&2),
+    "the pin names the consumed source through the coordinator's predicate"
+  );
+  assert!(
+    matches!(
+      c.remove_group(&2, &mut st),
+      Err(crate::RemoveError::SpokenFor)
+    ),
+    "the pinned id refuses removal, so the coordinator never tombstones it"
+  );
+  assert!(!c.is_retired(&2));
+  assert!(
+    matches!(
+      c.remove_group(&1, &mut st),
+      Err(crate::RemoveError::OwesRecovery)
+    ),
+    "the poisoned holder refuses its own removal"
+  );
+  assert!(
+    matches!(
+      c.create_group(2, single_voter(2), d, 7, SplitSm::default(), 0, &NoFloors),
+      Err(crate::CreateGroupError::AbsorbPending)
+    ),
+    "the pinned id refuses admission"
+  );
+  assert!(st.map.contains_key(&2), "the source's stores are intact");
+}
+
 /// The demux fence covers the debt window exactly as it covers a tombstone, and — like the
 /// tombstone check — it sits BEFORE store resolution, so the outcome does not depend on the
 /// embedder's `GroupStores` seam. The consumed source's id is NOT retired (its floor moves only at

@@ -164,11 +164,15 @@ pub(crate) enum ClaimRead {
   RefusedAbove { judged_at: Index },
 }
 
-/// The endpoint-resident merge state. One instance per endpoint, defaulted inert; every field is
-/// DERIVED from the log and re-derivable at restart (`freeze_queue` from the unapplied suffix,
-/// `frozen`/`freeze_index` from replaying the applied prefix, the park from re-encountering its
-/// entry), so nothing here is persisted. The lineage counter deliberately does NOT live here —
-/// incarnation and shape share ONE monotone per-id counter (`SplitState::shape_gen`).
+/// The endpoint-resident merge state. One instance per endpoint, defaulted inert; every field but
+/// one is DERIVED from the log and re-derivable at restart (`freeze_queue` from the unapplied
+/// suffix, `frozen`/`freeze_index` from replaying the applied prefix, the park from
+/// re-encountering its entry), so nothing here is persisted. The exception is
+/// [`recovery_pins`](Self::recovery_pins): a fail-stopped holder's record of the preserved stores
+/// its failed absorb depends on — the one field a restart CLEARS rather than re-derives, because
+/// the restart's re-derived park (from re-encountering that absorb's `CommitMerge`) is what
+/// replaces it. The lineage counter deliberately does NOT live here — incarnation and shape share
+/// ONE monotone per-id counter (`SplitState::shape_gen`).
 #[derive(Debug, Default)]
 pub(crate) struct MergeState {
   /// Every `PrepareMerge` in the UNAPPLIED suffix `(applied, last]`, in log order — the
@@ -361,6 +365,18 @@ pub(crate) struct MergeState {
   /// Non-empty only while `capture_debt` is `Some` (inheritance happens only inside a `Defer`,
   /// which always mints).
   pub(crate) inherited_debts: std::vec::Vec<crate::Merged>,
+  /// The encoded ids of every source whose PRESERVED STORES this POISONED holder pins: an absorb
+  /// consumed the source's endpoint and then failed to capture the union — the state machine
+  /// refused the fold, or the forced capture faulted — so the source's stores, and those of every
+  /// source in the debt chain it carried (the restored source replays its own `CommitMerge` and
+  /// re-parks against the next), are the union's only restart derivation. NOT a debt: a debt is a
+  /// promise a covering capture discharges, surfacing the `Merged` that floors and tears the source
+  /// down, but here no capture covered the fold (or none can — the holder is fail-stopped), so a
+  /// pin must never reach a discharge, an inheritance or a rebaseline path. It feeds exactly one
+  /// predicate, [`Endpoint::debt_names_source`] — the naming the removal, admission, demux and
+  /// factory gates consult — plus the holder's own removal gate. Volatile: the restart clears it,
+  /// and the re-derived park takes its place.
+  pub(crate) recovery_pins: Vec<Bytes>,
   /// The abandoned merges this TARGET must thaw its sources out of, keyed by source id — one entry
   /// per aborted source, inserted when a target-role abort (`RollbackMerge` at its live mint)
   /// APPLIES here, removed once that source is observed thawed past the abandoned generation (or
@@ -1442,9 +1458,36 @@ where
       .chain(self.merge.inherited_debts.iter())
   }
 
-  /// Whether any held debt (own or inherited) names `key` as its absorbed source.
-  pub(crate) fn debt_names_source(&self, key: &Bytes) -> bool {
-    self.capture_debt_chain().any(|m| m.source() == *key)
+  /// Whether any held debt (own or inherited) names `key` as its absorbed source — or a recovery
+  /// pin does. THE naming predicate every lifecycle surface consults for "are this id's preserved
+  /// stores spoken for": the container's cross-endpoint removal leg and admission gate, and the
+  /// drivers' demux fence and factory gate through
+  /// [`MultiRaft::debt_names`](crate::MultiRaft::debt_names). A debt's naming ends at its
+  /// discharge; a pin's only at the restart.
+  pub(crate) fn debt_names_source(&self, key: &[u8]) -> bool {
+    self
+      .capture_debt_chain()
+      .any(|m| m.source().as_ref() == key)
+      || self.merge.recovery_pins.iter().any(|p| p.as_ref() == key)
+  }
+
+  /// Pin the preserved stores of every listed source on this POISONED holder (see
+  /// [`MergeState::recovery_pins`]): the absorb consumed them without a covering capture, so until
+  /// a restart re-parks against them nothing may tear them down, tombstone, re-host or
+  /// re-materialize their ids — and this holder itself may not be removed in service.
+  pub(crate) fn pin_failed_capture(&mut self, sources: impl IntoIterator<Item = Bytes>) {
+    debug_assert!(
+      self.is_poisoned(),
+      "a recovery pin exists only on a fail-stopped holder"
+    );
+    self.merge.recovery_pins.extend(sources);
+  }
+
+  /// Whether this holder pins a consumed source's preserved stores (a failed absorb capture). The
+  /// holder's own removal refuses while it does: the ungated teardown drops volatile state, and
+  /// shedding the pin would strand every pinned source un-floored beside a dead target.
+  pub(crate) fn holds_recovery_pins(&self) -> bool {
+    !self.merge.recovery_pins.is_empty()
   }
 
   /// Drain the WHOLE chain (own debt first) — the consuming teardowns' take: the caller
