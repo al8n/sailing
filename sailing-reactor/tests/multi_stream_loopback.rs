@@ -18,10 +18,13 @@ use std::{
 
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
-use common::{CountSm, DelegatingEngine, EngineWatch, PRELOAD_TERM, TrapSm, preloaded_engine};
+use common::{
+  CountSm, DelegatingEngine, EngineWatch, PRELOAD_TERM, TrapSm, frozen_sources_engine,
+  preloaded_engine,
+};
 use sailing_proto::{
   ClusterId, ConfChange, ConfChangeType, Config, Data, Event, Index, LabelOptions, Labeled,
-  Passthrough, ReadOnlyOption, Role,
+  MergeBlockedCause, Passthrough, ReadOnlyOption, Role,
 };
 use sailing_reactor::{
   DriverConfig, DriverError, GroupBlueprint, GroupHandle, LifecycleEvent, MultiHandle,
@@ -4074,6 +4077,122 @@ async fn a_debt_windows_fence_signal_survives_a_full_lifecycle_tail() {
     },
   )
   .await;
+}
+
+/// THE IDLE-HOST BACKPRESSURE PIN, the held-merge pin's strand leg: a stranded source's
+/// observation, retained behind a full lifecycle tail, still reaches the embedder promptly once
+/// the tail drains — with NO other traffic and the source quiesced. Two hosts are handed engines
+/// holding five two-voter sources (2 to 6), each restored FROZEN for the never-hosted target 1, on
+/// capacity-1 lifecycle tails: on each host the first strand's observation fills the slot and the
+/// other four are retained at the coordinator. Every earlier cause's holder is quiesce-ineligible
+/// (a park, a debt, a cure debt, an owed adopt capture), so its host keeps cranking and re-offers
+/// a retained observation within a heartbeat; a stranded source is a clean frozen replica that
+/// quiesces (the leader off its own idleness, the follower off the flagged beat), after which a
+/// host wakes only for its housekeeping and the transport's keep-alive probes — both on a
+/// one-second cadence that the two idle hosts phase-lock into ONE wake per second. Pre-fix a
+/// retained observation that missed the crank before it (a crank hands one to the waiting
+/// receiver and buffers one more) therefore landed a full second later; post-fix the cue-retry
+/// deadline re-offers it within its 50 ms interval. The first retained observation lands at an
+/// arbitrary phase of the cadence, so the three that follow — each slot drained the instant the
+/// previous one arrives, so at least one of them spans a wake — are what is timed, on both hosts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranded_sources_observation_rides_the_cue_retry_wake_on_an_idle_host() {
+  const SOURCES: [u64; 5] = [2, 3, 4, 5, 6];
+  let addrs = addrs(45_440, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (dialer, acceptor) = plain_factories(id);
+    let watch = Arc::new(EngineWatch::default());
+    let (driver, handle): (
+      MForeign<CountSm, DelegatingEngine>,
+      MultiHandle<u64, u64, CountSm>,
+    ) = MultiReactorStreamDriver::bind_with_engine(
+      addrs[(id - 1) as usize],
+      peers,
+      dialer,
+      acceptor,
+      DriverConfig {
+        events_cap: 1,
+        ..DriverConfig::default()
+      },
+      DelegatingEngine::preloaded(frozen_sources_engine(&SOURCES, 1), watch),
+    )
+    .await
+    .expect("the host binds over the frozen sources");
+    metrics.push(driver.engine_metrics());
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // Restore each source on both hosts back to back, so no campaign solicits a host that does
+  // not yet hold the group (an unknown-group signal would take the one slot instead).
+  for gid in SOURCES {
+    for (i, h) in handles.iter().enumerate() {
+      let id = i as u64 + 1;
+      h.restore_group(gid, config(id, vec![1, 2]), id + 4, CountSm::default(), 0)
+        .await
+        .expect("the frozen source restores");
+      let status = h.group(gid).status().await.expect("hosted");
+      assert!(
+        status.frozen,
+        "node {id}: source {gid} restored frozen for the unhosted target"
+      );
+    }
+  }
+  // Every source elects and settles, then every host quiesces all five — the driver's own gauge
+  // says when. Then let the idle hosts' probe and housekeeping cadences phase-lock: from here
+  // nothing is sent to either host that is not on that one-second beat.
+  for (i, m) in metrics.iter().enumerate() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while m.quiesced_groups() < SOURCES.len() as u64 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "node {}: the stranded sources never quiesced ({} of {})",
+        i + 1,
+        m.quiesced_groups(),
+        SOURCES.len()
+      );
+      tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+  }
+  tokio::time::sleep(Duration::from_secs(2)).await;
+  let is_strand = |ev: &LifecycleEvent<u64, u64>| {
+    matches!(
+      ev,
+      LifecycleEvent::MergeBlocked {
+        target: 1,
+        cause: MergeBlockedCause::StrandedSource,
+        ..
+      }
+    )
+  };
+  for (i, h) in handles.iter().enumerate() {
+    let first = h
+      .lifecycle()
+      .try_recv()
+      .expect("the first strand's observation filled the one-slot tail");
+    assert!(is_strand(&first), "node {}: {first:?}", i + 1);
+    // The first RETAINED observation lands whenever the next wake re-offers it.
+    await_lifecycle(h.lifecycle(), "the first retained strand", is_strand).await;
+    // Each slot is free again the instant its predecessor arrived: from there a retained
+    // observation's latency is the cue-retry interval, or a whole beat without the re-arm.
+    let mut gaps = Vec::new();
+    for _ in 0..3 {
+      let started = std::time::Instant::now();
+      await_lifecycle(h.lifecycle(), "a retained strand", is_strand).await;
+      gaps.push(started.elapsed());
+    }
+    assert!(
+      gaps.iter().all(|g| *g < Duration::from_millis(500)),
+      "node {}: a retained observation waited {gaps:?} for an unrelated wake instead of riding \
+       the cue-retry deadline",
+      i + 1
+    );
+  }
 }
 
 /// Retry a leader-routed merge verb across nodes until some leader accepts it (transient

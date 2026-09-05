@@ -706,10 +706,9 @@ where
       }
       let _ = self.coord.poll_split_refusal();
     }
-    // RE-ARM, on the cue's own bounded schedule — never on `flush_pending`, which would couple an
-    // undelivered signal to the storage barrier and spin (see
-    // [`rearm_cue_retry`](Self::rearm_cue_retry)).
-    self.rearm_cue_retry();
+    // The cue-retry RE-ARM does not run here: it reads every one-shot queue of the crank, and the
+    // held-merge observations are offered only by the post-service tail — so the tail re-arms
+    // ([`publish_observations`](Self::publish_observations)), after every pump of the crank.
     // A fail-stopped group surfaces once on the same best-effort tail; a full tail drops the
     // observation and the embedder still finds the poison by direct inspection.
     while let Some(group) = self.coord.poll_poisoned() {
@@ -743,10 +742,58 @@ where
   /// is queued, and a parent holding one is quiesce-INELIGIBLE
   /// ([`Self::owes_merge_cure_ticks`] reads `fork_relay_pending`), so the group keeps its own
   /// timers armed and the loop keeps turning independently of this deadline.
+  ///
+  /// A RETAINED HELD-MERGE OBSERVATION rides the same schedule. It is the second one-shot signal
+  /// the bounded tail may refuse (the post-service drain keeps it queued at the coordinator
+  /// rather than dropping it), and unlike the split cues its holder is NOT necessarily
+  /// quiesce-ineligible: a park, a debt, a cure debt and an owed adopt capture all refuse
+  /// [`group_idle`](super::group_idle), so their hosts keep cranking and re-offer the observation
+  /// on the next crank — but a [`StrandedSource`](sailing_proto::MergeBlockedCause::StrandedSource)
+  /// holder is a clean FROZEN source that passes it when it leads, so its host can go idle on the
+  /// very crank that retained the observation, and without this deadline the placement layer
+  /// would see no hint until unrelated traffic or the housekeeping wake. The wake it arms is an
+  /// ordinary crank with nothing due and no barrier — `fire_timeouts` finds no deadline, the
+  /// pumps re-offer the cues, `service_merge_applies` re-derives (and retires) every hold, and
+  /// the tail re-offers the observation — so a hold that resolved meanwhile is retired, never
+  /// delivered stale. Read at the END of the tail, after every pump of the crank, so a signal
+  /// the tail just delivered does not arm a spurious wake.
   fn rearm_cue_retry(&mut self) {
-    let pending =
-      self.coord.peek_split_conflict().is_some() || self.coord.peek_split_refusal().is_some();
+    let pending = self.coord.peek_split_conflict().is_some()
+      || self.coord.peek_split_refusal().is_some()
+      || self.coord.peek_merge_blocked().is_some();
     self.cue_retry_at = pending.then(|| std::time::Instant::now() + CUE_RETRY_INTERVAL);
+  }
+
+  /// The post-service publication tail every crank ends in — the fail-stop signals, then the
+  /// held-merge observations, then the cue-retry re-arm. The ONLY publication point for the
+  /// observations: it reads strictly after the crank's end-of-crank retirement (see the note in
+  /// [`fork_drain`](Self::fork_drain)), so nothing stale is ever offered, and a retained
+  /// observation is re-offered by the next crank whatever woke it — traffic, a timer, or the
+  /// cue-retry deadline this tail arms for it. Best-effort for the poison (a full tail drops it;
+  /// the embedder still finds the poison by direct inspection), delivered-before-consumed for
+  /// the observation (a full tail leaves it queued for the retry).
+  fn publish_observations(&mut self) {
+    while let Some(group) = self.coord.poll_poisoned() {
+      let _ = self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::Poisoned { group });
+    }
+    while let Some(blocked) = self.coord.peek_merge_blocked() {
+      if self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::MergeBlocked {
+          target: blocked.target,
+          source: blocked.source,
+          boundary: blocked.boundary,
+          cause: blocked.cause,
+        })
+        .is_err()
+      {
+        break;
+      }
+      let _ = self.coord.poll_merge_blocked();
+    }
+    self.rearm_cue_retry();
   }
 
   fn storage_crank(&mut self, now: Now) {
@@ -914,27 +961,9 @@ where
     // work — an owed adopt capture faulting, a committed-corrupt decode in the resolver — and
     // this crank's earlier drain already ran, so without a second drain an otherwise idle
     // plane would sit on the queued poison until an unrelated wake. Same best-effort tail
-    // semantics as the pre-storage drain; the hold signal drains here too for the same reason.
-    while let Some(group) = self.coord.poll_poisoned() {
-      let _ = self
-        .lifecycle_tx
-        .try_send(LifecycleEvent::Poisoned { group });
-    }
-    while let Some(blocked) = self.coord.peek_merge_blocked() {
-      if self
-        .lifecycle_tx
-        .try_send(LifecycleEvent::MergeBlocked {
-          target: blocked.target,
-          source: blocked.source,
-          boundary: blocked.boundary,
-          cause: blocked.cause,
-        })
-        .is_err()
-      {
-        break;
-      }
-      let _ = self.coord.poll_merge_blocked();
-    }
+    // semantics as the pre-storage drain; the hold signal drains here too for the same reason,
+    // and this tail's re-arm is what brings an idle host back for one it had to retain.
+    self.publish_observations();
     self.flush_pending = self.engine.has_staged() || more;
     self
       .metrics
