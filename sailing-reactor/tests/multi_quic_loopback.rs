@@ -11,8 +11,10 @@ use std::{net::SocketAddr, time::Duration};
 
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
-use common::{CountSm, DelegatingEngine, EngineWatch, TestCa, TrapSm};
-use sailing_proto::{ClusterId, ConfChange, ConfChangeType, Config, Data, Index, Role};
+use common::{CountSm, DelegatingEngine, EngineWatch, TestCa, TrapSm, frozen_sources_engine};
+use sailing_proto::{
+  ClusterId, ConfChange, ConfChangeType, Config, Data, Index, MergeBlockedCause, Role,
+};
 use sailing_reactor::{
   DriverConfig, DriverError, GroupBlueprint, GroupHandle, LifecycleEvent, MultiHandle,
   MultiReactorQuicDriver, Node, factory_fn,
@@ -32,6 +34,9 @@ fn addrs(base_port: u16, n: u16) -> Vec<SocketAddr> {
 }
 
 type MDriver<F> = MultiReactorQuicDriver<TokioRuntime, u64, u64, F>;
+
+/// [`MDriver`]'s twin over a caller-supplied engine — the engine-accepting seam's type.
+type MForeign<F, E> = MultiReactorQuicDriver<TokioRuntime, u64, u64, F, E>;
 
 /// Bind one EMPTY multi-group QUIC host (groups arrive via commands).
 async fn bind_node<F>(
@@ -1930,6 +1935,222 @@ async fn a_courtesy_snapshot_cures_a_removed_peer_at_default_flags_over_quic() {
     Role::Leader,
     "the cured peer never leads the group it was removed from"
   );
+}
+
+/// THE IDLE-HOST BACKPRESSURE PIN on the QUIC driver — the stream suite's
+/// `a_stranded_sources_observation_rides_the_cue_retry_wake_on_an_idle_host`, verbatim over QUIC:
+/// two hosts restore five two-voter sources FROZEN for the never-hosted target 1 on capacity-1
+/// lifecycle tails, quiesce, and each retained strand observation must then reach the drained
+/// tail on the cue-retry deadline rather than a whole idle-host beat later.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranded_sources_observation_rides_the_cue_retry_wake_on_an_idle_host() {
+  const SOURCES: [u64; 5] = [2, 3, 4, 5, 6];
+  let ca = TestCa::new();
+  let addrs = addrs(45_030, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let watch = std::sync::Arc::new(EngineWatch::default());
+    let (driver, handle): (
+      MForeign<CountSm, DelegatingEngine>,
+      MultiHandle<u64, u64, CountSm>,
+    ) = MultiReactorQuicDriver::bind_with_engine(
+      addrs[(id - 1) as usize],
+      ca.options(id, &cluster()),
+      cluster(),
+      peers,
+      DriverConfig {
+        events_cap: 1,
+        ..DriverConfig::default()
+      },
+      DelegatingEngine::preloaded(frozen_sources_engine(&SOURCES, 1), watch),
+    )
+    .await
+    .expect("the host binds over the frozen sources");
+    metrics.push(driver.engine_metrics());
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  for gid in SOURCES {
+    for (i, h) in handles.iter().enumerate() {
+      let id = i as u64 + 1;
+      h.restore_group(gid, config(id, vec![1, 2]), id + 4, CountSm::default(), 0)
+        .await
+        .expect("the frozen source restores");
+      let status = h.group(gid).status().await.expect("hosted");
+      assert!(
+        status.frozen,
+        "node {id}: source {gid} restored frozen for the unhosted target"
+      );
+    }
+  }
+  for (i, m) in metrics.iter().enumerate() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while m.quiesced_groups() < SOURCES.len() as u64 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "node {}: the stranded sources never quiesced ({} of {})",
+        i + 1,
+        m.quiesced_groups(),
+        SOURCES.len()
+      );
+      tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+  }
+  tokio::time::sleep(Duration::from_secs(2)).await;
+  let is_strand = |ev: &LifecycleEvent<u64, u64>| {
+    matches!(
+      ev,
+      LifecycleEvent::MergeBlocked {
+        target: 1,
+        cause: MergeBlockedCause::StrandedSource,
+        ..
+      }
+    )
+  };
+  for (i, h) in handles.iter().enumerate() {
+    let first = h
+      .lifecycle()
+      .try_recv()
+      .expect("the first strand's observation filled the one-slot tail");
+    assert!(is_strand(&first), "node {}: {first:?}", i + 1);
+    await_lifecycle(h.lifecycle(), "the first retained strand", is_strand).await;
+    let mut gaps = Vec::new();
+    for _ in 0..3 {
+      let started = std::time::Instant::now();
+      await_lifecycle(h.lifecycle(), "a retained strand", is_strand).await;
+      gaps.push(started.elapsed());
+    }
+    assert!(
+      gaps.iter().all(|g| *g < Duration::from_millis(500)),
+      "node {}: a retained observation waited {gaps:?} for an unrelated wake instead of riding \
+       the cue-retry deadline",
+      i + 1
+    );
+  }
+}
+
+/// THE DISCONNECTED-TAIL PIN on the QUIC driver — the stream suite's
+/// `a_disconnected_lifecycle_tail_does_not_keep_a_stranded_host_cranking`, verbatim over QUIC:
+/// two hosts restore five two-voter sources FROZEN for the never-hosted target 1 on unread
+/// capacity-1 lifecycle tails, quiesce, and crank at the cue-retry cadence for the retained
+/// observations; then every `MultiHandle` is dropped while a projected `GroupHandle` per host
+/// keeps the driver alive, and each host's hosted-id scan count over the same window must fall
+/// to a quarter of that cadence or less instead of holding it for a tail no receiver can ever
+/// drain.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disconnected_lifecycle_tail_does_not_keep_a_stranded_host_cranking() {
+  const SOURCES: [u64; 5] = [2, 3, 4, 5, 6];
+  let ca = TestCa::new();
+  let addrs = addrs(45_080, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  let mut watches = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let watch = std::sync::Arc::new(EngineWatch::default());
+    let (driver, handle): (
+      MForeign<CountSm, DelegatingEngine>,
+      MultiHandle<u64, u64, CountSm>,
+    ) = MultiReactorQuicDriver::bind_with_engine(
+      addrs[(id - 1) as usize],
+      ca.options(id, &cluster()),
+      cluster(),
+      peers,
+      DriverConfig {
+        events_cap: 1,
+        ..DriverConfig::default()
+      },
+      DelegatingEngine::preloaded(frozen_sources_engine(&SOURCES, 1), watch.clone()),
+    )
+    .await
+    .expect("the host binds over the frozen sources");
+    metrics.push(driver.engine_metrics());
+    watches.push(watch);
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  for gid in SOURCES {
+    for (i, h) in handles.iter().enumerate() {
+      let id = i as u64 + 1;
+      h.restore_group(gid, config(id, vec![1, 2]), id + 4, CountSm::default(), 0)
+        .await
+        .expect("the frozen source restores");
+      let status = h.group(gid).status().await.expect("hosted");
+      assert!(
+        status.frozen,
+        "node {id}: source {gid} restored frozen for the unhosted target"
+      );
+    }
+  }
+  for (i, m) in metrics.iter().enumerate() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while m.quiesced_groups() < SOURCES.len() as u64 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "node {}: the stranded sources never quiesced ({} of {})",
+        i + 1,
+        m.quiesced_groups(),
+        SOURCES.len()
+      );
+      tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+  }
+  let scans = |i: usize| {
+    watches[i]
+      .group_scans
+      .load(std::sync::atomic::Ordering::SeqCst)
+  };
+  let window = Duration::from_secs(2);
+  let before: Vec<usize> = (0..2).map(scans).collect();
+  tokio::time::sleep(window).await;
+  let retained: Vec<usize> = (0..2).map(|i| scans(i) - before[i]).collect();
+  for (i, r) in retained.iter().enumerate() {
+    assert!(
+      *r >= 80,
+      "node {}: the full tail's retained observations were not re-offered on the cue-retry \
+       cadence ({r} hosted-id scans in two seconds)",
+      i + 1
+    );
+  }
+  let keepers: Vec<GroupHandle<u64, u64, CountSm>> =
+    handles.iter().map(|h| h.group(SOURCES[0])).collect();
+  drop(handles);
+  tokio::time::sleep(Duration::from_millis(250)).await;
+  let before: Vec<usize> = (0..2).map(scans).collect();
+  tokio::time::sleep(window).await;
+  for i in 0..2 {
+    let cranked = scans(i) - before[i];
+    assert!(
+      cranked * 4 <= retained[i],
+      "node {}: the host kept cranking ({cranked} hosted-id scans in two seconds, against {} \
+       with the tail merely full) for a lifecycle tail no receiver can ever drain: a \
+       disconnected tail re-armed the cue retry",
+      i + 1,
+      retained[i]
+    );
+  }
+  for (i, m) in metrics.iter().enumerate() {
+    assert_eq!(m.quiesced_groups(), SOURCES.len() as u64, "node {}", i + 1);
+  }
+  for (i, keeper) in keepers.iter().enumerate() {
+    let status = keeper
+      .status()
+      .await
+      .expect("the projected handle keeps the driver alive");
+    assert!(
+      status.frozen,
+      "node {}: the stranded source is still hosted and frozen",
+      i + 1
+    );
+  }
 }
 
 /// Compile-level proof that the ENGINE SEAM is publicly reachable on THIS surface: from a crate

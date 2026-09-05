@@ -18,10 +18,13 @@ use std::{
 
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
-use common::{CountSm, DelegatingEngine, EngineWatch, PRELOAD_TERM, TrapSm, preloaded_engine};
+use common::{
+  CountSm, DelegatingEngine, EngineWatch, PRELOAD_TERM, TrapSm, frozen_sources_engine,
+  preloaded_engine,
+};
 use sailing_proto::{
   ClusterId, ConfChange, ConfChangeType, Config, Data, Event, Index, LabelOptions, Labeled,
-  Passthrough, ReadOnlyOption, Role,
+  MergeBlockedCause, Passthrough, ReadOnlyOption, Role,
 };
 use sailing_reactor::{
   DriverConfig, DriverError, GroupBlueprint, GroupHandle, LifecycleEvent, MultiHandle,
@@ -4074,6 +4077,261 @@ async fn a_debt_windows_fence_signal_survives_a_full_lifecycle_tail() {
     },
   )
   .await;
+}
+
+/// THE IDLE-HOST BACKPRESSURE PIN, the held-merge pin's strand leg: a stranded source's
+/// observation, retained behind a full lifecycle tail, still reaches the embedder promptly once
+/// the tail drains — with NO other traffic and the source quiesced. Two hosts are handed engines
+/// holding five two-voter sources (2 to 6), each restored FROZEN for the never-hosted target 1, on
+/// capacity-1 lifecycle tails: on each host the first strand's observation fills the slot and the
+/// other four are retained at the coordinator. Every earlier cause's holder is quiesce-ineligible
+/// (a park, a debt, a cure debt, an owed adopt capture), so its host keeps cranking and re-offers
+/// a retained observation within a heartbeat; a stranded source is a clean frozen replica that
+/// quiesces (the leader off its own idleness, the follower off the flagged beat), after which a
+/// host wakes only for its housekeeping and the transport's keep-alive probes — both on a
+/// one-second cadence that the two idle hosts phase-lock into ONE wake per second. Pre-fix a
+/// retained observation that missed the crank before it (a crank hands one to the waiting
+/// receiver and buffers one more) therefore landed a full second later; post-fix the cue-retry
+/// deadline re-offers it within its 50 ms interval. The first retained observation lands at an
+/// arbitrary phase of the cadence, so the three that follow — each slot drained the instant the
+/// previous one arrives, so at least one of them spans a wake — are what is timed, on both hosts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranded_sources_observation_rides_the_cue_retry_wake_on_an_idle_host() {
+  const SOURCES: [u64; 5] = [2, 3, 4, 5, 6];
+  let addrs = addrs(45_440, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (dialer, acceptor) = plain_factories(id);
+    let watch = Arc::new(EngineWatch::default());
+    let (driver, handle): (
+      MForeign<CountSm, DelegatingEngine>,
+      MultiHandle<u64, u64, CountSm>,
+    ) = MultiReactorStreamDriver::bind_with_engine(
+      addrs[(id - 1) as usize],
+      peers,
+      dialer,
+      acceptor,
+      DriverConfig {
+        events_cap: 1,
+        ..DriverConfig::default()
+      },
+      DelegatingEngine::preloaded(frozen_sources_engine(&SOURCES, 1), watch),
+    )
+    .await
+    .expect("the host binds over the frozen sources");
+    metrics.push(driver.engine_metrics());
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // Restore each source on both hosts back to back, so no campaign solicits a host that does
+  // not yet hold the group (an unknown-group signal would take the one slot instead).
+  for gid in SOURCES {
+    for (i, h) in handles.iter().enumerate() {
+      let id = i as u64 + 1;
+      h.restore_group(gid, config(id, vec![1, 2]), id + 4, CountSm::default(), 0)
+        .await
+        .expect("the frozen source restores");
+      let status = h.group(gid).status().await.expect("hosted");
+      assert!(
+        status.frozen,
+        "node {id}: source {gid} restored frozen for the unhosted target"
+      );
+    }
+  }
+  // Every source elects and settles, then every host quiesces all five — the driver's own gauge
+  // says when. Then let the idle hosts' probe and housekeeping cadences phase-lock: from here
+  // nothing is sent to either host that is not on that one-second beat.
+  for (i, m) in metrics.iter().enumerate() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while m.quiesced_groups() < SOURCES.len() as u64 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "node {}: the stranded sources never quiesced ({} of {})",
+        i + 1,
+        m.quiesced_groups(),
+        SOURCES.len()
+      );
+      tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+  }
+  tokio::time::sleep(Duration::from_secs(2)).await;
+  let is_strand = |ev: &LifecycleEvent<u64, u64>| {
+    matches!(
+      ev,
+      LifecycleEvent::MergeBlocked {
+        target: 1,
+        cause: MergeBlockedCause::StrandedSource,
+        ..
+      }
+    )
+  };
+  for (i, h) in handles.iter().enumerate() {
+    let first = h
+      .lifecycle()
+      .try_recv()
+      .expect("the first strand's observation filled the one-slot tail");
+    assert!(is_strand(&first), "node {}: {first:?}", i + 1);
+    // The first RETAINED observation lands whenever the next wake re-offers it.
+    await_lifecycle(h.lifecycle(), "the first retained strand", is_strand).await;
+    // Each slot is free again the instant its predecessor arrived: from there a retained
+    // observation's latency is the cue-retry interval, or a whole beat without the re-arm.
+    let mut gaps = Vec::new();
+    for _ in 0..3 {
+      let started = std::time::Instant::now();
+      await_lifecycle(h.lifecycle(), "a retained strand", is_strand).await;
+      gaps.push(started.elapsed());
+    }
+    assert!(
+      gaps.iter().all(|g| *g < Duration::from_millis(500)),
+      "node {}: a retained observation waited {gaps:?} for an unrelated wake instead of riding \
+       the cue-retry deadline",
+      i + 1
+    );
+  }
+}
+
+/// THE DISCONNECTED-TAIL PIN, the idle-host pin's terminal twin: a retained strand observation
+/// must stop re-arming the cue-retry deadline once no lifecycle receiver can ever take it. The
+/// idle-host shape again — two hosts restore five two-voter sources FROZEN for the never-hosted
+/// target 1 on capacity-1 lifecycle tails — but nothing ever reads the tails: on each host the
+/// first strand's observation fills the slot, the other four are retained at the coordinator,
+/// and once every source has quiesced the cue-retry deadline is what wakes the host, re-offering
+/// them every 50 ms. The engine's hosted-id scan count exposes that cadence (the driver scans the
+/// ids a few times per crank and never while it sleeps in its select). Then every `MultiHandle`
+/// is dropped while a projected `GroupHandle` per host keeps the command channel, and so the
+/// driver, alive: the tails are disconnected for good (flume never re-attaches a receiver). A
+/// full tail retains an observation for a receiver that is merely behind; a disconnected one
+/// used to be handled the same, so the retained observations re-armed the deadline forever and
+/// two hosts whose every group had quiesced kept cranking at 20 Hz with nothing to deliver to.
+/// Now a disconnected tail consumes them at publication, nothing stays queued, and each host
+/// settles to its housekeeping beat and its peer's keep-alive probe — a few cranks a second
+/// against the cadence's twenty, measured as the same host's scan count over equal windows
+/// before and after the drop. The kept `GroupHandle` then proves the driver alive and its source
+/// still hosted and frozen.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_disconnected_lifecycle_tail_does_not_keep_a_stranded_host_cranking() {
+  const SOURCES: [u64; 5] = [2, 3, 4, 5, 6];
+  let addrs = addrs(45_460, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  let mut watches = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (dialer, acceptor) = plain_factories(id);
+    let watch = Arc::new(EngineWatch::default());
+    let (driver, handle): (
+      MForeign<CountSm, DelegatingEngine>,
+      MultiHandle<u64, u64, CountSm>,
+    ) = MultiReactorStreamDriver::bind_with_engine(
+      addrs[(id - 1) as usize],
+      peers,
+      dialer,
+      acceptor,
+      DriverConfig {
+        events_cap: 1,
+        ..DriverConfig::default()
+      },
+      DelegatingEngine::preloaded(frozen_sources_engine(&SOURCES, 1), watch.clone()),
+    )
+    .await
+    .expect("the host binds over the frozen sources");
+    metrics.push(driver.engine_metrics());
+    watches.push(watch);
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // Restore each source on both hosts back to back, so no campaign solicits a host that does
+  // not yet hold the group (an unknown-group signal would take the one slot instead).
+  for gid in SOURCES {
+    for (i, h) in handles.iter().enumerate() {
+      let id = i as u64 + 1;
+      h.restore_group(gid, config(id, vec![1, 2]), id + 4, CountSm::default(), 0)
+        .await
+        .expect("the frozen source restores");
+      let status = h.group(gid).status().await.expect("hosted");
+      assert!(
+        status.frozen,
+        "node {id}: source {gid} restored frozen for the unhosted target"
+      );
+    }
+  }
+  // Every source elects and settles, then every host quiesces all five — the driver's own gauge
+  // says when.
+  for (i, m) in metrics.iter().enumerate() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    while m.quiesced_groups() < SOURCES.len() as u64 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "node {}: the stranded sources never quiesced ({} of {})",
+        i + 1,
+        m.quiesced_groups(),
+        SOURCES.len()
+      );
+      tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+  }
+  let scans = |i: usize| watches[i].group_scans.load(Ordering::SeqCst);
+  let window = Duration::from_secs(2);
+  // The retained cadence, with the unread receivers still alive: a full tail refuses each
+  // offer and the cue retry keeps the quiesced hosts cranking — forty cranks over the window at
+  // a few scans each, of which half is demanded so a stalled retry is named as such.
+  let before: Vec<usize> = (0..2).map(scans).collect();
+  tokio::time::sleep(window).await;
+  let retained: Vec<usize> = (0..2).map(|i| scans(i) - before[i]).collect();
+  for (i, r) in retained.iter().enumerate() {
+    assert!(
+      *r >= 80,
+      "node {}: the full tail's retained observations were not re-offered on the cue-retry \
+       cadence ({r} hosted-id scans in two seconds)",
+      i + 1
+    );
+  }
+  // Every `MultiHandle` goes — the lifecycle receivers with them — while a projected handle per
+  // host keeps its driver alive: from here both tails are disconnected for good.
+  let keepers: Vec<GroupHandle<u64, u64, CountSm>> =
+    handles.iter().map(|h| h.group(SOURCES[0])).collect();
+  drop(handles);
+  // At most one cue-retry wake per host finds the disconnected tail; after it a host wakes only
+  // on its housekeeping beat and its peer's probe. A tail that still re-armed would hold the
+  // retained cadence over the same window; a quarter of it is a generous ceiling for a host
+  // that settled.
+  tokio::time::sleep(Duration::from_millis(250)).await;
+  let before: Vec<usize> = (0..2).map(scans).collect();
+  tokio::time::sleep(window).await;
+  for i in 0..2 {
+    let cranked = scans(i) - before[i];
+    assert!(
+      cranked * 4 <= retained[i],
+      "node {}: the host kept cranking ({cranked} hosted-id scans in two seconds, against {} \
+       with the tail merely full) for a lifecycle tail no receiver can ever drain: a \
+       disconnected tail re-armed the cue retry",
+      i + 1,
+      retained[i]
+    );
+  }
+  for (i, m) in metrics.iter().enumerate() {
+    assert_eq!(m.quiesced_groups(), SOURCES.len() as u64, "node {}", i + 1);
+  }
+  // The drivers are alive and the sources exactly as they were: hosted, frozen, stranded.
+  for (i, keeper) in keepers.iter().enumerate() {
+    let status = keeper
+      .status()
+      .await
+      .expect("the projected handle keeps the driver alive");
+    assert!(
+      status.frozen,
+      "node {}: the stranded source is still hosted and frozen",
+      i + 1
+    );
+  }
 }
 
 /// Retry a leader-routed merge verb across nodes until some leader accepts it (transient

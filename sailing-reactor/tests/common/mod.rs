@@ -13,9 +13,10 @@ use std::{
 
 use bytes::Bytes;
 use sailing_proto::{
-  EngineLog, EngineStable, EntriesRead, Entry, EntryKind, FloorStore, GroupEngine, GroupStores,
-  HardState, Index, LogDone, LogStore, MaybeOwned, MultiEngine, OpId, SnapshotChunkRead,
-  SnapshotMeta, StableDone, StableStore, StateMachine, Term,
+  Data, EngineLog, EngineStable, EntriesRead, Entry, EntryKind, FloorStore, GroupEngine,
+  GroupStores, HardState, Index, LogDone, LogStore, MaybeOwned, MultiEngine, OpId,
+  PrepareMergePayload, SnapshotChunkRead, SnapshotMeta, StableDone, StableStore, StateMachine,
+  Term,
 };
 
 /// A counting state machine: applies are counted; the response is the post-apply count.
@@ -670,6 +671,11 @@ pub struct EngineWatch {
   pub probe_term: AtomicU64,
   /// The probed group's last log index, refreshed alongside [`probe_term`](Self::probe_term).
   pub probe_last_index: AtomicU64,
+  /// Hosted-id scans ([`MultiEngine::group_ids`]) the driver ran: several per crank (the
+  /// storage step's, the pumps', the quiesce sweep's) and none while it sleeps in its select, so
+  /// a count that stays flat across a window is a driver at rest and one that climbs is a crank
+  /// cadence — the only window onto wakes once no handle is left to watch them through.
+  pub group_scans: AtomicUsize,
 }
 
 #[allow(dead_code)]
@@ -735,6 +741,7 @@ impl MultiEngine<u64, u64> for DelegatingEngine {
   }
 
   fn group_ids(&self) -> impl Iterator<Item = &u64> {
+    self.watch.group_scans.fetch_add(1, Ordering::SeqCst);
     self.inner.group_ids()
   }
 
@@ -831,6 +838,44 @@ pub fn preloaded_engine(gids: &[u64]) -> GroupEngine<u64, u64> {
     );
   }
   // Durable before the host ever sees it — the restart shape.
+  engine.flush();
+  engine
+}
+
+/// An engine that ALREADY holds, for every id in `sources`, one committed `PrepareMerge` freezing
+/// the group for `target` — the durable shape of a source whose host restarts after its freeze
+/// committed while the target it froze for is not hosted here: restored, each source is FROZEN
+/// for an unhosted target with no local exit (a stranded source). Built from the public store API
+/// alone, like [`preloaded_engine`].
+#[allow(dead_code)]
+pub fn frozen_sources_engine(sources: &[u64], target: u64) -> GroupEngine<u64, u64> {
+  let mut engine = GroupEngine::<u64, u64>::new();
+  let mut target_key = Vec::new();
+  Data::encode(&target, &mut target_key);
+  let payload = sailing_proto::fuzz_internals::shape_payload::prepare_merge(
+    &PrepareMergePayload::new(Bytes::from(target_key), 1),
+  );
+  for (n, gid) in sources.iter().enumerate() {
+    assert!(engine.add_group(*gid));
+    let (log, stable) = engine.stores(gid).expect("just admitted");
+    let term = Term::new(1);
+    let op = (n as u64 + 1) * 100;
+    log.submit_append(
+      OpId::new(op),
+      &[Entry::new(
+        term,
+        Index::new(1),
+        EntryKind::PrepareMerge,
+        payload.clone(),
+      )],
+    );
+    stable.submit_write(
+      OpId::new(op + 1),
+      HardState::initial()
+        .with_term(term)
+        .with_commit(Index::new(1)),
+    );
+  }
   engine.flush();
   engine
 }
